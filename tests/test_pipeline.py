@@ -4,6 +4,8 @@ import base64
 import json
 import logging
 import re
+import shutil
+import signal
 import threading
 import time
 from collections import Counter
@@ -13,12 +15,12 @@ from typing import Any
 import pytest
 
 from paper_orchestra import pipeline
-from paper_orchestra.compute.base import CompileResult, ComputeBackend, ExecResult
-from paper_orchestra.config import MemoryConfig, PipelineConfig
+from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
+from paper_orchestra.config import MemoryConfig, PipelineConfig, result_settings
 from paper_orchestra.context import RunContext, RunPaths
-from paper_orchestra.llm.base import LLMConfigError
+from paper_orchestra.llm.base import LLMConfigError, Usage
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
-from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
+from paper_orchestra.memory import ContextHarness, DreamReport, RunCancelled, TranscriptLog, Wiki
 from paper_orchestra.pipeline import PaperResult, prepare_run_dir, run_paper
 from paper_orchestra.utils.common import read_json, write_json
 
@@ -44,12 +46,19 @@ class FakeCompute(ComputeBackend):
 
     def __init__(self) -> None:
         self.closed = 0
+        #: What ``check`` reports; a test sets it to make the backend unusable.
+        self.problems: list[str] = []
+        self.checks: list[dict[str, bool]] = []
 
     def run_python(self, code, *, inputs=None, outputs=(), timeout=120.0) -> ExecResult:
         return ExecResult(returncode=0)
 
     def compile_latex(self, workdir, tex_name, *, output_pdf=None, timeout=240.0) -> CompileResult:
         return CompileResult(ok=True)
+
+    def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+        self.checks.append({"python": python, "latex": latex})
+        return list(self.problems)
 
     def close(self) -> None:
         self.closed += 1
@@ -62,6 +71,8 @@ class StubAgents:
         self.calls: list[str] = []
         #: Exceptions raised by successive calls of a stage, consumed front to back.
         self.failures: dict[str, list[BaseException]] = {}
+        #: Called with the run context each time a stage is entered, before it may fail.
+        self.hooks: dict[str, Any] = {}
         self.seen: dict[str, Any] = {}
         self.states: dict[str, dict[str, Any]] = {}
         self.figure_id = "fig_arch"
@@ -84,6 +95,8 @@ class StubAgents:
             self.states[stage] = read_json(ctx.paths.state)
             queue = self.failures.get(stage)
             error = queue.pop(0) if queue else None
+        if stage in self.hooks:
+            self.hooks[stage](ctx)
         if error is not None:
             raise error
 
@@ -258,6 +271,23 @@ def state_of(cfg: PipelineConfig) -> dict[str, Any]:
     return read_json(cfg.base_dir / "state.json")
 
 
+def provide_figure(cfg: PipelineConfig, caption: str = "The teaser.") -> None:
+    figures = cfg.base_dir / "raw_materials" / "figures"
+    figures.mkdir(exist_ok=True)
+    (figures / "teaser.png").write_bytes(PNG)
+    write_json(figures / "info.json", [{"name": "teaser", "caption": caption}])
+
+
+def stage_threads() -> list[threading.Thread]:
+    return [thread for thread in threading.enumerate() if thread.name.startswith("stage-")]
+
+
+def wait_for_stage_threads(timeout: float = 10.0) -> None:
+    for thread in stage_threads():
+        thread.join(timeout)
+    assert stage_threads() == []
+
+
 # -- happy paths -----------------------------------------------------------------
 
 
@@ -330,7 +360,9 @@ def test_ingest_mirrors_the_inputs_into_the_wiki(cfg, stubs):
     assert "[[sources/idea]]" in index and "[[literature/Smith2020]]" in index
 
 
-def test_run_with_plotting_runs_both_stages_concurrently_and_merges_figures(cfg, stubs, caplog):
+def test_run_with_plotting_runs_both_stages_concurrently_and_merges_kept_figures(
+    cfg, stubs, caplog
+):
     figures = cfg.base_dir / "raw_materials" / "figures"
     figures.mkdir()
     (figures / "teaser.png").write_bytes(PNG)
@@ -343,6 +375,7 @@ def test_run_with_plotting_runs_both_stages_concurrently_and_merges_figures(cfg,
         ],
     )
     cfg.use_plotting = True
+    cfg.keep_provided_figures = True
     # Both stubs block until the other one is running too: sequential stages would time out.
     stubs.barrier = threading.Barrier(2)
 
@@ -380,11 +413,35 @@ def test_run_with_plotting_runs_both_stages_concurrently_and_merges_figures(cfg,
     assert "The teaser." in page.body
 
 
+def test_plotting_generates_every_figure_and_leaves_the_provided_ones_alone(cfg, stubs, caplog):
+    # As in the original method: the figures of a paper that ships them (a benchmark folder
+    # serves both settings) are not shown to anyone when the run is asked to make its own.
+    provide_figure(cfg, caption="Our method reaches 93.1 on the original benchmark.")
+    cfg.use_plotting = True
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result, harness, _ = run(cfg)
+    paths = RunPaths(cfg.base_dir)
+
+    assert result.success, result.error
+    generated = [{"name": "fig_arch.png", "caption": "Overview."}]
+    assert stubs.seen["plotting_figure_lists"] == [[]]
+    assert stubs.seen["figures"] == generated
+    assert read_json(paths.figures_info) == generated
+    assert sorted(p.name for p in paths.figures_dir.iterdir()) == ["fig_arch.png", "info.json"]
+    wiki = harness.project
+    assert not wiki.exists("wiki/figures/teaser.md")
+    assert "93.1" not in wiki.injected_context()
+    # Leaving them out is said, with the way to get them in.
+    ignored = [r.getMessage() for r in caplog.records if "--keep-provided-figures" in r.message]
+    assert len(ignored) == 1 and "1 figure" in ignored[0]
+
+
 def test_a_repeated_plotting_stage_leaves_no_figures_of_the_earlier_one(cfg, stubs, monkeypatch):
     figures = cfg.base_dir / "raw_materials" / "figures"
     figures.mkdir()
     (figures / "teaser.png").write_bytes(PNG)
     cfg.use_plotting = True
+    cfg.keep_provided_figures = True
     run(cfg)
     paths = RunPaths(cfg.base_dir)
     assert (paths.figures_dir / "fig_arch.png").is_file()
@@ -419,6 +476,9 @@ def test_literature_stage_is_followed_by_a_synthesis_dream(cfg, stubs):
     assert "[[literature/Smith2020]]" in synthesis.body
     stages = [e["stage"] for e in events(harness, "dream")]
     assert stages == ["literature", "finalize"]
+    # The record says the follow-up ran, so a resumed run neither repeats nor misses it.
+    assert state_of(cfg)["stages"]["literature"]["after_done"] is True
+    assert "after_done" not in state_of(cfg)["stages"]["outline"]
 
 
 # -- bookkeeping -----------------------------------------------------------------
@@ -764,6 +824,7 @@ def test_plotting_failure_is_tolerated(cfg, stubs, caplog, monkeypatch):
     figures.mkdir()
     (figures / "teaser.png").write_bytes(PNG)
     cfg.use_plotting = True
+    cfg.keep_provided_figures = True
     stubs.failures["plotting"] = [RuntimeError("matplotlib boom"), RuntimeError("still boom")]
     with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
         result, harness, _ = run(cfg)
@@ -811,6 +872,101 @@ def test_configuration_errors_inside_a_stage_are_not_retried(cfg, stubs):
     assert stubs.calls == ["outline"]
 
 
+def unusable(compute: FakeCompute) -> Any:
+    """A hook that makes ``compute`` report itself unusable, as after a token expired."""
+
+    def hook(ctx: RunContext) -> None:
+        compute.problems = ["Modal is not authenticated: run `modal setup`."]
+
+    return hook
+
+
+def test_a_backend_failure_is_retried_while_the_backend_is_usable(cfg, stubs):
+    stubs.failures["section_writing"] = [ComputeError("the sandbox stopped")]
+    result, _, _ = run(cfg)
+
+    assert result.success
+    assert result.stages["section_writing"]["attempts"] == 2
+
+
+def test_an_unusable_backend_fails_the_run_instead_of_being_retried(cfg, stubs):
+    compute = FakeCompute()
+    stubs.hooks["section_writing"] = unusable(compute)
+    stubs.failures["section_writing"] = [
+        ComputeError("Modal is not authenticated."),
+        ComputeError("Modal is not authenticated."),
+    ]
+    result = run_paper(cfg, harness=make_harness(cfg), compute=compute)
+
+    assert not result.success
+    # A second attempt would have paid for the whole draft again, to fail the same way.
+    assert stubs.count()["section_writing"] == 1
+    assert result.stages["section_writing"]["attempts"] == 1
+    assert result.error.startswith("stage 'section_writing' failed after 1 attempt(s)")
+    assert "Modal is not authenticated: run `modal setup`." in result.error
+    assert state_of(cfg)["error"] == result.error
+
+
+def test_a_backend_error_that_says_the_backend_is_unusable_is_not_retried(cfg, stubs):
+    class Unauthenticated(ComputeError):
+        """What only the failing call can know: the token is there, but Modal rejects it."""
+
+        unusable = True
+
+    # The backend's own check finds nothing wrong.
+    stubs.failures["section_writing"] = [Unauthenticated("Modal rejected the token.")] * 2
+    result, _, _ = run(cfg)
+
+    assert not result.success
+    assert stubs.count()["section_writing"] == 1
+    assert result.error == (
+        "stage 'section_writing' failed after 1 attempt(s): "
+        "Unauthenticated: Modal rejected the token."
+    )
+
+
+def test_an_unusable_backend_is_not_tolerated_in_the_plotting_stage(cfg, stubs, monkeypatch):
+    cfg.use_plotting = True
+    compute = FakeCompute()
+    stubs.hooks["plotting"] = unusable(compute)
+    # The plotting agent reports the backend's error in its own words.
+    lost = "none of the 1 planned figure(s) could be produced (fig_arch: not authenticated)"
+    stubs.failures["plotting"] = [RuntimeError(lost), RuntimeError(lost)]
+    result = run_paper(cfg, harness=make_harness(cfg), compute=compute)
+
+    assert not result.success
+    assert stubs.count()["plotting"] == 1
+    assert "section_writing" not in stubs.calls
+    record = state_of(cfg)["stages"]["plotting"]
+    assert record["status"] == "failed" and "tolerated" not in record
+    assert result.error.startswith("stage 'plotting' failed after 1 attempt(s)")
+    assert "Modal is not authenticated: run `modal setup`." in result.error
+
+    # Once the backend works again the same command makes the figures.
+    again = StubAgents().install(monkeypatch)
+    resumed, _, _ = run(cfg)
+    assert resumed.success
+    assert again.calls == ["plotting", "section_writing", "refinement"]
+    assert again.seen["figures"] == [{"name": "fig_arch.png", "caption": "Overview."}]
+
+
+def test_a_configuration_error_is_not_tolerated_in_the_plotting_stage(cfg, stubs):
+    cfg.use_plotting = True
+    wrapped = RuntimeError("no figure could be planned")
+    wrapped.__cause__ = LLMConfigError("the plotting model cannot use tools")
+    stubs.failures["plotting"] = [wrapped]
+    result, _, _ = run(cfg)
+
+    assert not result.success
+    assert stubs.count()["plotting"] == 1
+    assert "section_writing" not in stubs.calls
+    assert "tolerated" not in result.stages["plotting"]
+    assert result.error == (
+        "stage 'plotting' failed after 1 attempt(s): RuntimeError: no figure could be planned "
+        "(LLMConfigError: the plotting model cannot use tools)"
+    )
+
+
 def test_an_interrupt_is_recorded_and_propagates(cfg, stubs):
     stubs.failures["section_writing"] = [KeyboardInterrupt()]
     with pytest.raises(KeyboardInterrupt):
@@ -822,8 +978,98 @@ def test_an_interrupt_is_recorded_and_propagates(cfg, stubs):
     assert state["stages"]["literature"]["status"] == "completed"
 
 
+def test_an_interrupted_stage_leaves_what_it_spent_and_no_model_call_follows(cfg, stubs):
+    def spend_then_interrupt(ctx: RunContext) -> None:
+        ctx.harness.generate(
+            "Write.", agent="SectionWritingAgent", stage="section_writing", model="fake"
+        )
+        raise KeyboardInterrupt
+
+    stubs.hooks["section_writing"] = spend_then_interrupt
+    harness = make_harness(cfg)
+    with pytest.raises(KeyboardInterrupt):
+        run(cfg, harness)
+
+    # The stage never settled, and what it spent is on the books all the same.
+    rows = {row["label"]: row for row in read_json(RunPaths(cfg.base_dir).usage)["by_label"]}
+    assert rows["section_writing.SectionWritingAgent"]["requests"] == 1
+    # Whatever the stage left working on threads of its own gets no further model call.
+    assert harness.cancelled
+
+
+def test_a_closed_state_takes_no_further_updates(tmp_path):
+    path = tmp_path / "state.json"
+    stages = {"plotting": {"status": "running", "attempts": 1, "outputs": []}}
+    state = pipeline._State(path, {"version": pipeline.STATE_VERSION}, stages)
+    state.close("interrupted", "the run was interrupted")
+    closed = path.read_text()
+    assert read_json(path)["stages"]["plotting"]["status"] == "interrupted"
+
+    # A stage that was still working when the run was closed reports in afterwards.
+    state.update("plotting", status="completed", outputs=["plotting_results.json"])
+    state.interrupt("stopped again")
+    state.close("succeeded")
+    assert path.read_text() == closed
+    assert state.record("plotting")["status"] == "interrupted"
+    assert state.closed
+
+
+def test_the_interruption_is_on_record_before_the_stages_are_waited_for(cfg, stubs, monkeypatch):
+    # Whoever stops the run may not wait as long as the run waits for its stages: the
+    # frontend, a batch and a scheduler all kill the process after a grace period.
+    cfg.use_plotting = True
+    monkeypatch.setattr(pipeline, "STOP_WAIT_SECONDS", 4.0)
+    plotting_started = threading.Event()
+    seen: dict[str, Any] = {}
+
+    class Interrupted(_Literature):
+        def run(self, outline: dict[str, Any]) -> None:
+            assert plotting_started.wait(timeout=5)
+            self.ctx.harness.generate("Search.", agent="Agent", stage="literature", model="fake")
+            raise KeyboardInterrupt
+
+    class Busy(_Plotting):
+        def run(self, outline: dict[str, Any]) -> list[dict[str, Any]]:
+            # In the middle of a long model call when the run is stopped.
+            paths = self.ctx.paths
+            plotting_started.set()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                seen["state"] = read_json(paths.state)
+                seen["usage"] = read_json(paths.usage)
+                labels = {row["label"] for row in seen["usage"]["by_label"]}
+                if seen["state"]["status"] == "interrupted" and "literature.Agent" in labels:
+                    break
+                time.sleep(0.01)
+            seen["run_over"] = run_over.is_set()
+            raise RuntimeError("the call came back")
+
+    run_over = threading.Event()
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Interrupted(stubs, ctx))
+    monkeypatch.setattr(pipeline, "_plotting_agent", lambda ctx: Busy(stubs, ctx))
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run(cfg)
+        run_over.set()
+    finally:
+        wait_for_stage_threads()
+
+    # Plotting looked while the run was still waiting for it.
+    assert not seen["run_over"]
+    assert seen["state"]["status"] == "interrupted"
+    assert seen["state"]["error"] == "the run was interrupted"
+    assert seen["state"]["stages"]["literature"]["status"] == "interrupted"
+    assert seen["state"]["stages"]["plotting"]["status"] == "interrupted"
+    rows = {row["label"]: row for row in seen["usage"]["by_label"]}
+    assert rows["literature.Agent"]["requests"] == 1
+    # A stage that stops within the wait still says how it ended.
+    record = state_of(cfg)["stages"]["plotting"]
+    assert record["status"] == "interrupted" and record["finished_at"] is not None
+
+
 def test_an_interrupt_does_not_wait_for_stages_running_side_by_side(cfg, stubs, monkeypatch):
     cfg.use_plotting = True
+    monkeypatch.setattr(pipeline, "STOP_WAIT_SECONDS", 0.2)
     plotting_started = threading.Event()
     release = threading.Event()
     plotting_attempts: list[str] = []
@@ -842,28 +1088,264 @@ def test_an_interrupt_does_not_wait_for_stages_running_side_by_side(cfg, stubs, 
 
     monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Interrupted(stubs, ctx))
     monkeypatch.setattr(pipeline, "_plotting_agent", lambda ctx: Stuck(stubs, ctx))
+    harness = make_harness(cfg)
     try:
         with pytest.raises(KeyboardInterrupt):
-            run(cfg)
-        # The interrupt came through while plotting was still in its first attempt.
+            run(cfg, harness)
+        # The interrupt came through while plotting was still in its first attempt, and the
+        # thread it runs on cannot keep the process alive.
         assert not release.is_set()
+        assert [thread.name for thread in stage_threads()] == ["stage-plotting"]
+        assert all(thread.daemon for thread in stage_threads())
+        # Whatever is still running stops at its next model call.
+        assert harness.cancelled
         state = state_of(cfg)
         assert state["status"] == "interrupted"
         assert state["stages"]["literature"]["status"] == "interrupted"
         assert state["stages"]["plotting"]["status"] == "interrupted"
     finally:
         release.set()
-        for thread in threading.enumerate():
-            if thread.name.startswith("stage"):
-                thread.join(timeout=10)
+        wait_for_stage_threads()
 
-    # Plotting finished the attempt it was in and did not start the retry it had left.
+    # Plotting ended the attempt it was in and started no retry.  What it did after the run
+    # was closed is not recorded: the stage stays interrupted, and its end is no lesson.
     assert plotting_attempts == ["attempt"]
     state = state_of(cfg)
     assert state["status"] == "interrupted"
-    assert state["stages"]["plotting"]["status"] == "failed"
+    assert state["stages"]["plotting"]["status"] == "interrupted"
     assert state["stages"]["plotting"]["attempts"] == 1
     assert "section_writing" not in stubs.calls
+    assert harness.project.pending_notes() == []
+
+
+def test_a_stage_that_ends_after_the_interrupt_is_not_recorded_as_completed(
+    cfg, stubs, monkeypatch
+):
+    cfg.use_plotting = True
+    monkeypatch.setattr(pipeline, "STOP_WAIT_SECONDS", 0.2)
+    plotting_started = threading.Event()
+    release = threading.Event()
+
+    class Interrupted(_Literature):
+        def run(self, outline: dict[str, Any]) -> None:
+            super().run(outline)
+            assert plotting_started.wait(timeout=5)
+            raise KeyboardInterrupt
+
+    class Slow(_Plotting):
+        def run(self, outline: dict[str, Any]) -> list[dict[str, Any]]:
+            plotting_started.set()
+            assert release.wait(timeout=10)
+            # The model call it was in when the run was stopped comes back.
+            self.ctx.harness.usage.record("plotting.Agent", "fake", Usage(requests=1))
+            return super().run(outline)
+
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Interrupted(stubs, ctx))
+    monkeypatch.setattr(pipeline, "_plotting_agent", lambda ctx: Slow(stubs, ctx))
+    harness = make_harness(cfg)
+    refreshes: list[str] = []
+    refresh = harness.refresh
+    harness.refresh = lambda: (refreshes.append("refresh"), refresh())[1]
+    paths = RunPaths(cfg.base_dir)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run(cfg, harness)
+        closed = {path: path.read_text() for path in (paths.state, paths.usage)}
+        refreshed = len(refreshes)
+    finally:
+        release.set()
+        wait_for_stage_threads()
+
+    # Plotting wrote all of its files after the run had been closed as interrupted.  What
+    # the run left when it was closed is final: by now a resumed run may own these files.
+    assert paths.plotting_results.is_file()
+    assert {path: path.read_text() for path in closed} == closed
+    assert len(refreshes) == refreshed
+    state = state_of(cfg)
+    assert state["status"] == "interrupted"
+    assert state["stages"]["plotting"]["status"] == "interrupted"
+    assert state["stages"]["literature"]["status"] == "interrupted"
+
+    # So the resumed run does both stages again, and literature gets its synthesis.
+    again = StubAgents().install(monkeypatch)
+    result, harness, _ = run(cfg)
+    assert result.success, result.error
+    assert again.calls[:2] in (["literature", "plotting"], ["plotting", "literature"])
+    assert again.calls[2:] == ["section_writing", "refinement"]
+    assert result.stages["outline"]["reused"] and not result.stages["literature"]["reused"]
+    assert harness.project.exists("wiki/synthesis/themes.md")
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="needs POSIX signals")
+def test_ctrl_c_stops_both_stages_at_their_next_model_call(cfg, stubs, monkeypatch):
+    cfg.use_plotting = True
+    made: Counter[str] = Counter()
+    both_running = threading.Barrier(2)
+    sent = threading.Event()
+
+    def busy(stage: str) -> Any:
+        def hook(ctx: RunContext) -> None:
+            both_running.wait(timeout=5)
+            # Four seconds of model calls, unless something stops them.
+            for _ in range(400):
+                ctx.harness.generate("Work.", agent="Agent", stage=stage, model="fake")
+                made[stage] += 1
+                if stage == "plotting" and made["literature"] and not sent.is_set():
+                    # What the terminal does on Ctrl-C: the main thread gets the signal.
+                    sent.set()
+                    signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+                time.sleep(0.01)
+
+        return hook
+
+    stubs.hooks["literature"] = busy("literature")
+    stubs.hooks["plotting"] = busy("plotting")
+    # A process started in the background ignores the signal unless it asks for it.
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run(cfg)
+    finally:
+        signal.signal(signal.SIGINT, previous or signal.SIG_DFL)
+
+    # The interrupt was passed on once both stages had stopped, a few calls in.
+    assert stage_threads() == []
+    counts = dict(made)
+    assert 0 < counts["plotting"] < 400 and 0 < counts["literature"] < 400
+    time.sleep(0.05)
+    assert dict(made) == counts
+    state = state_of(cfg)
+    assert state["status"] == "interrupted"
+    for name in ("literature", "plotting"):
+        record = state["stages"][name]
+        assert record["status"] == "interrupted" and record["attempts"] == 1
+        assert record["finished_at"] is not None and record["error"] is None
+    assert "section_writing" not in stubs.calls
+    # What the stages spent until they stopped is on the books.
+    rows = {row["label"]: row for row in read_json(RunPaths(cfg.base_dir).usage)["by_label"]}
+    assert rows["plotting.Agent"]["requests"] == counts["plotting"]
+    assert rows["literature.Agent"]["requests"] == counts["literature"]
+
+    # The same command picks the run up at the stages that were stopped.
+    again = StubAgents().install(monkeypatch)
+    result, harness, _ = run(cfg)
+    assert result.success, result.error
+    assert sorted(again.calls[:2]) == ["literature", "plotting"]
+    assert again.calls[2:] == ["section_writing", "refinement"]
+    assert result.stages["outline"]["reused"] is True
+    assert harness.project.exists("wiki/synthesis/themes.md")
+    # Usage of the interrupted invocation is carried.
+    rows = {row["label"]: row for row in result.usage["by_label"]}
+    assert rows["plotting.Agent"]["requests"] == counts["plotting"]
+
+
+class ExitHooks:
+    """Stands in for ``atexit``: what the process calls on its way out."""
+
+    def __init__(self) -> None:
+        self.hooks: list[Any] = []
+
+    def register(self, hook: Any) -> Any:
+        self.hooks.append(hook)
+        return hook
+
+    def unregister(self, hook: Any) -> None:
+        if hook in self.hooks:
+            self.hooks.remove(hook)
+
+
+@pytest.mark.parametrize("ends_first", ["stage", "process"])
+def test_the_backend_is_closed_once_the_interrupted_stage_or_the_process_has_ended(
+    cfg, stubs, monkeypatch, ends_first
+):
+    cfg.use_plotting = True
+    monkeypatch.setattr(pipeline, "STOP_WAIT_SECONDS", 0.2)
+    exits = ExitHooks()
+    monkeypatch.setattr(pipeline, "atexit", exits)
+    plotting_started = threading.Event()
+    release = threading.Event()
+    compute = FakeCompute()
+    closed_while_running: list[int] = []
+
+    class Interrupted(_Literature):
+        def run(self, outline: dict[str, Any]) -> None:
+            assert plotting_started.wait(timeout=5)
+            raise KeyboardInterrupt
+
+    class Stuck(_Plotting):
+        def run(self, outline: dict[str, Any]) -> list[dict[str, Any]]:
+            plotting_started.set()
+            assert release.wait(timeout=10)
+            # The stage is still using the backend here.
+            closed_while_running.append(compute.closed)
+            raise RuntimeError("stopped")
+
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Interrupted(stubs, ctx))
+    monkeypatch.setattr(pipeline, "_plotting_agent", lambda ctx: Stuck(stubs, ctx))
+    monkeypatch.setattr(pipeline, "_build_harness", make_harness)
+    monkeypatch.setattr(pipeline, "_build_compute", lambda config: compute)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_paper(cfg)
+        assert compute.closed == 0
+        if ends_first == "process":
+            # Plotting is still in its job when the process ends.  What the backend holds
+            # (sandboxes on a remote service, say) must not stay behind.
+            assert len(exits.hooks) == 1
+            exits.hooks[0]()
+            assert compute.closed == 1
+    finally:
+        release.set()
+        wait_for_stage_threads()
+        for thread in threading.enumerate():
+            if thread.name == "compute-close":
+                thread.join(5)
+
+    if ends_first == "stage":
+        assert closed_while_running == [0]
+    assert compute.closed == 1
+    # Nothing is left for the end of the process to do, or to keep the backend alive for.
+    assert exits.hooks == []
+
+
+def test_a_cancelled_run_is_an_interruption_not_a_failed_stage(cfg, stubs):
+    harness = make_harness(cfg)
+
+    def cancel(ctx: RunContext) -> None:
+        ctx.harness.cancel()
+        ctx.harness.generate(
+            "Write.", agent="SectionWritingAgent", stage="section_writing", model="fake"
+        )
+
+    stubs.hooks["section_writing"] = cancel
+    with pytest.raises(RunCancelled):
+        run(cfg, harness)
+
+    assert stubs.count()["section_writing"] == 1
+    state = state_of(cfg)
+    assert state["status"] == "interrupted"
+    record = state["stages"]["section_writing"]
+    assert record["status"] == "interrupted" and record["attempts"] == 1
+    assert record["error"] is None
+    assert state["stages"]["literature"]["status"] == "completed"
+    # Being stopped is not something a later run should learn from.
+    assert harness.project.pending_notes() == []
+    ends = [e["status"] for e in events(harness, "stage_end") if e["stage"] == "section_writing"]
+    assert ends == ["interrupted"]
+
+
+def test_a_stage_that_returns_after_the_run_was_cancelled_is_not_trusted(cfg, stubs):
+    # Agents skip over a failed model call in places, so a stage can return normally with
+    # less than its full work after the run was stopped.
+    stubs.hooks["section_writing"] = lambda ctx: ctx.harness.cancel()
+    with pytest.raises(RunCancelled):
+        run(cfg)
+
+    assert RunPaths(cfg.base_dir).raw_draft_tex.is_file()
+    state = state_of(cfg)
+    assert state["status"] == "interrupted"
+    assert state["stages"]["section_writing"]["status"] == "interrupted"
+    assert "refinement" not in stubs.calls
 
 
 # -- resume ----------------------------------------------------------------------
@@ -966,16 +1448,330 @@ def test_an_earlier_research_cutoff_invalidates_what_was_collected(cfg, stubs, m
     assert state_of(cfg)["config"]["research_cutoff"] == "2025-03"
 
 
-def test_enabling_plotting_on_resume_reruns_from_the_parallel_stage(cfg, stubs, monkeypatch):
-    run(cfg)
+def test_switching_plotting_on_or_off_starts_over(cfg, stubs, monkeypatch, caplog):
+    provide_figure(cfg)
+    _, harness, _ = run(cfg)
+    assert stubs.seen["figures"] == [{"name": "teaser.png", "caption": "The teaser."}]
+    assert harness.project.exists("wiki/figures/teaser.md")
+
+    # With plotting the figures are generated, so the workspace and the memory that were
+    # built around the provided ones do not stand.
     cfg.use_plotting = True
+    plotted = StubAgents().install(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result, harness, _ = run(cfg)
+    assert result.success
+    assert sorted(plotted.calls[1:3]) == ["literature", "plotting"]
+    assert plotted.count() == {
+        "outline": 1,
+        "literature": 1,
+        "plotting": 1,
+        "section_writing": 1,
+        "refinement": 1,
+    }
+    assert not any(record["reused"] for record in result.stages.values())
+    assert "use_plotting: False -> True" in caplog.text
+    assert plotted.seen["figures"] == [{"name": "fig_arch.png", "caption": "Overview."}]
+    assert not harness.project.exists("wiki/figures/teaser.md")
+
+    # And back: the generated figure must not stay in the paper.
+    cfg.use_plotting = False
+    plain = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    assert result.success
+    assert plain.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert plain.seen["figures"] == [{"name": "teaser.png", "caption": "The teaser."}]
+    assert "plotting" not in state_of(cfg)["stages"]
+    paths = RunPaths(cfg.base_dir)
+    assert not paths.plotting_results.exists() and not paths.generated_figures_dir.exists()
+    assert sorted(p.name for p in paths.figures_dir.iterdir()) == ["info.json", "teaser.png"]
+
+
+def use_another_idea_file(cfg: PipelineConfig) -> None:
+    # The same text under another name: the inputs' digest does not change.
+    (cfg.base_dir / "raw_materials" / "idea_dense.md").write_text(IDEA)
+    cfg.idea_filename = "idea_dense.md"
+
+
+SETTING_CHANGES = {
+    "idea_filename": use_another_idea_file,
+    "models.writer": lambda cfg: setattr(cfg.models, "writer", "claude-other"),
+    "models.reflection": lambda cfg: setattr(cfg.models, "reflection", "claude-other"),
+    "models.fast": lambda cfg: setattr(cfg.models, "fast", "claude-small"),
+    "models.effort": lambda cfg: setattr(cfg.models, "effort", "max"),
+    "models.fast_effort": lambda cfg: setattr(cfg.models, "fast_effort", "medium"),
+    "max_reflections": lambda cfg: setattr(cfg, "max_reflections", 5),
+    "retry_after_rejection": lambda cfg: setattr(cfg, "retry_after_rejection", False),
+    "max_formatting_rounds": lambda cfg: setattr(cfg, "max_formatting_rounds", 2),
+    "review_ensemble": lambda cfg: setattr(cfg, "review_ensemble", 1),
+    "max_repair_rounds": lambda cfg: setattr(cfg, "max_repair_rounds", 1),
+    "memory.enabled": lambda cfg: setattr(cfg.memory, "enabled", False),
+    "memory.lab": lambda cfg: setattr(cfg.memory, "lab", True),
+    "memory.dream": lambda cfg: setattr(cfg.memory, "dream", "off"),
+}
+
+
+@pytest.mark.parametrize("setting", sorted(SETTING_CHANGES))
+def test_a_changed_result_setting_starts_over(cfg, stubs, monkeypatch, caplog, setting):
+    first, _, _ = run(cfg)
+    assert first.success
+    before = cfg.result_settings()[setting]
+
+    SETTING_CHANGES[setting](cfg)
+    again = StubAgents().install(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result, _, _ = run(cfg)
+
+    assert result.success
+    # The paper on disk was written under the earlier setting: nothing of it is passed off
+    # as the work of this configuration.
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert not any(record["reused"] for record in result.stages.values())
+    warning = next(r.getMessage() for r in caplog.records if "every stage runs again" in r.message)
+    assert f"{setting}: {before!r} -> {cfg.result_settings()[setting]!r}" in warning
+    assert result_settings(state_of(cfg)["config"]) == cfg.result_settings()
+
+
+def test_a_stage_left_over_from_a_failed_run_is_not_finished_by_another_model(
+    cfg, stubs, monkeypatch
+):
+    stubs.failures["refinement"] = [RuntimeError("reviewer down"), RuntimeError("reviewer down")]
+    assert not run(cfg)[0].success
+
+    cfg.models.reflection = "claude-other"
     again = StubAgents().install(monkeypatch)
     result, _, _ = run(cfg)
+    assert result.success
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
 
+
+def test_settings_that_do_not_shape_the_paper_keep_the_resume(cfg, stubs, monkeypatch, tmp_path):
+    cfg.research_cutoff = "2025-06"
+    assert run(cfg)[0].success
+
+    cfg.compute = "modal"
+    cfg.max_stage_attempts = 5
+    cfg.literature_workers = 1
+    cfg.figure_workers = 1
+    cfg.figure_code_timeout = 10.0
+    cfg.latex_timeout = 999.0
+    cfg.memory.lab_dir = tmp_path / "another-lab"
+    cfg.memory.lab_consolidate = False
+    cfg.research_cutoff = "2025-09"
+    # Plotting is off, so its options are not in play.
+    cfg.models.plotting = "claude-other"
+    cfg.models.image = "some-image-model"
+    cfg.plotting_max_critic_rounds = 9
+    cfg.keep_provided_figures = True
+
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    assert result.success and again.calls == []
+    assert all(record["reused"] for record in result.stages.values())
+
+
+def test_a_state_file_without_the_settings_of_its_run_is_not_resumed(cfg, stubs, monkeypatch):
+    run(cfg)
+    state = state_of(cfg)
+    del state["config"]["models"]
+    write_json(cfg.base_dir / "state.json", state)
+
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    assert result.success
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
+
+
+def test_keeping_the_provided_figures_is_a_setting_of_the_run(cfg, stubs, monkeypatch):
+    provide_figure(cfg)
+    cfg.use_plotting = True
+    run(cfg)
+    assert stubs.seen["figures"] == [{"name": "fig_arch.png", "caption": "Overview."}]
+
+    cfg.keep_provided_figures = True
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    assert result.success
+    assert again.count()["outline"] == 1 and again.count()["plotting"] == 1
+    assert again.seen["figures"] == [
+        {"name": "teaser.png", "caption": "The teaser."},
+        {"name": "fig_arch.png", "caption": "Overview."},
+    ]
+
+
+def test_figures_that_are_not_used_do_not_invalidate_a_resume(cfg, stubs, monkeypatch):
+    provide_figure(cfg)
+    cfg.use_plotting = True
+    run(cfg)
+    (cfg.base_dir / "raw_materials" / "figures" / "later.png").write_bytes(PNG)
+    again = StubAgents().install(monkeypatch)
+    assert run(cfg)[0].success and again.calls == []
+
+    # Once they are part of the run, a change to them is a change of the inputs.
+    cfg.use_plotting = False
+    run(cfg)
+    (cfg.base_dir / "raw_materials" / "figures" / "more.png").write_bytes(PNG)
+    changed = StubAgents().install(monkeypatch)
+    assert run(cfg)[0].success
+    assert changed.calls == ["outline", "literature", "section_writing", "refinement"]
+
+
+def test_a_tolerated_plotting_failure_is_retried_when_the_run_did_not_finish(
+    cfg, stubs, monkeypatch
+):
+    cfg.use_plotting = True
+    stubs.failures["plotting"] = [RuntimeError("no display"), RuntimeError("no display")]
+    stubs.failures["section_writing"] = [RuntimeError("compile"), RuntimeError("compile")]
+    first, _, _ = run(cfg)
+    assert not first.success
+    assert first.stages["plotting"]["tolerated"] is True
+
+    # The run never delivered a paper without figures, so going on without them was not a
+    # result anyone accepted: plotting gets another chance.
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
     assert result.success
     assert again.calls == ["plotting", "section_writing", "refinement"]
     assert result.stages["literature"]["reused"] is True
+    plotting = result.stages["plotting"]
+    assert plotting["status"] == "completed" and "tolerated" not in plotting
     assert again.seen["figures"] == [{"name": "fig_arch.png", "caption": "Overview."}]
+
+
+def test_the_literature_synthesis_is_made_up_for_when_the_stage_is_reused(cfg, stubs, monkeypatch):
+    harness = make_harness(cfg)
+    real_dream = harness.dream
+
+    def killed_during_the_synthesis(**kwargs: Any) -> Any:
+        if kwargs["stage"] == "literature":
+            raise KeyboardInterrupt
+        return real_dream(**kwargs)
+
+    harness.dream = killed_during_the_synthesis
+    with pytest.raises(KeyboardInterrupt):
+        run(cfg, harness)
+    record = state_of(cfg)["stages"]["literature"]
+    assert record["status"] == "completed" and "after_done" not in record
+
+    again = StubAgents().install(monkeypatch)
+    result, harness, _ = run(cfg)
+    assert result.success
+    assert again.calls == ["section_writing", "refinement"]
+    assert result.stages["literature"]["reused"] is True
+    assert result.stages["literature"]["after_done"] is True
+    assert harness.project.exists("wiki/synthesis/themes.md")
+    assert [e["stage"] for e in events(harness, "dream")] == ["literature", "finalize"]
+
+
+def test_a_synthesis_that_did_not_complete_is_tried_again_on_resume(cfg, stubs, monkeypatch):
+    harness = make_harness(cfg)
+    real_dream = harness.dream
+
+    def busy(**kwargs: Any) -> Any:
+        if kwargs["stage"] == "literature":
+            return DreamReport(
+                dream_id="d1",
+                scope="project",
+                stage="literature",
+                error="another consolidation of this wiki is in progress",
+            )
+        return real_dream(**kwargs)
+
+    harness.dream = busy
+    stubs.failures["refinement"] = [RuntimeError("reviewer down"), RuntimeError("reviewer down")]
+    first, _, _ = run(cfg, harness)
+    assert not first.success
+    assert "after_done" not in first.stages["literature"]
+
+    again = StubAgents().install(monkeypatch)
+    result, harness, _ = run(cfg)
+    assert result.success and again.calls == ["refinement"]
+    assert result.stages["literature"]["after_done"] is True
+    assert harness.project.exists("wiki/synthesis/themes.md")
+
+    # A finished run is left alone, also when the synthesis never came about.
+    state = state_of(cfg)
+    del state["stages"]["literature"]["after_done"]
+    write_json(cfg.base_dir / "state.json", state)
+    client = FakeLLM(responder)
+    assert run(cfg, make_harness(cfg, client))[0].success
+    assert client.requests == []
+
+
+def test_reused_ingest_writes_its_source_pages_again_when_the_wiki_lacks_them(
+    cfg, stubs, monkeypatch
+):
+    provide_figure(cfg)
+    stubs.failures["refinement"] = [RuntimeError("reviewer down"), RuntimeError("reviewer down")]
+    first, _, _ = run(cfg)
+    assert not first.success
+    shutil.rmtree(cfg.project_memory_dir)
+
+    again = StubAgents().install(monkeypatch)
+    client = FakeLLM(responder)
+    result, harness, _ = run(cfg, make_harness(cfg, client))
+
+    assert result.success and again.calls == ["refinement"]
+    assert result.stages["ingest"]["reused"] is True
+    wiki = harness.project
+    assert wiki.read("wiki/sources/idea.md").body == IDEA
+    assert wiki.read("wiki/sources/experimental_log.md").body == LOG
+    assert wiki.exists("wiki/sources/guidelines.md") and wiki.exists("wiki/sources/template.md")
+    assert wiki.read("wiki/figures/teaser.md").meta["origin"] == "provided"
+    # Writing them back is plain file work.
+    assert client.requests == []
+
+    # Pages that are in place are left as they are.
+    marker = wiki.read("wiki/sources/idea.md").meta["updated"]
+    assert run(cfg, make_harness(cfg))[0].success
+    assert Wiki(cfg.project_memory_dir).read("wiki/sources/idea.md").meta["updated"] == marker
+
+
+def test_resume_counts_stages_that_ran_side_by_side_once(cfg, stubs, monkeypatch):
+    cfg.use_plotting = True
+    stubs.failures["refinement"] = [RuntimeError("reviewer down"), RuntimeError("reviewer down")]
+    assert not run(cfg)[0].success
+    # As if literature had taken 100 s and plotting, next to it, 60 s.
+    state = state_of(cfg)
+    state["stages"]["literature"]["seconds"] = 100.0
+    state["stages"]["plotting"]["seconds"] = 60.0
+    write_json(cfg.base_dir / "state.json", state)
+
+    StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    assert result.success
+    breakdown = read_json(RunPaths(cfg.base_dir).time_breakdown)
+    assert breakdown["Parallel_Lit_and_Plot"] == 100.0
+    # The pair took 100 s of the run's time, not 160 s.
+    assert 100.0 <= breakdown["Total_Time_Span"] < 150.0
+
+
+def test_usage_is_written_while_a_stage_is_still_running(cfg, stubs, monkeypatch):
+    monkeypatch.setattr(pipeline, "USAGE_FLUSH_SECONDS", 0.02)
+    usage_path = RunPaths(cfg.base_dir).usage
+    seen: dict[str, Any] = {}
+
+    def spend(ctx: RunContext) -> None:
+        ctx.harness.generate(
+            "Write.", agent="SectionWritingAgent", stage="section_writing", model="fake"
+        )
+        # The stage has not settled, and would lose this if the process were killed now.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            labels = {row["label"] for row in read_json(usage_path)["by_label"]}
+            if "section_writing.SectionWritingAgent" in labels:
+                break
+            time.sleep(0.01)
+        seen["labels"] = labels
+        seen["stage"] = read_json(ctx.paths.state)["stages"]["section_writing"]["status"]
+
+    stubs.hooks["section_writing"] = spend
+    result, _, _ = run(cfg)
+
+    assert result.success
+    assert seen["stage"] == "running"
+    assert "section_writing.SectionWritingAgent" in seen["labels"]
+    assert read_json(usage_path) == result.usage
 
 
 # -- validation ------------------------------------------------------------------
@@ -1062,6 +1858,34 @@ def test_missing_tex_fails_the_run_before_any_stage(cfg, stubs, monkeypatch):
     assert stubs.calls == []
 
 
+def test_the_backend_is_asked_whether_it_can_do_the_work_before_any_stage(cfg, stubs):
+    compute = FakeCompute()
+    compute.problems = ["Modal is not authenticated: run `modal setup`."]
+    result = run_paper(cfg, harness=make_harness(cfg), compute=compute)
+
+    assert not result.success
+    assert result.error == "Modal is not authenticated: run `modal setup`."
+    assert stubs.calls == []
+    # Figure code only runs with plotting.
+    assert compute.checks == [{"python": False, "latex": True}]
+
+    cfg.use_plotting = True
+    run_paper(cfg, harness=make_harness(cfg), compute=compute)
+    assert compute.checks[-1] == {"python": True, "latex": True}
+
+
+def test_a_backend_check_that_raises_fails_the_run_before_any_stage(cfg, stubs):
+    class Broken(FakeCompute):
+        def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+            raise ComputeError("the Modal SDK is not installed")
+
+    result = run_paper(cfg, harness=make_harness(cfg), compute=Broken())
+
+    assert not result.success
+    assert result.error == "the Modal SDK is not installed"
+    assert stubs.calls == []
+
+
 def test_prepare_run_dir_copies_and_validates_raw_materials(tmp_path, template_dir):
     source = tmp_path / "materials"
     (source / "figures").mkdir(parents=True)
@@ -1133,3 +1957,98 @@ def test_state_file_is_valid_json_at_every_write(cfg, stubs, monkeypatch):
     monkeypatch.setattr(pipeline, "write_json", spy)
     run(cfg)
     assert seen[0] == "running" and seen[-1] == "succeeded" and len(seen) > 12
+
+
+def test_a_retried_literature_stage_keeps_the_record_of_verified_papers(cfg, stubs):
+    from paper_orchestra.agents.literature import CHECKPOINT_NAME
+
+    seen: list[str | None] = []
+
+    def literature(ctx: RunContext) -> None:
+        checkpoint = ctx.paths.literature_dir / CHECKPOINT_NAME
+        seen.append(checkpoint.read_text() if checkpoint.is_file() else None)
+        # What an earlier attempt leaves besides the record must still be cleared.
+        assert not (ctx.paths.literature_dir / "citation_map.json").exists()
+        ctx.paths.literature_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(f"verified in attempt {len(seen)}")
+        (ctx.paths.literature_dir / "citation_map.json").write_text("{}")
+
+    stubs.hooks["literature"] = literature
+    stubs.failures["literature"] = [RuntimeError("the writer was refused")]
+    result, _, _ = run(cfg)
+    assert result.success and result.stages["literature"]["attempts"] == 2
+    assert seen == [None, "verified in attempt 1"]
+
+    # Starting over plans a new outline, and with it a new search.
+    cfg.resume = False
+    seen.clear()
+    assert run(cfg)[0].success
+    assert seen == [None]
+
+
+# -- what invalidates a resume, and what a failed re-run leaves behind ---------------------
+
+
+@pytest.mark.parametrize("change", ["experimental_log", "figure", "figure_caption"])
+def test_changed_results_or_figures_start_over(cfg, stubs, monkeypatch, change):
+    figures = cfg.base_dir / "raw_materials" / "figures"
+    figures.mkdir()
+    (figures / "teaser.png").write_bytes(PNG)
+    (figures / "info.json").write_text(json.dumps([{"name": "teaser.png", "caption": "old"}]))
+    run(cfg)
+    if change == "experimental_log":
+        (cfg.base_dir / "raw_materials" / "experimental_log.md").write_text(LOG + "Now 93.4.\n")
+    elif change == "figure":
+        (figures / "teaser.png").write_bytes(PNG + b"changed")
+    else:
+        (figures / "info.json").write_text(json.dumps([{"name": "teaser.png", "caption": "new"}]))
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    # New results or a replaced figure must never be answered with the old paper.
+    assert result.success
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert not any(record["reused"] for record in result.stages.values())
+
+
+def test_a_failed_rerun_does_not_leave_the_earlier_paper_as_its_result(cfg, stubs, monkeypatch):
+    run(cfg)
+    paths = RunPaths(cfg.base_dir)
+    assert paths.final_pdf.is_file() and paths.raw_draft_tex.is_file()
+    (paths.latex_dir / "leftover_from_the_first_run.tex").write_text("old")
+    (paths.literature_dir / "leftover.json").write_text("{}")
+    (cfg.base_dir / "raw_materials" / "idea_sparse.md").write_text("# A different idea\n")
+
+    again = StubAgents().install(monkeypatch)
+    again.failures["section_writing"] = [RuntimeError("down"), RuntimeError("down")]
+    result, _, _ = run(cfg)
+    assert not result.success
+    # Anyone looking at the output directory must not take the old paper for the result.
+    for stale in (paths.final_pdf, paths.final_tex, paths.time_breakdown):
+        assert not stale.exists(), stale
+    assert not (cfg.base_dir / "memory_report.json").exists()
+    assert not paths.raw_draft_tex.exists()  # the first run's draft is not this run's
+    assert not (paths.latex_dir / "leftover_from_the_first_run.tex").exists()
+    assert not (paths.literature_dir / "leftover.json").exists()
+
+
+def test_an_interrupted_or_killed_run_resumes_where_it_stopped(cfg, stubs, monkeypatch):
+    stubs.failures["section_writing"] = [KeyboardInterrupt()]
+    with pytest.raises(KeyboardInterrupt):
+        run(cfg)
+    assert state_of(cfg)["status"] == "interrupted"
+
+    again = StubAgents().install(monkeypatch)
+    # A kill (SIGKILL, preemption) cannot even record that the run was stopped.
+    again.failures["refinement"] = [KeyboardInterrupt()]
+    with monkeypatch.context() as patch:
+        patch.setattr(pipeline._State, "interrupt", lambda self, error: None)
+        patch.setattr(pipeline._State, "close", lambda self, status, error=None: None)
+        with pytest.raises(KeyboardInterrupt):
+            run(cfg)
+    assert again.calls == ["section_writing", "refinement"]
+    assert state_of(cfg)["status"] == "running"
+
+    last = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+    assert result.success and last.calls == ["refinement"]
+    assert state_of(cfg)["status"] == "succeeded"

@@ -21,33 +21,38 @@ Stages run in this order::
 
 Each stage is retried on its own, its outcome is persisted in ``state.json``
 after every transition, and a later invocation in the same directory resumes
-after the last stage that completed (as long as the inputs did not change and
-the research cutoff did not move earlier).
+after the last stage that completed.  That holds as long as the inputs and the
+settings that shape the paper are the same and the research cutoff did not move
+earlier; otherwise every stage runs again.
 Agents are created through the module-level factory functions below, which
 import lazily, so tests can swap in stubs and importing this module stays cheap.
 """
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import queue
 import secrets
 import shutil
 import threading
 import time
 import traceback
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from paper_orchestra.config import PipelineConfig
+from paper_orchestra.compute.base import ComputeError
+from paper_orchestra.config import DEPENDENT_RESULT_SETTINGS, PipelineConfig, result_settings
 from paper_orchestra.context import RunContext, RunPaths
 from paper_orchestra.llm.base import LLMConfigError, Usage, UsageTracker
+from paper_orchestra.memory.harness import RunCancelled
 from paper_orchestra.utils.common import read_json, read_text, write_json
 
 if TYPE_CHECKING:
@@ -76,6 +81,14 @@ MEMORY_REPORT_NAME = "memory_report.json"
 
 FIGURE_SUFFIXES = (".png", ".jpg", ".jpeg", ".pdf")
 
+#: How long an interrupted run waits for the stages on other threads before the interrupt
+#: is passed on.  They stop at their next model call; one in the middle of a long call or
+#: job is left behind after this.
+STOP_WAIT_SECONDS = 10.0
+#: While stages run, ``usage.json`` is brought up to date at most this often, so a run that
+#: is killed loses no more than the last moments of what it spent.
+USAGE_FLUSH_SECONDS = 5.0
+
 LITERATURE_SYNTHESIS_FOCUS = (
     "The literature stage just finished collecting and verifying papers (one page each under "
     "wiki/literature/). Build a short synthesis of that literature under wiki/synthesis/: the "
@@ -87,6 +100,8 @@ LITERATURE_SYNTHESIS_FOCUS = (
 _USAGE_FIELDS = tuple(Usage().to_dict())
 #: A compile log in an exception message should not swamp ``state.json`` or a memory note.
 _MAX_ERROR_CHARS = 2_000
+#: The error ``state.json`` gives for a run that was stopped.
+_INTERRUPTED = "the run was interrupted"
 
 
 #: Called as ``on_stage(name, record)`` when a stage has settled; see :func:`run_paper`.
@@ -102,7 +117,8 @@ class PaperResult:
     success: bool
     pdf_path: Path | None
     base_dir: Path
-    #: Per stage: ``status``, ``seconds``, ``attempts``, ``error`` (plus ``outputs``, ``reused``).
+    #: Per stage: ``status``, ``seconds``, ``attempts``, ``error`` (plus ``outputs``, ``reused``
+    #: and, where they apply, ``tolerated`` and ``after_done``).
     stages: dict[str, dict[str, Any]]
     usage: dict[str, Any]
     error: str | None = None
@@ -269,7 +285,15 @@ def _preflight(cfg: PipelineConfig, harness: ContextHarness, compute: ComputeBac
         except LLMConfigError as exc:
             # Diagrams fall back to model-written plotting code, so this is not fatal.
             log.warning("The image model '%s' cannot be used: %s", image, exc)
-    problems = compute.check(python=cfg.use_plotting, latex=True)
+    return _backend_problem(cfg, compute)
+
+
+def _backend_problem(cfg: PipelineConfig, compute: ComputeBackend) -> str | None:
+    """Why the compute backend cannot do this run's work, when it says so."""
+    try:
+        problems = compute.check(python=cfg.use_plotting, latex=True)
+    except ComputeError as exc:
+        return str(exc)
     return problems[0] if problems else None
 
 
@@ -319,8 +343,18 @@ def _describe(exc: BaseException) -> str:
     return text[:_MAX_ERROR_CHARS] + " ... (cut here; the log has the full error)"
 
 
+def _causes(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and, in turn, the exceptions it was raised from."""
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        yield link
+        link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+
+
 def _fingerprint(cfg: PipelineConfig, paths: RunPaths) -> str:
-    """Digest of everything the authors supplied: idea, log, figures and template."""
+    """Digest of what the authors supplied and the run uses: idea, log, figures, template."""
     digest = hashlib.sha256()
 
     def add(label: str, path: Path) -> None:
@@ -329,7 +363,11 @@ def _fingerprint(cfg: PipelineConfig, paths: RunPaths) -> str:
 
     add("idea", paths.idea)
     add("experimental_log", paths.experimental_log)
-    for label, root in (("figures", paths.provided_figures_dir), ("template", cfg.template_dir)):
+    roots = [("template", cfg.template_dir)]
+    if cfg.uses_provided_figures:
+        # Figures that plotting replaces are not inputs: changing them changes nothing.
+        roots.insert(0, ("figures", paths.provided_figures_dir))
+    for label, root in roots:
         if not root.is_dir():
             continue
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
@@ -351,6 +389,31 @@ def _cutoff_moved_earlier(previous: dict[str, Any], current: str) -> bool:
     except ValueError:
         return True
     return earlier_cutoff is None or cutoff < earlier_cutoff
+
+
+def _changed_settings(previous: dict[str, Any], cfg: PipelineConfig) -> list[str]:
+    """The settings that shape the paper and differ from the earlier run's (``name: old -> new``).
+
+    A setting the earlier state does not record counts as changed: what that run
+    did cannot be told.
+    """
+    recorded = previous.get("config")
+    before = result_settings(recorded if isinstance(recorded, dict) else {})
+    now = cfg.result_settings()
+    # The settings of a part that was switched on or off go without saying.
+    implied = {
+        name
+        for switch, names in DEPENDENT_RESULT_SETTINGS.items()
+        if before.get(switch) != now.get(switch)
+        for name in names
+    }
+    changes = []
+    for name, value in now.items():
+        if name in implied or (name in before and before[name] == value):
+            continue
+        old = repr(before[name]) if name in before else "not recorded"
+        changes.append(f"{name}: {old} -> {value!r}")
+    return changes
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +485,17 @@ def _provided_figures(paths: RunPaths) -> tuple[list[dict[str, Any]], list[str]]
             "what they show"
         )
     return entries, problems
+
+
+def _figures_in_use(cfg: PipelineConfig, paths: RunPaths) -> tuple[list[dict[str, Any]], list[str]]:
+    """The provided figures that are part of this run, and what is off about them.
+
+    With plotting every figure is generated and the provided ones stay out of the
+    workspace, the figure list and the memory, unless the run is told to keep them.
+    """
+    if not cfg.uses_provided_figures:
+        return [], []
+    return _provided_figures(paths)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +588,7 @@ class _State:
     ) -> None:
         self._path = path
         self._lock = threading.Lock()
+        self._closed = False
         self._data: dict[str, Any] = {**header, "status": "running", "error": None}
         self._data["stages"] = stages
         with self._lock:
@@ -523,8 +598,21 @@ class _State:
         self._data["updated_at"] = _timestamp()
         write_json(self._path, self._data)
 
-    def update(self, stage: str, **fields: Any) -> None:
+    @property
+    def closed(self) -> bool:
         with self._lock:
+            return self._closed
+
+    def update(self, stage: str, **fields: Any) -> None:
+        """Record a transition of ``stage``; ignored once the run has been closed.
+
+        A stage that is still winding down on another thread when the run is
+        closed as interrupted must not turn up as completed afterwards: the
+        resumed run would then reuse work nobody waited for.
+        """
+        with self._lock:
+            if self._closed:
+                return
             self._data["stages"][stage].update(fields)
             self._save()
 
@@ -536,15 +624,33 @@ class _State:
         with self._lock:
             return {name: dict(record) for name, record in self._data["stages"].items()}
 
+    def interrupt(self, error: str) -> None:
+        """Put on record that the run is being stopped.
+
+        The state stays open, so a stage that stops in time can still say how it
+        ended; :meth:`close` then makes the record final.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._set_status("interrupted", error)
+            self._save()
+
     def close(self, status: str, error: str | None = None) -> None:
         with self._lock:
-            self._data["status"] = status
-            self._data["error"] = error
-            if status == "interrupted":
-                for record in self._data["stages"].values():
-                    if record["status"] == "running":
-                        record["status"] = "interrupted"
+            if self._closed:
+                return
+            self._closed = True
+            self._set_status(status, error)
             self._save()
+
+    def _set_status(self, status: str, error: str | None) -> None:
+        self._data["status"] = status
+        self._data["error"] = error
+        if status == "interrupted":
+            for record in self._data["stages"].values():
+                if record["status"] == "running":
+                    record["status"] = "interrupted"
 
 
 # ---------------------------------------------------------------------------
@@ -559,8 +665,12 @@ class _Stage:
     run: Callable[[], Sequence[Path]]
     #: A failure is tolerated: the run continues without this stage's output.
     optional: bool = False
-    #: Runs once after the stage completed (not when its result is reused).
+    #: Follow-up that runs once after the stage completed.  The stage record says when it
+    #: is done (``after_done``), so a resumed run makes up for one that is missing.
     after: Callable[[], None] | None = None
+    #: Runs when the stage's result is reused: puts back what the stage keeps outside its
+    #: recorded outputs, if that is gone.
+    restore: Callable[[], None] | None = None
 
 
 class _Runner:
@@ -571,7 +681,7 @@ class _Runner:
         if ctx.cfg.use_plotting:
             middle.append(_Stage("plotting", self._plotting, optional=True))
         self.groups: tuple[tuple[_Stage, ...], ...] = (
-            (_Stage("ingest", self._ingest),),
+            (_Stage("ingest", self._ingest, restore=self._restore_source_pages),),
             (_Stage("outline", self._outline),),
             tuple(middle),
             (_Stage("section_writing", self._section_writing),),
@@ -587,9 +697,16 @@ class _Runner:
         self.carried_seconds = 0.0
         self.invocation_start = 0.0
         self.start_time = 0.0
-        #: Set when the run is interrupted while stages run side by side: a stage that is
-        #: still working finishes its current attempt and starts nothing new.
+        #: Whether any stage is left to run in this invocation.
+        self.pending = False
+        #: Set when the run is over before its stages are: a stage that is still working on
+        #: another thread starts nothing new.
         self._stop = threading.Event()
+        #: Stages that neither another attempt nor going on without them can help, with what
+        #: to add to the stage's own error (see :meth:`_blocker`).
+        self._blocked: dict[str, str] = {}
+        self._stage_threads: list[threading.Thread] = []
+        self._usage_lock = threading.Lock()
         self.state: _State
 
     # -- orchestration ---------------------------------------------------------
@@ -604,6 +721,7 @@ class _Runner:
         self.reuse = self._plan_reuse(previous)
         names = [stage.name for group in self.groups for stage in group]
         to_run = [name for name in names if name not in self.reuse]
+        self.pending = bool(to_run)
 
         failure: str | None = None
         if to_run:
@@ -619,7 +737,13 @@ class _Runner:
             self.carried_usage = _carried_usage(paths.usage)
             for name in self.reuse:
                 stages[name] = {**_blank_record(), **previous["stages"][name], "reused": True}
-            self.carried_seconds = sum(float(stages[n]["seconds"] or 0.0) for n in self.reuse)
+            # Stages that ran side by side overlapped, so their group took as long as its
+            # slowest stage: the same rule as for Parallel_Lit_and_Plot in the breakdown.
+            spent = {name: float(stages[name]["seconds"] or 0.0) for name in self.reuse}
+            self.carried_seconds = sum(
+                max((spent.get(stage.name, 0.0) for stage in group), default=0.0)
+                for group in self.groups
+            )
             if self.reuse:
                 self.start_time = float(previous.get("start_time") or self.invocation_start)
                 log.info(
@@ -648,13 +772,22 @@ class _Runner:
 
         if failure is None:
             try:
-                failure = self._run_groups()
+                with self._usage_kept_current():
+                    failure = self._run_groups()
             except BaseException:
+                # The run is over.  Nothing may go on spending behind its back, and nothing
+                # that ends from here on may be recorded as done.
+                self._stop.set()
+                self._guarded(harness.cancel, "stop of the run's model calls")
                 self._guarded(
-                    lambda: self.state.close("interrupted", "the run was interrupted"),
+                    lambda: self.state.close("interrupted", _INTERRUPTED),
                     "update of state.json",
                 )
                 self._guarded(self._write_usage, "usage report")
+                log.warning(
+                    "The run in %s was interrupted; running the same command again resumes it.",
+                    paths.base_dir,
+                )
                 raise
 
         status = "failed" if failure else "succeeded"
@@ -694,6 +827,18 @@ class _Runner:
         ):
             log.warning("Ignoring %s (unknown format): every stage runs again.", paths.state)
             return None
+        changed = _changed_settings(previous, cfg)
+        if changed:
+            # The stages on disk were made under other settings.  Building on them would
+            # deliver, and record as this configuration's work, a paper it did not write.
+            log.warning(
+                "The settings changed since the previous run in %s (%s), so every stage runs "
+                "again and replaces that run's paper. The project memory there is kept; use a "
+                "new output directory to keep both papers or for an independent run.",
+                paths.base_dir,
+                "; ".join(changed),
+            )
+            return None
         if previous.get("inputs") != fingerprint:
             log.warning(
                 "The idea, experimental log, figures or template changed since the previous run "
@@ -718,13 +863,16 @@ class _Runner:
 
         A stage is reused when it completed, its recorded outputs still exist
         and every stage before it is reused too.  An optional stage whose
-        failure the earlier run accepted is settled as well: resuming continues
-        a run, it does not reopen decisions the run already made.
+        failure the earlier run accepted is settled as well, provided that run
+        went on to deliver its paper.  If it did not, nobody got a result
+        without that stage's output, and what broke the stage may be what
+        stopped the run: the stage is run again.
         """
         reuse: set[str] = set()
         if previous is None:
             return reuse
         base = self.ctx.paths.base_dir
+        delivered = previous.get("status") == "succeeded"
         for group in self.groups:
             done = []
             for stage in group:
@@ -735,7 +883,7 @@ class _Runner:
                 if record.get("status") == "completed":
                     if outputs and all((base / rel).is_file() for rel in outputs):
                         done.append(stage.name)
-                elif stage.optional and record.get("tolerated"):
+                elif stage.optional and record.get("tolerated") and delivered:
                     done.append(stage.name)
             reuse.update(done)
             if len(done) < len(group):
@@ -748,6 +896,9 @@ class _Runner:
             outcomes = self._run_group(group)
             failed = [stage for stage in group if not outcomes[stage.name]]
             fatal = next((stage for stage in failed if not stage.optional), None)
+            # Going on without an optional stage does not help when what broke it breaks
+            # the stages after it as well.
+            fatal = fatal or next((stage for stage in failed if stage.name in self._blocked), None)
             if fatal is None:
                 for stage in failed:
                     record = self.state.record(stage.name)
@@ -765,9 +916,10 @@ class _Runner:
                 self._notify(stage.name)
             if fatal is not None:
                 record = self.state.record(fatal.name)
+                detail = self._blocked.get(fatal.name)
                 return (
                     f"stage '{fatal.name}' failed after {record['attempts']} attempt(s): "
-                    f"{record['error']}"
+                    f"{record['error']}" + (f" ({detail})" if detail else "")
                 )
         return None
 
@@ -775,21 +927,83 @@ class _Runner:
         """Run the stages of one group side by side; whether each one produced its output."""
         if len(group) == 1:
             return {group[0].name: self._run_stage(group[0])}
-        pool = ThreadPoolExecutor(len(group), thread_name_prefix="stage")
+        results: queue.SimpleQueue[tuple[str, bool | BaseException]] = queue.SimpleQueue()
+
+        def work(stage: _Stage) -> None:
+            try:
+                outcome: bool | BaseException = self._run_stage(stage)
+            except BaseException as exc:  # passed to the main thread, which ends the run
+                outcome = exc
+            results.put((stage.name, outcome))
+
+        # Daemon threads, so a stage that is slow to stop cannot keep an interrupted process
+        # alive.  On the normal path every one of them is joined below.
+        threads = [
+            threading.Thread(target=work, args=(stage,), name=f"stage-{stage.name}", daemon=True)
+            for stage in group
+        ]
+        self._stage_threads.extend(threads)
+        outcomes: dict[str, bool] = {}
         try:
-            futures = {stage.name: pool.submit(self._run_stage, stage) for stage in group}
-            # Every result is awaited, so a failing stage never leaves its sibling running
-            # behind the pipeline's back.
-            outcomes = {name: future.result() for name, future in futures.items()}
+            for thread in threads:
+                thread.start()
+            for _ in threads:
+                name, outcome = results.get()
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                outcomes[name] = outcome
         except BaseException:
-            # An interrupt cannot stop a stage in the middle of a model call, but waiting
-            # for it here would keep the run going, and spending, through every retry.
-            # The stages are told to wind down and the interrupt is passed on at once.
-            self._stop.set()
-            pool.shutdown(wait=False, cancel_futures=True)
+            self._stop_stages(threads)
             raise
-        pool.shutdown()
+        # Every stage is awaited, so a failing one never leaves its sibling running behind
+        # the pipeline's back.
+        for thread in threads:
+            thread.join()
         return outcomes
+
+    def _stop_stages(self, threads: Sequence[threading.Thread]) -> None:
+        """End the stages on other threads when the run is interrupted.
+
+        A stage cannot be stopped in the middle of a model call or a compute job,
+        but waiting for it to finish would keep the run going, and spending,
+        through every call it has left.  The harness refuses every further model
+        call instead, which ends a stage at its next one, and the stages get a
+        bounded time to get there so that what they spent is still recorded.
+        ``state.json`` and ``usage.json`` say that the run was interrupted before
+        that wait begins.
+        """
+        self._stop.set()
+        self._guarded(self.ctx.harness.cancel, "stop of the run's model calls")
+        running = [thread for thread in threads if thread.is_alive()]
+        if not running:
+            return
+        # On record before the wait, not after it: whoever stopped the run may end the
+        # process sooner (a kill after a grace period, a second interrupt).
+        self._guarded(lambda: self.state.interrupt(_INTERRUPTED), "update of state.json")
+        self._guarded(self._write_usage, "usage report")
+        log.warning(
+            "Interrupted: stopping %s at the next model call (waiting up to %.0f s).",
+            " and ".join(thread.name.removeprefix("stage-") for thread in running),
+            STOP_WAIT_SECONDS,
+        )
+        deadline = time.monotonic() + STOP_WAIT_SECONDS
+        for thread in running:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        left = [thread.name for thread in running if thread.is_alive()]
+        if left:
+            log.warning(
+                "Still busy %.0f s after the interrupt: %s. Not waiting any longer; what "
+                "these do from here on is not recorded.",
+                STOP_WAIT_SECONDS,
+                ", ".join(left),
+            )
+
+    def running_stages(self) -> list[threading.Thread]:
+        """Stage threads that outlived the run (it was interrupted and they were slow to stop)."""
+        return [thread for thread in self._stage_threads if thread.is_alive()]
+
+    def _stopping(self) -> bool:
+        return self._stop.is_set() or self.ctx.harness.cancelled
 
     def _notify(self, name: str) -> None:
         callback = self.on_stage
@@ -806,6 +1020,7 @@ class _Runner:
         name = stage.name
         if name in self.reuse:
             log.info("Stage %s: reusing the result of the earlier run.", name)
+            self._make_up_for(stage)
             return True
 
         attempts = self.ctx.cfg.max_stage_attempts
@@ -813,8 +1028,8 @@ class _Runner:
         seconds = 0.0
         started_at = _timestamp()
         for attempt in range(1, attempts + 1):
-            if self._stop.is_set():
-                break
+            if self._stopping():
+                raise RunCancelled(f"the run was stopped before the {name} stage started")
             self.state.update(
                 name,
                 status="running",
@@ -828,6 +1043,10 @@ class _Runner:
             started = time.monotonic()
             try:
                 outputs = [Path(path) for path in stage.run()]
+                if self._stopping():
+                    # Agents carry on after a model call that failed in places, so a stage
+                    # can come back from a stopped run with less than its work.
+                    raise RunCancelled(f"the run was stopped during the {name} stage")
                 missing = [str(path) for path in outputs if not path.is_file()]
                 if missing:
                     raise StageError(
@@ -835,14 +1054,15 @@ class _Runner:
                     )
             except Exception as exc:
                 seconds += time.monotonic() - started
+                if isinstance(exc, RunCancelled) or self._stopping():
+                    # Not a failure of the stage: nothing to retry, to tolerate or to learn.
+                    self._stage_interrupted(name, attempt, seconds)
+                    if isinstance(exc, RunCancelled):
+                        raise
+                    raise RunCancelled(f"the run was stopped during the {name} stage") from exc
                 error = _describe(exc)
-                # A configuration problem (credentials, SDK, unsupported option) is the
-                # same on every attempt, so it is not retried.
-                retry = (
-                    attempt < attempts
-                    and not isinstance(exc, LLMConfigError)
-                    and not self._stop.is_set()
-                )
+                blocker = self._blocker(exc)
+                retry = attempt < attempts and blocker is None
                 log.error(
                     "Stage %s failed (attempt %d of %d): %s",
                     name,
@@ -866,7 +1086,9 @@ class _Runner:
                     seconds=round(seconds, 3),
                     error=error,
                 )
-                self._note_failure(stage, attempt, attempts, exc, retry)
+                self._note_failure(stage, attempt, attempts, exc, retry, blocker is not None)
+                if blocker is not None:
+                    self._blocked[name] = blocker
                 if not retry:
                     break
                 continue
@@ -888,16 +1110,94 @@ class _Runner:
                 seconds=round(seconds, 3),
             )
             log.info("Stage %s completed in %.1f s.", name, seconds)
-            if stage.after is not None and not self._stop.is_set():
-                self._guarded(stage.after, f"consolidation after the {name} stage")
+            self._run_after(stage)
             self._settle(name)
             return True
 
         self._settle(name)
         return False
 
+    def _stage_interrupted(self, name: str, attempt: int, seconds: float) -> None:
+        self.state.update(
+            name, status="interrupted", finished_at=_timestamp(), seconds=round(seconds, 3)
+        )
+        self._record(
+            "stage_end",
+            stage=name,
+            status="interrupted",
+            attempt=attempt,
+            seconds=round(seconds, 3),
+        )
+        log.info("Stage %s was interrupted.", name)
+        self._settle(name)
+
+    def _blocker(self, exc: Exception) -> str | None:
+        """Why neither another attempt nor going on without the stage can work, if so.
+
+        A configuration problem (credentials, SDK, unsupported option) and a
+        compute backend that cannot do its work are the same on every attempt,
+        and the stages that follow depend on them as well.  A backend error can
+        say so itself (an ``unusable`` attribute that is true).  Beyond that the
+        backend is asked, because a stage may report a backend failure in its
+        own words.  The result is what to add to the stage's own error, which
+        may be nothing; ``None`` means the failure may be transient.
+        """
+        for link in _causes(exc):
+            if isinstance(link, LLMConfigError) or (
+                isinstance(link, ComputeError) and getattr(link, "unusable", False)
+            ):
+                return "" if link is exc else _describe(link)
+        compute = self.ctx.compute
+        try:
+            problem = _backend_problem(self.ctx.cfg, compute)
+        except Exception as error:
+            log.warning("The %s compute backend could not be checked: %s", compute.name, error)
+            return None
+        if problem is None:
+            return None
+        return f"the {compute.name} compute backend cannot be used: {problem}"
+
+    def _run_after(self, stage: _Stage) -> None:
+        """Run the stage's follow-up and record that it is done.
+
+        The stage itself is already recorded as completed.  The separate mark is
+        what lets a resumed run tell a follow-up that ran from one that was cut
+        off or did not complete, which it then makes up for.
+        """
+        if stage.after is None or self._stopping():
+            return
+        try:
+            stage.after()
+        except Exception as exc:
+            # Memory upkeep: the paper can be written without it.
+            log.warning(
+                "The follow-up of the %s stage did not complete (%s). A resumed run tries it again.",
+                stage.name,
+                exc,
+                exc_info=not isinstance(exc, StageError),
+            )
+            return
+        self.state.update(stage.name, after_done=True)
+
+    def _make_up_for(self, stage: _Stage) -> None:
+        """Supply what a reused stage still owes the stages that run."""
+        if stage.restore is not None:
+            self._guarded(stage.restore, f"check of what the {stage.name} stage left in memory")
+        # The follow-up prepares memory for later stages; when none of them runs, a model
+        # session would be spent on pages that nothing reads.
+        owed = stage.after is not None and not self.state.record(stage.name).get("after_done")
+        if owed and self.pending:
+            log.info("Stage %s: its follow-up is not recorded as done; running it now.", stage.name)
+            self._run_after(stage)
+
     def _note_failure(
-        self, stage: _Stage, attempt: int, attempts: int, exc: Exception, retry: bool
+        self,
+        stage: _Stage,
+        attempt: int,
+        attempts: int,
+        exc: Exception,
+        retry: bool,
+        blocked: bool,
     ) -> None:
         """Leave the failure in memory so the retry and later stages can see what went wrong."""
         frames = traceback.extract_tb(exc.__traceback__)
@@ -908,7 +1208,7 @@ class _Runner:
         )
         if retry:
             outcome = "The stage is being retried from its start."
-        elif stage.optional:
+        elif stage.optional and not blocked:
             outcome = "The run continues without this stage's output."
         else:
             outcome = "The run stopped here; a resumed run starts again from this stage."
@@ -935,32 +1235,80 @@ class _Runner:
 
     def _settle(self, name: str) -> None:
         """After a stage ran: refresh the memory index and persist what the run has spent."""
+        if self.state.closed:
+            # A stage that outlived an interrupted run: the run's files are final.
+            return
         self._guarded(self.ctx.harness.refresh, f"memory refresh after the {name} stage")
         self._guarded(self._write_usage, "usage report")
 
     def _write_usage(self) -> dict[str, Any]:
-        report = _usage_report(self.ctx.harness.usage, self.carried_usage, self.usage_baseline)
-        write_json(self.ctx.paths.usage, report)
+        # Stage threads and the periodic flush write this file too; one at a time, so the
+        # report written last is never older than the one it replaces.
+        with self._usage_lock:
+            report = _usage_report(self.ctx.harness.usage, self.carried_usage, self.usage_baseline)
+            write_json(self.ctx.paths.usage, report)
         return report
+
+    @contextlib.contextmanager
+    def _usage_kept_current(self) -> Iterator[None]:
+        """Bring ``usage.json`` up to date while stages run, not only when one settles.
+
+        A stage can run for a long time, and a run that is killed in the middle
+        of it would otherwise lose everything the stage spent.  The ledger does
+        not announce new entries, so it is looked at every
+        ``USAGE_FLUSH_SECONDS`` and written out when it has grown.
+        """
+        ledger = self.ctx.harness.usage
+        done = threading.Event()
+
+        def flush() -> None:
+            written = ledger.total()
+            while not done.wait(USAGE_FLUSH_SECONDS):
+                total = ledger.total()
+                if total != written:
+                    self._guarded(self._write_usage, "usage report")
+                    written = total
+
+        thread = threading.Thread(target=flush, name="usage-flush", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            done.set()
+            thread.join()
 
     # -- stages ----------------------------------------------------------------
 
     def _ingest(self) -> list[Path]:
-        cfg, paths = self.ctx.cfg, self.ctx.paths
+        cfg, paths, harness = self.ctx.cfg, self.ctx.paths, self.ctx.harness
         # Start from the template as shipped: drafts and figures of an earlier run must not
         # leak into this one.
         if paths.latex_dir.exists():
             shutil.rmtree(paths.latex_dir)
         shutil.copytree(cfg.template_dir, paths.latex_dir)
         paths.figures_dir.mkdir(exist_ok=True)
-        if paths.provided_figures_dir.is_dir():
+        if cfg.uses_provided_figures and paths.provided_figures_dir.is_dir():
             shutil.copytree(paths.provided_figures_dir, paths.figures_dir, dirs_exist_ok=True)
+        # What an earlier run generated goes as well: without plotting no stage would clear
+        # it, and it would pass for this run's figures.
+        paths.plotting_results.unlink(missing_ok=True)
+        if paths.generated_figures_dir.is_dir():
+            shutil.rmtree(paths.generated_figures_dir)
 
-        figures, problems = _provided_figures(paths)
+        figures, problems = _figures_in_use(cfg, paths)
         for problem in problems:
             log.warning("Provided figures: %s.", problem)
         write_json(paths.figures_info, figures)
-        if not figures:
+        if not cfg.uses_provided_figures:
+            unused, _ = _provided_figures(paths)
+            if unused:
+                log.warning(
+                    "The %d figure(s) in %s are not used: with plotting on, every figure is "
+                    "generated. Pass --keep-provided-figures to give them to the writer as well.",
+                    len(unused),
+                    paths.provided_figures_dir,
+                )
+        elif not figures:
             if cfg.use_plotting:
                 log.info(
                     "No figures were provided in %s; the plotting stage generates them.",
@@ -974,13 +1322,18 @@ class _Runner:
                     ", ".join(FIGURE_SUFFIXES),
                     paths.provided_figures_dir,
                 )
+        # Figure pages describe files in the workspace, which was just rebuilt.  The pages
+        # of an earlier run (figures it was given or generated) would announce files that
+        # are not there, and captions this run is not meant to see.
+        for stale in harness.list_pages("wiki/figures"):
+            harness.delete_page(stale)
         self._write_source_pages(figures)
         return [paths.template_tex, paths.guidelines, paths.figures_info]
 
-    def _write_source_pages(self, figures: Sequence[dict[str, Any]]) -> None:
-        """Mirror the inputs into the wiki as read-only ground truth."""
-        cfg, paths, harness = self.ctx.cfg, self.ctx.paths, self.ctx.harness
-        sources = (
+    def _source_pages(self) -> tuple[tuple[str, str, str, Path], ...]:
+        """The inputs that are mirrored into the wiki: page name, title, summary, file."""
+        cfg, paths = self.ctx.cfg, self.ctx.paths
+        return (
             ("idea", "Idea", "The research idea, verbatim as the authors provided it.", paths.idea),
             (
                 "experimental_log",
@@ -1001,7 +1354,11 @@ class _Runner:
                 cfg.template_dir / "template.tex",
             ),
         )
-        for name, title, summary, path in sources:
+
+    def _write_source_pages(self, figures: Sequence[dict[str, Any]]) -> None:
+        """Mirror the inputs into the wiki as read-only ground truth."""
+        paths, harness = self.ctx.paths, self.ctx.harness
+        for name, title, summary, path in self._source_pages():
             text = read_text(path)
             harness.write_page(
                 f"wiki/sources/{name}.md",
@@ -1047,9 +1404,38 @@ class _Runner:
                 },
             )
 
+    def _restore_source_pages(self) -> None:
+        """Write the source pages again when ingest is reused but the wiki lacks them.
+
+        That happens when the memory directory was removed or another one is
+        used now.  The source pages are what every session is told to trust and
+        what keeps this paper's content out of the lab memory, so a run must not
+        go on without them.  Writing them is plain file work.
+        """
+        harness = self.ctx.harness
+        if not harness.enabled:
+            return
+        present = set(harness.list_pages("wiki/sources"))
+        missing = [
+            name for name, *_ in self._source_pages() if f"wiki/sources/{name}.md" not in present
+        ]
+        if not missing:
+            return
+        log.warning(
+            "The project memory has no source page for: %s. Writing the source pages again.",
+            ", ".join(missing),
+        )
+        figures, _ = _figures_in_use(self.ctx.cfg, self.ctx.paths)
+        self._write_source_pages(figures)
+        harness.refresh()
+
     def _outline(self) -> list[Path]:
+        from paper_orchestra.agents.literature import CHECKPOINT_NAME
+
         cfg, paths = self.ctx.cfg, self.ctx.paths
-        for stale in (paths.outline, self.pristine_outline):
+        # A new outline starts the literature search over, even if it happens to ask for
+        # the searches an earlier outline asked for.
+        for stale in (paths.outline, self.pristine_outline, paths.literature_dir / CHECKPOINT_NAME):
             stale.unlink(missing_ok=True)
         # The outline is planned against the template as shipped, also when an earlier run
         # already filled sections in.
@@ -1067,10 +1453,19 @@ class _Runner:
         return outline
 
     def _literature(self) -> list[Path]:
+        from paper_orchestra.agents.literature import CHECKPOINT_NAME
+
         cfg, paths = self.ctx.cfg, self.ctx.paths
         # A retried or resumed stage must see the inputs as they were before its own earlier
-        # attempt filled in the template and injected citations into the outline.
+        # attempt filled in the template and injected citations into the outline.  The one
+        # thing kept is the agent's record of the papers it has verified: the search is the
+        # expensive half of the stage, and a failure while writing should not repeat it.
+        # (The agent itself decides whether the record still matches the outline.)
+        checkpoint = paths.literature_dir / CHECKPOINT_NAME
+        verified = checkpoint.read_bytes() if checkpoint.is_file() else None
         _reset_dir(paths.literature_dir)
+        if verified is not None:
+            checkpoint.write_bytes(verified)
         _atomic_copy(cfg.template_dir / "template.tex", paths.template_tex)
         _atomic_copy(self.pristine_outline, paths.outline)
         _literature_agent(self.ctx).run(self._outline_for_agents())
@@ -1095,7 +1490,7 @@ class _Runner:
             stage="literature", focus=LITERATURE_SYNTHESIS_FOCUS, build=True
         )
         if report is not None and report.error:
-            log.warning("The literature synthesis did not complete: %s", report.error)
+            raise StageError(f"literature synthesis: {report.error}")
 
     def _plotting(self) -> list[Path]:
         paths = self.ctx.paths
@@ -1104,9 +1499,9 @@ class _Runner:
         return [paths.plotting_results, paths.figures_info]
 
     def _reset_figure_workspace(self) -> None:
-        """Undo what an earlier plotting attempt left: only the provided figures remain listed."""
+        """Undo what an earlier plotting attempt left: only the figures ingest listed remain."""
         paths = self.ctx.paths
-        provided, _ = _provided_figures(paths)
+        provided, _ = _figures_in_use(self.ctx.cfg, paths)
         keep = {entry["name"] for entry in provided}
         if paths.generated_figures_dir.is_dir():
             for stale in paths.generated_figures_dir.iterdir():
@@ -1205,6 +1600,14 @@ def run_paper(
     ``harness`` and ``compute`` default to what ``cfg`` asks for; a compute
     backend created here is closed before returning, one passed in is not.
 
+    An interrupt (``KeyboardInterrupt``, or ``harness.cancel()`` from another
+    thread, which surfaces as ``RunCancelled``) is passed on after the run was
+    recorded as interrupted in ``state.json`` and ``usage.json`` was written.
+    Stages running on other threads are told to stop and waited for briefly; a
+    harness that was cancelled stays cancelled, so resume with a new one.  If a
+    stage is still busy after that wait, a backend created here is closed once
+    the stage has ended, or when the process ends, whichever comes first.
+
     ``on_stage(name, record)`` is called from this thread each time a stage has
     settled (completed, failed for good, or reused from an earlier run), with
     the stage's ``state.json`` record.  Stages that run side by side are
@@ -1218,11 +1621,48 @@ def run_paper(
     if compute is None:
         compute = _build_compute(cfg)
     ctx = RunContext(cfg=cfg, paths=paths, harness=harness, compute=compute, usage=harness.usage)
+    runner = _Runner(ctx, on_stage)
     try:
-        return _Runner(ctx, on_stage).run()
+        return runner.run()
     finally:
         if owns_compute:
+            _close_when_idle(compute, runner.running_stages())
+
+
+def _close_when_idle(compute: ComputeBackend, stages: Sequence[threading.Thread]) -> None:
+    """Close a backend this module built, once no stage can be using it any more.
+
+    After an interrupt a stage may still be in the middle of a job.  Closing the
+    backend under it would let its next job start resources that nothing
+    releases, so the close waits for those stages on a thread of its own.  A
+    process that ends before they do closes the backend on its way out: the
+    stages end with the process, and what the backend holds outside it (remote
+    sandboxes, say) would otherwise be left running.
+    """
+    lock = threading.Lock()
+    closed = False
+
+    def close() -> None:
+        nonlocal closed
+        # Under the lock, so the end of the process waits for a close that is under way.
+        with lock:
+            if closed:
+                return
+            closed = True
             try:
                 compute.close()
             except Exception as exc:
                 log.warning("Closing the %s compute backend failed: %s", compute.name, exc)
+
+    def close_after_stages() -> None:
+        for stage in stages:
+            stage.join()
+        close()
+        # Nothing is left for the end of the process to do, or to keep the backend for.
+        atexit.unregister(close)
+
+    if not stages:
+        close()
+        return
+    atexit.register(close)
+    threading.Thread(target=close_after_stages, name="compute-close", daemon=True).start()

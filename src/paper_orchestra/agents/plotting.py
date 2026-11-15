@@ -45,9 +45,10 @@ from pydantic import BaseModel
 
 from paper_orchestra.config import PAPER_BANANA_ENV
 from paper_orchestra.context import RunContext
+from paper_orchestra.errors import stops_the_run
 from paper_orchestra.llm.base import Image, LLMClient, LLMError, Part, Text
 from paper_orchestra.llm.parsing import parse_python
-from paper_orchestra.memory.harness import HarnessConversation, MemoryPolicy
+from paper_orchestra.memory.harness import HarnessConversation, MemoryPolicy, RunCancelled
 from paper_orchestra.prompts import plotting as prompts
 from paper_orchestra.prompts.plotting import TaskName
 from paper_orchestra.utils.common import read_text, write_json
@@ -651,8 +652,16 @@ class PlottingAgent:
 
         workers = max(1, min(cfg.figure_workers, len(specs)))
         log.info("Plotting %d figure(s) with %d worker(s).", len(specs), workers)
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="figure") as pool:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="figure")
+        try:
             outcomes = list(pool.map(self._figure_or_skip, specs))
+        except KeyboardInterrupt:
+            # Figures in flight stop at their next model call instead of running to the end.
+            self.ctx.harness.cancel()
+            raise
+        finally:
+            # After an error or an interrupt, figures that have not started are dropped.
+            pool.shutdown(wait=True, cancel_futures=True)
         finished = [outcome for outcome in outcomes if isinstance(outcome, _Finished)]
         skipped = [outcome for outcome in outcomes if isinstance(outcome, _Skipped)]
         results = self._write_outputs(finished)
@@ -683,8 +692,9 @@ class PlottingAgent:
     # -- setup -----------------------------------------------------------------
 
     def _provided_stems(self) -> set[str]:
+        """File stems that generated figures must not take: the provided figures in use."""
         provided = self.ctx.paths.provided_figures_dir
-        if not provided.is_dir():
+        if not self.ctx.cfg.uses_provided_figures or not provided.is_dir():
             return set()
         return {path.stem for path in provided.iterdir() if path.is_file()}
 
@@ -719,6 +729,10 @@ class PlottingAgent:
         try:
             return self._process(spec)
         except Exception as exc:
+            if stops_the_run(exc):
+                # The run was stopped, or every other figure would fail the same way: this
+                # is not one figure's problem, so it is not recorded as a skipped figure.
+                raise
             log.warning("Figure '%s' failed and is skipped: %s", spec.figure_id, _describe(exc))
             log.debug("Traceback for figure '%s':", spec.figure_id, exc_info=True)
             harness = self.ctx.harness
@@ -792,6 +806,8 @@ class PlottingAgent:
             try:
                 revised_png = renderer.render(revised, suggestions=suggestions)
             except Exception as exc:
+                if stops_the_run(exc):
+                    raise
                 # Whatever broke, the figure already has a valid render: a revision is an
                 # improvement to try, never a reason to lose the figure.
                 history.append(_history_entry(round_index, suggestions, revised, "render_failed"))
@@ -951,6 +967,8 @@ class PlottingAgent:
             try:
                 return image_renderer, image_renderer.render(description)
             except Exception as exc:
+                if isinstance(exc, RunCancelled):
+                    raise
                 # The code path below can draw any diagram, so no failure of the image
                 # model (its provider's SDK included) is allowed to cost the figure.
                 reason = (

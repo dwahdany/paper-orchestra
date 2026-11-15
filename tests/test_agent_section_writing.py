@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +28,14 @@ from paper_orchestra.context import RunContext, RunPaths
 from paper_orchestra.llm.base import LLMRefusal
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
+from paper_orchestra.prompts.format import FORMAT_FIX_SYSTEM_PROMPT
+from paper_orchestra.prompts.literature import WRITER_SYSTEM_PROMPT
+from paper_orchestra.prompts.no_leakage import UNIVERSAL_NO_LEAKAGE_PROMPT
+from paper_orchestra.prompts.outline import OUTLINE_SYSTEM_PROMPT
+from paper_orchestra.prompts.refinement import (
+    CONTENT_REFINEMENT_SYSTEM_PROMPT,
+    LATEX_REPAIR_SYSTEM_PROMPT,
+)
 from paper_orchestra.prompts.section_writing import (
     NO_LATEX_IN_REPLY,
     SECTION_WRITING_SYSTEM_PROMPT,
@@ -216,8 +225,12 @@ def test_clean_first_draft_is_written_without_touching_the_workspace(tmp_path, r
     [request] = client.requests
     assert request.model == ctx.cfg.models.writer
     assert request.system.startswith("Role: Senior AI Researcher.")
-    assert "Strict Knowledge Isolation" in request.system
     assert "# Memory" in request.system and request.memory is not None
+    # The rule about sources comes first and the memory block follows it; the two agree
+    # on what memory is for.
+    rule = request.system.index(UNIVERSAL_NO_LEAKAGE_PROMPT.strip())
+    assert rule < request.system.index("# Memory")
+    assert "overrides all other instructions" not in request.system
     text = request.text
     for tag in (
         "outline",
@@ -746,6 +759,85 @@ def test_prompts_render_literal_latex():
     assert "<problems>\n- \\begin{figure*} ended by \\end{figure}\n</problems>" in repair_prompt(
         "- \\begin{figure*} ended by \\end{figure}"
     )
+
+
+def test_the_figure_instructions_cover_a_paper_without_figures():
+    figures = SECTION_WRITING_SYSTEM_PROMPT.split("5. Figures and visual fidelity")[1]
+    figures = figures.split("6. Style")[0]
+    # The list can be empty ("No figures provided."): the writer is told what that means
+    # instead of being asked to use all of the figures of an empty list.
+    assert "Use all of the figures listed" not in figures
+    assert "lists none" in figures and "has no figures" in figures
+    prompt = section_writing_user_prompt(
+        outline="{}",
+        citation_library="lib",
+        idea="idea",
+        experimental_log="log",
+        figures="No figures provided.",
+        guidelines="rules",
+        template="t",
+    )
+    assert "Insert the figures using the file paths" not in prompt
+    assert "if it lists any" in prompt
+
+
+# -- the rule about sources and anonymity --------------------------------------
+
+
+def test_the_isolation_rule_explains_itself_at_normal_volume():
+    rule = UNIVERSAL_NO_LEAKAGE_PROMPT
+    # No shouting, and no claim to outrank the rest of the prompt.
+    assert re.findall(r"\b[A-Z]{2,}\b", rule) == []
+    assert "!" not in rule
+    for phrase in ("overrides all other", "only available source", "as if you have no prior"):
+        assert phrase not in rule
+
+    text = " ".join(rule.lower().split())
+    # What the paper is written from ...
+    for source in (
+        "the idea",
+        "the experimental log",
+        "provided or generated figures",
+        "verified bibliography",
+        "template and guidelines",
+        "memory",
+    ):
+        assert source in text
+    # ... what stays out, and why ...
+    assert "recall about this work, its published version, its authors or its results" in text
+    assert "evaluated" in text and "from its inputs alone" in text
+    # ... what is welcome ...
+    assert "general writing skill and general background knowledge" in text
+    # ... what memory is for ...
+    assert "guide how to write" in text
+    assert "what the paper claims comes from this run's materials" in text
+    # ... and anonymity, which the section writer's instructions refer to "at the end".
+    for item in ("author names", "affiliations", "e-mail addresses", "acknowledgements"):
+        assert item in text
+    assert "double-blind" in text
+    assert "anonymity requirement at the end" in SECTION_WRITING_SYSTEM_PROMPT
+    last_paragraph = rule.strip().strip("-").strip().split("\n\n")[-1]
+    assert last_paragraph.startswith("The manuscript is anonymous")
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        OUTLINE_SYSTEM_PROMPT,
+        WRITER_SYSTEM_PROMPT,
+        SECTION_WRITING_SYSTEM_PROMPT,
+        CONTENT_REFINEMENT_SYSTEM_PROMPT,
+        LATEX_REPAIR_SYSTEM_PROMPT,
+        FORMAT_FIX_SYSTEM_PROMPT,
+    ],
+    ids=["outline", "literature", "section_writing", "revision", "latex_repair", "format_fix"],
+)
+def test_every_authoring_prompt_ends_with_the_isolation_rule(prompt):
+    assert prompt.endswith(UNIVERSAL_NO_LEAKAGE_PROMPT)
+    assert prompt.count(UNIVERSAL_NO_LEAKAGE_PROMPT) == 1
+    # The whole prompt is at normal volume, and nothing in it asks for what the rule excludes.
+    assert re.findall(r"\b(?:MUST|NEVER|ALWAYS|CRITICAL|IMPORTANT)\b", prompt) == []
+    assert "author names if missing" not in prompt
 
 
 # -- the real thing ------------------------------------------------------------

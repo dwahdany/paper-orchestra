@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import sys
@@ -11,9 +12,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+#: Set (to anything) where TeX Live is expected, such as CI: the tests that compile real
+#: documents then fail loudly instead of being skipped when TeX is missing.
+REQUIRE_TEX_ENV = "PAPER_ORCHESTRA_REQUIRE_TEX"
+
+
 def pytest_collection_modifyitems(config, items):
     if shutil.which("pdflatex") and shutil.which("bibtex"):
         return
+    if os.environ.get(REQUIRE_TEX_ENV):
+        raise pytest.UsageError(
+            f"{REQUIRE_TEX_ENV} is set but pdflatex/bibtex are not on PATH: the tests that "
+            "compile real documents would be skipped."
+        )
     skip = pytest.mark.skip(reason="pdflatex/bibtex not installed")
     for item in items:
         if "latex" in item.keywords:

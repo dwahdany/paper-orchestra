@@ -7,6 +7,7 @@ entry points (CLI, Modal app, frontend) and never by library modules.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -106,6 +107,10 @@ class PipelineConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     research_cutoff: str = field(default_factory=default_research_cutoff)
     use_plotting: bool = False
+    #: With plotting on, every figure is generated and ``raw_materials/figures`` is left
+    #: alone, as in the original method.  Set this to give the writer the provided figures
+    #: as well.  Without plotting the provided figures are always used.
+    keep_provided_figures: bool = False
     plotting_max_critic_rounds: int = 3
     max_reflections: int = 3
     #: After a rejected revision, go back to the last accepted version and use the remaining
@@ -133,6 +138,15 @@ class PipelineConfig:
     def project_memory_dir(self) -> Path:
         return self.memory.project_dir or (self.base_dir / "memory")
 
+    @property
+    def uses_provided_figures(self) -> bool:
+        """Whether the figures in ``raw_materials/figures`` are part of this run."""
+        return not self.use_plotting or self.keep_provided_figures
+
+    def result_settings(self) -> dict[str, Any]:
+        """The settings of this configuration that shape the paper; see :func:`result_settings`."""
+        return result_settings(self.to_dict())
+
     def to_dict(self) -> dict[str, Any]:
         def convert(value: Any) -> Any:
             if isinstance(value, Path):
@@ -155,6 +169,85 @@ class PipelineConfig:
                 memory_raw[key] = Path(memory_raw[key])
         memory = MemoryConfig(**memory_raw)
         return cls(models=models, memory=memory, **data)
+
+
+#: Settings that shape what a run writes, by their dotted name in ``PipelineConfig.to_dict()``.
+RESULT_SETTINGS = (
+    "idea_filename",
+    "experimental_log_filename",
+    "models.writer",
+    "models.reflection",
+    "models.fast",
+    "models.effort",
+    "models.fast_effort",
+    "use_plotting",
+    "max_reflections",
+    "retry_after_rejection",
+    "max_formatting_rounds",
+    "review_ensemble",
+    "max_repair_rounds",
+    "memory.enabled",
+)
+#: Result settings that only count while the setting they are listed under is switched on.
+DEPENDENT_RESULT_SETTINGS: dict[str, tuple[str, ...]] = {
+    "use_plotting": (
+        "keep_provided_figures",
+        "models.plotting",
+        "models.image",
+        "plotting_max_critic_rounds",
+    ),
+    "memory.enabled": ("memory.lab", "memory.dream"),
+}
+#: Settings that say where or how fast the work is done, not what comes out.  The research
+#: cutoff is here because resuming has its own rule for it: a later cutoff keeps the
+#: literature collected so far valid.
+NEUTRAL_SETTINGS = (
+    "base_dir",
+    "template_dir",
+    "research_cutoff",
+    "compute",
+    "resume",
+    "max_stage_attempts",
+    "literature_workers",
+    "figure_workers",
+    "figure_code_timeout",
+    "latex_timeout",
+    "memory.project_dir",
+    "memory.lab_dir",
+    "memory.lab_consolidate",
+)
+
+
+def result_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    """The settings in ``config`` (a ``PipelineConfig.to_dict()``) that shape the paper.
+
+    Two runs over the same inputs with equal result settings do the same work, so
+    one may continue where the other stopped.  The mapping is flat, keyed by
+    dotted name.  A setting that ``config`` does not record is absent from it,
+    and so are the settings of a part that is switched off: changing the
+    plotting model alone changes nothing while plotting is off.
+    """
+
+    def lookup(name: str) -> tuple[bool, Any]:
+        node: Any = config
+        for part in name.split("."):
+            if not isinstance(node, Mapping) or part not in node:
+                return False, None
+            node = node[part]
+        return True, node
+
+    settings: dict[str, Any] = {}
+    for name in RESULT_SETTINGS:
+        found, value = lookup(name)
+        if not found:
+            continue
+        settings[name] = value
+        if value:
+            for dependent in DEPENDENT_RESULT_SETTINGS.get(name, ()):
+                found, dependent_value = lookup(dependent)
+                if found:
+                    settings[dependent] = dependent_value
+    return settings
 
 
 #: The templates shipped inside the package, so an installed wheel has them too.

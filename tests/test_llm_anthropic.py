@@ -690,6 +690,23 @@ def test_strict_tools_are_dropped_when_the_first_request_is_rejected(api, client
     assert len(api.requests) == 7
 
 
+def test_strict_tools_are_never_dropped_after_a_request_was_accepted(api, client):
+    # Once the API accepted a request, the tool definitions are part of the history that
+    # replayed thinking is checked against: a later 400 must not be answered by re-sending
+    # the conversation with other definitions.
+    tools = [ToolSpec("lookup", "Look a term up.", LOOKUP_SCHEMA, lambda _: "page text")]
+    api.script += [
+        msg([tool_use("tu_1", "lookup", {"q": "x"})], "tool_use"),  # accepted with strict tools
+        lambda _: api_error(400, "invalid_request_error", "prompt is too long", "req_long"),
+        msg([text("must never be reached")]),
+    ]
+    conversation = client.conversation(model=MODEL, tools=tools)
+    with pytest.raises(LLMError, match="prompt is too long"):
+        conversation.send("go")
+    assert len(api.requests) == 2  # the 400 is final: no third request with other tools
+    assert all(body["tools"][0].get("strict") is True for body in api.requests)
+
+
 def test_invalid_tool_declarations_are_config_errors(client):
     def tool(name: str, schema: Any = None) -> ToolSpec:
         return ToolSpec(name, "d", schema or {"type": "object", "properties": {}}, lambda _: "x")

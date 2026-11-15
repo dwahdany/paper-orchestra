@@ -298,7 +298,7 @@ def test_run_writes_a_validated_normalized_outline(tmp_path):
     assert request.label == "outline.OutlineAgent"
     assert request.schema is Outline
     assert request.system.startswith("You are a senior AI researcher")
-    assert "Strict Knowledge Isolation" in request.system
+    assert UNIVERSAL_NO_LEAKAGE_PROMPT.strip() in request.system
     assert "# Memory" in request.system  # the main authoring call reads memory
     for tag, content in (
         ("idea", "We propose WidgetNet."),

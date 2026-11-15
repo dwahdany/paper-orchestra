@@ -29,13 +29,20 @@ from paper_orchestra.agents.plotting import (
     task_name,
     to_png,
 )
-from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
+from paper_orchestra.compute.base import (
+    BackendUnusable,
+    CompileResult,
+    ComputeBackend,
+    ComputeError,
+    ExecResult,
+)
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.config import PAPER_BANANA_ENV, ModelConfig, PipelineConfig
 from paper_orchestra.context import RunContext, RunPaths
+from paper_orchestra.errors import stops_the_run
 from paper_orchestra.llm.base import Capabilities, LLMConfigError, ToolError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
-from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
+from paper_orchestra.memory import ContextHarness, RunCancelled, TranscriptLog, Wiki
 from paper_orchestra.prompts import plotting as prompts
 
 LOGGER = "paper_orchestra.agents.plotting"
@@ -1252,3 +1259,58 @@ def test_prompts_render_without_stray_braces():
         "plot", description=braces, aspect_ratio="1:1", figsize=(7.3, 7.3)
     )
     assert braces in prompts.code_repair_request(problem="p", output=braces)
+
+
+# -- failures that are not one figure's problem -----------------------------------------
+
+
+def test_a_stopped_run_is_not_recorded_as_skipped_figures(tmp_path):
+    holder: dict = {}
+
+    def plan(request: FakeRequest) -> str:
+        holder["ctx"].harness.cancel()  # the user pressed Ctrl-C while this call ran
+        return "**Detailed Description:** a plan"
+
+    ctx = holder["ctx"] = make_ctx(tmp_path, scripted_llm(plan=plan))
+    with pytest.raises(RunCancelled):
+        PlottingAgent(ctx).run({"plotting_plan": [figure("a"), figure("b")]})
+    # Nothing in memory claims that a figure failed: the run resumes with a clean slate.
+    assert notes(ctx) == []
+    assert ctx.harness.project.list("wiki/figures") == []
+
+
+def test_a_model_that_cannot_be_used_ends_the_stage_instead_of_skipping_every_figure(tmp_path):
+    def plan(request: FakeRequest) -> str:
+        raise LLMConfigError("ANTHROPIC_API_KEY is not set")
+
+    ctx = make_ctx(tmp_path, scripted_llm(plan=plan))
+    with pytest.raises(LLMConfigError, match="ANTHROPIC_API_KEY"):
+        PlottingAgent(ctx).run({"plotting_plan": [figure("a"), figure("b"), figure("c")]})
+    assert notes(ctx) == []
+
+
+def test_an_unusable_backend_ends_the_stage_with_its_own_message(tmp_path):
+    def unusable(code: str, call: int) -> ExecResult:
+        raise BackendUnusable("Modal is not authenticated: run `modal setup`")
+
+    ctx = make_ctx(tmp_path, scripted_llm(), FakeCompute(unusable))
+    with pytest.raises(Exception, match="Modal is not authenticated") as caught:
+        PlottingAgent(ctx).run({"plotting_plan": [figure("a"), figure("b")]})
+    assert stops_the_run(caught.value)
+    assert notes(ctx) == []
+
+
+def test_ignored_provided_figures_do_not_rename_generated_ones(tmp_path):
+    ctx = make_ctx(tmp_path, scripted_llm(), use_plotting=True)
+    ctx.paths.provided_figures_dir.mkdir()
+    (ctx.paths.provided_figures_dir / "fig_accuracy.png").write_bytes(image_bytes("green"))
+    (result,) = PlottingAgent(ctx).run({"plotting_plan": [figure("fig_accuracy")]})
+    assert result["figure_id"] == "fig_accuracy"  # the provided file is not part of this run
+
+    kept = make_ctx(
+        tmp_path / "kept", scripted_llm(), use_plotting=True, keep_provided_figures=True
+    )
+    kept.paths.provided_figures_dir.mkdir()
+    (kept.paths.provided_figures_dir / "fig_accuracy.png").write_bytes(image_bytes("green"))
+    (result,) = PlottingAgent(kept).run({"plotting_plan": [figure("fig_accuracy")]})
+    assert result["figure_id"] == "fig_accuracy_2"

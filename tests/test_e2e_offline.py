@@ -8,8 +8,11 @@ executed by the local compute backend and the paper compiled by pdflatex.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+import signal
+import threading
 
 import pytest
 from rapidfuzz import fuzz
@@ -27,6 +30,9 @@ from paper_orchestra.utils.scholar import SemanticScholar
 pytestmark = pytest.mark.latex
 
 REVISION_MARKER = "We state the scope of each claim explicitly."
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 LIBRARY = [
     {
@@ -176,9 +182,14 @@ class Model:
     def __init__(self, paths: RunPaths) -> None:
         self.paths = paths
         self.memory_views: list[str] = []
+        #: Label of a model call during which the user presses Ctrl-C (once).
+        self.interrupt_during: str | None = None
 
     def __call__(self, request: FakeRequest) -> str:
         label = request.label
+        if label == self.interrupt_during:
+            self.interrupt_during = None
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
         if label == "outline.OutlineAgent":
             return json.dumps(OUTLINE)
         if label == "literature.discovery":
@@ -486,3 +497,59 @@ def test_rerunning_a_finished_run_reuses_every_stage(run):
     authoring = [r.label for r in client.requests[calls:] if not r.label.startswith("dream.")]
     assert authoring == []  # no stage was run again
     assert paths.final_pdf.read_bytes() == pdf
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="needs POSIX signals")
+def test_ctrl_c_during_plotting_then_the_same_command_finishes_the_paper(run):
+    _cfg, paths, client, model, _session, execute = run
+    # The folder ships the original paper's figure, as a benchmark folder does.  With plotting
+    # on, every figure is generated and nobody is shown this one or its caption.
+    caption = "ORIGINAL-CAPTION our method reaches the best score."
+    paths.provided_figures_dir.mkdir()
+    (paths.provided_figures_dir / "teaser.png").write_bytes(PNG)
+    (paths.provided_figures_dir / "info.json").write_text(
+        json.dumps([{"name": "teaser.png", "caption": caption}])
+    )
+
+    model.interrupt_during = "plotting.code"
+    # A process started in the background ignores the signal unless it asks for it.
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            execute()
+    finally:
+        signal.signal(signal.SIGINT, previous or signal.SIG_DFL)
+
+    # Literature and plotting ran on their own threads; both stopped before the interrupt
+    # was passed on, and nothing went on to write the paper.
+    assert [t.name for t in threading.enumerate() if t.name.startswith("stage-")] == []
+    state = json.loads(paths.state.read_text())
+    assert state["status"] == "interrupted"
+    assert state["stages"]["plotting"]["status"] == "interrupted"
+    assert state["stages"]["literature"]["status"] in ("completed", "interrupted")
+    assert state["stages"]["section_writing"]["status"] == "pending"
+    assert "section_writing.SectionWritingAgent" not in client.labels()
+    spent = len(client.requests)
+    assert json.loads(paths.usage.read_text())["total"]["requests"] == spent
+
+    result, harness = execute()
+
+    assert result.success, result.error
+    state = json.loads(paths.state.read_text())
+    assert {stage["status"] for stage in state["stages"].values()} == {"completed"}
+    assert state["stages"]["outline"]["reused"] and not state["stages"]["plotting"]["reused"]
+    assert paths.final_pdf.read_bytes().startswith(b"%PDF")
+    # The literature synthesis exists whether or not the interrupt came before it.
+    assert state["stages"]["literature"]["after_done"] is True
+    assert harness.project.exists("wiki/synthesis/architectures.md")
+    # Both invocations are on the books.
+    assert json.loads(paths.usage.read_text())["total"]["requests"] == len(client.requests)
+
+    # The paper has the generated figure only.
+    figures = json.loads(paths.figures_info.read_text())
+    assert [figure["name"] for figure in figures] == ["fig_main_results.png"]
+    assert not (paths.figures_dir / "teaser.png").exists()
+    assert "teaser" not in paths.final_tex.read_text()
+    assert not harness.project.exists("wiki/figures/teaser.md")
+    for request in client.requests:
+        assert "ORIGINAL-CAPTION" not in f"{request.system}\n{request.text}", request.label

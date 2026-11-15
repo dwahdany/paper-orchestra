@@ -18,7 +18,9 @@
    proposes candidate papers (title, year, reason).
 2. *Verification*: every candidate has to be found in Semantic Scholar under
    (nearly) its title and be published before the research cutoff.  This is
-   the gate that keeps hallucinated references out of the paper.
+   the gate that keeps hallucinated references out of the paper.  The verified
+   papers are saved at once (``collected_papers.json``), so that a later
+   attempt of the stage whose writing step failed does not search again.
 3. *Assets*: ``references.bib``, ``citation_map.json`` and the outline with
    ``citation_candidates`` per section, all using the same citation keys.
 4. *Writing*: the writer model fills the Introduction and Related Work of the
@@ -28,7 +30,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
+import json
 import logging
 import re
 import string
@@ -42,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from paper_orchestra.agents.outline import write_outline_page
+from paper_orchestra.errors import stops_the_run
 from paper_orchestra.llm.base import LLMParseError, WebSearch
 from paper_orchestra.llm.parsing import parse_latex
 from paper_orchestra.memory.harness import MemoryPolicy
@@ -78,6 +83,11 @@ DISCOVERY_LABEL = "literature.discovery"
 LITERATURE_DIR = "wiki/literature"
 #: Namespace of the cross-run Semantic Scholar cache (see ``memory.cache``).
 CACHE_NAMESPACE = "semantic-scholar"
+#: File in the stage's output directory that holds the verified papers of this run's search.
+#: It is the one file there that an attempt of the stage reads back, so whoever clears the
+#: directory between attempts has to leave it in place for the search not to be repeated.
+CHECKPOINT_NAME = "collected_papers.json"
+_CHECKPOINT_VERSION = 1
 
 INTRO_SECTION = "Introduction"
 DEFAULT_VENUE = "arXiv"
@@ -345,6 +355,32 @@ def collect_search_tasks(outline: Mapping[str, Any]) -> list[SearchTask]:
                     "targeted",
                 )
     return tasks
+
+
+def _core_problem(outline: Mapping[str, Any]) -> str:
+    """The problem the paper addresses, which every exploration search is told about."""
+    intro = (outline.get("intro_related_work_plan") or {}).get("introduction_strategy") or {}
+    return str(intro.get("problem_gap_hypothesis") or "N/A")
+
+
+def _search_fingerprint(
+    tasks: Sequence[SearchTask], core_problem: str, cutoff: str | None, model: str
+) -> str:
+    """Digest of what a literature search is asked: the tasks, the cutoff and who searches.
+
+    A saved collection answers exactly this question.  When the outline is regenerated, the
+    cutoff moves or another model is put in charge of discovery, the digest differs and
+    the search runs again.
+    """
+    asked = {
+        "version": _CHECKPOINT_VERSION,
+        "tasks": [[task.search_type, task.section, task.focus, task.context] for task in tasks],
+        "core_problem": core_problem,
+        "cutoff": cutoff,
+        "model": model,
+    }
+    text = json.dumps(asked, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def inject_citations(outline: dict[str, Any], papers: Sequence[PaperData]) -> dict[str, Any]:
@@ -825,10 +861,19 @@ class LiteratureAgent:
             self._cutoff or "none",
             cfg.literature_workers,
         )
-        found = self._collect(tasks, outline)
+        fingerprint = _search_fingerprint(
+            tasks, _core_problem(outline), self._cutoff, cfg.models.fast
+        )
+        found = self._load_checkpoint(fingerprint)
+        searched = found is None
+        if found is None:
+            found = self._collect(tasks, outline)
+            log.info("Literature search finished: %s", found.stats.describe())
+            # Saved before the writing turn: that turn can fail (a refusal, a truncated or
+            # incomplete document, an API error), and the search is the expensive part.
+            self._save_checkpoint(fingerprint, found)
         stats = found.stats
         papers = list(found.papers.values())
-        log.info("Literature search finished: %s", stats.describe())
         if stats.failed_tasks or stats.lookup_errors or stats.skipped_lookups:
             harness.note(
                 "The literature search was incomplete: "
@@ -845,14 +890,15 @@ class LiteratureAgent:
                 "No verified papers were collected (%s); continuing with an empty bibliography",
                 stats.describe(),
             )
-            harness.note(
-                "No paper could be verified in Semantic Scholar, so references.bib is empty "
-                "and the Introduction and Related Work were written without citations. "
-                f"Search summary: {stats.describe()}.",
-                stage=STAGE,
-                agent=AGENT,
-                title="Empty bibliography",
-            )
+            if searched:  # otherwise the attempt that searched has left this note already
+                harness.note(
+                    "No paper could be verified in Semantic Scholar, so references.bib is "
+                    "empty and the Introduction and Related Work were written without "
+                    f"citations. Search summary: {stats.describe()}.",
+                    stage=STAGE,
+                    agent=AGENT,
+                    title="Empty bibliography",
+                )
 
         bibtex = generate_bibtex(papers)
         citation_map = generate_citation_map(papers)
@@ -894,6 +940,81 @@ class LiteratureAgent:
             papers=len(papers),
         )
 
+    # -- checkpoint ------------------------------------------------------------
+
+    def _save_checkpoint(self, fingerprint: str, found: _Collection) -> None:
+        """Keep the verified papers for a later attempt of this stage.
+
+        Only a complete search is kept.  One that lost search tasks or lookups (usually to
+        the kind of outage that also fails the writing turn) is worth repeating, because
+        the next attempt may find what this one missed.
+        """
+        stats = found.stats
+        if stats.failed_tasks or stats.lookup_errors or stats.skipped_lookups:
+            return
+        path = self.ctx.paths.literature_dir / CHECKPOINT_NAME
+        try:
+            write_json(
+                path,
+                {
+                    "version": _CHECKPOINT_VERSION,
+                    "fingerprint": fingerprint,
+                    "stats": asdict(stats),
+                    "papers": [paper.model_dump() for paper in found.papers.values()],
+                },
+            )
+        except OSError as exc:
+            # The checkpoint saves a repeated search; the stage does not depend on it.
+            log.warning("Could not save the verified papers to %s: %s", path, exc)
+
+    def _load_checkpoint(self, fingerprint: str) -> _Collection | None:
+        """The collection an earlier attempt saved for this very search, if there is one.
+
+        Anything else (no file, another search, a file that does not hold what this
+        module wrote) means the search runs: the papers in the file skip verification,
+        so it is trusted only as a whole.
+        """
+        path = self.ctx.paths.literature_dir / CHECKPOINT_NAME
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            log.warning("Ignoring the unreadable literature checkpoint %s: %s", path, exc)
+            return None
+        if not isinstance(saved, dict) or saved.get("version") != _CHECKPOINT_VERSION:
+            log.warning("Ignoring the literature checkpoint %s: unknown format", path)
+            return None
+        if saved.get("fingerprint") != fingerprint:
+            log.info(
+                "The verified papers in %s were collected for other search tasks, another "
+                "cutoff or by another model; searching again",
+                path,
+            )
+            return None
+        try:
+            papers = [PaperData.model_validate(entry) for entry in saved["papers"]]
+            stats = LiteratureStats(**saved["stats"])
+            if not all(type(count) is int for count in asdict(stats).values()):
+                raise TypeError("a search counter is not a number")
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("Ignoring the damaged literature checkpoint %s: %s", path, exc)
+            return None
+        found = _Collection(stats=stats)
+        for paper in papers:
+            found.papers[normalize_title(paper.title)] = paper
+            found.keys.add(paper.citation_key.casefold())
+        if len(found.papers) != len(papers) or len(found.keys) != len(papers):
+            log.warning("Ignoring the literature checkpoint %s: it repeats a paper", path)
+            return None
+        log.info(
+            "Reusing the %d verified paper(s) that an earlier attempt of this stage "
+            "collected (%s); no search is run",
+            len(papers),
+            stats.describe(),
+        )
+        return found
+
     # -- discovery and verification --------------------------------------------
 
     def _collect(self, tasks: Sequence[SearchTask], outline: Mapping[str, Any]) -> _Collection:
@@ -916,8 +1037,7 @@ class LiteratureAgent:
                 "depend entirely on the Semantic Scholar check",
                 cfg.models.fast,
             )
-        intro = (outline.get("intro_related_work_plan") or {}).get("introduction_strategy") or {}
-        core_problem = str(intro.get("problem_gap_hypothesis") or "N/A")
+        core_problem = _core_problem(outline)
 
         last_error: Exception | None = None
         pool = ThreadPoolExecutor(
@@ -931,6 +1051,8 @@ class LiteratureAgent:
                 try:
                     candidates = future.result()
                 except Exception as exc:
+                    if stops_the_run(exc):
+                        raise
                     # One search task failing costs some references, not the stage.
                     found.stats.failed_tasks += 1
                     last_error = exc
@@ -955,6 +1077,10 @@ class LiteratureAgent:
                     found.stats.empty_tasks += 1
                 for candidate in candidates:
                     self._verify(candidate, task, found)
+        except KeyboardInterrupt:
+            # Searches in flight are not followed by further calls.
+            self.ctx.harness.cancel()
+            raise
         finally:
             # On the normal path everything has finished; after an error or an interrupt this
             # drops the calls that have not started instead of waiting for them.

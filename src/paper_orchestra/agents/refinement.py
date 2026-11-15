@@ -32,9 +32,15 @@ A revision or formatting candidate only replaces the current version if its buil
 no worse: a PDF that comes with LaTeX errors, unresolved references or static problems
 the current version does not have is turned down (a revision gets one repair turn first).
 
-Once the initial draft compiles there is always a valid version to fall back on, so
-a failure in a later step is logged and recorded and the run continues with the last
-version that was accepted.
+The stage needs two things before it can do any of this: a draft that compiles and a
+review of it.  Without either it raises :class:`RefinementError`, so that the pipeline
+retries the stage, or fails the run in a way a resume picks up, instead of delivering the
+unrevised draft as the refined paper.  After that there is always a valid version to fall
+back on: a failure in one iteration or formatting round is logged and recorded, costs that
+step only, and the run continues with the last version that was accepted.  Two failures
+are not survived step by step: a configuration error ends the content loop, because every
+further iteration would be refused the same way, and a stop request (``RunCancelled``)
+ends the stage.
 """
 
 from __future__ import annotations
@@ -60,9 +66,9 @@ from paper_orchestra.agents.section_writing import (
 )
 from paper_orchestra.context import RunContext
 from paper_orchestra.eval.agent_review import perform_review_agentreview
-from paper_orchestra.llm.base import Image, LLMParseError, Part, Pdf, Text
+from paper_orchestra.llm.base import Image, LLMConfigError, LLMParseError, Part, Pdf, Text
 from paper_orchestra.llm.parsing import parse_json_and_latex, parse_latex
-from paper_orchestra.memory.harness import HarnessConversation, MemoryPolicy
+from paper_orchestra.memory.harness import HarnessConversation, MemoryPolicy, RunCancelled
 from paper_orchestra.prompts.format import (
     FORMAT_FIX_SYSTEM_PROMPT,
     FORMAT_REVIEW_SYSTEM_PROMPT,
@@ -109,7 +115,7 @@ _SHEET_MAX_SIDE = 2576
 
 
 class RefinementError(RuntimeError):
-    """The refinement stage has no compilable paper to work with."""
+    """The refinement stage cannot start: no compilable paper, or no review of it."""
 
 
 # -- formatting review schema -------------------------------------------------
@@ -432,13 +438,19 @@ class ContentRefinementAgent:
 
     # -- content loop ----------------------------------------------------------
 
-    def _content_loop(self, current: _Version) -> _Version:
-        cfg, harness = self.ctx.cfg, self.ctx.harness
+    def _baseline_review(self, current: _Version) -> dict[str, Any]:
+        """Review the draft; raises when that fails.
+
+        Every revision is written against this review and judged by it, so without it the
+        stage has nothing to deliver but the draft it was given.  Raising hands the failure
+        (in practice an outage or a rate limit) to the pipeline's stage retry and to a
+        later resume.
+        """
         try:
             review = self._review(current.pdf, "v0")
             self._reviews["v0"] = review
             self._write_review_page("v0")
-            harness.record(
+            self.ctx.harness.record(
                 "review",
                 stage=STAGE,
                 agent=AGENT,
@@ -446,25 +458,40 @@ class ContentRefinementAgent:
                 outcome="BASELINE",
                 scores=extract_scores(review),
             )
+        except RunCancelled:
+            raise
         except Exception as exc:
-            self._failed("the baseline review (the paper is not revised)", exc, current)
-            write_json(self.workdir / CONTENT_WORKLOG, self.worklogs)
-            return current
+            raise RefinementError(
+                f"the baseline review of {current.name} failed, so the paper cannot be "
+                f"refined: {_error_text(exc)}"
+            ) from exc
+        return review
 
+    def _content_loop(self, current: _Version) -> _Version:
+        cfg, harness = self.ctx.cfg, self.ctx.harness
+        review = self._baseline_review(current)
         base = "v0"
         for round_no in range(1, cfg.max_reflections + 1):
             label = f"v{round_no}"
             log.info("%s: refinement iteration %d of %d.", AGENT, round_no, cfg.max_reflections)
             try:
                 result = self._reflect(round_no, current, review, base)
+            except RunCancelled:
+                raise
             except Exception as exc:
                 self.worklogs[label] = {
                     "round": round_no,
                     "outcome": "ERROR",
                     "error": _error_text(exc),
                 }
+                write_json(self.workdir / CONTENT_WORKLOG, self.worklogs)
                 self._failed(f"refinement iteration {round_no}", exc, current)
-                break
+                if isinstance(exc, LLMConfigError):
+                    # The same request would be refused the same way in every iteration.
+                    break
+                # Anything else (an outage, a review that could not be read) costs this
+                # iteration only: the next one revises the last accepted version again.
+                continue
             self.worklogs[label] = result.entry
             write_json(self.workdir / CONTENT_WORKLOG, self.worklogs)
             log.info("%s: revision %s: %s.", AGENT, label, result.entry["outcome"])
@@ -541,9 +568,13 @@ class ContentRefinementAgent:
         Returns the reviser's worklog and the check of the last document it returned
         (``None`` if it never returned one).
         """
+        # An iteration that failed left no revision behind: it is not revision history.
+        history = {
+            label: entry for label, entry in self.worklogs.items() if entry["outcome"] != "ERROR"
+        }
         prompt = revision_user_prompt(
             iteration=round_no,
-            previous_log=json.dumps(self.worklogs, indent=4) if self.worklogs else "None",
+            previous_log=json.dumps(history, indent=4) if history else "None",
             review=json.dumps(review, indent=2, ensure_ascii=False),
             score=extract_scores(review)["Overall"],
             guidelines=self._guidelines,
@@ -728,6 +759,8 @@ class ContentRefinementAgent:
                     log.info("%s: the formatting review found nothing to fix.", AGENT)
                     break
                 entry, accepted = self._format_fix(label, current, review)
+            except RunCancelled:
+                raise
             except Exception as exc:
                 self.format_worklogs[label] = {"outcome": "ERROR", "error": _error_text(exc)}
                 self._failed(f"formatting round {round_no}", exc, current)

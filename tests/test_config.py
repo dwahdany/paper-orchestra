@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import json
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
 from paper_orchestra.config import (
     DEFAULT_MODEL,
+    DEPENDENT_RESULT_SETTINGS,
+    NEUTRAL_SETTINGS,
+    RESULT_SETTINGS,
     MemoryConfig,
     ModelConfig,
     PipelineConfig,
     default_lab_memory_dir,
     resolve_template_dir,
+    result_settings,
 )
 from paper_orchestra.context import RunPaths
 
@@ -38,6 +44,87 @@ def test_config_round_trips_through_plain_dict(tmp_path):
     restored = PipelineConfig.from_dict(data)
     assert restored == cfg
     assert restored.project_memory_dir == tmp_path / "mem"
+
+
+def test_provided_figures_are_used_without_plotting_or_when_kept(tmp_path):
+    cfg = PipelineConfig(base_dir=tmp_path, template_dir=tmp_path)
+    assert cfg.keep_provided_figures is False
+    assert cfg.uses_provided_figures  # no plotting: the provided figures are the figures
+
+    cfg.use_plotting = True
+    assert not cfg.uses_provided_figures  # as in the original method
+    cfg.keep_provided_figures = True
+    assert cfg.uses_provided_figures
+
+    data = cfg.to_dict()
+    assert data["keep_provided_figures"] is True
+    assert PipelineConfig.from_dict(data) == cfg
+    # A configuration written before the option existed still loads.
+    del data["keep_provided_figures"]
+    assert PipelineConfig.from_dict(data).keep_provided_figures is False
+
+
+def test_every_option_is_classified_as_shaping_the_paper_or_not():
+    # A new option must be put in one list or the other: an option that changes the paper
+    # and is missing from the result settings would let a resumed run reuse stale stages.
+    options = {field.name for field in fields(PipelineConfig)} - {"models", "memory"}
+    options |= {f"models.{field.name}" for field in fields(ModelConfig)}
+    options |= {f"memory.{field.name}" for field in fields(MemoryConfig)}
+    dependent = [name for names in DEPENDENT_RESULT_SETTINGS.values() for name in names]
+    classified = [*RESULT_SETTINGS, *dependent, *NEUTRAL_SETTINGS]
+
+    assert sorted(classified) == sorted(options)
+    assert set(DEPENDENT_RESULT_SETTINGS) <= set(RESULT_SETTINGS)
+
+
+def test_result_settings_are_what_shapes_the_paper(tmp_path):
+    cfg = PipelineConfig(base_dir=tmp_path / "a", template_dir=tmp_path / "t")
+    settings = cfg.result_settings()
+    assert settings["models.writer"] == DEFAULT_MODEL and settings["models.effort"] == "high"
+    assert settings["use_plotting"] is False and settings["memory.dream"] == "stages"
+    # They survive the trip through state.json unchanged.
+    assert result_settings(json.loads(json.dumps(cfg.to_dict()))) == settings
+
+    # Where and how fast the work is done does not count.
+    elsewhere = PipelineConfig(
+        base_dir=tmp_path / "b",
+        template_dir=tmp_path / "t2",
+        compute="modal",
+        resume=False,
+        max_stage_attempts=5,
+        literature_workers=1,
+        figure_workers=1,
+        figure_code_timeout=5.0,
+        latex_timeout=5.0,
+        research_cutoff="2020-01",
+        memory=MemoryConfig(
+            project_dir=tmp_path / "m", lab_dir=tmp_path / "l", lab_consolidate=False
+        ),
+    )
+    assert elsewhere.result_settings() == settings
+
+    # The options of a part that is switched off are not in play.
+    cfg.models.plotting = "another-model"
+    cfg.plotting_max_critic_rounds = 7
+    cfg.keep_provided_figures = True
+    assert cfg.result_settings() == settings
+    cfg.use_plotting = True
+    plotting = cfg.result_settings()
+    assert plotting["models.plotting"] == "another-model"
+    assert plotting["plotting_max_critic_rounds"] == 7 and plotting["keep_provided_figures"]
+    assert "models.image" in plotting
+
+    cfg.memory.enabled = False
+    without_memory = cfg.result_settings()
+    assert without_memory["memory.enabled"] is False
+    assert "memory.lab" not in without_memory and "memory.dream" not in without_memory
+
+    # What a stored configuration does not record is absent, not guessed.
+    assert result_settings({"use_plotting": True, "models": {"writer": "m"}}) == {
+        "use_plotting": True,
+        "models.writer": "m",
+    }
+    assert result_settings({"models": "not a mapping"}) == {}
 
 
 def test_memory_dirs(tmp_path, monkeypatch):

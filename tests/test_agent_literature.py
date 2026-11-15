@@ -12,6 +12,7 @@ import pytest
 from paper_orchestra.agents.literature import (
     ABSTRACT_LIMIT,
     CACHE_NAMESPACE,
+    CHECKPOINT_NAME,
     CandidatePaper,
     DiscoveryResult,
     LiteratureAgent,
@@ -30,15 +31,16 @@ from paper_orchestra.agents.literature import (
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.config import ModelConfig, PipelineConfig
 from paper_orchestra.context import RunContext, RunPaths
-from paper_orchestra.llm.base import Capabilities, LLMError, WebSearch
+from paper_orchestra.llm.base import Capabilities, LLMError, LLMRefusal, WebSearch
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
-from paper_orchestra.memory import ContextHarness, KeyValueCache, TranscriptLog, Wiki
+from paper_orchestra.memory import ContextHarness, KeyValueCache, RunCancelled, TranscriptLog, Wiki
 from paper_orchestra.prompts.literature import (
     DISCOVERY_SYSTEM_PROMPT,
     WRITER_SYSTEM_PROMPT,
     min_cited,
     writer_user_prompt,
 )
+from paper_orchestra.prompts.no_leakage import UNIVERSAL_NO_LEAKAGE_PROMPT
 from paper_orchestra.utils.latex import bib_keys, cite_keys
 from paper_orchestra.utils.scholar import (
     SemanticScholar,
@@ -732,6 +734,7 @@ def test_run_end_to_end(tmp_path):
     out = paths.literature_dir
     assert sorted(p.name for p in out.iterdir()) == [
         "citation_map.json",
+        CHECKPOINT_NAME,
         "outline_v1.json",
         "references.bib",
         "updated_template.tex",
@@ -810,7 +813,7 @@ def test_the_writer_gets_everything_in_tags_and_reads_memory(tmp_path):
     assert request.model == "fake-writer" and request.effort == "high"
     assert request.system.startswith(WRITER_SYSTEM_PROMPT)
     assert "# Memory" in request.system and request.memory is not None
-    assert "Strict Knowledge Isolation" in request.system
+    assert UNIVERSAL_NO_LEAKAGE_PROMPT.strip() in request.system
     assert "{{" not in WRITER_SYSTEM_PROMPT and "\\cite{key}" in WRITER_SYSTEM_PROMPT
     assert "\\usepackage[capitalize]{cleveref}" in WRITER_SYSTEM_PROMPT
 
@@ -1266,8 +1269,9 @@ def test_a_document_that_stays_incomplete_fails_the_stage(tmp_path):
     with pytest.raises(RuntimeError, match=r"still incomplete after 1 repair turn"):
         LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
     assert len(writer_requests(client)) == 2
-    # Nothing was put in place for later stages.
-    assert not ctx.paths.literature_dir.exists()
+    # Nothing was put in place for later stages: only the verified papers were kept, for
+    # the next attempt of this stage.
+    assert [p.name for p in ctx.paths.literature_dir.iterdir()] == [CHECKPOINT_NAME]
     assert ctx.paths.template_tex.read_text() == TEMPLATE
     assert not ctx.paths.references_bib.exists() and not ctx.paths.outline.exists()
     assert ctx.harness.project.list("wiki/literature") == []
@@ -1492,3 +1496,203 @@ def test_the_input_outline_may_be_reused_after_a_failure(tmp_path):
     with pytest.raises(RuntimeError):
         LiteratureAgent(ctx, scholar=make_scholar()).run(outline)
     assert outline == before
+
+
+# -- the checkpoint of the verified papers -----------------------------------
+
+
+def failing_once(error: Exception) -> Callable[[FakeRequest], str]:
+    """A writer whose first conversation fails with ``error``; later ones write the sections."""
+    calls = {"count": 0}
+
+    def writer(request: FakeRequest) -> str:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise error
+        return good_writer(request)
+
+    return writer
+
+
+def literature_event(ctx: RunContext) -> dict:
+    """What the stage recorded about its search and its result, without the bookkeeping."""
+    (event,) = [e for e in ctx.harness.transcripts.events() if e["type"] == "literature"]
+    assert {"papers", "cited", "tasks", "candidates", "lookups", "verified"} <= set(event)
+    return {key: value for key, value in event.items() if key not in ("session", "ts", "seq")}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMRefusal("the model declined the request"),
+        LLMError("request req_9 failed: overloaded"),
+    ],
+    ids=["refusal", "api-error"],
+)
+def test_a_failed_writing_turn_keeps_the_verified_papers_for_the_retry(tmp_path, error, caplog):
+    clean, clean_ctx, _, _ = run_agent(tmp_path, name="clean", lab=False)
+
+    client = FakeLLM(Script(writer=failing_once(error)))
+    session = FakeS2Session()
+    ctx = make_ctx(tmp_path, client, lab=False)
+    checkpoint = ctx.paths.literature_dir / CHECKPOINT_NAME
+
+    with pytest.raises(type(error)):
+        LiteratureAgent(ctx, scholar=make_scholar(session)).run(make_outline())
+
+    # The search was paid for once and its verified result is on disk ...
+    assert len(discovery_requests(client)) == 3 and len(session.queries) == 7
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    keys = [paper["citation_key"] for paper in saved["papers"]]
+    assert keys == [SURVEY, FOUNDATIONS, DRIFT, ADAM]
+    assert saved["papers"][0]["sections"] == ["Introduction", "Related Work: 2.1 Widget Models"]
+    # ... but nothing is in place for later stages yet.
+    assert [p.name for p in ctx.paths.literature_dir.iterdir()] == [CHECKPOINT_NAME]
+    assert not ctx.paths.references_bib.exists() and not ctx.paths.outline.exists()
+    assert ctx.harness.project.list("wiki/literature") == []
+
+    # The next attempt of the stage goes straight to the writing turn.
+    with caplog.at_level(logging.INFO, logger="paper_orchestra.agents.literature"):
+        result = LiteratureAgent(ctx, scholar=make_scholar(session)).run(make_outline())
+    assert len(discovery_requests(client)) == 3 and len(session.queries) == 7
+    assert "Reusing the 4 verified paper(s)" in caplog.text
+
+    # What it delivers is what a run that never failed delivers.
+    assert result == clean
+    assert writer_requests(client)[-1].text == writer_requests_of(clean_ctx)[-1].text
+    for path in ("citation_map", "references_bib", "outline", "template_tex"):
+        ours, theirs = getattr(ctx.paths, path), getattr(clean_ctx.paths, path)
+        assert ours.read_text(encoding="utf-8") == theirs.read_text(encoding="utf-8")
+    assert literature_event(ctx) == literature_event(clean_ctx)
+    wiki, clean_wiki = ctx.harness.project, clean_ctx.harness.project
+    assert wiki.read(f"wiki/literature/{SURVEY}.md").body == (
+        clean_wiki.read(f"wiki/literature/{SURVEY}.md").body
+    )
+    assert notes(ctx) == notes(clean_ctx) == []
+
+
+def writer_requests_of(ctx: RunContext) -> list[FakeRequest]:
+    return writer_requests(ctx.harness.client_for("fake-writer"))
+
+
+@pytest.mark.parametrize("changed", ["search task", "problem statement", "cutoff", "model"])
+def test_a_checkpoint_of_another_search_is_not_reused(tmp_path, changed):
+    client = FakeLLM(Script(writer=failing_once(LLMRefusal("declined"))))
+    session = FakeS2Session()
+    ctx = make_ctx(tmp_path, client)
+    with pytest.raises(LLMRefusal):
+        LiteratureAgent(ctx, scholar=make_scholar(session)).run(make_outline())
+    assert len(discovery_requests(client)) == 3
+
+    outline = make_outline()
+    intro = outline["intro_related_work_plan"]["introduction_strategy"]
+    if changed == "search task":
+        # The outline was regenerated and asks for something else.
+        intro["search_directions"] = ["widget drift failure"]
+    elif changed == "problem statement":
+        intro["problem_gap_hypothesis"] = "Widgets wear out."
+    elif changed == "cutoff":
+        ctx = make_ctx(tmp_path, client, cutoff="2025-06")
+    else:
+        ctx.cfg.models.fast = "another-fast-model"
+
+    result = LiteratureAgent(ctx, scholar=make_scholar(session)).run(outline)
+
+    # The search ran again, for what is asked now.
+    assert len(discovery_requests(client)) == 6
+    if changed == "search task":
+        assert list(result.citation_map) == [DRIFT, SURVEY, ADAM]
+    elif changed == "cutoff":
+        assert "Future2025FutureWidgets" in result.citation_map
+    # The checkpoint now belongs to the new search: a further attempt would reuse it.
+    saved = json.loads((ctx.paths.literature_dir / CHECKPOINT_NAME).read_text(encoding="utf-8"))
+    assert [paper["citation_key"] for paper in saved["papers"]] == list(result.citation_map)
+
+
+def test_an_incomplete_search_is_repeated_by_the_retry(tmp_path):
+    outage = {"over": False}
+
+    class FlakyScript(Script):
+        def __call__(self, request: FakeRequest) -> str:
+            if not outage["over"] and ">widget drift failure</" in request.text:
+                raise LLMError("overloaded (req_123)")
+            return super().__call__(request)
+
+    client = FakeLLM(FlakyScript(writer=failing_once(LLMError("overloaded (req_124)"))))
+    ctx = make_ctx(tmp_path, client)
+    with pytest.raises(LLMError, match="req_124"):
+        LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+    # A search that lost a task is not kept: the retry may find what it missed.
+    assert not ctx.paths.literature_dir.exists()
+
+    outage["over"] = True
+    result = LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+    assert len(discovery_requests(client)) == 6
+    assert list(result.citation_map) == [SURVEY, FOUNDATIONS, DRIFT, ADAM]
+
+
+def test_an_empty_bibliography_is_reported_once_across_attempts(tmp_path):
+    empty = {task: [] for task in DISCOVERY}
+    client = FakeLLM(Script(empty, failing_once(LLMRefusal("declined"))))
+    ctx = make_ctx(tmp_path, client)
+    with pytest.raises(LLMRefusal):
+        LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+    result = LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+
+    assert result.papers == 0 and len(discovery_requests(client)) == 3
+    ((kind, note),) = notes(ctx)  # written by the attempt that searched, not again
+    assert kind == "observation" and "references.bib is empty" in note
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda saved: "not json at all",
+        lambda saved: json.dumps([saved]),
+        lambda saved: json.dumps(saved | {"version": 0}),
+        lambda saved: json.dumps(saved | {"papers": [{"title": "No Key"}]}),
+        lambda saved: json.dumps(saved | {"papers": saved["papers"][:1] * 2}),
+        lambda saved: json.dumps(saved | {"stats": {"unknown_counter": 1}}),
+        lambda saved: json.dumps(saved | {"stats": saved["stats"] | {"verified": "four"}}),
+        lambda saved: json.dumps({k: v for k, v in saved.items() if k != "papers"}),
+    ],
+    ids=[
+        "text",
+        "list",
+        "version",
+        "invalid-paper",
+        "duplicate-key",
+        "unknown-counter",
+        "counter-type",
+        "no-papers",
+    ],
+)
+def test_a_checkpoint_that_cannot_be_trusted_is_ignored(tmp_path, damage):
+    client = FakeLLM(Script(writer=failing_once(LLMRefusal("declined"))))
+    ctx = make_ctx(tmp_path, client)
+    with pytest.raises(LLMRefusal):
+        LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+    checkpoint = ctx.paths.literature_dir / CHECKPOINT_NAME
+    checkpoint.write_text(
+        damage(json.loads(checkpoint.read_text(encoding="utf-8"))), encoding="utf-8"
+    )
+
+    result = LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+
+    assert len(discovery_requests(client)) == 6  # searched again
+    assert list(result.citation_map) == [SURVEY, FOUNDATIONS, DRIFT, ADAM]
+
+
+def test_a_stopped_run_ends_the_search_without_counting_failed_tasks(tmp_path, caplog):
+    holder: dict = {}
+
+    def responder(request: FakeRequest) -> str:
+        holder["ctx"].harness.cancel()  # the stop arrives while the first search runs
+        return json.dumps({"candidates": []})
+
+    client = FakeLLM(responder)
+    ctx = holder["ctx"] = make_ctx(tmp_path, client, literature_workers=1)
+    with caplog.at_level(logging.WARNING), pytest.raises(RunCancelled):
+        LiteratureAgent(ctx, scholar=make_scholar(FakeS2Session())).run(make_outline())
+    assert len(client.requests) == 1  # no further call was started
+    assert "Search task" not in caplog.text  # a stop is not a failed search

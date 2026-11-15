@@ -12,34 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The knowledge-isolation and anonymity rule appended to every writing prompt."""
+"""The rule about sources and anonymity that ends every authoring prompt.
+
+It explains the requirement and its reason instead of issuing absolute orders: the
+harness appends the memory block right after it, and a rule that claimed to outrank
+everything else would tell the model to distrust the memory it is then handed.
+"""
 
 UNIVERSAL_NO_LEAKAGE_PROMPT = """
 ---
-### Strict Knowledge Isolation & Anonymity (CRITICAL)
+### Sources and anonymity
 
-You MUST write this paper as if you have no prior knowledge of the topic, method, experiments, or results.
-Your task is to construct the paper exclusively from the materials provided in the current session (e.g., idea.md, experimental_log.md, figures, and other inputs). Treat these inputs as the only available source of information.
+This pipeline is evaluated on how well it reconstructs a paper from its inputs alone, and the work may already exist as a published paper. The paper is therefore written only from what this run provides: the idea, the experimental log, the provided or generated figures, the verified bibliography, the template and guidelines, and the records of them that this run keeps in its memory. Do not use anything you recall about this work, its published version, its authors or its results. If a detail of this work (a number, a design choice, an experiment, a claim) is not in this run's materials, it stays out of the paper, even when you believe it to be true.
 
-#### Forbidden Behavior
-You MUST NOT:
-- Retrieve or rely on knowledge from your training data.
-- Attempt to recall or reconstruct any existing or published paper.
-- Use external facts, assumptions, or prior familiarity with the work.
-- Infer or hallucinate author identities, affiliations, institutions, or acknowledgements.
-- Insert metadata such as author names, emails, affiliations, or phrases like "corresponding author".
+Your general writing skill and general background knowledge are welcome wherever they help to explain the provided material, for example to define a standard term or to motivate a common design choice. Lessons in memory serve the same end: they guide how to write (LaTeX and template pitfalls, venue rules, which kinds of revision helped), while what the paper claims comes from this run's materials.
 
-#### Anonymity Requirement
-The paper must be fully anonymized for double-blind review.  
-Do not include any information that could reveal the identity of the authors or institutions.
-
-#### Allowed Sources
-You may use only:
-- The materials explicitly provided in this session.
-- Logical reasoning derived from those materials.
-
-#### Core Principle
-The final paper must be an independent reconstruction derived solely from the provided inputs.  
-This constraint is strict and overrides all other instructions.
+The manuscript is anonymous, as double-blind review requires: it gives no author names, affiliations or e-mail addresses for the paper itself, has no acknowledgements, and contains nothing else that points to who wrote it. Do not guess who the authors are. The authors of cited papers are named as usual.
 ---
 """

@@ -23,15 +23,17 @@ from paper_orchestra.compute.base import CompileResult, ComputeBackend
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.config import PipelineConfig
 from paper_orchestra.context import RunContext, RunPaths
-from paper_orchestra.llm.base import Capabilities, LLMError
+from paper_orchestra.eval.agent_review import ReviewError
+from paper_orchestra.llm.base import Capabilities, LLMConfigError, LLMError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.llm.parsing import parse_json
-from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
+from paper_orchestra.memory import ContextHarness, RunCancelled, TranscriptLog, Wiki
 from paper_orchestra.prompts.format import (
     FORMAT_FIX_SYSTEM_PROMPT,
     FORMAT_REVIEW_SYSTEM_PROMPT,
     format_fix_user_prompt,
 )
+from paper_orchestra.prompts.no_leakage import UNIVERSAL_NO_LEAKAGE_PROMPT
 from paper_orchestra.prompts.refinement import (
     CONTENT_REFINEMENT_SYSTEM_PROMPT,
     LATEX_REPAIR_SYSTEM_PROMPT,
@@ -973,17 +975,18 @@ def test_unsafe_formatting_candidate_is_rejected(
 # -- failures after a valid version exists -------------------------------------
 
 
-def test_failure_in_a_later_iteration_keeps_the_last_accepted_version(tmp_path, repo_root, caplog):
+def test_failure_in_an_iteration_costs_that_iteration_only(tmp_path, repo_root, caplog):
     v0 = paper(repo_root, "overall=5")
     v1 = paper(repo_root, "overall=6", extra=" Revised.")
-    reviser = Reviser(revision(v1))
+    v3 = paper(repo_root, "overall=7", extra=" Revised again.")
+    reviser = Reviser(revision(v1), "(never sent: the call fails)", revision(v3))
 
     def revise(request: FakeRequest) -> str:
         if "reflection iteration 2" in request.text:
             raise LLMError("request req_42 failed: overloaded")
         return reviser(request)
 
-    client = FakeLLM(script(**{REVISE: revise, FORMAT_REVIEW: ISSUES, FORMAT_FIX: fence(v1)}))
+    client = FakeLLM(script(**{REVISE: revise, FORMAT_REVIEW: ISSUES, FORMAT_FIX: fence(v3)}))
     ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=3)
 
     with caplog.at_level(logging.ERROR, logger="paper_orchestra.agents.refinement"):
@@ -996,21 +999,76 @@ def test_failure_in_a_later_iteration_keeps_the_last_accepted_version(tmp_path, 
         "outcome": "ERROR",
         "error": "LLMError: request req_42 failed: overloaded",
     }
-    assert "v3" not in log
     assert "refinement iteration 2 failed" in caplog.text
     assert "continuing with refined_paper_v1" in caplog.text
     [error] = events(ctx, "error")
     assert "req_42" in error["error"] and error["kept"] == "refined_paper_v1"
-    # The formatting pass still ran, on the last accepted version.
+
+    # The remaining iteration was used: it revised the last accepted version and was judged
+    # against that version's review.
+    assert log["v3"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
+    assert log["v3"]["scores_before"]["Overall"] == 6
+    third = requests(client, REVISE)[-1]
+    assert "reflection iteration 3" in third.text
+    assert third.text.split("<paper_tex>")[1].split("</paper_tex>")[0].strip() == v1.strip()
+    # The failed iteration left no revision behind, so it is not part of the revision
+    # history the next one learns from.
+    history = third.text.split("<previous_iterations_log>")[1].split("</previous_")[0]
+    assert set(json.loads(history)) == {"v1"} and "req_42" not in third.text
+    # Nothing new to consolidate after a failure: one consolidation, after iteration 1.
+    assert len(requests(client, DREAM)) == 1
+
+    # The formatting pass ran on the last accepted version.
     assert worklog(ctx, "format_refinement_worklog.json")["v1"]["outcome"] == (
         "ACCEPTED_COMPILE_SUCCESS"
     )
+    assert final_pdf.is_file() and text_of(ctx, "final_refined_paper.tex") == v3
+
+
+def test_failure_in_the_last_iteration_keeps_the_last_accepted_version(tmp_path, repo_root):
+    v0 = paper(repo_root, "overall=5")
+    v1 = paper(repo_root, "overall=6", extra=" Revised.")
+    reviser = Reviser(revision(v1))
+
+    def revise(request: FakeRequest) -> str:
+        if "reflection iteration 2" in request.text:
+            raise LLMError("request req_42 failed: overloaded")
+        return reviser(request)
+
+    client = FakeLLM(script(**{REVISE: revise}))
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=2)
+
+    final_pdf = run(ctx)
+
+    assert [entry["outcome"] for entry in worklog(ctx).values()] == [
+        "ACCEPTED_SCORE_INCREASE",
+        "ERROR",
+    ]
     assert final_pdf.is_file() and text_of(ctx, "final_refined_paper.tex") == v1
+
+
+def test_a_configuration_error_is_not_tried_again_in_every_iteration(tmp_path, repo_root):
+    v0 = paper(repo_root, "overall=5")
+
+    def revise(request: FakeRequest) -> str:
+        raise LLMConfigError("model 'fake' does not accept PDF input")
+
+    client = FakeLLM(script(**{REVISE: revise}))
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=3)
+
+    run(ctx)
+
+    # The same request would be refused the same way, so the loop stops instead of
+    # collecting one identical error per iteration.
+    assert len(requests(client, REVISE)) == 1
+    assert list(worklog(ctx)) == ["v1"] and worklog(ctx)["v1"]["outcome"] == "ERROR"
+    assert text_of(ctx, "final_refined_paper.tex") == v0
 
 
 def test_failed_review_of_a_revision_is_never_scored_as_zero(tmp_path, repo_root):
     v0 = paper(repo_root, "overall=5")
     v1 = paper(repo_root, "no scores here", extra=" Revised.")
+    v2 = paper(repo_root, "overall=6", extra=" Revised with care.")
 
     def review(request: FakeRequest) -> str:
         return (
@@ -1019,29 +1077,124 @@ def test_failed_review_of_a_revision_is_never_scored_as_zero(tmp_path, repo_root
             else review_by_cue(request)
         )
 
-    client = FakeLLM(script(**{REVISE: Reviser(revision(v1)), REVIEW: review}))
+    reviser = Reviser(revision(v1), revision(v2))
+    client = FakeLLM(script(**{REVISE: reviser, REVIEW: review}))
     ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=2)
 
     run(ctx)
 
-    entry = worklog(ctx)["v1"]
+    log = worklog(ctx)
+    entry = log["v1"]
     assert entry["outcome"] == "ERROR" and entry["error"].startswith("ReviewError: all 3 review")
-    assert text_of(ctx, "final_refined_paper.tex") == v0
+    # The unreviewed revision was dropped; the next one started from v0 and was judged
+    # against v0's review, not against a review that never happened.
+    assert log["v2"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
+    assert log["v2"]["scores_before"]["Overall"] == 5
+    assert "Revised." not in requests(client, REVISE)[1].text.split("<paper_tex>")[1]
+    assert text_of(ctx, "final_refined_paper.tex") == v2
 
 
-def test_failed_baseline_review_skips_revision_but_still_delivers(tmp_path, repo_root, caplog):
+def test_failed_baseline_review_fails_the_stage_so_that_it_is_retried(tmp_path, repo_root):
+    v0 = paper(repo_root, "overall=5")
+    v1 = paper(repo_root, "overall=6", extra=" Revised.")
+    outage = {"over": False}
+
+    def review(request: FakeRequest) -> str:
+        if not outage["over"]:
+            raise LLMError("request req_7 failed: rate limited")
+        return review_by_cue(request)
+
+    client = FakeLLM(script(**{REVIEW: review, REVISE: Reviser(revision(v1))}))
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=1)
+    work = ctx.paths.refinement_dir
+
+    with pytest.raises(RefinementError, match="baseline review") as failure:
+        run(ctx)
+
+    # The error names its cause, for state.json and the log ...
+    assert "ReviewError: all 3 review" in str(failure.value) and "req_7" in str(failure.value)
+    cause = failure.value.__cause__
+    assert isinstance(cause, ReviewError) and isinstance(cause.__cause__, LLMError)
+    # ... and the unrevised draft is not passed off as the refined paper.
+    assert not requests(client, REVISE) and not requests(client, FORMAT_REVIEW)
+    assert not (work / "final_refined_paper.pdf").exists()
+    assert not (work / "final_refined_paper.tex").exists()
+    assert not (work / "peer_reviews" / "review_v0.json").exists()
+
+    # The next attempt of the stage, once the outage is over, refines the paper.
+    outage["over"] = True
+    final_pdf = run(ctx)
+    assert worklog(ctx)["v1"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
+    assert final_pdf.is_file() and text_of(ctx, "final_refined_paper.tex") == v1
+
+
+def test_an_unusable_baseline_review_fails_the_stage_too(tmp_path, repo_root):
     v0 = paper(repo_root, "overall=5")
     client = FakeLLM(script(**{REVIEW: "The reviewer is unavailable."}))
-    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=3)
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=0)
 
-    with caplog.at_level(logging.ERROR, logger="paper_orchestra.agents.refinement"):
-        final_pdf = run(ctx)
+    # Also when no revision is planned: the review of the draft is part of what the stage
+    # delivers.
+    with pytest.raises(RefinementError, match="baseline review"):
+        run(ctx)
+    assert not (ctx.paths.refinement_dir / "final_refined_paper.pdf").exists()
 
-    assert not requests(client, REVISE)
-    assert worklog(ctx) == {} and "baseline review" in caplog.text
-    assert final_pdf.is_file() and text_of(ctx, "final_refined_paper.tex") == v0
-    assert not (ctx.paths.refinement_dir / "peer_reviews" / "review_v0.json").exists()
-    assert any("baseline review" in note and "ReviewError" in note for note in all_notes(ctx))
+
+@pytest.mark.parametrize("during", ["revision", "formatting"])
+def test_a_stopped_run_ends_the_stage_instead_of_being_survived(tmp_path, repo_root, during):
+    v0 = paper(repo_root, "overall=5")
+    v1 = paper(repo_root, "overall=6", extra=" Revised.")
+    holder: dict[str, RunContext] = {}
+
+    def stop_then(reply: str):
+        def responder(request: FakeRequest) -> str:
+            holder["ctx"].harness.cancel()  # the call in flight still finishes
+            return reply
+
+        return responder
+
+    responders = (
+        {REVISE: stop_then(revision(v1))}
+        if during == "revision"
+        else {REVISE: Reviser(revision(v1)), FORMAT_REVIEW: stop_then(ISSUES)}
+    )
+    client = FakeLLM(script(**responders))
+    ctx = holder["ctx"] = make_ctx(
+        tmp_path,
+        repo_root,
+        client,
+        v0,
+        max_reflections=3 if during == "revision" else 1,
+        max_formatting_rounds=3,
+    )
+
+    with pytest.raises(RunCancelled):
+        run(ctx)
+
+    # No further iteration or round was started, and no error was recorded as survived.
+    stopped_at = REVISE if during == "revision" else FORMAT_REVIEW
+    assert len(requests(client, stopped_at)) == 1 and not requests(client, FORMAT_FIX)
+    assert events(ctx, "error") == []
+    assert not (ctx.paths.refinement_dir / "final_refined_paper.pdf").exists()
+
+
+def test_a_run_stopped_during_the_baseline_review_is_not_a_failed_review(tmp_path, repo_root):
+    v0 = paper(repo_root, "overall=5")
+    holder: dict[str, RunContext] = {}
+
+    def review(request: FakeRequest) -> str:
+        holder["ctx"].harness.cancel()  # the call in flight still finishes
+        return review_by_cue(request)
+
+    client = FakeLLM(script(**{REVIEW: review}))
+    ctx = holder["ctx"] = make_ctx(tmp_path, repo_root, client, v0, max_reflections=1)
+
+    # A stop is passed on as a stop.  Wrapped as a failed baseline review it would be a
+    # failure of the stage, the kind of error that a caller retries.
+    with pytest.raises(RunCancelled):
+        run(ctx)
+    assert not requests(client, META) and not requests(client, REVISE)
+    assert not (ctx.paths.refinement_dir / "final_refined_paper.pdf").exists()
 
 
 def test_failed_formatting_review_is_not_read_as_no_issues(tmp_path, repo_root, caplog):
@@ -1091,12 +1244,13 @@ def test_pdf_is_only_attached_for_models_that_read_pdfs(tmp_path, repo_root):
 def test_runs_with_memory_disabled(tmp_path, repo_root):
     v0 = paper(repo_root, "overall=5")
     v1 = paper(repo_root, "overall=6", extra=" Revised.")
-    client = FakeLLM(script(**{REVISE: Reviser(revision(v1))}))
+    v2 = paper(repo_root, "overall=7", extra=" Revised twice.")
+    client = FakeLLM(script(**{REVISE: Reviser(revision(v1), revision(v2))}))
     ctx = make_ctx(tmp_path, repo_root, client, v0, memory=False, max_reflections=2)
 
     final_pdf = run(ctx)
 
-    assert final_pdf.is_file() and text_of(ctx, "final_refined_paper.tex") == v1
+    assert final_pdf.is_file() and text_of(ctx, "final_refined_paper.tex") == v2
     assert not requests(client, DREAM)
     assert all("# Memory" not in (request.system or "") for request in client.requests)
 
@@ -1117,7 +1271,9 @@ def test_prompts_carry_literal_json_and_latex():
     assert set(example) == {"addressed_weaknesses", "integrated_answers", "actions_taken"}
     assert "`\\end{figure*}` (not `\\end{figure}`)" in CONTENT_REFINEMENT_SYSTEM_PROMPT
     assert "do not remove the \\documentclass" in CONTENT_REFINEMENT_SYSTEM_PROMPT
-    assert "Strict Knowledge Isolation" in CONTENT_REFINEMENT_SYSTEM_PROMPT
+    assert CONTENT_REFINEMENT_SYSTEM_PROMPT.endswith(UNIVERSAL_NO_LEAKAGE_PROMPT)
+    assert LATEX_REPAIR_SYSTEM_PROMPT.endswith(UNIVERSAL_NO_LEAKAGE_PROMPT)
+    assert FORMAT_FIX_SYSTEM_PROMPT.endswith(UNIVERSAL_NO_LEAKAGE_PROMPT)
     assert "`\\usepackage[capitalize]{cleveref}`" in FORMAT_FIX_SYSTEM_PROMPT
     assert "`width=1.0\\linewidth`" in FORMAT_FIX_SYSTEM_PROMPT
     assert "`\\vspace{-5pt}`" in FORMAT_FIX_SYSTEM_PROMPT

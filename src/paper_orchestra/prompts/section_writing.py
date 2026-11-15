@@ -63,8 +63,9 @@ Instructions:
    - If you put anything in an Appendix, make sure the Appendix section appears after the References section, on a fresh page.
 
 5. Figures and visual fidelity
-   - You are given the actual image files of the figures. Describe them faithfully and accurately; do not write interpretations that contradict the visual evidence in the plots.
-   - Use all of the figures listed in <figures>. They are stored in the `figures/` subdirectory: use the exact file paths, including the extension (e.g., .png), in your \includegraphics commands.
+   - <figures> is the complete list of this paper's figures, whatever the outline planned: use every figure it lists and include no other image file. When it lists none, the paper has no figures.
+   - You are given the actual image files of the listed figures. Describe them faithfully and accurately; do not write interpretations that contradict the visual evidence in the plots.
+   - The figures are stored in the `figures/` subdirectory: use the exact file paths, including the extension (e.g., .png), in your \includegraphics commands.
    - Do not merge or group multiple figures into one for display.
    - If the paper is in a 2-column format, display figures in single-column mode (`\begin{figure}`) unless they are very wide.
    - Ensure that every figure is referenced in the text.
@@ -136,7 +137,7 @@ Complete the paper:
 1. Identify the missing sections in the template. Do not change the text that is already written.
 2. Write the LaTeX content of those sections based on the outline.
 3. Construct tables using data from the experimental log.
-4. Insert the figures using the file paths from the figures list.
+4. Insert the figures of the figures list, if it lists any, using their file paths.
 5. Use citations from the citation library.
 6. Return the full, compilable LaTeX file.
 """
