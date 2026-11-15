@@ -18,13 +18,16 @@ from typing import Any
 import pytest
 
 import paper_orchestra.compute.modal_backend as modal_backend
-from paper_orchestra.compute import BACKEND_NAMES, ComputeError, get_backend
+from paper_orchestra.compute import BACKEND_NAMES, ComputeBackend, ComputeError, get_backend
+from paper_orchestra.compute.base import BackendUnusable
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.compute.modal_backend import (
-    TEXLIVE_INSTALL_COMMAND,
+    TEX_PACKAGES_ENV,
     ModalBackend,
+    extra_tex_packages,
     modal_token_configured,
     pack_tree,
+    texlive_install_command,
 )
 from paper_orchestra.utils.latex import latex_commands
 
@@ -302,6 +305,12 @@ def real_sdk() -> types.SimpleNamespace:
     )
 
 
+@pytest.fixture(autouse=True)
+def no_extra_tex_packages(monkeypatch) -> None:
+    """The images are the default ones, whatever the shell that runs the tests has exported."""
+    monkeypatch.delenv(TEX_PACKAGES_ENV, raising=False)
+
+
 @pytest.fixture
 def fake(monkeypatch, tmp_path) -> FakeModal:
     hub = FakeModal(tmp_path / "modal")
@@ -549,12 +558,91 @@ def test_latex_sandbox_image_has_texlive_without_recommends(fake, backend, tmp_p
     backend.compile_latex(tmp_path, "paper")
     [(_, created)] = fake.named("Sandbox.create")
     image = created["image"]
-    assert image.named("Image.run_commands") == [(TEXLIVE_INSTALL_COMMAND,)]
-    assert "--no-install-recommends" in TEXLIVE_INSTALL_COMMAND
-    assert "texlive-latex-extra" in TEXLIVE_INSTALL_COMMAND
-    assert "texlive-plain-generic" in TEXLIVE_INSTALL_COMMAND
+    command = texlive_install_command()
+    assert image.named("Image.run_commands") == [(command,)]
+    assert "--no-install-recommends" in command
+    assert "texlive-latex-extra" in command
+    assert "texlive-plain-generic" in command
     assert created["block_network"] is True and not created.get("secrets")
     assert created["include_oidc_identity_token"] is False
+
+
+def test_tex_images_carry_the_fonts_that_common_templates_need():
+    r"""`\mathbbm`, inconsolata (ACL), newtx and libertine (acmart) and lmodern."""
+    packages = texlive_install_command().split("--no-install-recommends ")[1].split(" && ")[0]
+    assert {"texlive-fonts-extra", "lmodern", "texlive-publishers"} <= set(packages.split())
+    assert len(packages.split()) == len(set(packages.split()))
+
+
+def test_extra_tex_packages_come_from_the_environment(fake, tmp_path, monkeypatch):
+    assert extra_tex_packages({}) == ()
+    asked = " fonts-lato  texlive-lang-german\tlmodern fonts-lato libfoo++1.2 "
+    assert extra_tex_packages({TEX_PACKAGES_ENV: asked}) == (
+        "fonts-lato",
+        "texlive-lang-german",  # lmodern is installed anyway, and nothing is listed twice
+        "libfoo++1.2",
+    )
+    monkeypatch.setenv(TEX_PACKAGES_ENV, "fonts-lato texlive-music")
+    assert extra_tex_packages() == ("fonts-lato", "texlive-music")
+    fake.handlers.append(
+        scripted(pdflatex=lambda *_: FakeProcess(), bibtex=lambda *_: FakeProcess())
+    )
+    (tmp_path / "paper.tex").write_text("x")
+    ModalBackend().compile_latex(tmp_path, "paper")
+    [(_, created)] = fake.named("Sandbox.create")
+    [(command,)] = created["image"].named("Image.run_commands")
+    assert command == texlive_install_command(("fonts-lato", "texlive-music"))
+    assert " latexmk fonts-lato texlive-music && rm -rf " in command
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "lmodern; rm -rf /",
+        "$(curl example.org)",
+        "fonts-lato && true",
+        "--allow-unauthenticated",
+        "Texlive-Fonts-Extra",
+        "a",
+        "fonts-lato\nRUN true",
+        "pkg=1.0",
+    ],
+)
+def test_extra_tex_packages_must_be_package_names(fake, monkeypatch, value):
+    """The names become part of a shell command of the image build."""
+    with pytest.raises(ValueError, match="is not a Debian package name") as raised:
+        extra_tex_packages({TEX_PACKAGES_ENV: value})
+    assert TEX_PACKAGES_ENV in str(raised.value)
+    # Reported when the backend is built, not by the first compile of a paid-for run.
+    monkeypatch.setenv(TEX_PACKAGES_ENV, value)
+    with pytest.raises(ValueError, match=TEX_PACKAGES_ENV):
+        ModalBackend()
+    assert fake.calls == []
+
+
+def test_check_finds_a_missing_modal_token_without_contacting_modal(fake, backend, monkeypatch):
+    """Preflight: no outline, literature search or draft is paid for before Modal is usable."""
+    assert inspect.signature(ModalBackend.check) == inspect.signature(ComputeBackend.check)
+    [problem] = backend.check()
+    assert "Modal is not authenticated" in problem
+    assert "`modal setup`" in problem and "--compute local" in problem
+    # The paper itself is compiled in a sandbox, so this holds without figure code too.
+    assert backend.check(python=False, latex=True) == [problem]
+    assert backend.check(python=False, latex=False) == []
+
+    fake.settings.update(token_id="ak-test", token_secret="as-test")
+    assert backend.check() == []
+    fake.settings.clear()
+    # Inside a Modal Function the container's own identity starts the sandboxes.
+    fake.local = False
+    assert backend.check() == []
+    fake.local = True
+
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: True))
+    compiles_here = ModalBackend(latex="local")
+    assert compiles_here.check(python=False, latex=True) == []
+    assert compiles_here.check(python=True, latex=True) == [problem]
+    assert fake.calls == []  # nothing was looked up, created or started
 
 
 def test_expired_sandbox_is_replaced_and_the_job_retried(fake, backend):
@@ -613,13 +701,23 @@ def test_job_longer_than_the_sandbox_lifetime_is_refused(fake):
 
 def test_modal_errors_become_compute_errors(fake, backend):
     fake.lookup_error = fake.exception.AuthError("Token missing")
-    with pytest.raises(ComputeError, match="modal token new"):
+    with pytest.raises(ComputeError, match="modal token new") as refused:
         backend.run_python("pass")
+    # A token Modal turns down (expired, revoked, of another profile) passes check(), which
+    # contacts nobody.  The error says that another attempt cannot help, so that the stage is
+    # not paid for a second time.
+    assert isinstance(refused.value, BackendUnusable) and refused.value.unusable is True
     fake.lookup_error = None
 
-    fake.create_error = fake.exception.Error("Insufficient capacity")
-    with pytest.raises(ComputeError, match=r"could not start a Modal sandbox.*Insufficient"):
+    fake.create_error = fake.exception.AuthError("Token expired")
+    with pytest.raises(BackendUnusable, match="Modal is not authenticated"):
         backend.run_python("pass")
+    fake.create_error = fake.exception.Error("Insufficient capacity")
+    with pytest.raises(
+        ComputeError, match=r"could not start a Modal sandbox.*Insufficient"
+    ) as busy:
+        backend.run_python("pass")
+    assert busy.value.unusable is False  # this one may pass: the stage is tried again
     fake.create_error = ConnectionError("network down")
     with pytest.raises(ComputeError, match="ConnectionError: network down"):
         backend.run_python("pass")
@@ -636,7 +734,7 @@ def test_modal_errors_become_compute_errors(fake, backend):
     assert len(fake.sandboxes) == 1 and len(fake.sandboxes[0].commands) == 1
 
 
-def test_inside_a_modal_function_the_container_app_owns_the_sandbox(fake, backend):
+def test_inside_a_modal_function_the_container_app_owns_the_sandbox(fake, backend, tmp_path):
     fake.local = False
     fake.handlers.append(scripted(python=lambda *_: FakeProcess()))
     backend.run_python("pass")
@@ -644,6 +742,19 @@ def test_inside_a_modal_function_the_container_app_owns_the_sandbox(fake, backen
     [(_, created)] = fake.named("Sandbox.create")
     assert created["app"] is None and created["block_network"] is True
     assert backend.describe()["inside_modal_function"] is True
+
+    # The container of a Function holds its credentials: the papers it compiles go to a
+    # sandbox that has none of them and no way out, and one sandbox serves every build.
+    fake.handlers.append(
+        scripted(pdflatex=lambda *_: FakeProcess(), bibtex=lambda *_: FakeProcess())
+    )
+    (tmp_path / "paper.tex").write_text("x")
+    for _ in range(3):
+        backend.compile_latex(tmp_path, "paper")
+    [_, (_, latex)] = fake.named("Sandbox.create")
+    assert latex["app"] is None and latex["block_network"] is True
+    assert latex["include_oidc_identity_token"] is False
+    assert not latex.get("secrets") and not latex.get("env") and not latex.get("volumes")
 
 
 @needs_coreutils
@@ -970,3 +1081,16 @@ def test_calls_match_the_installed_modal_sdk(real_sdk, fake, backend, tmp_path):
     assert callable(real_sdk.ContainerProcess.wait)
     assert {"stdout", "stderr"} <= set(dir(real_sdk.ContainerProcess))
     assert callable(real_sdk.StreamReader.__iter__)  # output is read chunk by chunk
+
+
+def test_a_document_the_screen_refuses_never_reaches_a_sandbox(fake, backend, tmp_path):
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF stale")
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\\begin{document}"
+        "\\immediate\\pdfobj stream file {/etc/passwd}\\end{document}"
+    )
+    result = backend.compile_latex(tmp_path, "paper")
+    assert not result.ok and result.pdf_path is None
+    assert any("pdfobj is not allowed" in error for error in result.errors)
+    assert fake.named("Sandbox.create") == []  # nothing was started, uploaded or run
+    assert not (tmp_path / "paper.pdf").exists()

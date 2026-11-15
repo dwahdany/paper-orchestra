@@ -8,8 +8,13 @@ scratch directory) and is replaced transparently once it has expired or been
 collected for idleness.
 
 ``latex="local"`` keeps the Sandbox for Python but compiles with the TeX Live
-install of the current machine.  ``paper_orchestra.modal_app`` uses that mode
-because its image already ships TeX Live.
+install of the current machine.  ``paper_orchestra.modal_app`` offers that mode
+(``PAPER_ORCHESTRA_MODAL_LATEX=local``) for speed; by default it compiles in a
+Sandbox too, away from the credentials of its own container.
+
+``PAPER_ORCHESTRA_MODAL_TEX_PACKAGES`` names extra Debian packages (separated
+by spaces) to install in the TeX Live images, for templates that need more
+than the list below.
 
 The ``modal`` package is imported inside functions so that importing this
 module, and the rest of the package, works without the ``modal`` extra.
@@ -21,6 +26,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 import tarfile
 import tempfile
 import threading
@@ -33,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from paper_orchestra.compute.base import (
+    BackendUnusable,
     CompileResult,
     ComputeBackend,
     ComputeError,
@@ -50,6 +57,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 APP_ENV = "PAPER_ORCHESTRA_MODAL_APP"
+TEX_PACKAGES_ENV = "PAPER_ORCHESTRA_MODAL_TEX_PACKAGES"
 DEFAULT_APP_NAME = "paper-orchestra"
 INSTALL_HINT = "Install the Modal SDK with `uv sync --extra modal`."
 
@@ -58,25 +66,56 @@ PYTHON_PACKAGES = ("numpy>=1.26", "matplotlib>=3.8", "pandas", "seaborn", "scipy
 
 #: Covers the bundled templates and the usual conference styles.  ``plain-generic``
 #: (soul, ulem) is only a Recommends of latex-extra, so it is listed explicitly.
+#: ``fonts-extra`` (inconsolata, newtx, libertine, bbm, dsfont) and ``lmodern`` are what
+#: ACL- and ACM-style templates and ``\mathbbm`` need; they add about 1.7 GiB to the layer.
 TEXLIVE_PACKAGES = (
     "texlive-latex-base",
     "texlive-latex-recommended",
     "texlive-latex-extra",
     "texlive-fonts-recommended",
+    "texlive-fonts-extra",
     "texlive-science",
     "texlive-bibtex-extra",
     "texlive-publishers",
     "texlive-plain-generic",
     "cm-super",
+    "lmodern",
     "latexmk",
 )
-#: ``Image.apt_install`` cannot pass ``--no-install-recommends``; with recommends
-#: the TeX Live layer roughly doubles in size.
-TEXLIVE_INSTALL_COMMAND = (
-    "apt-get update && apt-get install -y --no-install-recommends "
-    + " ".join(TEXLIVE_PACKAGES)
-    + " && rm -rf /var/lib/apt/lists/*"
-)
+# Debian's rule for package names.  The names end up in a shell command of the image build.
+_APT_PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]+")
+
+
+def extra_tex_packages(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The extra Debian packages asked for through ``PAPER_ORCHESTRA_MODAL_TEX_PACKAGES``.
+
+    Raises ``ValueError`` for anything that is not a package name.
+    """
+    raw = (os.environ if environ is None else environ).get(TEX_PACKAGES_ENV, "")
+    packages: list[str] = []
+    for name in raw.split():
+        if not _APT_PACKAGE.fullmatch(name):
+            raise ValueError(
+                f"{TEX_PACKAGES_ENV}={raw!r}: {name!r} is not a Debian package name. Give "
+                "package names separated by spaces, for example 'texlive-lang-german fonts-lato'."
+            )
+        if name not in TEXLIVE_PACKAGES and name not in packages:
+            packages.append(name)
+    return tuple(packages)
+
+
+def texlive_install_command(extra_packages: Sequence[str] = ()) -> str:
+    """The image build step that installs TeX Live plus ``extra_packages``.
+
+    ``Image.apt_install`` cannot pass ``--no-install-recommends``; with recommends
+    the TeX Live layer roughly doubles in size.
+    """
+    return (
+        "apt-get update && apt-get install -y --no-install-recommends "
+        + " ".join((*TEXLIVE_PACKAGES, *extra_packages))
+        + " && rm -rf /var/lib/apt/lists/*"
+    )
+
 
 SandboxKind = Literal["python", "latex"]
 LatexMode = Literal["sandbox", "local"]
@@ -147,12 +186,16 @@ def python_image() -> modal.Image:
     )
 
 
-def latex_image() -> modal.Image:
-    """Image with TeX Live for compiling papers."""
+def latex_image(extra_packages: Sequence[str] | None = None) -> modal.Image:
+    """Image with TeX Live for compiling papers.
+
+    ``extra_packages`` defaults to what ``PAPER_ORCHESTRA_MODAL_TEX_PACKAGES`` asks for.
+    """
     modal = _import_modal()
+    extra = extra_tex_packages() if extra_packages is None else extra_packages
     return (
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
-        .run_commands(TEXLIVE_INSTALL_COMMAND)
+        .run_commands(texlive_install_command(extra))
         .env({"TEXMFVAR": "/tmp/texmf-var"})
     )
 
@@ -285,6 +328,8 @@ class ModalBackend(ComputeBackend):
         self.sandbox_lifetime = sandbox_lifetime
         self.idle_timeout = idle_timeout
         self._local = LocalBackend() if latex == "local" else None
+        # Read now, so that a malformed value is reported before any work is done.
+        self._tex_packages = extra_tex_packages() if latex == "sandbox" else ()
         self._slots: dict[SandboxKind, _Slot] = {"python": _Slot(), "latex": _Slot()}
         self._state_lock = threading.Lock()
         self._app: Any = None
@@ -566,7 +611,7 @@ class ModalBackend(ComputeBackend):
                 "sleep",
                 "infinity",
                 app=self._lookup_app(),
-                image=python_image() if kind == "python" else latex_image(),
+                image=python_image() if kind == "python" else latex_image(self._tex_packages),
                 timeout=_seconds(self.sandbox_lifetime),
                 idle_timeout=_seconds(self.idle_timeout),
                 cpu=(min(0.5, self.cpu), self.cpu),
@@ -576,7 +621,9 @@ class ModalBackend(ComputeBackend):
                 include_oidc_identity_token=False,
             )
         except modal.exception.AuthError as exc:
-            raise ComputeError(
+            # check() only sees whether a token is configured; one that Modal turns down
+            # shows here.  It is turned down on every attempt, so the run should stop.
+            raise BackendUnusable(
                 "Modal is not authenticated. Run `modal token new`, or set MODAL_TOKEN_ID and "
                 "MODAL_TOKEN_SECRET."
             ) from exc
@@ -629,6 +676,19 @@ class ModalBackend(ComputeBackend):
             log.debug("Could not remove %s in the Modal sandbox: %s", job_dir, exc)
 
     # -- lifecycle ---------------------------------------------------------------
+
+    def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+        """Why no sandbox could be started, found without starting one or contacting Modal."""
+        needs_sandbox = python or (latex and self._local is None)
+        # Inside a Modal Function the container's own identity starts the sandboxes.
+        if not needs_sandbox or not self._modal.is_local() or modal_token_configured():
+            return []
+        return [
+            "Modal is not authenticated (no token is configured on this machine), so the "
+            "sandboxes that compile the paper and run figure code cannot be started. Run "
+            "`modal setup` (or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET), or use "
+            "--compute local."
+        ]
 
     def close(self) -> None:
         sandboxes: list[Any] = []

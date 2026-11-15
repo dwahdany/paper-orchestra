@@ -1,6 +1,7 @@
 """Run the PaperOrchestra pipeline on Modal.
 
-From a checkout of this repository (the image is built from its ``uv.lock``)::
+From a checkout of this repository (the image is built from its ``pyproject.toml``
+and ``uv.lock``, so the app cannot be run or deployed from an installed wheel)::
 
     uv run modal run -m paper_orchestra.modal_app \\
         --raw-materials-dir ./raw_materials --template cvpr2025 --plotting
@@ -10,7 +11,8 @@ From a checkout of this repository (the image is built from its ``uv.lock``)::
 waits for it and downloads ``final_paper.pdf``, ``final_paper.tex`` and
 ``usage.json``.  A deployed app exposes ``write_paper(job)``,
 ``write_batch(jobs)`` and ``consolidate_memory(model)`` to
-``modal.Function.from_name``.
+``modal.Function.from_name``; ``paper-orchestra modal batch`` calls
+``write_paper`` once per paper (see :mod:`paper_orchestra.modal_batch`).
 
 Volume layout (``PAPER_ORCHESTRA_MODAL_VOLUME``, default ``paper-orchestra``,
 mounted at ``/vol``)::
@@ -18,7 +20,10 @@ mounted at ``/vol``)::
     inputs/<run_id>/raw_materials/   uploaded by the local entrypoint
     inputs/<run_id>/template/        the LaTeX template of that run
     runs/<run_id>/                   the pipeline's working directory and outputs
+    runs/<run_id>/.lease.json        present while a call is writing that run
     memory/                          the lab wiki shared by all runs
+    memory/cache/                    what the pipeline keeps across runs, beside the wiki
+    memory/.lease.json               present while the wiki is being consolidated
 
 Credentials.  ``write_paper`` attaches the Modal Secret named by
 ``PAPER_ORCHESTRA_MODAL_SECRET`` (default ``paper-orchestra``; ``none`` attaches
@@ -35,39 +40,65 @@ no Secret).  Two setups are supported:
   ``ANTHROPIC_SERVICE_ACCOUNT_ID`` / ``ANTHROPIC_WORKSPACE_ID`` when the
   federation rule asks for them.  Put them in the Secret, or export them in the
   shell that runs ``modal run`` / ``modal deploy``: they are forwarded to the
-  Function.  The federation rule should pin Modal's ``workspace_id``,
-  ``app_name`` and ``function_name`` claims.
+  Function.  The federation rule should pin Modal's ``workspace_id`` and
+  ``app_name`` claims.  A rule that also pins ``function_name`` has to admit both
+  ``write_paper`` and ``consolidate_memory``: each Function presents a token of
+  its own.  When the token exchange is refused, the error says what the token
+  of that container looked like and what to compare it with on the Anthropic
+  side.
 
 In keyless mode the container must not also hold ``ANTHROPIC_API_KEY``,
 ``ANTHROPIC_AUTH_TOKEN`` or ``ANTHROPIC_PROFILE``: the SDK would silently prefer
 them over the federated identity.  ``write_paper`` refuses to start when both
 are present.
 
-Isolation.  The pipeline compiles LaTeX inside its own container, which holds
-the credentials, so TeX runs with paranoid file access.  Model-written figure
-code runs in a nested Sandbox with no network, no Secret and no identity token.
+Isolation.  The container of ``write_paper`` holds the credentials, so nothing
+model-written runs in it: LaTeX is compiled, and figure code is run, in nested
+Sandboxes with no network, no Secret and no identity token.  One LaTeX Sandbox
+serves all the builds of a run.  ``PAPER_ORCHESTRA_MODAL_LATEX=local`` compiles
+inside the container instead, which is faster; TeX then runs with a scrubbed
+environment and paranoid file access, and documents that use file-reading
+constructs are refused either way.
 
 Preemption.  Modal may restart a Function at any time.  The volume is committed
 in the background every few seconds, between stages and once more before a
 summary is returned, and the pipeline resumes from
 ``runs/<run_id>/state.json``, so calling ``write_paper`` again with the same job
-continues where the last attempt stopped.  A run id must not be in flight twice
-at the same time.
+continues where the last attempt stopped.
+
+One run per run id.  Two containers driving the same run directory would repeat
+each other's stages and overwrite each other's files, so ``write_paper`` takes
+a lease on the run directory: a second call for a run id that is in flight
+returns a failed summary that says so instead of running.  A container that
+was stopped (its call cancelled, ``modal run`` interrupted) leaves its lease
+behind.  A call that finds a lease therefore watches it: a heartbeat that moves
+belongs to a run in flight, one that has stopped is taken over once it is a few
+minutes old, and the run is resumed.  A retry of the same call takes its lease
+over at once.
 
 Lab memory.  Runs share the lab wiki on the volume, where a lock file cannot keep
-two containers apart and the last writer of a file wins.  So a run only adds its
-lessons to the wiki as notes, and ``consolidate_memory``, which never runs in
-more than one container at a time, folds the notes into pages.  ``write_paper``
-calls it after a successful run.
+two containers apart and the last writer of a file wins.  So a run never writes
+the wiki's pages or its index: it only adds files of its own, its lessons as
+notes and what it looked up as cache entries, and ``consolidate_memory`` folds
+the notes into pages and rewrites the index.  That Function never runs in more
+than one container at a time, and it takes a lease on the wiki, so that two
+Apps that share a volume (two ``modal run`` at once, say) do not consolidate it
+together either.  ``write_paper`` calls it after a successful run, and once
+before a run on a volume whose lab wiki does not exist yet.
 
 Other settings, read when the app is run or deployed: ``PAPER_ORCHESTRA_MODAL_APP``
 (App name, default ``paper-orchestra``), ``PAPER_ORCHESTRA_MODAL_TIMEOUT``
-(seconds per attempt of ``write_paper``, default six hours) and
-``PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS`` (papers written in parallel, default 4).
+(seconds per attempt of ``write_paper``, default six hours),
+``PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS`` (papers written in parallel, default 4),
+``PAPER_ORCHESTRA_MODAL_LATEX`` (``sandbox`` or ``local``, see above) and
+``PAPER_ORCHESTRA_MODAL_TEX_PACKAGES`` (extra Debian packages for the TeX Live
+images, separated by spaces).
 """
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import dataclasses
 import json
 import logging
@@ -89,9 +120,13 @@ from paper_orchestra.compute.modal_backend import (
     DEFAULT_APP_NAME,
     INSTALL_HINT,
     PYTHON_VERSION,
-    TEXLIVE_INSTALL_COMMAND,
+    TEX_PACKAGES_ENV,
+    LatexMode,
     ModalBackend,
+    extra_tex_packages,
+    latex_image,
     python_image,
+    texlive_install_command,
 )
 from paper_orchestra.config import (
     BUNDLED_TEMPLATES_DIR,
@@ -109,6 +144,7 @@ from paper_orchestra.context import RunPaths
 from paper_orchestra.llm.base import Effort, LLMConfigError
 from paper_orchestra.log import setup_logging
 from paper_orchestra.memory.harness import ContextHarness
+from paper_orchestra.memory.wiki import INDEX_FILE
 
 try:
     import modal
@@ -125,15 +161,22 @@ VOLUME_ENV = "PAPER_ORCHESTRA_MODAL_VOLUME"
 SECRET_ENV = "PAPER_ORCHESTRA_MODAL_SECRET"
 TIMEOUT_ENV = "PAPER_ORCHESTRA_MODAL_TIMEOUT"
 MAX_CONTAINERS_ENV = "PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS"
+LATEX_ENV = "PAPER_ORCHESTRA_MODAL_LATEX"
 DEFAULT_VOLUME_NAME = "paper-orchestra"
 DEFAULT_SECRET_NAME = "paper-orchestra"
 NO_SECRET = "none"
+
+#: Longest run id, in characters.  A run id is a directory name on the volume.
+RUN_ID_MAX = 80
 
 VOLUME_MOUNT = "/vol"
 CONTAINER_TEMPLATES = "/root/templates"
 INPUTS_ROOT = "inputs"
 RUNS_ROOT = "runs"
 LAB_MEMORY_ROOT = "memory"
+#: In a directory of the volume while a call is writing it: who that is and when it last
+#: said so.
+LEASE_NAME = ".lease.json"
 
 #: Extras installed in the image, so the optional providers work on Modal too.
 IMAGE_EXTRAS = ("modal", "gemini", "openai")
@@ -177,10 +220,34 @@ _CONSOLIDATE_TIMEOUT = 60 * 60
 _DEFAULT_MAX_CONTAINERS = 4
 _COMMIT_ATTEMPTS = 3
 _COMMIT_RETRY_DELAY = 2.0
+#: Seconds between the heartbeats of a lease.
+_LEASE_REFRESH = 30.0
+#: A lease whose heartbeat is older than this was left by a container that is gone.  Several
+#: refresh periods: other containers only see a heartbeat once a background commit of the
+#: volume has published it.
+_LEASE_STALE = 5 * _LEASE_REFRESH
+#: After taking a lease, wait this long before checking that it is still ours, so that a
+#: container that took it in the same moment has had time to commit its own.
+_LEASE_SETTLE = 3.0
+#: Seconds between two looks at a lease that another call holds.
+_LEASE_POLL = 5.0
+#: How the Anthropic client words a credential it could not use (llm/anthropic_client.py).
+_CREDENTIAL_FAILURE = re.compile(
+    r"credentials could not be used|WorkloadIdentityError|IdentityTokenFileError"
+)
+#: Claims of Modal's identity token that a federation rule can match on.  None is a secret.
+_TOKEN_CLAIMS = (
+    "iss",
+    "aud",
+    "workspace_id",
+    "environment_name",
+    "app_name",
+    "function_name",
+)
 
 # Modal only issues identity tokens to Apps whose name matches this rule.
 _MODAL_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
-_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+_RUN_ID = re.compile(rf"[A-Za-z0-9][A-Za-z0-9._-]{{0,{RUN_ID_MAX - 1}}}")
 _TEMPLATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _RESEARCH_CUTOFF = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 _CONTAINER_OWNED_FIELDS = frozenset({"base_dir", "template_dir", "compute"})
@@ -189,6 +256,10 @@ _CONTAINER_OWNED_MEMORY = ("project_dir", "lab_dir", "lab_consolidate")
 
 class JobError(ValueError):
     """The job cannot run as configured; running it again would fail the same way."""
+
+
+class LeaseHeld(JobError):
+    """Another call is writing this part of the volume right now."""
 
 
 # -- settings -------------------------------------------------------------------
@@ -204,6 +275,10 @@ class Settings:
     timeout: int
     #: How many papers are written at the same time.
     max_containers: int
+    #: Where ``write_paper`` compiles LaTeX: in a nested Sandbox or in its own container.
+    latex: LatexMode = "sandbox"
+    #: Extra Debian packages installed in the TeX Live images.
+    tex_packages: tuple[str, ...] = ()
 
 
 def _modal_name(variable: str, value: str) -> str:
@@ -230,6 +305,15 @@ def _int_setting(
     return value
 
 
+def latex_mode(environ: Mapping[str, str]) -> LatexMode:
+    """Where ``write_paper`` compiles LaTeX, from ``PAPER_ORCHESTRA_MODAL_LATEX``."""
+    raw = environ.get(LATEX_ENV) or ""
+    mode = raw.strip().lower() or "sandbox"
+    if mode not in get_args(LatexMode):
+        raise ValueError(f"{LATEX_ENV}={raw!r} must be one of: {', '.join(get_args(LatexMode))}")
+    return mode  # type: ignore[return-value]
+
+
 def load_settings(environ: Mapping[str, str]) -> Settings:
     """Read the deployment settings; an unset variable selects its default.
 
@@ -244,6 +328,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         secret_name=_modal_name(SECRET_ENV, secret) if attach_secret else None,
         timeout=_int_setting(environ, TIMEOUT_ENV, _DEFAULT_TIMEOUT, 60, _MAX_TIMEOUT),
         max_containers=_int_setting(environ, MAX_CONTAINERS_ENV, _DEFAULT_MAX_CONTAINERS, 1, 1000),
+        latex=latex_mode(environ),
+        tex_packages=extra_tex_packages(environ),
     )
 
 
@@ -260,9 +346,13 @@ def function_env(settings: Settings, environ: Mapping[str, str]) -> dict[str, st
         SECRET_ENV: settings.secret_name or NO_SECRET,
         TIMEOUT_ENV: str(settings.timeout),
         MAX_CONTAINERS_ENV: str(settings.max_containers),
+        LATEX_ENV: settings.latex,
         LAB_MEMORY_ENV: f"{VOLUME_MOUNT}/{LAB_MEMORY_ROOT}",
         TEMPLATES_ENV: CONTAINER_TEMPLATES,
     }
+    if settings.tex_packages:
+        # The container builds the image of its LaTeX Sandbox from the same list.
+        env[TEX_PACKAGES_ENV] = " ".join(settings.tex_packages)
     env.update({name: environ[name] for name in FORWARDED_VARS if environ.get(name)})
     return env
 
@@ -298,6 +388,116 @@ def check_credentials(environ: Mapping[str, str]) -> str:
     return "none"
 
 
+def _identity_token(environ: Mapping[str, str]) -> str | None:
+    for name in _IDENTITY_TOKEN_VARS:
+        value = environ.get(name)
+        if not value:
+            continue
+        if not name.endswith("_FILE"):
+            return value.strip()
+        try:
+            return Path(value).read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def identity_token_claims(environ: Mapping[str, str]) -> dict[str, Any]:
+    """What the identity token of this container says about itself, read without verifying.
+
+    Only used to describe the token in logs and error messages; nothing here is
+    trusted or secret.  Returns ``{}`` when there is no token or it is not a JWT.
+    Besides the claims a federation rule can match on, the result has
+    ``lifetime_seconds`` (``exp - iat``) and ``single_use`` (the token carries a
+    ``jti``, so it can be exchanged once).
+    """
+    parts = (_identity_token(environ) or "").split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    claims: dict[str, Any] = {
+        name: payload[name] for name in _TOKEN_CLAIMS if isinstance(payload.get(name), str)
+    }
+    issued, expires = payload.get("iat"), payload.get("exp")
+    if isinstance(issued, int | float) and isinstance(expires, int | float):
+        claims["lifetime_seconds"] = int(expires - issued)
+    claims["single_use"] = "jti" in payload
+    return claims
+
+
+def federation_advice(environ: Mapping[str, str]) -> str:
+    """What to compare on the Anthropic side when the identity token was not accepted.
+
+    The token endpoint refuses with the same opaque answer whatever the reason,
+    so this names the usual ones next to what this container's token carries.
+    """
+    claims = identity_token_claims(environ)
+    described = ", ".join(f"{name}={claims[name]}" for name in _TOKEN_CLAIMS if name in claims)
+    lifetime = claims.get("lifetime_seconds")
+    checks = [
+        "the issuer registered there is https://oidc.modal.com with audience oidc.modal.com",
+        (
+            "the issuer's maximum token lifetime is at least that of Modal's token ("
+            + (f"{lifetime} s for this one" if lifetime is not None else "it could not be read")
+            + "; the default maximum is one hour, and Modal documents tokens valid for 48 h)"
+        ),
+        (
+            "the conditions of the federation rule match this container"
+            + (f" ({described})" if described else "")
+            + "; a rule that pins function_name must admit both write_paper and "
+            "consolidate_memory, which authenticate separately"
+        ),
+    ]
+    if claims.get("single_use"):
+        checks.append(
+            "the token can be exchanged only once (it carries a jti), so the access token the "
+            f"rule issues should last as long as one attempt of write_paper ({SETTINGS.timeout}"
+            f" s, {TIMEOUT_ENV}): a run that outlives it needs a token Modal has refreshed"
+        )
+    return (
+        "This container authenticates with Workload Identity Federation and its identity token "
+        "was not accepted. The exact reason is in the federation history of the Anthropic "
+        "Console. Check that " + "; that ".join(checks) + "."
+    )
+
+
+def explain_credential_failure(error: str | None, environ: Mapping[str, str]) -> str | None:
+    """Add :func:`federation_advice` to an error that reports an unusable federated credential."""
+    keyless = all(environ.get(name) for name in _WIF_REQUIRED)
+    if not error or not keyless or not _CREDENTIAL_FAILURE.search(error):
+        return error
+    return f"{error}\n{federation_advice(environ)}"
+
+
+def announce_credentials(environ: Mapping[str, str]) -> str:
+    """Check the Anthropic credential of this container and log which one it is.
+
+    Shared by ``write_paper`` and ``consolidate_memory``: both call a model, each
+    with the identity of its own Function.  Returns what
+    :func:`check_credentials` returns.
+    """
+    credential = check_credentials(environ)
+    if credential == "none":
+        log.warning(
+            "No Anthropic credential is configured in this container (no API key in the "
+            "Modal Secret and no Workload Identity Federation ids); Claude models will fail."
+        )
+        return credential
+    log.info("Anthropic credential in use: %s.", credential)
+    claims = identity_token_claims(environ) if credential == "workload_identity" else {}
+    if claims:
+        log.info(
+            "Identity token: %s.",
+            ", ".join(f"{name}={value}" for name, value in claims.items()),
+        )
+    return credential
+
+
 # -- jobs and paths -------------------------------------------------------------
 
 
@@ -309,8 +509,8 @@ def new_run_id(now: datetime | None = None) -> str:
 def validate_run_id(run_id: object) -> str:
     if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
         raise JobError(
-            f"run_id must be 1 to 80 letters, digits, '.', '_' or '-' and start with a letter "
-            f"or digit; got {run_id!r}"
+            f"run_id must be 1 to {RUN_ID_MAX} letters, digits, '.', '_' or '-' and start with "
+            f"a letter or digit; got {run_id!r}"
         )
     return run_id
 
@@ -338,6 +538,7 @@ def build_job(
     experimental_log_filename: str = "experimental_log.md",
     research_cutoff: str | None = None,
     use_plotting: bool = False,
+    keep_provided_figures: bool = False,
     plotting_max_critic_rounds: int | None = None,
     writer_model: str | None = None,
     reflection_model: str | None = None,
@@ -381,6 +582,7 @@ def build_job(
         "experimental_log_filename": experimental_log_filename,
         "research_cutoff": cutoff,
         "use_plotting": use_plotting,
+        "keep_provided_figures": keep_provided_figures or None,
         "plotting_max_critic_rounds": plotting_max_critic_rounds,
         "resume": resume,
         "models": {role: value for role, value in models.items() if value},
@@ -575,23 +777,215 @@ def _reload_volume(reload: Callable[[], None] | None) -> None:
         log.warning("Could not reload the volume: %s", exc)
 
 
+class VolumeLease:
+    """Marks a directory of the volume as being written by one call.
+
+    The volume has no file locking and the last writer of a file wins, so the
+    lease is a small file that names its holder and the time of its last
+    heartbeat.  A call that finds the heartbeat of another holder moving leaves
+    the directory alone.  The heartbeat is rewritten by a thread and reaches
+    other containers with the background commits of the volume; this thread
+    never commits itself, because an explicit commit must come from the thread
+    that does the work (see :class:`StageCheckpoint`).
+    """
+
+    def __init__(self, path: Path, owner: str, subject: str) -> None:
+        self.path = path
+        self.owner = owner
+        self.subject = subject
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @classmethod
+    def acquire(
+        cls,
+        directory: Path,
+        owner: str,
+        *,
+        subject: str,
+        commit: Callable[[], None],
+        reload: Callable[[], None] | None = None,
+    ) -> VolumeLease:
+        """Take the lease of ``directory`` or raise :class:`LeaseHeld`.
+
+        ``owner`` identifies the call; a retry of the same call (after a crash
+        or a preemption) presents the same one and takes its own lease over at
+        once.  ``subject`` names the directory in messages.  The caller has
+        reloaded the volume, so a lease another container committed is visible
+        here.  With ``reload``, a fresh lease of another call is watched before
+        it is believed (see :meth:`_wait_for_holder`), which can take as long
+        as a lease needs to go stale.
+        """
+        lease = cls(directory / LEASE_NAME, owner, subject)
+        lease._wait_for_holder(reload)
+        directory.mkdir(parents=True, exist_ok=True)
+        lease._write()
+        commit_volume(commit)
+        if reload is not None:
+            # Two calls that start together both find the directory free.  The later commit
+            # wins the file, so look again once both have had time to commit.
+            time.sleep(_LEASE_SETTLE)
+            _reload_volume(reload)
+            lease._refuse_if_held()
+            lease._write()
+        lease._thread = threading.Thread(target=lease._beat, name="volume-lease", daemon=True)
+        lease._thread.start()
+        return lease
+
+    def _read(self) -> dict[str, Any] | None:
+        try:
+            held = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(held, dict) or not isinstance(held.get("at"), int | float):
+            return None
+        return held
+
+    def _other_holder(self) -> dict[str, Any] | None:
+        """The lease another call holds on the directory; ``None`` when it is free to take.
+
+        A lease whose heartbeat is stale was left by a container that is gone,
+        and counts as free.
+        """
+        held = self._read()
+        if held is None or held.get("owner") == self.owner:
+            return None
+        age = time.time() - held["at"]
+        if age >= _LEASE_STALE:
+            log.warning(
+                "Taking over %s: the call that held it (%s) last reported %.0f s ago.",
+                self.subject,
+                held.get("owner"),
+                age,
+            )
+            return None
+        return held
+
+    def _held(self, held: Mapping[str, Any]) -> LeaseHeld:
+        age = max(time.time() - held["at"], 0.0)
+        return LeaseHeld(
+            f"{self.subject} is already being written by another call ({held.get('owner')}, "
+            f"last heartbeat {age:.0f} s ago), so this call left it alone. Wait for "
+            "that call or cancel it. If its container was stopped, its hold ends once the "
+            f"heartbeat is {_LEASE_STALE:.0f} s old."
+        )
+
+    def _refuse_if_held(self) -> None:
+        held = self._other_holder()
+        if held is not None:
+            raise self._held(held)
+
+    def _wait_for_holder(self, reload: Callable[[], None] | None) -> None:
+        """Return once the directory is free to take; raise :class:`LeaseHeld` if it is in use.
+
+        A container that was stopped (its call cancelled, its App stopped with
+        Ctrl-C, killed) could not give its lease up, and until that heartbeat is
+        stale it looks like one of a call at work.  Launching the run again is
+        how such a run is resumed, so a fresh lease is not believed at once: it
+        is watched.  A heartbeat that moves, or a lease that changes hands, is a
+        call at work and this one is turned away; a heartbeat that stays as it
+        is goes stale and the lease is taken over.  Without ``reload`` nothing
+        another container commits can be seen, and a fresh lease is believed.
+        """
+        first = held = self._other_holder()
+        if held is None:
+            return
+        if reload is None:
+            raise self._held(held)
+        # The watch never lasts longer than a lease takes to go stale, whatever the time in
+        # the lease says: it was stamped by the clock of another container.
+        watch = min(max(held["at"] + _LEASE_STALE - time.time(), 0.0), _LEASE_STALE)
+        log.info(
+            "Another call (%s) holds the lease on %s; watching whether that call is still "
+            "at work, for up to %.0f s.",
+            held.get("owner"),
+            self.subject,
+            watch,
+        )
+        deadline = time.monotonic() + watch
+        while held == first:
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "Taking over %s: the call that held it (%s) is gone, its heartbeat did "
+                    "not move.",
+                    self.subject,
+                    held.get("owner"),
+                )
+                return
+            time.sleep(_LEASE_POLL)
+            _reload_volume(reload)
+            held = self._other_holder()
+        if held is not None:
+            raise self._held(held)
+
+    def _write(self) -> None:
+        record = json.dumps({"owner": self.owner, "at": time.time()})
+        # Replaced in one step: a commit of the volume never catches a half-written lease.
+        partial = self.path.with_name(f"{self.path.name}.{secrets.token_hex(3)}.tmp")
+        try:
+            partial.write_text(record, encoding="utf-8")
+            os.replace(partial, self.path)
+        finally:
+            partial.unlink(missing_ok=True)
+
+    def _beat(self) -> None:
+        while not self._stop.wait(_LEASE_REFRESH):
+            try:
+                self._write()
+            except OSError as exc:  # for example while the volume is being reloaded
+                log.warning("Could not refresh the lease of %s: %s", self.subject, exc)
+
+    def release(self) -> None:
+        """Stop the heartbeat and remove the lease; the next commit makes that visible."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        held = self._read()
+        if held is None or held.get("owner") == self.owner:
+            with contextlib.suppress(OSError):
+                self.path.unlink(missing_ok=True)
+
+    def __enter__(self) -> VolumeLease:
+        return self
+
+    def __exit__(self, kind: type[BaseException] | None, *exc: object) -> None:
+        # Released when the work ended, well or badly.  Not when it was interrupted: after a
+        # preemption the next attempt of the call may already hold this lease (it has the
+        # same owner, and this container cannot see its file), and removing the file here
+        # would remove it for that attempt too.  A lease left behind goes stale by itself.
+        if kind is None or issubclass(kind, Exception):
+            self.release()
+        else:
+            self._stop.set()
+
+
+def _call_owner(owner: str | None) -> str:
+    """The name a call holds leases under; calls made outside Modal get one of their own."""
+    return owner or f"unnamed-{secrets.token_hex(6)}"
+
+
 def run_job(
     job: Mapping[str, Any],
     *,
     commit: Callable[[], None],
     reload: Callable[[], None] | None = None,
     consolidate: Callable[[str], Any] | None = None,
+    owner: str | None = None,
     mount: Path = Path(VOLUME_MOUNT),
 ) -> dict[str, Any]:
     """Run one paper inside the container and return its summary.
 
     Problems that a retry cannot fix (a malformed job, missing inputs, unusable
-    credentials) are returned as a failed summary.  Anything else propagates so
-    that Modal retries the call, which resumes the run.  The summary is returned
-    only after a final commit, so the files it lists can be downloaded at once.
+    credentials, a run id that another call is writing) are returned as a failed
+    summary.  Anything else propagates so that Modal retries the call, which
+    resumes the run.  The summary is returned only after a final commit, so the
+    files it lists can be downloaded at once.
 
-    ``consolidate(model)`` is ``consolidate_memory``: after a successful run it
-    folds the lessons the run left in the lab wiki into pages.
+    ``consolidate(model)`` is ``consolidate_memory``, the one writer of the lab
+    wiki: it creates the wiki before the first run on a volume and, after a
+    successful run, folds the lessons the run left there into pages.  ``owner``
+    identifies this call for the lease on the run directory (the Modal function
+    call id, which a retry of the call keeps).
     """
     started = time.monotonic()
     run_id = job.get("run_id") if isinstance(job, Mapping) else None
@@ -600,26 +994,32 @@ def run_job(
     lessons_model: str | None = None
     try:
         spec = job_spec(job, mount)
-        credential = check_credentials(os.environ)
-        if credential == "none":
-            log.warning(
-                "No Anthropic credential is configured in this container (no API key in the "
-                "Modal Secret and no Workload Identity Federation ids); Claude models will fail."
-            )
-        else:
-            log.info("Anthropic credential in use: %s.", credential)
+        announce_credentials(os.environ)
         if not spec.config.template_dir.is_dir():
             raise JobError(f"LaTeX template not found in the container: {spec.config.template_dir}")
-        # Raises ComputeError here, before any model call, if the image lacks TeX Live.
-        backend = ModalBackend(latex="local")
-        summary = _run_pipeline(spec, backend, commit, mount, started)
+        # In local mode this raises ComputeError, before any model call, if the image lacks
+        # TeX Live.
+        backend = ModalBackend(latex=latex_mode(os.environ))
+        _ensure_lab_wiki(spec, consolidate, reload)
+        # Given up before the commits below, so that the run is free as soon as what it
+        # wrote is visible to other containers.
+        with VolumeLease.acquire(
+            spec.config.base_dir,
+            _call_owner(owner),
+            subject=f"run {spec.run_id}",
+            commit=commit,
+            reload=reload,
+        ):
+            summary = _run_pipeline(spec, backend, commit, mount, started)
+        summary["error"] = explain_credential_failure(summary["error"], os.environ)
         memory = spec.config.memory
         # Lessons reach the lab wiki in the last stage, and only a model can fold them in.
         if summary["success"] and memory.resolved_lab_dir() is not None and memory.dream != "off":
             lessons_model = spec.config.models.reflection
     except (FileNotFoundError, ValueError, LLMConfigError, ComputeError) as exc:
         log.error("Run %s cannot proceed: %s", run_id, exc)
-        summary = failure_summary(run_id, str(exc), time.monotonic() - started)
+        error = explain_credential_failure(str(exc), os.environ)
+        summary = failure_summary(run_id, error or str(exc), time.monotonic() - started)
     except Exception:
         try:
             commit()
@@ -632,6 +1032,23 @@ def run_job(
     return summary
 
 
+def _ensure_lab_wiki(
+    spec: JobSpec, consolidate: Callable[[str], Any] | None, reload: Callable[[], None] | None
+) -> None:
+    """Have the lab wiki created by its one writer before this run opens it.
+
+    Opening a wiki that does not exist yet writes its empty index.  Done from
+    this container, that file could later replace an index the consolidation
+    has written in the meantime, because the last commit of a file wins.
+    """
+    lab_dir = spec.config.memory.resolved_lab_dir()
+    if consolidate is None or lab_dir is None or (lab_dir / INDEX_FILE).is_file():
+        return
+    log.info("The lab memory does not exist on this volume yet; having it created.")
+    _share_lessons(consolidate, spec.config.models.reflection)
+    _reload_volume(reload)
+
+
 def _run_pipeline(
     spec: JobSpec, backend: ModalBackend, commit: Callable[[], None], mount: Path, started: float
 ) -> dict[str, Any]:
@@ -639,8 +1056,10 @@ def _run_pipeline(
 
     config = spec.config
     os.environ[LAB_MEMORY_ENV] = str(mount / LAB_MEMORY_ROOT)
-    # This container holds the credentials and compiles model-written LaTeX: paranoid input
-    # keeps TeX from reading /proc/self/environ or the identity token file into the PDF.
+    # This container holds the credentials.  When LaTeX is compiled here rather than in a
+    # Sandbox, the local backend already gives TeX an environment of its own; this covers a
+    # TeX process started any other way: paranoid input keeps it from reading
+    # /proc/self/environ or the identity token file into the PDF.
     os.environ["openin_any"] = "p"  # noqa: SIM112 - kpathsea reads the lowercase name
     with backend:
         prepare_run_dir(config, spec.raw_materials_dir)
@@ -678,28 +1097,45 @@ def consolidate_lab(
     *,
     commit: Callable[[], None],
     reload: Callable[[], None] | None = None,
+    owner: str | None = None,
     mount: Path = Path(VOLUME_MOUNT),
 ) -> dict[str, Any]:
     """Fold the notes that runs left in the lab wiki into its pages; return the report.
 
     ``model`` holds the consolidation session, which sees the lab wiki and
     nothing of any paper.  Only one of these may run at a time: it is the single
-    writer of the lab's pages.
+    writer of the lab's pages and of its index.  Within one App the Function's
+    container limit sees to that; a lease on the wiki keeps the consolidations
+    of other Apps that use the same volume apart, and one that finds the wiki
+    taken returns a report with an ``error`` and leaves the notes for the next.
+    Credentials are checked as for ``write_paper``; this Function presents an
+    identity token of its own.
     """
     _reload_volume(reload)
-    check_credentials(os.environ)
-    with tempfile.TemporaryDirectory(prefix="paper-orchestra-lab-") as scratch:
+    announce_credentials(os.environ)
+    lab_dir = mount / LAB_MEMORY_ROOT
+    try:
+        lease = VolumeLease.acquire(
+            lab_dir, _call_owner(owner), subject="the lab memory", commit=commit, reload=reload
+        )
+    except LeaseHeld as exc:
+        return {"scope": "lab", "error": str(exc), "notes_archived": 0, "pages_changed": []}
+    with lease, tempfile.TemporaryDirectory(prefix="paper-orchestra-lab-") as scratch:
         # A harness is built around a project wiki; no paper is involved here, so an empty
         # one in a scratch directory stands in.
         config = PipelineConfig(
             base_dir=Path(scratch),
             template_dir=Path(scratch),
             models=ModelConfig(reflection=model),
-            memory=MemoryConfig(lab_dir=mount / LAB_MEMORY_ROOT, dream="end"),
+            memory=MemoryConfig(lab_dir=lab_dir, dream="end"),
         )
         report = ContextHarness.create(config).consolidate_lab_memory()
     commit_volume(commit)
-    return _jsonable(report.to_dict()) if report is not None else {}
+    if report is None:
+        return {}
+    described = _jsonable(report.to_dict())
+    described["error"] = explain_credential_failure(described.get("error"), os.environ)
+    return described
 
 
 def check_batch(jobs: Sequence[Mapping[str, Any]]) -> None:
@@ -728,7 +1164,8 @@ def batch_results(
 # -- launching from this machine ---------------------------------------------------
 
 
-def _visible_files(root: Path) -> Iterator[Path]:
+def visible_files(root: Path) -> Iterator[Path]:
+    """The files under ``root`` that are uploaded: everything that is not hidden."""
     for current, dirs, files in os.walk(root):
         dirs[:] = sorted(name for name in dirs if not name.startswith("."))
         for name in sorted(files):
@@ -739,17 +1176,53 @@ def _visible_files(root: Path) -> Iterator[Path]:
 def upload_inputs(
     volume: Any, run_id: str, raw_materials_dir: Path, template_dir: Path
 ) -> tuple[str, str]:
-    """Upload a run's inputs; return the volume paths of the raw materials and the template."""
+    """Upload a run's inputs; return the volume paths of the raw materials and the template.
+
+    What an earlier launch of the run id uploaded is replaced, not added to: a
+    figure that has since been removed from the raw materials must not reach
+    the paper.  What is no longer among the inputs is removed after the upload
+    and nothing else is, so the inputs are never missing from the volume: a run
+    may be reading them (a second launch of a run in flight is turned away by
+    the run itself, after this upload), and an upload that fails leaves the
+    inputs of the earlier launch in place.
+    """
+    root = f"{INPUTS_ROOT}/{run_id}"
     targets = (
-        (raw_materials_dir, f"{INPUTS_ROOT}/{run_id}/raw_materials"),
-        (template_dir, f"{INPUTS_ROOT}/{run_id}/template"),
+        (raw_materials_dir, f"{root}/raw_materials"),
+        (template_dir, f"{root}/template"),
     )
+    uploaded: set[str] = set()
     # force: launching a run id again, to resume it, uploads the same files once more.
     with volume.batch_upload(force=True) as batch:
         for source, target in targets:
-            for path in _visible_files(source):
-                batch.put_file(path, f"/{target}/{path.relative_to(source).as_posix()}")
+            for path in visible_files(source):
+                remote = f"{target}/{path.relative_to(source).as_posix()}"
+                batch.put_file(path, f"/{remote}")
+                uploaded.add(remote)
+    _remove_stale_inputs(volume, root, uploaded)
     return targets[0][1], targets[1][1]
+
+
+def _remove_stale_inputs(volume: Any, root: str, uploaded: set[str]) -> None:
+    """Remove what is under ``root`` on the volume and was not part of this upload."""
+    # The files just uploaded and the directories they are in.
+    kept = uploaded | {
+        parent.as_posix() for name in uploaded for parent in PurePosixPath(name).parents
+    }
+    removed: list[str] = []
+    # Sorted, so that a directory comes before what it holds and goes in one step.
+    for entry in sorted(volume.listdir(root, recursive=True), key=lambda entry: entry.path):
+        name = entry.path.strip("/")
+        # Entries are named from the root of the volume.  One that is not plainly inside this
+        # run's inputs is not removed, whatever the listing meant by it.
+        inside = name.startswith(f"{root}/") and ".." not in PurePosixPath(name).parts
+        if not inside or name in kept or any(name.startswith(f"{gone}/") for gone in removed):
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            volume.remove_file(name, recursive=entry.type == modal.volume.FileEntryType.DIRECTORY)
+        removed.append(name)
+    if removed:
+        log.info("Removed from the volume, as no longer among the inputs: %s", ", ".join(removed))
 
 
 def wait_for_result(call: Any, *, poll_seconds: float = 300.0) -> dict[str, Any]:
@@ -823,7 +1296,8 @@ def launch(
     job["raw_materials_dir"], job["template_dir"] = upload_inputs(volume, run, raw, template_dir)
     call = function.spawn(job)
     log.info(
-        "Started run %s (function call %s). Launching this run id again resumes it.",
+        "Started run %s (function call %s). Once it has stopped, launching this run id again "
+        "resumes it; while it is running a second launch is refused.",
         run,
         getattr(call, "object_id", "unknown"),
     )
@@ -845,14 +1319,37 @@ def launch(
 # -- Modal objects ------------------------------------------------------------------
 
 
-def _pipeline_image() -> modal.Image:
-    # In a checkout this file is src/paper_orchestra/modal_app.py.  Inside the container the
-    # path points nowhere, which is fine: image steps are only evaluated when building.
-    root = Path(__file__).resolve().parents[2]
+def project_root(package_file: Path) -> Path:
+    """The source checkout that ``package_file`` (this module) belongs to.
+
+    The image installs the third-party dependencies from the checkout's
+    ``pyproject.toml`` and ``uv.lock``.  An installed wheel carries neither, and
+    Modal would only say so in the middle of an image build, in terms of a path
+    inside the virtual environment.
+    """
+    root = package_file.resolve().parents[2]
+    missing = [name for name in ("pyproject.toml", "uv.lock") if not (root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"The Modal app is run from a source checkout of paper-orchestra: its image is "
+            f"built from the project's pyproject.toml and uv.lock, and {' and '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} not in {root}. This copy of the package "
+            "looks like an installed wheel. Clone the repository, run `uv sync --extra modal` "
+            "in it, and use `uv run paper-orchestra modal ...` from there."
+        )
+    return root
+
+
+def _pipeline_image(settings: Settings) -> modal.Image:
+    # In a checkout this file is src/paper_orchestra/modal_app.py.  The container imports
+    # this module too; there the image is never built and the path is not looked at.
+    root = project_root(Path(__file__)) if modal.is_local() else Path(__file__).parents[2]
     templates = os.environ.get(TEMPLATES_ENV) or str(BUNDLED_TEMPLATES_DIR)
     return (
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
-        .run_commands(TEXLIVE_INSTALL_COMMAND)
+        # For PAPER_ORCHESTRA_MODAL_LATEX=local.  It is also the first layer of the image of
+        # the LaTeX Sandbox, so building this image leaves little of that one to build.
+        .run_commands(texlive_install_command(settings.tex_packages))
         # Third-party dependencies exactly as locked; uv_sync does not install the project.
         .uv_sync(str(root), extras=list(IMAGE_EXTRAS), extra_options="--no-dev")
         .env({"PYTHONUNBUFFERED": "1"})
@@ -867,7 +1364,7 @@ SETTINGS = load_settings(os.environ)
 
 app = modal.App(SETTINGS.app_name, include_source=False)
 volume = modal.Volume.from_name(SETTINGS.volume_name, create_if_missing=True)
-image = _pipeline_image()
+image = _pipeline_image(SETTINGS)
 # Listed after the named Secret so that these values win.
 _env_secret = modal.Secret.from_dict(function_env(SETTINGS, os.environ))
 _named_secrets = [modal.Secret.from_name(SETTINGS.secret_name)] if SETTINGS.secret_name else []
@@ -896,9 +1393,21 @@ def write_paper(job: dict[str, Any]) -> dict[str, Any]:
     source and the usage report), ``stages``, ``usage`` and ``seconds``.
     """
     setup_logging(rich=False)
-    return run_job(
-        job, commit=volume.commit, reload=volume.reload, consolidate=consolidate_memory.remote
-    )
+    try:
+        return run_job(
+            job,
+            commit=volume.commit,
+            reload=volume.reload,
+            consolidate=consolidate_memory.remote,
+            # The same for every attempt of this call, so a retry takes over its own lease.
+            owner=modal.current_function_call_id(),
+        )
+    except (modal.exception.Error, TimeoutError) as exc:
+        # Whoever waits for this call must be able to tell "Modal could not be asked about
+        # the call" and "the call is still running" (FunctionCall.get raises the builtin
+        # TimeoutError for that) from "the call failed"; either error raised in here is the
+        # third, and passed on as it is the caller would read it as one of the first two.
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
 
 
 @app.function(
@@ -915,12 +1424,17 @@ def write_paper(job: dict[str, Any]) -> dict[str, Any]:
 def consolidate_memory(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """Fold the lessons that runs left as notes in the lab wiki into its pages.
 
-    ``write_paper`` calls this after a successful run.  Returns the
-    consolidation report (``notes_seen``, ``notes_archived``, ``pages_changed``,
-    ``error``, ...).
+    ``write_paper`` calls this after a successful run, and before a run on a
+    volume that has no lab wiki yet.  Returns the consolidation report
+    (``notes_seen``, ``notes_archived``, ``pages_changed``, ``error``, ...).
     """
     setup_logging(rich=False)
-    return consolidate_lab(model, commit=volume.commit, reload=volume.reload)
+    return consolidate_lab(
+        model,
+        commit=volume.commit,
+        reload=volume.reload,
+        owner=modal.current_function_call_id(),
+    )
 
 
 @app.function(
@@ -937,6 +1451,14 @@ def write_batch(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Returns one summary per job, in order; a job whose call raised is reported
     as a failed summary instead of failing the batch.
+
+    For programmatic use with batches that finish within a day.  This call
+    cannot outlive Modal's limit of 24 hours for one Function call: at that
+    point it is stopped, the papers still being written are cancelled, and no
+    summary is returned for any paper (the finished ones stay on the volume
+    under ``runs/<run_id>``).  ``paper-orchestra modal batch`` does not use it:
+    it calls ``write_paper`` once per paper and collects each paper as it
+    finishes.
     """
     setup_logging(rich=False)
     check_batch(jobs)
@@ -950,9 +1472,11 @@ def main(
     output_dir: str | None = None,
     run_id: str | None = None,
     plotting: bool = False,
+    keep_provided_figures: bool = False,
     idea_filename: str = "idea_sparse.md",
     experimental_log_filename: str = "experimental_log.md",
     research_cutoff: str | None = None,
+    model: str | None = None,
     writer_model: str | None = None,
     reflection_model: str | None = None,
     plotting_model: str | None = None,
@@ -968,12 +1492,17 @@ def main(
     """Write one paper on Modal from a local raw-materials directory.
 
     The options mirror ``paper-orchestra write``.  ``template`` is a template
-    name (``cvpr2025``) or a directory.  Pass the ``--run-id`` of an interrupted
-    run to resume it.
+    name (``cvpr2025``) or a directory.  ``model`` is the model of the writer,
+    reflection, plotting and fast roles unless the option of a role names
+    another; without ``model`` the fast role follows the writer, as it does for
+    ``write``.  Pass the ``--run-id`` of an interrupted run to resume it.
     """
     setup_logging()
+    # The Sandbox images are built here, where the build log is visible, rather than by the
+    # first compile or the first figure of the run.
+    if SETTINGS.latex == "sandbox":
+        latex_image(SETTINGS.tex_packages).build(app)
     if plotting:
-        # Built here, where the build log is visible, rather than by the first figure of the run.
         python_image().build(app)
     summary = launch(
         volume=volume,
@@ -983,13 +1512,15 @@ def main(
         output_dir=output_dir,
         run_id=run_id,
         use_plotting=plotting,
+        keep_provided_figures=keep_provided_figures,
         idea_filename=idea_filename,
         experimental_log_filename=experimental_log_filename,
         research_cutoff=research_cutoff,
-        writer_model=writer_model,
-        reflection_model=reflection_model,
-        plotting_model=plotting_model,
-        fast_model=fast_model,
+        writer_model=writer_model or model,
+        reflection_model=reflection_model or model,
+        plotting_model=plotting_model or model,
+        # Without --model, discovery stays on the writer's provider (see cli._role_models).
+        fast_model=fast_model or model or writer_model,
         image_model=image_model,
         effort=effort,
         plotting_max_critic_rounds=plotting_max_critic_rounds,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import dataclasses
 import inspect
 import json
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import types
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +23,7 @@ import pytest
 
 from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.compute.local import LocalBackend
-from paper_orchestra.compute.modal_backend import ModalBackend
+from paper_orchestra.compute.modal_backend import TEX_PACKAGES_ENV, ModalBackend
 from paper_orchestra.config import DEFAULT_MODEL, LAB_MEMORY_ENV, TEMPLATES_ENV
 from paper_orchestra.context import RunPaths
 from paper_orchestra.llm.base import LLMConfigError
@@ -34,9 +36,12 @@ modal = pytest.importorskip("modal")
 
 import paper_orchestra.modal_app as modal_app  # noqa: E402
 from paper_orchestra.modal_app import (  # noqa: E402
+    LEASE_NAME,
     JobError,
+    LeaseHeld,
     Settings,
     StageCheckpoint,
+    VolumeLease,
     batch_results,
     build_job,
     check_batch,
@@ -45,12 +50,17 @@ from paper_orchestra.modal_app import (  # noqa: E402
     consolidate_lab,
     container_path,
     download_outputs,
+    explain_credential_failure,
     failure_summary,
+    federation_advice,
     function_env,
+    identity_token_claims,
     job_spec,
+    latex_mode,
     launch,
     load_settings,
     new_run_id,
+    project_root,
     run_job,
     upload_inputs,
     validate_run_id,
@@ -84,15 +94,32 @@ class FakeVolume:
         root.mkdir(parents=True, exist_ok=True)
         self.uploaded: list[str] = []
         self.forced: list[bool] = []
+        self.removed: list[str] = []
         self.commits = 0
         self.reloads = 0
-        self.commit_errors: list[Exception] = []
+        #: What the next commits raise, in order; ``None`` lets a commit through.
+        self.commit_errors: list[Exception | None] = []
         self.reload_error: Exception | None = None
+        self.upload_error: Exception | None = None
 
     @contextmanager
     def batch_upload(self, force: bool = False):
         self.forced.append(force)
+        if self.upload_error is not None:
+            raise self.upload_error
         yield FakeBatch(self)
+
+    def listdir(self, path: str, *, recursive: bool = False):
+        """Entries under ``path``, named from the root of the volume as Modal names them."""
+        assert recursive, "the launcher lists a run's inputs as a whole"
+        kinds = modal.volume.FileEntryType
+        return [
+            types.SimpleNamespace(
+                path=found.relative_to(self.root).as_posix(),
+                type=kinds.DIRECTORY if found.is_dir() else kinds.FILE,
+            )
+            for found in sorted((self.root / path).rglob("*"))
+        ]
 
     def read_file(self, path: str):
         target = self.root / path
@@ -102,10 +129,22 @@ class FakeVolume:
         for start in range(0, len(data), 5):
             yield data[start : start + 5]
 
+    def remove_file(self, path: str, recursive: bool = False) -> None:
+        target = self.root / path
+        if not target.exists():
+            raise FileNotFoundError(path)
+        self.removed.append(path)
+        if target.is_dir():
+            assert recursive, "a directory is only removed recursively"
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+
     def commit(self) -> None:
         self.commits += 1
-        if self.commit_errors:
-            raise self.commit_errors.pop(0)
+        error = self.commit_errors.pop(0) if self.commit_errors else None
+        if error is not None:
+            raise error
 
     def reload(self) -> None:
         self.reloads += 1
@@ -165,6 +204,7 @@ class StubPipeline:
         self.prepared: list[tuple[Any, Path | None]] = []
         self.runs: list[dict[str, Any]] = []
         self.success = True
+        self.failure = "stage refinement failed: boom"
         self.error: Exception | None = None
         #: Called after each stage has settled; its value is recorded in ``checkpoints``.
         self.observe = lambda: None
@@ -172,6 +212,11 @@ class StubPipeline:
         #: Overrides the stages that settle.
         self.only_stages: list[str] | None = None
         self.refresh_errors: list[Exception] = []
+        #: Lessons the run marks as portable, as ``(page, text)``; the end of the run
+        #: shares them with the lab memory the way the real pipeline does.
+        self.lessons: list[tuple[str, str]] = []
+        #: What the run looks up and keeps for later runs, as ``(key, value)``.
+        self.lookups: list[tuple[str, Any]] = []
 
     def prepare_run_dir(self, cfg, raw_materials_dir):
         self.prepared.append((cfg, raw_materials_dir))
@@ -213,6 +258,7 @@ class StubPipeline:
                     name: os.environ.get(name)
                     for name in (LAB_MEMORY_ENV, "openin_any", "ANTHROPIC_FEDERATION_RULE_ID")
                 },
+                "lease": (cfg.base_dir / LEASE_NAME).is_file(),
             }
         )
         if self.error is not None:
@@ -227,13 +273,19 @@ class StubPipeline:
             paths.usage.write_text(json.dumps({"total": {"requests": 3}}))
         for name in self.stages(cfg):
             self.settle(name, cfg, harness)
+        for key, value in self.lookups:
+            harness.cache.put("literature", key, value)
+        if self.lessons:
+            for page, text in self.lessons:
+                harness.write_page(page, text, {"portable": True})
+            harness.finish()
         return types.SimpleNamespace(
             success=self.success,
             pdf_path=paths.final_pdf if self.success else None,
             base_dir=cfg.base_dir,
             stages={"outline": {"status": "done", "attempts": attempts + 1, "error": None}},
             usage={"total": {"requests": 3}, "report": paths.usage},
-            error=None if self.success else "stage refinement failed: boom",
+            error=None if self.success else self.failure,
         )
 
 
@@ -252,6 +304,29 @@ def pipeline(monkeypatch) -> StubPipeline:
     return stub
 
 
+@pytest.fixture(autouse=True)
+def no_settle_delay(monkeypatch) -> None:
+    """A call that took a lease normally waits a moment before it checks that it kept it.
+
+    And one that finds the lease of another call looks at it every few seconds.
+    """
+    monkeypatch.setattr(modal_app, "_LEASE_SETTLE", 0.0)
+    monkeypatch.setattr(modal_app, "_LEASE_POLL", 0.01)
+
+
+@pytest.fixture(autouse=True)
+def default_modal_settings(monkeypatch) -> None:
+    """The tests see the defaults, whatever the shell that runs them has exported."""
+    monkeypatch.delenv(modal_app.LATEX_ENV, raising=False)
+    monkeypatch.delenv(TEX_PACKAGES_ENV, raising=False)
+    # Read from the environment when the module was imported.
+    monkeypatch.setattr(
+        modal_app,
+        "SETTINGS",
+        dataclasses.replace(modal_app.SETTINGS, latex="sandbox", tex_packages=()),
+    )
+
+
 @pytest.fixture
 def volume(tmp_path) -> FakeVolume:
     return FakeVolume(tmp_path / "vol")
@@ -263,6 +338,35 @@ def logs(caplog, monkeypatch):
     monkeypatch.setattr(logging.getLogger("paper_orchestra"), "propagate", True)
     caplog.set_level(logging.INFO, logger="paper_orchestra")
     return caplog
+
+
+def lab_wiki(volume: FakeVolume) -> Wiki:
+    """The lab wiki of a volume that has been used before."""
+    return Wiki(volume.root / "memory", name="lab")
+
+
+def identity_token(**claims: Any) -> str:
+    """An unsigned stand-in for the JWT Modal gives a container."""
+
+    def part(data: dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+
+    return f"{part({'alg': 'RS256', 'kid': 'k'})}.{part(claims)}.c2lnbmF0dXJl"
+
+
+MODAL_CLAIMS = {
+    "iss": "https://oidc.modal.com",
+    "aud": "oidc.modal.com",
+    "sub": "modal:workspace_id:ac-1:environment_name:main:app_name:paper-orchestra",
+    "workspace_id": "ac-1",
+    "environment_name": "main",
+    "app_name": "paper-orchestra",
+    "function_name": "consolidate_memory",
+    "container_id": "ta-1",
+    "iat": 1_800_000_000,
+    "exp": 1_800_172_800,
+    "jti": "one-time",
+}
 
 
 def stage_inputs(volume: FakeVolume, run_id: str = "run-1") -> dict[str, Any]:
@@ -308,6 +412,9 @@ def test_settings_defaults_and_overrides():
         secret_name="paper-orchestra",
         timeout=6 * 3600,
         max_containers=4,
+        # Model-written LaTeX is compiled away from the credentials unless asked otherwise.
+        latex="sandbox",
+        tex_packages=(),
     )
     custom = load_settings(
         {
@@ -316,9 +423,19 @@ def test_settings_defaults_and_overrides():
             "PAPER_ORCHESTRA_MODAL_SECRET": " anthropic-wif ",
             "PAPER_ORCHESTRA_MODAL_TIMEOUT": "7200",
             "PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS": "2",
+            "PAPER_ORCHESTRA_MODAL_LATEX": " Local ",
+            "PAPER_ORCHESTRA_MODAL_TEX_PACKAGES": "texlive-lang-german  fonts-lato lmodern",
         }
     )
-    assert custom == Settings("my.app", "papers_v2", "anthropic-wif", 7200, 2)
+    assert custom == Settings(
+        "my.app",
+        "papers_v2",
+        "anthropic-wif",
+        7200,
+        2,
+        latex="local",
+        tex_packages=("texlive-lang-german", "fonts-lato"),  # lmodern is installed anyway
+    )
     for spelling in ("none", "NONE", "", "  "):
         assert load_settings({"PAPER_ORCHESTRA_MODAL_SECRET": spelling}).secret_name is None
 
@@ -332,6 +449,9 @@ def test_settings_defaults_and_overrides():
         ("PAPER_ORCHESTRA_MODAL_TIMEOUT", "2h", "is not an integer"),
         ("PAPER_ORCHESTRA_MODAL_TIMEOUT", "90000", "must be between 60 and 86400"),
         ("PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS", "0", "must be between 1 and 1000"),
+        ("PAPER_ORCHESTRA_MODAL_LATEX", "docker", "must be one of: sandbox, local"),
+        ("PAPER_ORCHESTRA_MODAL_TEX_PACKAGES", "lmodern; curl x", "is not a Debian package name"),
+        ("PAPER_ORCHESTRA_MODAL_TEX_PACKAGES", "$(id)", "is not a Debian package name"),
     ],
 )
 def test_invalid_settings_name_the_variable(variable, value, message):
@@ -360,6 +480,7 @@ def test_function_env_forwards_ids_but_never_secrets():
         "PAPER_ORCHESTRA_MODAL_SECRET": "none",
         "PAPER_ORCHESTRA_MODAL_TIMEOUT": "21600",
         "PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS": "4",
+        "PAPER_ORCHESTRA_MODAL_LATEX": "sandbox",
         "PAPER_ORCHESTRA_MEMORY_DIR": "/vol/memory",
         "PAPER_ORCHESTRA_TEMPLATES": "/root/templates",
         **WIF_IDS,
@@ -367,6 +488,11 @@ def test_function_env_forwards_ids_but_never_secrets():
         "PAPER_ORCHESTRA_STRUCTURED_OUTPUTS": "0",
     }
     assert all(value for value in env.values())  # Modal may drop empty values
+    # The container builds the image of its LaTeX sandbox from the same package list.
+    extra = load_settings({"PAPER_ORCHESTRA_MODAL_TEX_PACKAGES": "fonts-lato texlive-music"})
+    assert function_env(extra, {})["PAPER_ORCHESTRA_MODAL_TEX_PACKAGES"] == (
+        "fonts-lato texlive-music"
+    )
 
 
 @pytest.mark.parametrize(
@@ -379,6 +505,10 @@ def test_function_env_forwards_ids_but_never_secrets():
             "PAPER_ORCHESTRA_MODAL_VOLUME": "v",
             "PAPER_ORCHESTRA_MODAL_TIMEOUT": "600",
             "PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS": "9",
+        },
+        {
+            "PAPER_ORCHESTRA_MODAL_LATEX": "local",
+            "PAPER_ORCHESTRA_MODAL_TEX_PACKAGES": "fonts-lato texlive-lang-german",
         },
     ],
 )
@@ -463,6 +593,7 @@ def test_build_job_keeps_only_what_was_asked_for():
         idea_filename="idea.md",
         experimental_log_filename="log.md",
         use_plotting=True,
+        keep_provided_figures=True,
         plotting_max_critic_rounds=5,
         writer_model="claude-fable-5-2",
         reflection_model="gemini-3.1-pro-preview",
@@ -483,6 +614,8 @@ def test_build_job_keeps_only_what_was_asked_for():
     }
     assert full["memory"] == {"enabled": False, "lab": False, "dream": "off"}
     assert full["plotting_max_critic_rounds"] == 5 and full["use_plotting"] is True
+    assert full["keep_provided_figures"] is True
+    assert job_spec(full).config.keep_provided_figures is True
     assert "template" not in full and full["resume"] is False
     assert json.loads(json.dumps(full)) == full
     # The cutoff is fixed when the job is built, so a retry next month sees the same one.
@@ -606,16 +739,18 @@ def test_run_job_runs_the_pipeline_on_the_volume(pipeline, volume, monkeypatch, 
     }
     assert json.loads(json.dumps(summary)) == summary and summary["seconds"] >= 0
     assert (volume.root / "runs/run-1/final_paper.pdf").read_bytes() == b"%PDF-1.5 the idea"
-    # One commit as each stage settles, and a last one before the summary is returned.
+    # One commit for the lease on the run, one as each stage settles, and a last one before
+    # the summary is returned.
     assert pipeline.checkpoints == [
-        ("ingest", 1),
-        ("outline", 2),
-        ("literature", 3),
-        ("section_writing", 4),
-        ("refinement", 5),
-        ("finalize", 6),
+        ("ingest", 2),
+        ("outline", 3),
+        ("literature", 4),
+        ("section_writing", 5),
+        ("refinement", 6),
+        ("finalize", 7),
     ]
-    assert (volume.reloads, volume.commits) == (1, 7)
+    # Reloaded on arrival, and once more to see whether another call took the run meanwhile.
+    assert (volume.reloads, volume.commits) == (2, 8)
 
     [(prepared_cfg, raw_materials_dir)] = pipeline.prepared
     assert raw_materials_dir == volume.root / "inputs/run-1/raw_materials"
@@ -625,8 +760,11 @@ def test_run_job_runs_the_pipeline_on_the_volume(pipeline, volume, monkeypatch, 
     assert cfg.template_dir == volume.root / "inputs/run-1/template"
     assert cfg.compute == "modal" and cfg.research_cutoff == "2025-06"
     assert cfg.memory.resolved_lab_dir() == volume.root / "memory"
-    # LaTeX is compiled in the container, figure code in a nested sandbox.
-    assert isinstance(run["compute"], ModalBackend) and run["compute"].latex == "local"
+    # Nothing model-written runs next to the credentials: LaTeX is compiled, and figure code
+    # is run, in nested sandboxes.
+    assert isinstance(run["compute"], ModalBackend) and run["compute"].latex == "sandbox"
+    # The run held the lease on its directory while it worked and gave it up at the end.
+    assert run["lease"] is True and not (volume.root / "runs/run-1" / LEASE_NAME).exists()
     assert run["env"][LAB_MEMORY_ENV] == str(volume.root / "memory")
     assert run["env"]["openin_any"] == "p"
     assert "Anthropic credential in use: api_key." in logs.text
@@ -640,7 +778,7 @@ def test_run_job_is_resumable(pipeline, volume):
     assert first["stages"]["outline"]["attempts"] == 1
     assert again["stages"]["outline"]["attempts"] == 2  # continued from state.json
     assert again["success"] and again["files"] == first["files"]
-    assert volume.commits == 2 * (6 + 1) and volume.reloads == 0
+    assert volume.commits == 2 * (1 + 6 + 1) and volume.reloads == 0
 
     fresh = run_job({**job, "resume": False}, commit=volume.commit, mount=volume.root)
     assert fresh["stages"]["outline"]["attempts"] == 1
@@ -651,7 +789,7 @@ def test_run_job_reports_a_failed_pipeline(pipeline, volume):
     summary = run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
     assert summary["success"] is False and summary["error"] == "stage refinement failed: boom"
     assert summary["files"] == {} and summary["run_dir"] == "runs/run-1"
-    assert volume.commits == 6 + 1  # partial progress is still made durable
+    assert volume.commits == 1 + 6 + 1  # partial progress is still made durable
 
 
 def test_run_job_keyless_with_modal_identity(pipeline, volume, monkeypatch, logs):
@@ -686,22 +824,26 @@ def test_run_job_refuses_an_api_key_in_keyless_mode(pipeline, volume, monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("change", "message"),
+    ("change", "message", "commits"),
     [
-        ({"run_id": "../escape"}, "run_id must be"),
-        ({"unknown": 1}, "unknown job option"),
-        ({"template_dir": "inputs/run-1/no-such-template"}, "LaTeX template not found"),
-        ({"raw_materials_dir": "inputs/run-1/empty"}, "required file not found"),
+        ({"run_id": "../escape"}, "run_id must be", 1),
+        ({"unknown": 1}, "unknown job option", 1),
+        ({"template_dir": "inputs/run-1/no-such-template"}, "LaTeX template not found", 1),
+        # Found once the run directory is being prepared, so after the lease was committed.
+        ({"raw_materials_dir": "inputs/run-1/empty"}, "required file not found", 2),
     ],
 )
-def test_run_job_returns_unfixable_problems_instead_of_raising(pipeline, volume, change, message):
+def test_run_job_returns_unfixable_problems_instead_of_raising(
+    pipeline, volume, change, message, commits
+):
     job = stage_inputs(volume)
     (volume.root / "inputs/run-1/empty").mkdir()
     summary = run_job({**job, **change}, commit=volume.commit, mount=volume.root)
     assert summary["success"] is False and message in summary["error"]
     assert summary["files"] == {} and pipeline.runs == []
     assert json.loads(json.dumps(summary)) == summary
-    assert volume.commits == 1
+    assert volume.commits == commits
+    assert not list(volume.root.rglob(LEASE_NAME))
 
 
 def test_run_job_rejects_a_job_that_is_not_a_dict(pipeline, volume):
@@ -710,20 +852,34 @@ def test_run_job_rejects_a_job_that_is_not_a_dict(pipeline, volume):
     assert "a job must be a dict" in summary["error"]
 
 
-def test_run_job_checks_for_tex_before_any_model_call(pipeline, volume, monkeypatch):
+def test_latex_is_compiled_in_the_container_only_when_asked(pipeline, volume, monkeypatch):
+    """PAPER_ORCHESTRA_MODAL_LATEX=local trades the sandbox for speed."""
+    assert latex_mode({}) == "sandbox" and latex_mode({modal_app.LATEX_ENV: "LOCAL"}) == "local"
+    monkeypatch.setenv(modal_app.LATEX_ENV, "local")
+    assert run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)["success"]
+    assert pipeline.runs[0]["compute"].latex == "local"
+    assert pipeline.runs[0]["env"]["openin_any"] == "p"
+
+    # In that mode a missing TeX Live is found before any model call.
     monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: False))
-    summary = run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
+    summary = run_job(stage_inputs(volume, "run-2"), commit=volume.commit, mount=volume.root)
     assert summary["success"] is False and "pdflatex and bibtex" in summary["error"]
-    assert pipeline.prepared == [] and pipeline.runs == []
+    assert len(pipeline.prepared) == 1 and len(pipeline.runs) == 1
+
+    monkeypatch.setenv(modal_app.LATEX_ENV, "docker")
+    summary = run_job(stage_inputs(volume, "run-3"), commit=volume.commit, mount=volume.root)
+    assert summary["success"] is False and "PAPER_ORCHESTRA_MODAL_LATEX" in summary["error"]
 
 
 def test_run_job_lets_crashes_propagate_so_modal_retries(pipeline, volume):
     pipeline.error = RuntimeError("worker died")
     with pytest.raises(RuntimeError, match="worker died"):
         run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
-    assert volume.commits == 1
+    assert volume.commits == 1 + 1  # the lease, then what was written before the crash
+    # The retry must not find the run taken by the attempt that crashed.
+    assert not (volume.root / "runs/run-1" / LEASE_NAME).exists()
 
-    volume.commit_errors = [RuntimeError("volume busy")]
+    volume.commit_errors = [None, RuntimeError("volume busy")]
     with pytest.raises(RuntimeError, match="worker died"):
         run_job(stage_inputs(volume, "run-2"), commit=volume.commit, mount=volume.root)
 
@@ -734,15 +890,15 @@ def test_checkpoints_wait_for_stages_that_run_side_by_side(pipeline, volume):
     assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
     # No commit while a sibling stage may still be writing files; the next boundary has it.
     assert pipeline.checkpoints == [
-        ("ingest", 1),
-        ("outline", 2),
-        ("literature", 2),
-        ("plotting", 2),
-        ("section_writing", 3),
-        ("refinement", 4),
-        ("finalize", 5),
+        ("ingest", 2),
+        ("outline", 3),
+        ("literature", 3),
+        ("plotting", 3),
+        ("section_writing", 4),
+        ("refinement", 5),
+        ("finalize", 6),
     ]
-    assert volume.commits == 5 + 1
+    assert volume.commits == 1 + 5 + 1
 
 
 def test_stage_checkpoint_commits_on_the_driving_thread_only_and_never_raises(logs):
@@ -782,7 +938,7 @@ def test_the_pipeline_gets_a_harness_that_checkpoints_after_every_refresh(
     before = volume.commits
     assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
     assert [type(error) for error in pipeline.refresh_errors] == [OSError] * 6
-    assert volume.commits == before + 6 + 1  # a failed refresh does not cost the checkpoint
+    assert volume.commits == before + 1 + 6 + 1  # a failed refresh does not cost the checkpoint
 
     assert run_job({**job, "memory": {"enabled": False}}, commit=volume.commit, mount=volume.root)[
         "success"
@@ -792,22 +948,22 @@ def test_the_pipeline_gets_a_harness_that_checkpoints_after_every_refresh(
 
 def test_run_job_tolerates_failed_checkpoints_and_reloads(pipeline, volume, logs):
     volume.reload_error = RuntimeError("there are open files preventing the operation")
-    volume.commit_errors = [RuntimeError("volume busy")]
+    volume.commit_errors = [None, RuntimeError("volume busy")]
     job = stage_inputs(volume)
     assert run_job(job, commit=volume.commit, reload=volume.reload, mount=volume.root)["success"]
     assert "Could not reload the volume" in logs.text
     assert "Could not commit the volume between stages: volume busy" in logs.text
-    assert volume.commits == 6 + 1
+    assert volume.commits == 1 + 6 + 1
 
 
 def test_run_job_insists_on_the_final_commit(pipeline, volume):
     pipeline.only_stages = []
     job = stage_inputs(volume)
-    volume.commit_errors = [RuntimeError("busy 1"), RuntimeError("busy 2")]
+    volume.commit_errors = [None, RuntimeError("busy 1"), RuntimeError("busy 2")]
     assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
-    assert volume.commits == 3
+    assert volume.commits == 1 + 3
 
-    volume.commit_errors = [RuntimeError(f"busy {n}") for n in range(3)]
+    volume.commit_errors = [None, *(RuntimeError(f"busy {n}") for n in range(3))]
     with pytest.raises(RuntimeError, match="busy 2"):
         run_job(job, commit=volume.commit, mount=volume.root)
 
@@ -819,11 +975,12 @@ def test_run_job_has_the_lab_memory_consolidated_after_a_successful_run(pipeline
         calls.append((model, volume.commits))
         return {"notes_archived": 2, "pages_changed": ["wiki/lessons/latex.md"], "error": None}
 
+    lab_wiki(volume)
     job = {**stage_inputs(volume), "models": {"reflection": "claude-opus-4-8"}}
     summary = run_job(job, commit=volume.commit, consolidate=consolidate, mount=volume.root)
     assert summary["success"]
     # With the reflection model, and only after the final commit made the run's notes visible.
-    assert calls == [("claude-opus-4-8", 6 + 1)] and volume.commits == 6 + 1
+    assert calls == [("claude-opus-4-8", 1 + 6 + 1)] and volume.commits == 1 + 6 + 1
     assert "Lab memory consolidated: 2 note(s) folded in, 1 page(s) changed." in logs.text
 
 
@@ -841,6 +998,7 @@ def test_run_job_skips_the_consolidation_when_there_is_nothing_to_fold_in(
     pipeline, volume, change, pipeline_succeeds
 ):
     pipeline.success = pipeline_succeeds
+    lab_wiki(volume)
     calls: list[str] = []
     summary = run_job(
         {**stage_inputs(volume), **change},
@@ -855,6 +1013,7 @@ def test_run_job_survives_a_failed_consolidation(pipeline, volume, logs):
     def crashing(model: str) -> dict[str, Any]:
         raise TimeoutError("took too long")
 
+    lab_wiki(volume)
     job = stage_inputs(volume)
     assert run_job(job, commit=volume.commit, consolidate=crashing, mount=volume.root)["success"]
     assert "Could not consolidate the lab memory (TimeoutError: took too long)" in logs.text
@@ -903,7 +1062,9 @@ def test_consolidate_lab_folds_the_notes_of_earlier_runs_into_pages(volume, scri
     assert "Load cleveref after hyperref." in page.read_text()
     assert lab.pending_notes() == []
     # It saw the notes other containers committed, and its pages are durable when it returns.
-    assert (volume.reloads, volume.commits) == (1, 1)
+    # The other reload and commit belong to its lease on the wiki, which it gave up.
+    assert (volume.reloads, volume.commits) == (2, 2)
+    assert not (volume.root / "memory" / LEASE_NAME).exists()
 
 
 def test_consolidate_lab_without_pending_notes_asks_no_model(volume, scripted_model):
@@ -911,7 +1072,7 @@ def test_consolidate_lab_without_pending_notes_asks_no_model(volume, scripted_mo
     scripted_model(lambda request: requests.append(request) or "nothing to do")
     report = consolidate_lab("fake", commit=volume.commit, mount=volume.root)
     assert (report["notes_seen"], report["llm_used"], report["error"]) == (0, False, None)
-    assert requests == [] and volume.commits == 1
+    assert requests == [] and volume.commits == 1 + 1
 
 
 def test_consolidate_lab_reports_a_model_that_cannot_be_used(volume, monkeypatch):
@@ -928,7 +1089,54 @@ def test_consolidate_lab_reports_a_model_that_cannot_be_used(volume, monkeypatch
         monkeypatch.setenv(name, value)
     with pytest.raises(JobError, match="exactly one credential"):
         consolidate_lab("fake", commit=volume.commit, mount=volume.root)
-    assert volume.commits == 1
+    assert volume.commits == 1 + 1  # nothing after the first consolidation
+
+
+def test_consolidations_of_two_apps_do_not_write_the_lab_wiki_together(
+    volume, scripted_model, monkeypatch
+):
+    """One container at a time holds within an App; two Apps can share a volume."""
+    monkeypatch.setattr(modal_app, "_LEASE_REFRESH", 0.01)
+    lab_wiki(volume).add_note("Load cleveref after hyperref.", kind="lesson")
+    other: dict[str, Any] = {}
+
+    def responder(request: FakeRequest) -> str:
+        # While this consolidation is in its session, the one of another App starts.
+        other["report"] = consolidate_lab(
+            "fake-dreamer",
+            commit=volume.commit,
+            reload=volume.reload,
+            owner="fc-other-app",
+            mount=volume.root,
+        )
+        request.memory.create(
+            "/memories/wiki/lessons/latex.md",
+            "---\nsummary: LaTeX pitfalls\n---\nLoad cleveref after hyperref.",
+        )
+        return "Folded one lesson."
+
+    scripted_model(responder)
+    report = consolidate_lab(
+        "fake-dreamer",
+        commit=volume.commit,
+        reload=volume.reload,
+        owner="fc-this-app",
+        mount=volume.root,
+    )
+    assert (report["error"], report["notes_archived"]) == (None, 1)
+    refused = other["report"]
+    assert (
+        "the lab memory is already being written by another call (fc-this-app" in (refused["error"])
+    )
+    assert refused["notes_archived"] == 0 and refused["pages_changed"] == []
+    assert json.loads(json.dumps(refused)) == refused
+    assert not (volume.root / "memory" / LEASE_NAME).exists()
+
+    # Afterwards the wiki is free again.
+    again = consolidate_lab(
+        "fake-dreamer", commit=volume.commit, owner="fc-other-app", mount=volume.root
+    )
+    assert again["error"] is None
 
 
 @pytest.mark.parametrize(
@@ -943,7 +1151,8 @@ def test_run_job_does_not_retry_configuration_errors_from_the_pipeline(pipeline,
     pipeline.error = error
     summary = run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
     assert summary["success"] is False and summary["error"] == str(error)
-    assert volume.commits == 1
+    assert volume.commits == 1 + 1  # the lease and its release
+    assert not (volume.root / "runs/run-1" / LEASE_NAME).exists()
 
 
 def test_commit_volume_retries_then_gives_up(monkeypatch, logs):
@@ -979,6 +1188,524 @@ def test_failure_summary_has_the_shape_of_a_summary():
         "seconds": 1.3,
     }
     assert failure_summary({"not": "a string"}, "bad")["run_id"] is None
+
+
+# -- one run per run id ---------------------------------------------------------------
+
+
+def test_a_run_that_is_in_flight_is_not_started_a_second_time(pipeline, volume, monkeypatch):
+    """Two calls for one run id must not drive the same directory at the same time."""
+    # The second call is turned away when it sees the heartbeat of the first one move.
+    monkeypatch.setattr(modal_app, "_LEASE_REFRESH", 0.01)
+    job = stage_inputs(volume)
+    second: dict[str, Any] = {}
+
+    def the_same_job_arrives_again() -> None:
+        # While the first call is working, a second submission reaches another container.
+        if not second:
+            second["summary"] = run_job(
+                job,
+                commit=volume.commit,
+                reload=volume.reload,
+                mount=volume.root,
+                owner="fc-second",
+            )
+
+    pipeline.observe = the_same_job_arrives_again
+    first = run_job(
+        job, commit=volume.commit, reload=volume.reload, mount=volume.root, owner="fc-first"
+    )
+
+    assert first["success"]
+    assert len(pipeline.prepared) == 1 and len(pipeline.runs) == 1  # the paper ran once
+    refused = second["summary"]
+    assert refused["success"] is False and refused["run_id"] == "run-1"
+    assert "run run-1 is already being written by another call (fc-first" in refused["error"]
+    assert json.loads(json.dumps(refused)) == refused
+    assert first["stages"]["outline"]["attempts"] == 1
+
+    # Once the first call is over the run id can be submitted again, which resumes the run.
+    again = run_job(job, commit=volume.commit, mount=volume.root, owner="fc-third")
+    assert again["success"] and again["stages"]["outline"]["attempts"] == 2
+
+
+def test_the_lease_is_committed_before_the_run_and_released_with_its_results(pipeline, volume):
+    lease = volume.root / "runs/run-1" / LEASE_NAME
+    at_commit: list[bool] = []
+
+    def commit() -> None:
+        at_commit.append(lease.is_file())
+        volume.commit()
+
+    pipeline.observe = lambda: json.loads(lease.read_text())
+    started = time.time()
+    summary = run_job(stage_inputs(volume), commit=commit, mount=volume.root, owner="fc-1")
+    assert summary["success"]
+    # Other containers see the lease from the first commit on, and see it gone in the commit
+    # that makes the results visible.
+    assert at_commit == [True] * 7 + [False]
+    held = [value for _, value in pipeline.checkpoints]
+    assert {value["owner"] for value in held} == {"fc-1"}
+    assert all(started <= value["at"] <= time.time() for value in held)
+    assert sorted(path.name for path in lease.parent.iterdir() if path.name.startswith(".")) == []
+
+
+def test_a_retry_of_the_same_call_takes_its_own_lease_over_at_once(pipeline, volume):
+    job = stage_inputs(volume)
+    lease = volume.root / "runs/run-1" / LEASE_NAME
+    lease.parent.mkdir(parents=True)
+    # What a preempted container leaves behind: a fresh lease that nobody released.
+    lease.write_text(json.dumps({"owner": "fc-1", "at": time.time()}))
+    assert run_job(job, commit=volume.commit, mount=volume.root, owner="fc-1")["success"]
+    assert not lease.exists()
+
+    # Another call has to wait until that heartbeat is old.
+    lease.write_text(json.dumps({"owner": "fc-1", "at": time.time()}))
+    refused = run_job(job, commit=volume.commit, mount=volume.root, owner="fc-2")
+    assert refused["success"] is False and "already being written" in refused["error"]
+    assert json.loads(lease.read_text())["owner"] == "fc-1"  # not released by the refused call
+    assert len(pipeline.runs) == 1
+
+
+def test_a_lease_whose_heartbeat_stopped_is_taken_over(pipeline, volume, logs):
+    job = stage_inputs(volume)
+    lease = volume.root / "runs/run-1" / LEASE_NAME
+    lease.parent.mkdir(parents=True)
+    almost = time.time() - modal_app._LEASE_STALE + 20
+    lease.write_text(json.dumps({"owner": "fc-gone", "at": almost}))
+    refused = run_job(job, commit=volume.commit, mount=volume.root, owner="fc-new")
+    assert refused["success"] is False and "fc-gone" in refused["error"]
+    assert f"once the heartbeat is {modal_app._LEASE_STALE:.0f} s old" in refused["error"]
+
+    lease.write_text(json.dumps({"owner": "fc-gone", "at": time.time() - modal_app._LEASE_STALE}))
+    assert run_job(job, commit=volume.commit, mount=volume.root, owner="fc-new")["success"]
+    assert "Taking over run run-1: the call that held it (fc-gone)" in logs.text
+
+    # A lease that cannot be read holds nobody back for ever.
+    lease.write_text("{not json")
+    assert run_job(job, commit=volume.commit, mount=volume.root, owner="fc-new")["success"]
+    assert len(pipeline.runs) == 2 and not lease.exists()
+
+
+def test_a_run_whose_container_was_stopped_is_resumed_without_asking_twice(
+    pipeline, volume, monkeypatch, logs
+):
+    """Ctrl-C on `modal run`, or `--cancel`, stops a container before it can give up its lease.
+
+    Launching the run id again is how such a run is resumed, so that launch must not be
+    turned away because the heartbeat the container left still looks fresh.
+    """
+    job = stage_inputs(volume)
+    lease = volume.root / "runs/run-1" / LEASE_NAME
+    lease.parent.mkdir(parents=True)
+    monkeypatch.setattr(modal_app, "_LEASE_STALE", 1.0)
+    lease.write_text(json.dumps({"owner": "fc-stopped", "at": time.time()}))
+    resumed = run_job(
+        job, commit=volume.commit, reload=volume.reload, mount=volume.root, owner="fc-new"
+    )
+    assert resumed["success"] and len(pipeline.runs) == 1
+    # It watched the lease until the heartbeat that never moved was stale.
+    assert volume.reloads > 2
+    assert "watching whether that call is still at work" in logs.text
+    assert "Taking over run run-1: the call that held it (fc-stopped)" in logs.text
+    assert not lease.exists()
+
+    # A holder that is at work shows a new heartbeat, and the run is left to it.
+    monkeypatch.setattr(modal_app, "_LEASE_STALE", 150.0)
+    monkeypatch.setattr(modal_app, "_LEASE_REFRESH", 0.01)
+    holder = VolumeLease.acquire(
+        lease.parent, "fc-working", subject="run run-1", commit=volume.commit
+    )
+    try:
+        refused = run_job(
+            job, commit=volume.commit, reload=volume.reload, mount=volume.root, owner="fc-new"
+        )
+    finally:
+        holder.release()
+    assert refused["success"] is False and len(pipeline.runs) == 1
+    assert "run run-1 is already being written by another call (fc-working" in refused["error"]
+
+    # So does a lease that changes hands: another call took the run over while this one
+    # was watching.
+    taken = {"owner": "fc-quicker", "at": time.time()}
+    lease.write_text(json.dumps({"owner": "fc-stopped", "at": taken["at"]}))
+    looks: list[int] = []
+
+    def another_call_takes_the_run() -> None:
+        looks.append(len(looks))
+        if len(looks) > 1:  # the first look is the one run_job takes on arrival
+            lease.write_text(json.dumps(taken))
+
+    refused = run_job(
+        job, commit=volume.commit, reload=another_call_takes_the_run, mount=volume.root
+    )
+    assert refused["success"] is False and "(fc-quicker" in refused["error"]
+    assert len(pipeline.runs) == 1
+
+    # The clocks of two containers need not agree.  A heartbeat stamped by one that runs
+    # ahead never looks old, so the watch itself ends after the time a lease takes to go
+    # stale: a heartbeat that has not moved by then is not going to.
+    monkeypatch.setattr(modal_app, "_LEASE_STALE", 0.5)
+    lease.write_text(json.dumps({"owner": "fc-stopped", "at": time.time() + 3600}))
+    resumed = run_job(
+        job, commit=volume.commit, reload=volume.reload, mount=volume.root, owner="fc-new"
+    )
+    assert resumed["success"] and len(pipeline.runs) == 2
+    assert "its heartbeat did not move" in logs.text
+
+
+def test_the_heartbeat_keeps_the_lease_of_a_long_run_fresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(modal_app, "_LEASE_REFRESH", 0.01)
+    run_dir = tmp_path / "runs" / "r1"
+    path = run_dir / LEASE_NAME
+    commits: list[int] = []
+    lease = VolumeLease.acquire(run_dir, "fc-1", subject="run r1", commit=lambda: commits.append(1))
+    try:
+        first = json.loads(path.read_text())
+        assert first["owner"] == "fc-1"
+        deadline = time.monotonic() + 10
+        while json.loads(path.read_text())["at"] == first["at"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert json.loads(path.read_text())["at"] > first["at"]
+        # The heartbeat thread leaves committing to the thread that drives the pipeline.
+        assert commits == [1]
+        with pytest.raises(LeaseHeld, match="run r1 is already being written by another call"):
+            VolumeLease.acquire(run_dir, "fc-2", subject="run r1", commit=lambda: None)
+    finally:
+        lease.release()
+    lease.release()
+    assert list(run_dir.iterdir()) == []
+
+    # A lease that was taken over meanwhile is not the old holder's to remove.
+    lease = VolumeLease.acquire(run_dir, "fc-1", subject="run r1", commit=lambda: None)
+    path.write_text(json.dumps({"owner": "fc-2", "at": time.time()}))
+    lease.release()
+    assert json.loads(path.read_text())["owner"] == "fc-2"
+
+
+def test_an_interrupted_run_leaves_its_lease_to_the_retry_of_the_same_call(pipeline, volume):
+    """After a preemption the next attempt may already hold the lease this one would remove."""
+    job = stage_inputs(volume)
+    lease = volume.root / "runs/run-1" / LEASE_NAME
+    pipeline.error = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        run_job(job, commit=volume.commit, mount=volume.root, owner="fc-1")
+    assert json.loads(lease.read_text())["owner"] == "fc-1"
+
+    pipeline.error = None
+    refused = run_job(job, commit=volume.commit, mount=volume.root, owner="fc-2")
+    assert refused["success"] is False and "already being written" in refused["error"]
+    # The attempt Modal starts after a preemption is the same call: it goes ahead at once.
+    assert run_job(job, commit=volume.commit, mount=volume.root, owner="fc-1")["success"]
+    assert not lease.exists()
+    assert run_job(job, commit=volume.commit, mount=volume.root, owner="fc-2")["success"]
+
+
+def test_two_calls_that_start_in_the_same_moment_do_not_both_run(tmp_path):
+    run_dir = tmp_path / "runs" / "r1"
+    path = run_dir / LEASE_NAME
+
+    def reload_shows_the_other_commit() -> None:
+        # Both found the run free and wrote a lease; the later commit won the file.
+        path.write_text(json.dumps({"owner": "fc-other", "at": time.time()}))
+
+    with pytest.raises(LeaseHeld, match="fc-other"):
+        VolumeLease.acquire(
+            run_dir,
+            "fc-mine",
+            subject="run r1",
+            commit=lambda: None,
+            reload=reload_shows_the_other_commit,
+        )
+    assert json.loads(path.read_text())["owner"] == "fc-other"
+
+    # The call whose commit came last sees its own lease and goes ahead.
+    lease = VolumeLease.acquire(
+        run_dir, "fc-other", subject="run r1", commit=lambda: None, reload=lambda: None
+    )
+    lease.release()
+    assert not path.exists()
+
+
+# -- the lab memory is written by one Function only --------------------------------------
+
+
+def lab_files(volume: FakeVolume) -> dict[str, bytes]:
+    root = volume.root / "memory"
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_a_run_adds_notes_to_the_lab_memory_and_changes_nothing_else_there(pipeline, volume):
+    """Runs share the lab wiki without locking, so only consolidate_memory may rewrite it."""
+    lab = lab_wiki(volume)
+    lab.write("wiki/lessons/latex.md", "Load cleveref after hyperref.", {"summary": "LaTeX"})
+    lab.set_standing_notes("- Compile twice after changing the bibliography.")
+    lab.rebuild_index()
+    # A page the index does not list yet and a note that waits for the consolidation: a run
+    # that rebuilt the index, or tidied the wiki, would show.
+    lab.write("wiki/lessons/figures.md", "Prefer vector graphics.", {"summary": "Figures"})
+    lab.add_note("Keep tables narrow.", stage="promotion", kind="lesson")
+    before = lab_files(volume)
+    assert "MEMORY.md" in before and "figures" not in before["MEMORY.md"].decode()
+
+    pipeline.lessons = [("wiki/lessons/tables.md", "Rules from booktabs read better.")]
+    pipeline.lookups = [("doi:10.1000/182", {"title": "A paper the run looked up"})]
+    job = {**stage_inputs(volume), "memory": {"dream": "off"}}
+    summary = run_job(job, commit=volume.commit, reload=volume.reload, mount=volume.root)
+    assert summary["success"]
+
+    after = lab_files(volume)
+    # The index, every page and every earlier note are byte for byte what they were.
+    assert {path: after[path] for path in before} == before
+    # What the run left is in files of its own, which no other container writes: its lesson
+    # as a note, and what it looked up as an entry of the cache beside the wiki.
+    entry, note = sorted(set(after) - set(before))
+    assert note.startswith("notes/") and entry.startswith("cache/literature/")
+    assert "Rules from booktabs read better." in after[note].decode()
+    assert "A paper the run looked up" in after[entry].decode()
+    harness = pipeline.runs[0]["harness"]
+    assert harness.lab.root == volume.root / "memory" and harness.consolidate_lab is False
+
+
+def test_the_lab_wiki_of_a_new_volume_is_created_by_its_one_writer(
+    pipeline, volume, scripted_model
+):
+    """Not even the first, empty index is written by a run: the last commit of a file wins."""
+    scripted_model(lambda request: "nothing to do")
+    index = volume.root / "memory" / "MEMORY.md"
+    calls: list[tuple[str, int]] = []
+    found: list[tuple[bytes, int] | None] = []
+    left: list[tuple[bytes, int]] = []
+
+    def state() -> tuple[bytes, int] | None:
+        return (index.read_bytes(), index.stat().st_mtime_ns) if index.is_file() else None
+
+    def consolidate(model: str) -> dict[str, Any]:
+        calls.append((model, volume.reloads))
+        found.append(state())
+        report = consolidate_lab(model, commit=volume.commit, mount=volume.root)
+        left.append(state())
+        return report
+
+    job = {**stage_inputs(volume), "models": {"reflection": "fake-dreamer"}}
+    summary = run_job(
+        job, commit=volume.commit, reload=volume.reload, consolidate=consolidate, mount=volume.root
+    )
+    assert summary["success"]
+    # Asked for before the run opened the wiki, and again after it for the run's lessons.
+    assert calls == [("fake-dreamer", 1), ("fake-dreamer", 3)]
+    assert found[0] is None and left[0] is not None
+    # In between, the run reloaded the volume to see the new wiki and left its index alone.
+    assert found[1] == left[0]
+
+    again = run_job(
+        stage_inputs(volume, "run-2"),
+        commit=volume.commit,
+        consolidate=consolidate,
+        mount=volume.root,
+    )
+    assert again["success"] and len(calls) == 3  # the wiki exists: only the final call
+
+    # A run that does not use the lab memory does not have it created.
+    fresh = FakeVolume(volume.root.parent / "other-volume")
+    job = {**stage_inputs(fresh), "memory": {"lab": False}}
+    assert run_job(job, commit=fresh.commit, consolidate=consolidate, mount=fresh.root)["success"]
+    assert len(calls) == 3 and not (fresh.root / "memory").exists()
+
+
+# -- keyless credentials -----------------------------------------------------------------
+
+
+def test_identity_token_claims_describe_the_token_without_revealing_it(tmp_path):
+    token = identity_token(**MODAL_CLAIMS)
+    token_file = tmp_path / "token"
+    token_file.write_text(token + "\n")
+    expected = {
+        "iss": "https://oidc.modal.com",
+        "aud": "oidc.modal.com",
+        "workspace_id": "ac-1",
+        "environment_name": "main",
+        "app_name": "paper-orchestra",
+        "function_name": "consolidate_memory",
+        "lifetime_seconds": 172_800,
+        "single_use": True,
+    }
+    assert identity_token_claims({"MODAL_IDENTITY_TOKEN_FILE": str(token_file)}) == expected
+    assert identity_token_claims({"MODAL_IDENTITY_TOKEN": token}) == expected
+    # A token chosen explicitly is the one the SDK presents.
+    other = identity_token(iss="https://issuer.example", iat=0, exp=600)
+    assert identity_token_claims(
+        {"ANTHROPIC_IDENTITY_TOKEN": other, "MODAL_IDENTITY_TOKEN": token}
+    ) == {"iss": "https://issuer.example", "lifetime_seconds": 600, "single_use": False}
+    for unreadable in (
+        {},
+        {"MODAL_IDENTITY_TOKEN": "not-a-jwt"},
+        {"MODAL_IDENTITY_TOKEN": "a.b.c"},
+        {"MODAL_IDENTITY_TOKEN": "e30.WyJhIl0.c2ln"},  # the payload is a list
+        {"MODAL_IDENTITY_TOKEN_FILE": str(tmp_path / "missing")},
+    ):
+        assert identity_token_claims(unreadable) == {}
+
+
+def test_a_refused_identity_token_comes_with_what_to_check():
+    token = identity_token(**MODAL_CLAIMS)
+    environ = {**WIF_IDS, "MODAL_IDENTITY_TOKEN": token}
+    refused = (
+        "stage 'outline' failed: LLMConfigError: Anthropic credentials could not be used: "
+        "WorkloadIdentityError: 401 Authentication failed."
+    )
+    explained = explain_credential_failure(refused, environ)
+    assert explained.startswith(refused + "\n") and explained.endswith(federation_advice(environ))
+    for expected in (
+        "federation history of the Anthropic Console",
+        "https://oidc.modal.com with audience oidc.modal.com",
+        "172800 s for this one",
+        "workspace_id=ac-1",
+        "app_name=paper-orchestra",
+        "function_name=consolidate_memory",
+        "must admit both write_paper and consolidate_memory",
+        "can be exchanged only once",
+        "PAPER_ORCHESTRA_MODAL_TIMEOUT",
+    ):
+        assert expected in explained, expected
+    assert token not in explained and "one-time" not in explained
+
+    # Without a readable token the advice still names what to compare.
+    assert "it could not be read" in federation_advice(WIF_IDS)
+    # Only a federated credential that was not accepted gets the advice.
+    assert explain_credential_failure("stage 'outline' failed: boom", environ) == (
+        "stage 'outline' failed: boom"
+    )
+    assert explain_credential_failure(refused, {"ANTHROPIC_API_KEY": "sk"}) == refused
+    assert explain_credential_failure(None, environ) is None
+
+
+def test_run_job_explains_a_refused_identity_token(pipeline, volume, monkeypatch, logs):
+    claims = {**MODAL_CLAIMS, "function_name": "write_paper"}
+    for name, value in {**WIF_IDS, "MODAL_IDENTITY_TOKEN": identity_token(**claims)}.items():
+        monkeypatch.setenv(name, value)
+    pipeline.success = False
+    pipeline.failure = (
+        "stage 'outline' failed: LLMConfigError: Anthropic credentials could not be used "
+        "(writer): WorkloadIdentityError: 401 Authentication failed."
+    )
+    summary = run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
+    assert summary["success"] is False and summary["error"].startswith(pipeline.failure)
+    assert "function_name=write_paper" in summary["error"]
+    assert "federation history of the Anthropic Console" in summary["error"]
+    assert "Anthropic credential in use: workload_identity." in logs.text
+    assert "Identity token: iss=https://oidc.modal.com" in logs.text
+    assert "lifetime_seconds=172800" in logs.text
+
+    # The same when the credential is found unusable before the first stage.
+    pipeline.error = LLMConfigError(
+        "Anthropic credentials could not be used: IdentityTokenFileError: no such file"
+    )
+    summary = run_job(stage_inputs(volume, "run-2"), commit=volume.commit, mount=volume.root)
+    assert "must admit both write_paper and consolidate_memory" in summary["error"]
+
+    # Other failures of a keyless run are left as they are.
+    pipeline.error = None
+    pipeline.failure = "stage refinement failed: boom"
+    summary = run_job(stage_inputs(volume, "run-3"), commit=volume.commit, mount=volume.root)
+    assert summary["error"] == "stage refinement failed: boom"
+
+
+def test_consolidate_memory_checks_and_explains_credentials_like_write_paper(
+    volume, monkeypatch, scripted_model, logs
+):
+    """It authenticates with a token of its own: a rule pinned to write_paper rejects it."""
+    lab_wiki(volume).add_note("A lesson.", kind="lesson")
+
+    def refused(request: FakeRequest) -> str:
+        raise LLMConfigError(
+            "Anthropic credentials could not be used (dream.lab): WorkloadIdentityError: "
+            "401 Authentication failed."
+        )
+
+    scripted_model(refused)
+    report = consolidate_lab("fake-dreamer", commit=volume.commit, mount=volume.root)
+    assert "No Anthropic credential is configured in this container" in logs.text
+    assert report["notes_archived"] == 0 and "WorkloadIdentityError" in report["error"]
+    assert "federation history" not in report["error"]  # not a keyless container
+
+    for name, value in {**WIF_IDS, "MODAL_IDENTITY_TOKEN": identity_token(**MODAL_CLAIMS)}.items():
+        monkeypatch.setenv(name, value)
+    report = consolidate_lab("fake-dreamer", commit=volume.commit, mount=volume.root)
+    assert "Anthropic credential in use: workload_identity." in logs.text
+    assert "function_name=consolidate_memory" in logs.text
+    assert "WorkloadIdentityError" in report["error"]
+    assert "function_name=consolidate_memory" in report["error"]
+    assert "must admit both write_paper and consolidate_memory" in report["error"]
+    assert json.loads(json.dumps(report)) == report
+    assert len(lab_wiki(volume).pending_notes()) == 1  # the lesson waits for the next attempt
+
+
+# -- the image -----------------------------------------------------------------------------
+
+
+def test_the_image_is_built_from_a_source_checkout(tmp_path, repo_root):
+    assert project_root(Path(modal_app.__file__)) == repo_root
+    checkout = tmp_path / "checkout"
+    module = checkout / "src" / "paper_orchestra" / "modal_app.py"
+    module.parent.mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text("[project]\n")
+    (checkout / "uv.lock").write_text("version = 1\n")
+    assert project_root(module) == checkout
+
+    (checkout / "uv.lock").unlink()
+    with pytest.raises(FileNotFoundError, match="run from a source checkout") as raised:
+        project_root(module)
+    assert f"uv.lock is not in {checkout}" in str(raised.value)
+
+    wheel = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "paper_orchestra"
+    with pytest.raises(FileNotFoundError) as raised:
+        project_root(wheel / "modal_app.py")
+    assert f"pyproject.toml and uv.lock are not in {wheel.parents[1]}" in str(raised.value)
+    assert "installed wheel" in str(raised.value)
+    assert "uv sync --extra modal" in str(raised.value)
+
+
+def test_an_installed_copy_of_the_package_refuses_to_define_the_modal_app(tmp_path):
+    """Instead of an image build that fails on a path inside the virtual environment."""
+    site = tmp_path / "site-packages"
+    shutil.copytree(
+        Path(modal_app.__file__).parent,
+        site / "paper_orchestra",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("MODAL_", "PAPER_ORCHESTRA_", "ANTHROPIC_"))
+    }
+    env.update(MODAL_CONFIG_PATH=str(tmp_path / "no-such-config.toml"), PYTHONPATH=str(site))
+    code = (
+        "import paper_orchestra, paper_orchestra.modal_batch\n"
+        f"assert paper_orchestra.__file__.startswith({str(site)!r}), paper_orchestra.__file__\n"
+        "import paper_orchestra.modal_app\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=tmp_path, env=env
+    )
+    assert done.returncode != 0
+    assert "FileNotFoundError: The Modal app is run from a source checkout" in done.stderr
+    assert f"are not in {tmp_path}" in done.stderr
+
+
+def test_the_container_does_not_look_for_a_checkout(monkeypatch):
+    """Inside the container the package lives at /root and no image is ever built."""
+
+    def looked(package_file: Path) -> Path:
+        raise AssertionError("looked for a checkout inside the container")
+
+    monkeypatch.setattr(modal_app.modal, "is_local", lambda: False)
+    monkeypatch.setattr(modal_app, "project_root", looked)
+    assert isinstance(modal_app._pipeline_image(modal_app.SETTINGS), modal.Image)
 
 
 # -- batches --------------------------------------------------------------------------
@@ -1036,17 +1763,22 @@ def test_write_paper_commits_and_reloads_the_mounted_volume(monkeypatch, tmp_pat
     monkeypatch.setattr(modal_app, "volume", fake_volume)
     seen: dict[str, Any] = {}
 
-    def fake_run_job(job, *, commit, reload, consolidate):
+    def fake_run_job(job, *, commit, reload, consolidate, owner):
         commit()
         reload()
         seen["job"] = job
+        seen["owner"] = owner
         seen["report"] = consolidate("some-model")
+        if job["run_id"] == "unreachable":
+            raise modal.exception.ConnectionError("could not commit the volume")
+        if job["run_id"] == "timed-out":
+            raise TimeoutError("no answer within 60 s")
         return {"success": True}
 
-    def fake_consolidate_lab(model, *, commit, reload):
+    def fake_consolidate_lab(model, *, commit, reload, owner):
         commit()
         reload()
-        return {"model": model}
+        return {"model": model, "owner": owner}
 
     monkeypatch.setattr(modal_app, "run_job", fake_run_job)
     monkeypatch.setattr(modal_app, "consolidate_lab", fake_consolidate_lab)
@@ -1059,8 +1791,23 @@ def test_write_paper_commits_and_reloads_the_mounted_volume(monkeypatch, tmp_pat
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # .local() warns that the Volume is not mounted
         assert modal_app.write_paper.local({"run_id": "r"}) == {"success": True}
-    assert seen == {"job": {"run_id": "r"}, "report": {"model": "some-model"}}
-    assert (fake_volume.commits, fake_volume.reloads) == (2, 2)
+        # The lease on the run is held under the id of the function call (none out here).
+        assert seen == {
+            "job": {"run_id": "r"},
+            "owner": modal.current_function_call_id(),
+            "report": {"model": "some-model", "owner": modal.current_function_call_id()},
+        }
+        assert (fake_volume.commits, fake_volume.reloads) == (2, 2)
+        # A Modal error raised by the run is the run's failure.  Passed on as it is, whoever
+        # waits for the call would read it as "Modal could not be asked about the call".
+        with pytest.raises(RuntimeError, match="ConnectionError: could not commit") as raised:
+            modal_app.write_paper.local({"run_id": "unreachable"})
+        assert not isinstance(raised.value, modal.exception.Error)
+        # FunctionCall.get raises the builtin TimeoutError while a call is running.  A call
+        # that ended with one would look as if it were still running, for ever.
+        with pytest.raises(RuntimeError, match="TimeoutError: no answer within 60 s") as raised:
+            modal_app.write_paper.local({"run_id": "timed-out"})
+        assert not isinstance(raised.value, TimeoutError)
 
 
 # -- launching ------------------------------------------------------------------------
@@ -1079,6 +1826,56 @@ def test_upload_inputs_sends_visible_files_only(volume, tmp_path):
         "/inputs/r1/template/template.tex",
     ]
     assert volume.forced == [True]  # a resumed run uploads the same files again
+
+    # Launching the run id again replaces its inputs: what is no longer there locally must
+    # not stay on the volume and find its way into the paper.
+    (raw / "figures" / "plot.png").unlink()
+    (raw / "figures" / "new.png").write_bytes(b"\x89PNG new")
+    (volume.root / "inputs/other-run").mkdir()
+    upload_inputs(volume, "r1", raw, template)
+    uploaded = volume.root / "inputs/r1/raw_materials"
+    assert sorted(path.name for path in (uploaded / "figures").iterdir()) == ["new.png"]
+    assert (uploaded / "idea_sparse.md").read_text() == "local idea"
+    assert (volume.root / "inputs/other-run").is_dir()  # other runs are left alone
+    # Only what is no longer among the inputs was removed, once the new files were there.  A
+    # run may be reading its inputs (a second launch is turned away by the run itself, after
+    # this upload), and it must never find them missing.
+    assert volume.removed == ["inputs/r1/raw_materials/figures/plot.png"]
+
+    # A directory that is gone locally goes with everything in it.
+    shutil.rmtree(raw / "figures")
+    upload_inputs(volume, "r1", raw, template)
+    assert not (uploaded / "figures").exists()
+    assert volume.removed[1:] == ["inputs/r1/raw_materials/figures"]
+
+    # An upload that fails leaves the inputs of the earlier launch where they were.
+    volume.upload_error = modal.exception.ConnectionError("Deadline exceeded")
+    with pytest.raises(modal.exception.ConnectionError):
+        upload_inputs(volume, "r1", raw, template)
+    assert (uploaded / "idea_sparse.md").read_text() == "local idea"
+    assert sorted(path.name for path in (volume.root / "inputs/r1/template").iterdir()) == [
+        "guidelines.md",
+        "style.sty",
+        "template.tex",
+    ]
+    volume.upload_error = None
+
+    # Whatever a listing says, nothing outside the inputs of this run is ever removed.
+    (volume.root / "runs/r1").mkdir(parents=True)
+    (volume.root / "runs/r1/state.json").write_text("{}")
+    kinds = modal.volume.FileEntryType
+    volume.listdir = lambda path, recursive=False: [
+        types.SimpleNamespace(path="/runs/r1/state.json", type=kinds.FILE),
+        types.SimpleNamespace(path="runs/r1", type=kinds.DIRECTORY),
+        types.SimpleNamespace(path="inputs/r1/../../runs/r1/state.json", type=kinds.FILE),
+        types.SimpleNamespace(path="inputs/other-run", type=kinds.DIRECTORY),
+        types.SimpleNamespace(path="/inputs/r1/raw_materials/idea_sparse.md", type=kinds.FILE),
+    ]
+    upload_inputs(volume, "r1", raw, template)
+    assert len(volume.removed) == 2
+    assert (volume.root / "runs/r1/state.json").is_file()
+    assert (volume.root / "inputs/other-run").is_dir()
+    assert (uploaded / "idea_sparse.md").is_file()  # named with a leading slash, still known
 
 
 def test_download_outputs_fetches_what_the_summary_lists(volume, tmp_path, logs):
@@ -1243,6 +2040,8 @@ def test_fakes_match_the_modal_sdk_calls_the_app_makes():
         (modal.Volume.batch_upload, (), {"force": True}),
         (AbstractVolumeUploadContextManager.put_file, (Path("idea.md"), "/inputs/r/idea.md"), {}),
         (modal.Volume.read_file, ("runs/r/final_paper.pdf",), {}),
+        (modal.Volume.remove_file, ("inputs/r",), {"recursive": True}),
+        (modal.Volume.listdir, ("inputs/r",), {"recursive": True}),
         (modal.Volume.commit, (), {}),
         (modal.Volume.reload, (), {}),
         (modal.Function.spawn, ({"run_id": "r"},), {}),
@@ -1254,6 +2053,12 @@ def test_fakes_match_the_modal_sdk_calls_the_app_makes():
     for function, args, kwargs in calls:
         inspect.signature(function).bind(None, *args, **kwargs)
     assert hasattr(modal.FunctionCall, "object_id")
+    # What a listing of the volume is made of.
+    entry = {field.name for field in dataclasses.fields(modal.volume.FileEntry)}
+    assert {"path", "type"} <= entry
+    assert {"FILE", "DIRECTORY"} <= set(modal.volume.FileEntryType.__members__)
+    inspect.signature(modal.current_function_call_id).bind()
+    assert modal.is_local() is True
 
 
 def test_pipeline_entry_points_accept_what_run_job_passes():
@@ -1268,12 +2073,15 @@ def test_pipeline_entry_points_accept_what_run_job_passes():
     assert "harness.refresh" in inspect.getsource(pipeline)
 
 
-def test_main_builds_the_sandbox_image_then_launches(monkeypatch):
+def test_main_builds_the_sandbox_images_then_launches(monkeypatch):
     monkeypatch.setattr(modal_app, "setup_logging", lambda **_: None)
     built: list[Any] = []
-    monkeypatch.setattr(
-        modal_app, "python_image", lambda: types.SimpleNamespace(build=built.append)
-    )
+
+    def image(kind: str):
+        return lambda *args: types.SimpleNamespace(build=lambda app: built.append((kind, app)))
+
+    monkeypatch.setattr(modal_app, "python_image", image("python"))
+    monkeypatch.setattr(modal_app, "latex_image", image("latex"))
     seen: dict[str, Any] = {}
 
     def fake_launch(**kwargs):
@@ -1293,20 +2101,70 @@ def test_main_builds_the_sandbox_image_then_launches(monkeypatch):
         dream="end",
         lab_memory=False,
     )
-    assert built == [modal_app.app]
+    # Both where the build log is visible: the image LaTeX is compiled in, and the one for
+    # figure code.
+    assert built == [("latex", modal_app.app), ("python", modal_app.app)]
     assert seen["volume"] is modal_app.volume and seen["function"] is modal_app.write_paper
     launcher_options = ("volume", "function", "raw_materials_dir", "template", "output_dir")
     assert [seen.pop(name) for name in launcher_options[2:]] == ["raw", "cvpr2025", "out"]
     job = build_job(**{k: v for k, v in seen.items() if k not in launcher_options})
     assert job["run_id"] == "r1" and job["use_plotting"] is True
-    assert job["models"] == {"writer": "claude-fable-5-2", "effort": "low"}
+    # Naming only the writer keeps discovery on the writer's model, as `write` does.
+    assert job["models"] == {
+        "writer": "claude-fable-5-2",
+        "fast": "claude-fable-5-2",
+        "effort": "low",
+    }
     assert job["memory"] == {"enabled": True, "lab": False, "dream": "end"}
 
+    del built[:]
     for run_id in ("failing", "not-downloaded"):
         with pytest.raises(SystemExit) as raised:
             modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id=run_id)
         assert raised.value.code == 1
-    assert built == [modal_app.app]  # without --plotting no figure code runs: nothing to build
+    # Without --plotting no figure code runs, so only the LaTeX image is built.
+    assert built == [("latex", modal_app.app)] * 2
+
+    # Compiling in the container needs no LaTeX sandbox, hence no image for one.
+    del built[:]
+    monkeypatch.setattr(
+        modal_app, "SETTINGS", dataclasses.replace(modal_app.SETTINGS, latex="local")
+    )
+    modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id="r2")
+    assert built == []
+
+
+def test_main_takes_one_model_for_every_role(monkeypatch):
+    """`--model`, as `paper-orchestra write` has it; the options of a role still win."""
+    monkeypatch.setattr(modal_app, "setup_logging", lambda **_: None)
+    monkeypatch.setattr(
+        modal_app, "latex_image", lambda *_: types.SimpleNamespace(build=lambda app: None)
+    )
+    seen: dict[str, Any] = {}
+
+    def fake_launch(**kwargs):
+        seen.update(kwargs)
+        return {"success": True, "downloaded": {"pdf": "final_paper.pdf"}}
+
+    monkeypatch.setattr(modal_app, "launch", fake_launch)
+    modal_app.main(
+        raw_materials_dir="raw",
+        template="cvpr2025",
+        run_id="r1",
+        model="claude-opus-4-8",
+        fast_model="claude-haiku-4-5",
+    )
+    roles = {name: seen[f"{name}_model"] for name in ("writer", "reflection", "plotting", "fast")}
+    assert roles == {
+        "writer": "claude-opus-4-8",
+        "reflection": "claude-opus-4-8",
+        "plotting": "claude-opus-4-8",
+        "fast": "claude-haiku-4-5",
+    }
+    assert seen["image_model"] is None
+
+    modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id="r2")
+    assert {seen[f"{name}_model"] for name in roles} == {None}  # the pipeline's defaults
 
 
 def test_local_entrypoint_flags_are_understood_by_the_modal_cli():
@@ -1325,9 +2183,11 @@ def test_local_entrypoint_flags_are_understood_by_the_modal_cli():
         "--output-dir TEXT",
         "--run-id TEXT",
         "--plotting / --no-plotting",
+        "--keep-provided-figures / --no-keep-provided-figures",
         "--idea-filename TEXT",
         "--experimental-log-filename TEXT",
         "--research-cutoff TEXT",
+        "--model TEXT",
         "--writer-model TEXT",
         "--reflection-model TEXT",
         "--plotting-model TEXT",
@@ -1399,7 +2259,7 @@ print(json.dumps({
     described = json.loads(done.stdout)
     functions = described.pop("functions")
     assert described == {
-        "settings": ["smoke.app", "paper-orchestra", None, 21600, 4],
+        "settings": ["smoke.app", "paper-orchestra", None, 21600, 4, "sandbox", []],
         "app": "smoke.app",
     }
     assert functions["write_paper"] == {

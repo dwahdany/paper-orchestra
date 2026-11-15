@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
-import threading
+import multiprocessing
+import os
+import signal
+import subprocess
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,8 @@ from paper_orchestra.batch import load_papers, run_batch, summarize
 from paper_orchestra.config import MemoryConfig, ModelConfig, PipelineConfig
 from paper_orchestra.pipeline import PaperResult
 from paper_orchestra.utils.common import read_json, write_json
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
 
 
 @pytest.fixture
@@ -53,51 +58,109 @@ def cfg(tmp_path: Path, template_dir: Path) -> PipelineConfig:
     )
 
 
-class Workers:
-    """Replaces the per-paper worker; runs in threads so the test can observe it."""
+SCRIPT_ENV = "PAPER_ORCHESTRA_TEST_BATCH_SCRIPT"
+#: Long enough that a paper still "being written" can only end by being stopped.
+FOREVER = 120.0
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, outcomes: dict[str, Any]) -> None:
-        self.outcomes = outcomes
-        self.jobs: list[dict[str, Any]] = []
-        #: Papers that must already be in the log on disk when a paper's worker runs.
-        self.must_see: dict[str, set[str]] = {}
-        self.logs_seen: dict[str, dict[str, Any]] = {}
-        self.pool_sizes: list[int] = []
-        monkeypatch.setattr(batch, "_write_paper", self.write)
-        monkeypatch.setattr(batch, "_process_pool", self.pool)
 
-    def pool(self, max_workers: int) -> ThreadPoolExecutor:
-        self.pool_sizes.append(max_workers)
-        return ThreadPoolExecutor(max_workers=max_workers)
+def scripted_paper(job: dict[str, Any]) -> dict[str, Any]:
+    """Stands in for ``batch._write_paper`` inside the real worker processes.
 
-    def write(self, job: dict[str, Any]) -> dict[str, Any]:
-        self.jobs.append(job)
-        paper_dir = Path(job["config"]["base_dir"])
-        log_path = paper_dir.parent / batch.LOG_NAME
-        # Wait (briefly) for the papers this one must find in the log already.
-        expected = self.must_see.get(job["paper_id"], set())
-        deadline = time.monotonic() + 5
-        seen: dict[str, Any] = {}
-        while True:
-            seen = read_json(log_path) if log_path.is_file() else {}
-            if expected <= set(seen) or time.monotonic() > deadline:
-                break
+    A worker process sees none of the test's objects: its script arrives through the
+    environment and what it observed is left as files in the paper's run directory.
+    """
+    paper_id = job["paper_id"]
+    paper_dir = Path(job["config"]["base_dir"])
+    out = paper_dir.parent
+    step = json.loads(os.environ[SCRIPT_ENV])[paper_id]
+    write_json(paper_dir / "job.json", job)
+    write_json(paper_dir / "log_seen.json", read_json(out / batch.LOG_NAME, default={}))
+    (paper_dir / "started").write_text(str(os.getpid()))
+    # Papers that must be in flight together with this one before it goes on.
+    deadline = time.monotonic() + 30
+    for other in step.get("alongside", ()):
+        while not (out / other / "started").exists():
+            if time.monotonic() > deadline:
+                return {"paper_id": paper_id, "status": "failed", "error": f"{other} never ran"}
             time.sleep(0.01)
-        self.logs_seen[job["paper_id"]] = seen
-        outcome = self.outcomes[job["paper_id"]]
-        if isinstance(outcome, BaseException):
-            raise outcome
-        if outcome == "success":
-            paper_dir.mkdir(parents=True, exist_ok=True)
-            pdf = paper_dir / "final_paper.pdf"
-            pdf.write_bytes(b"%PDF")
-            return {"paper_id": job["paper_id"], "status": "success", "paper_path": str(pdf)}
-        return {
-            "paper_id": job["paper_id"],
-            "status": "failed",
-            "paper_path": "",
-            "error": outcome,
-        }
+    time.sleep(step.get("linger", 0.0))
+
+    action = step["do"]
+    if action == "fail":
+        return {"paper_id": paper_id, "status": "failed", "paper_path": "", "error": step["error"]}
+    if action == "raise":
+        raise RuntimeError(step["error"])
+    if action == "exit":
+        os._exit(step["code"])
+    if action == "kill":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if action == "deaf at first":
+        # What happens to a worker with more than one thread now and then: the batch's
+        # stop request is taken by another thread and never interrupts the main one.
+        interrupt = signal.getsignal(signal.SIGTERM)
+        missed: list[int] = []
+
+        def miss_the_first(signum: int, frame: object) -> None:
+            if not missed:
+                missed.append(signum)
+                (paper_dir / "missed").write_text("")
+            else:
+                interrupt(signum, frame)
+
+        signal.signal(signal.SIGTERM, miss_the_first)
+    if action in ("sleep", "stubborn", "deaf at first"):
+        try:
+            time.sleep(FOREVER)
+        except KeyboardInterrupt:
+            (paper_dir / "interrupted").write_text("")
+            if action != "stubborn":
+                raise
+            time.sleep(FOREVER)
+    pdf = paper_dir / "final_paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    return {"paper_id": paper_id, "status": "success", "paper_path": str(pdf)}
+
+
+class Script:
+    """Tells the stand-in workers what to do and reads back what they left behind."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, out: Path, steps: dict[str, dict[str, Any]]
+    ) -> None:
+        self.out = out
+        for name in ("job.json", "log_seen.json", "started", "interrupted"):
+            for leftover in out.glob(f"*/{name}"):
+                leftover.unlink()
+        monkeypatch.setattr(batch, "_write_paper", scripted_paper)
+        monkeypatch.setenv(SCRIPT_ENV, json.dumps(steps))
+
+    def jobs(self) -> dict[str, dict[str, Any]]:
+        return {path.parent.name: read_json(path) for path in self.out.glob("*/job.json")}
+
+    def log_seen(self, paper_id: str) -> dict[str, Any]:
+        """The batch log as it was on disk when the paper's worker started."""
+        return read_json(self.out / paper_id / "log_seen.json")
+
+    def marked(self, marker: str) -> list[str]:
+        return sorted(path.parent.name for path in self.out.glob(f"*/{marker}"))
+
+
+SUCCESS = {"do": "success"}
+
+
+def interrupt_after_the_first_paper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ctrl-C arrives in the batch process right after it logged its first finished paper."""
+    real_write_json = batch.write_json
+    fired: list[bool] = []
+
+    def write(path: Path, data: Any) -> Path:
+        result = real_write_json(path, data)
+        if not fired:
+            fired.append(True)
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(batch, "write_json", write)
 
 
 # -- which papers ------------------------------------------------------------------
@@ -172,16 +235,16 @@ def test_invalid_batches_are_rejected(root, tmp_path):
 
 
 def test_batch_writes_the_log_as_papers_finish(root, cfg, tmp_path, monkeypatch, caplog):
-    workers = Workers(
+    out = tmp_path / "out"
+    script = Script(
         monkeypatch,
+        out,
         {
-            "p1": "success",
-            "p2": "stage 'literature' failed after 2 attempt(s)",
-            "p3": BrokenProcessPool("A process in the process pool was terminated abruptly"),
+            "p1": SUCCESS,
+            "p2": {"do": "fail", "error": "stage 'literature' failed after 2 attempt(s)"},
+            "p3": {"do": "raise", "error": "out of disk"},
         },
     )
-    workers.must_see = {"p2": {"p1"}, "p3": {"p1", "p2"}}
-    out = tmp_path / "out"
     with caplog.at_level(logging.INFO, logger="paper_orchestra"):
         log_path = run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=1)
 
@@ -193,29 +256,67 @@ def test_batch_writes_the_log_as_papers_finish(root, cfg, tmp_path, monkeypatch,
             "paper_path": "",
             "error": "stage 'literature' failed after 2 attempt(s)",
         },
-        "p3": {
-            "status": "error",
-            "paper_path": "",
-            "error": "BrokenProcessPool: A process in the process pool was terminated abruptly",
-        },
+        "p3": {"status": "error", "paper_path": "", "error": "RuntimeError: out of disk"},
     }
-    # The log on disk grew while the batch was still running: each paper found the
-    # results of the ones that finished before it.
-    assert workers.logs_seen["p2"]["p1"]["status"] == "success"
-    assert sorted(workers.logs_seen["p3"]) == ["p1", "p2"]
-    assert workers.pool_sizes == [1]
+    # One paper at a time, and the log on disk grew while the batch was still running:
+    # each paper started with the results of the ones before it.
+    assert script.log_seen("p1") == {}
+    assert script.log_seen("p2")["p1"]["status"] == "success"
+    assert sorted(script.log_seen("p3")) == ["p1", "p2"]
     assert "Batch finished: 3 paper(s), 1 written, 1 failed, 1 in error." in caplog.text
-    assert "Paper p3 error (3 of 3): BrokenProcessPool" in caplog.text
+    assert "Paper p3 error (3 of 3): RuntimeError: out of disk" in caplog.text
     assert summarize(read_json(log_path)) == {"success": 1, "failed": 1, "error": 1}
+    assert multiprocessing.active_children() == []
+
+
+@pytest.mark.parametrize(
+    ("death", "reported"),
+    [
+        ({"do": "exit", "code": 3}, "worker exited with code 3"),
+        pytest.param({"do": "kill"}, "worker exited with code -9 (SIGKILL)", marks=posix_only),
+    ],
+)
+def test_a_worker_that_dies_takes_only_its_own_paper_with_it(
+    death, reported, root, cfg, tmp_path, monkeypatch, caplog
+):
+    out = tmp_path / "out"
+    Script(
+        monkeypatch,
+        out,
+        {
+            # Still being written when p2's worker dies next to it.
+            "p1": {"do": "success", "alongside": ["p2"], "linger": 1.0},
+            "p2": {**death, "alongside": ["p1"]},
+            # Still queued at that moment.
+            "p3": SUCCESS,
+        },
+    )
+    with caplog.at_level(logging.INFO, logger="paper_orchestra"):
+        log = read_json(run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=2))
+
+    assert log == {
+        "p1": {"status": "success", "paper_path": str(out / "p1" / "final_paper.pdf")},
+        "p2": {"status": "error", "paper_path": "", "error": reported},
+        "p3": {"status": "success", "paper_path": str(out / "p3" / "final_paper.pdf")},
+    }
+    assert (out / "p1" / "final_paper.pdf").is_file() and (out / "p3" / "final_paper.pdf").is_file()
+    assert "Batch finished: 3 paper(s), 2 written, 0 failed, 1 in error." in caplog.text
+    assert multiprocessing.active_children() == []
 
 
 def test_every_paper_gets_its_own_config(root, cfg, tmp_path, monkeypatch):
-    workers = Workers(monkeypatch, {"p1": "success", "p2": "success", "p3": "success"})
     out = tmp_path / "out"
-    run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=8)
+    everyone = ["p1", "p2", "p3"]
+    script = Script(
+        monkeypatch, out, {paper_id: {**SUCCESS, "alongside": everyone} for paper_id in everyone}
+    )
+    log = read_json(run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=8))
 
-    assert workers.pool_sizes == [3]
-    by_id = {job["paper_id"]: job for job in workers.jobs}
+    # All three were in flight together: each waited for the other two before it finished.
+    assert {paper_id: entry["status"] for paper_id, entry in log.items()} == dict.fromkeys(
+        everyone, "success"
+    )
+    by_id = script.jobs()
     assert set(by_id) == {"p1", "p2", "p3"}
     for paper_id, job in by_id.items():
         paper_cfg = PipelineConfig.from_dict(job["config"])
@@ -233,21 +334,41 @@ def test_every_paper_gets_its_own_config(root, cfg, tmp_path, monkeypatch):
     assert cfg.memory.project_dir == tmp_path / "shared-memory"
 
 
+def test_no_more_than_max_workers_papers_are_in_flight(root, cfg, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    script = Script(
+        monkeypatch,
+        out,
+        {
+            "p1": {**SUCCESS, "alongside": ["p2"]},
+            "p2": {**SUCCESS, "alongside": ["p1"]},
+            "p3": SUCCESS,
+        },
+    )
+    run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=2)
+
+    assert script.log_seen("p1") == script.log_seen("p2") == {}
+    # The third paper had to wait for a free slot: one of the others was already logged.
+    assert set(script.log_seen("p3")) & {"p1", "p2"}
+
+
 def test_batch_resumes_and_skips_papers_that_are_already_written(root, cfg, tmp_path, monkeypatch):
     out = tmp_path / "out"
-    first = Workers(monkeypatch, {"p1": "success", "p2": "boom", "p3": "success"})
+    first = Script(
+        monkeypatch, out, {"p1": SUCCESS, "p2": {"do": "fail", "error": "boom"}, "p3": SUCCESS}
+    )
     log_path = run_batch(cfg, root_input_folder=root, output_dir=out)
-    assert len(first.jobs) == 3
+    assert sorted(first.jobs()) == ["p1", "p2", "p3"]
     # p3 "succeeded" but its PDF is gone, so the log entry is not trusted.
     (out / "p3" / "final_paper.pdf").unlink()
     earlier = read_json(log_path)
     earlier["other-batch"] = {"status": "success", "paper_path": "/elsewhere/final_paper.pdf"}
     write_json(log_path, earlier)
 
-    second = Workers(monkeypatch, {"p2": "success", "p3": "success"})
+    second = Script(monkeypatch, out, {"p2": SUCCESS, "p3": SUCCESS})
     run_batch(cfg, root_input_folder=root, output_dir=out)
 
-    assert sorted(job["paper_id"] for job in second.jobs) == ["p2", "p3"]
+    assert sorted(second.jobs()) == ["p2", "p3"]
     log = read_json(log_path)
     assert {paper_id: entry["status"] for paper_id, entry in log.items()} == {
         "p1": "success",
@@ -257,54 +378,274 @@ def test_batch_resumes_and_skips_papers_that_are_already_written(root, cfg, tmp_
     }
     assert "error" not in log["p2"]
 
-    third = Workers(monkeypatch, {})
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("no worker may be started when every paper is written")
+
+    monkeypatch.setattr(batch, "_Worker", unexpected)
     assert run_batch(cfg, root_input_folder=root, output_dir=out) == log_path
-    assert third.jobs == [] and third.pool_sizes == []
     assert read_json(log_path) == log
 
 
-def test_an_interrupted_batch_starts_no_further_papers(root, cfg, tmp_path, monkeypatch):
-    workers = Workers(monkeypatch, {"p1": "success", "p2": "success", "p3": "success"})
-    release = threading.Event()
-    real_write = workers.write
+def test_only_a_success_with_its_pdf_counts_as_already_written(tmp_path):
+    pdf = tmp_path / "final_paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    assert batch._already_written({"status": "success", "paper_path": str(pdf)})
+    # "submitted" and "cancelled" are written by the Modal batch client for papers in flight.
+    for status in ("failed", "error", "submitted", "cancelled"):
+        assert not batch._already_written({"status": status, "paper_path": str(pdf)})
+    assert not batch._already_written({"status": "success", "paper_path": str(tmp_path / "gone")})
+    assert not batch._already_written({"status": "success", "paper_path": ""})
+    assert not batch._already_written(None)
+    assert summarize(
+        {"a": {"status": "submitted"}, "b": {"status": "cancelled"}, "c": {"status": "success"}}
+    ) == {"success": 1, "failed": 0, "error": 0}
 
-    def write(job: dict[str, Any]) -> dict[str, Any]:
-        if job["paper_id"] == "p2":
-            # Still being written when the interrupt arrives.
-            assert release.wait(timeout=10)
-        return real_write(job)
 
-    monkeypatch.setattr(batch, "_write_paper", write)
-    real_write_json = batch.write_json
-
-    def interrupted_after_the_first_paper(path: Path, data: Any) -> Path:
-        result = real_write_json(path, data)
-        if data:
-            raise KeyboardInterrupt
-        return result
-
-    monkeypatch.setattr(batch, "write_json", interrupted_after_the_first_paper)
+@posix_only
+def test_an_interrupted_batch_stops_its_workers_and_starts_no_further_papers(
+    root, cfg, tmp_path, monkeypatch
+):
     out = tmp_path / "out"
-    try:
-        with pytest.raises(KeyboardInterrupt):
-            run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=1)
-        # The interrupt came through while p2 was still in progress.
-        assert not release.is_set()
-    finally:
-        release.set()
-        for thread in threading.enumerate():
-            if thread.name.startswith("ThreadPoolExecutor"):
-                thread.join(timeout=10)
+    script = Script(
+        monkeypatch,
+        out,
+        {
+            "p1": {**SUCCESS, "alongside": ["p2"]},
+            # Still being written when the interrupt arrives.
+            "p2": {"do": "sleep"},
+            # Still queued.
+            "p3": SUCCESS,
+        },
+    )
+    interrupt_after_the_first_paper(monkeypatch)
+    began = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=2)
 
-    # p3 was still queued: it is cancelled instead of being written after the interrupt.
-    assert [job["paper_id"] for job in workers.jobs] == ["p1", "p2"]
+    # The paper in flight was stopped, not waited for, and nothing outlives the batch.
+    assert time.monotonic() - began < FOREVER / 2
+    assert multiprocessing.active_children() == []
+    # Its worker was interrupted the way Ctrl-C would have, so the run could close its state.
+    assert script.marked("interrupted") == ["p2"]
+    assert script.marked("started") == ["p1", "p2"]
     assert read_json(out / "paper_writing_log.json") == {
-        "p1": {"status": "success", "paper_path": str(out / "p1" / "final_paper.pdf")}
+        "p1": {"status": "success", "paper_path": str(out / "p1" / "final_paper.pdf")},
+        "p2": {"status": "error", "paper_path": "", "error": batch.INTERRUPTED},
     }
 
 
+@posix_only
+def test_a_worker_that_ignores_the_stop_is_killed_after_the_grace_period(
+    root, cfg, tmp_path, monkeypatch
+):
+    out = tmp_path / "out"
+    script = Script(
+        monkeypatch,
+        out,
+        {"p1": {**SUCCESS, "alongside": ["p2"]}, "p2": {"do": "stubborn"}, "p3": SUCCESS},
+    )
+    monkeypatch.setattr(batch, "STOP_GRACE_SECONDS", 1.0)
+    interrupt_after_the_first_paper(monkeypatch)
+    began = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=2)
+
+    assert time.monotonic() - began < FOREVER / 2
+    assert multiprocessing.active_children() == []
+    # It was asked first and carried on regardless.
+    assert script.marked("interrupted") == ["p2"]
+    assert not (out / "p2" / "final_paper.pdf").exists()
+    assert read_json(out / "paper_writing_log.json")["p2"] == {
+        "status": "error",
+        "paper_path": "",
+        "error": batch.INTERRUPTED,
+    }
+
+
+@posix_only
+def test_a_worker_that_missed_the_stop_request_is_asked_again(root, cfg, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    script = Script(
+        monkeypatch,
+        out,
+        {"p1": {**SUCCESS, "alongside": ["p2"]}, "p2": {"do": "deaf at first"}, "p3": SUCCESS},
+    )
+    # A grace period that is short for a failing test and many requests long.
+    monkeypatch.setattr(batch, "STOP_GRACE_SECONDS", 6.0)
+    monkeypatch.setattr(batch, "STOP_REPEAT_SECONDS", 0.2)
+    interrupt_after_the_first_paper(monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=2)
+
+    assert multiprocessing.active_children() == []
+    assert script.marked("missed") == ["p2"]
+    # The paper was interrupted, so its run could close itself: it was not left to be
+    # killed when the grace period ran out.
+    assert script.marked("interrupted") == ["p2"]
+    assert read_json(out / "paper_writing_log.json")["p2"] == {
+        "status": "error",
+        "paper_path": "",
+        "error": batch.INTERRUPTED,
+    }
+
+
+@posix_only
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["ctrl_c", "sigterm"])
+def test_an_interrupt_while_a_worker_is_started_still_stops_that_worker(
+    signum, root, cfg, tmp_path, monkeypatch
+):
+    out = tmp_path / "out"
+    script = Script(monkeypatch, out, {"p1": {"do": "sleep"}, "p2": SUCCESS, "p3": SUCCESS})
+
+    def interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    context = multiprocessing.get_context("spawn")
+    start_process = context.Process.start
+
+    def start(process: Any) -> None:
+        start_process(process)
+        # The worker's process exists and the batch has not taken note of it yet.
+        os.kill(os.getpid(), signum)
+
+    monkeypatch.setattr(context.Process, "start", start)
+    # Ctrl-C as Python takes it and SIGTERM as the command line does.
+    before = signal.signal(signum, interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=1)
+        left = multiprocessing.active_children()
+        handler = signal.getsignal(signum)
+    finally:
+        signal.signal(signum, signal.SIG_DFL if before is None else before)
+        # A worker the batch lost track of would keep this test session from ending.
+        for process in multiprocessing.active_children():
+            process.kill()
+            process.join()
+
+    assert left == [], "a worker outlived the batch that started it"
+    # The interrupt was acted on once the worker was known: it was stopped and its paper
+    # recorded, and no further paper was started.
+    assert script.marked("started") in ([], ["p1"])
+    assert read_json(out / "paper_writing_log.json") == {
+        "p1": {"status": "error", "paper_path": "", "error": batch.INTERRUPTED}
+    }
+    # The signal is handled as before from then on.
+    assert handler is interrupt
+
+
+#: The real command line with a slow stand-in for the pipeline.  The stand-in is installed
+#: at module level on purpose: the worker processes import this file again and need it too.
+SIGNAL_DRIVER = """
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+from paper_orchestra import batch, cli
+from paper_orchestra.pipeline import PaperResult
+
+
+def slow_run_paper(cfg, **kwargs):
+    base = Path(cfg.base_dir)
+    # A run has more threads than its main one (it keeps usage.json current from another),
+    # and a process with several threads does not always hand a signal to the main one.
+    threading.Thread(target=threading.Event().wait, daemon=True).start()
+    try:
+        # Inside the try: the test sends its signal as soon as this file exists.
+        (base / "started").write_text(str(os.getpid()))
+        time.sleep(120)
+    except KeyboardInterrupt:
+        (base / "interrupted").write_text("")
+        if not os.environ.get("BATCH_TEST_STUBBORN"):
+            raise
+        time.sleep(120)
+    pdf = base / "final_paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    return PaperResult(True, pdf, base, {}, {})
+
+
+batch.run_paper = slow_run_paper
+
+if __name__ == "__main__":
+    cli.main(sys.argv[1:])
+"""
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _stopping(stderr: Path) -> bool:
+    """Whether the batch has said (in its log, on stderr) that it is stopping its papers."""
+    return "Stopping the batch" in " ".join(stderr.read_text().split())
+
+
+@posix_only
+@pytest.mark.parametrize("how", ["ctrl_c", "sigterm", "ctrl_c_twice"])
+def test_stopping_the_batch_command_stops_the_papers_in_flight(how, root, template_dir, tmp_path):
+    driver = tmp_path / "driver.py"
+    driver.write_text(SIGNAL_DRIVER)
+    out = tmp_path / "out"
+    # In the last case the papers carry on after their interrupt, as a run does while a
+    # stage finishes its current model call.
+    env = {**os.environ, "BATCH_TEST_STUBBORN": "1" if how == "ctrl_c_twice" else ""}
+    said = tmp_path / "stderr.txt"
+    with said.open("w") as stderr:
+        proc = subprocess.Popen(
+            [sys.executable, str(driver), "batch", "--root-input-folder", str(root),
+             "--template", str(template_dir), "--output-dir", str(out), "--max-workers", "2",
+             "--no-lab-memory"],
+            cwd=tmp_path,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            # Its own process group, so the signal of a terminal's Ctrl-C can be reproduced.
+            start_new_session=True,
+        )  # fmt: skip
+    try:
+        deadline = time.monotonic() + 60
+        while len(list(out.glob("*/started"))) < 2:
+            assert proc.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        if how == "sigterm":
+            os.kill(proc.pid, signal.SIGTERM)  # kill, timeout, a scheduler: the batch only
+        else:
+            os.killpg(proc.pid, signal.SIGINT)  # Ctrl-C: the batch and its workers at once
+        if how == "ctrl_c_twice":
+            # A second Ctrl-C ends the grace period the batch gives the papers.  It has to
+            # come once that period has begun: an interrupt that arrives while the batch is
+            # still acting on the first one is the same interrupt.
+            while len(list(out.glob("*/interrupted"))) < 2 or not _stopping(said):
+                assert proc.poll() is None and time.monotonic() < deadline
+                time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGINT)
+
+        # Long before a paper would have finished, and before the grace period is over.
+        assert proc.wait(timeout=batch.STOP_GRACE_SECONDS / 2) == 130
+        deadline = time.monotonic() + 10
+        while _group_alive(proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _group_alive(proc.pid), "worker processes outlived the batch"
+        # Both papers in flight took their interrupt path; the third was never started.
+        assert sorted(p.parent.name for p in out.glob("*/started")) == ["p1", "p2"]
+        assert sorted(p.parent.name for p in out.glob("*/interrupted")) == ["p1", "p2"]
+        assert not list(out.glob("*/final_paper.pdf"))
+        interrupted = {"status": "error", "paper_path": "", "error": batch.INTERRUPTED}
+        assert read_json(out / "paper_writing_log.json") == {"p1": interrupted, "p2": interrupted}
+    finally:
+        if _group_alive(proc.pid):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+
 def test_batch_rejects_bad_requests(root, cfg, tmp_path, monkeypatch):
-    workers = Workers(monkeypatch, {})
+    script = Script(monkeypatch, tmp_path / "out", {})
     with pytest.raises(ValueError, match="max_workers must be at least 1"):
         run_batch(cfg, root_input_folder=root, output_dir=tmp_path / "out", max_workers=0)
     empty = tmp_path / "empty"
@@ -317,7 +658,7 @@ def test_batch_rejects_bad_requests(root, cfg, tmp_path, monkeypatch):
     (out / batch.LOG_NAME).write_text("{ not json")
     with pytest.raises(ValueError, match="is not valid JSON"):
         run_batch(cfg, root_input_folder=root, output_dir=out)
-    assert workers.jobs == []
+    assert script.jobs() == {} and multiprocessing.active_children() == []
 
 
 # -- the worker --------------------------------------------------------------------

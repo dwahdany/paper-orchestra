@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import fnmatch
 import inspect
 import json
 import logging
+import os
+import re
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,23 +20,28 @@ from typer.testing import CliRunner
 
 from paper_orchestra import __version__, cli
 from paper_orchestra import doctor as doctor_module
-from paper_orchestra.compute.base import ComputeError
+from paper_orchestra.compute.base import ComputeBackend, ComputeError
 from paper_orchestra.config import DEFAULT_MODEL, PipelineConfig
+from paper_orchestra.llm.base import LLMError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.llm.router import register_client, reset_clients
 from paper_orchestra.memory import Wiki
 from paper_orchestra.pipeline import PaperResult
-from paper_orchestra.utils.common import write_json
+from paper_orchestra.utils.common import read_json, write_json
 
 runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch: pytest.MonkeyPatch):
-    """No test leaves a registered client or a changed log level behind."""
+    """No test leaves a registered client, a changed log level or a signal handler behind."""
     logger = logging.getLogger("paper_orchestra")
     level = logger.level
+    on_sigterm = signal.getsignal(signal.SIGTERM)
     yield
+    # ``cli.main`` installs a SIGTERM handler for the life of its process.
+    if on_sigterm is not None:
+        signal.signal(signal.SIGTERM, on_sigterm)
     logger.setLevel(level)
     reset_clients()
 
@@ -184,7 +194,8 @@ def test_write_accepts_the_original_command_line(materials, template, tmp_path, 
     assert cfg.models.reflection == "gpt-reviewer"
     assert cfg.models.plotting == "gpt-plotter"
     assert cfg.models.image == "imagen-x"
-    assert cfg.models.fast == DEFAULT_MODEL
+    # The original command line had no flag for the discovery model: it follows the writer.
+    assert cfg.models.fast == "gpt-writer"
     assert cfg.research_cutoff == "2024-11"
     assert cfg.use_plotting is True
     assert cfg.plotting_max_critic_rounds == 5
@@ -213,6 +224,7 @@ def test_write_new_flags(materials, template, tmp_path, recorder):
             "--dream", "end",
             "--no-resume",
             "--no-plotting",
+            "--keep-provided-figures",
         ],
     )  # fmt: skip
 
@@ -231,6 +243,44 @@ def test_write_new_flags(materials, template, tmp_path, recorder):
     assert cfg.memory.dream == "end"
     assert cfg.resume is False
     assert cfg.use_plotting is False
+    assert cfg.keep_provided_figures is True
+
+
+@pytest.mark.parametrize(
+    ("flags", "fast", "reflection"),
+    [
+        ([], DEFAULT_MODEL, DEFAULT_MODEL),
+        (["--writer-model", "gemini-writer"], "gemini-writer", DEFAULT_MODEL),
+        (["--writer_model_name=gemini-writer"], "gemini-writer", DEFAULT_MODEL),
+        # What the original frontend sent for a run on one provider: every model it could name.
+        (
+            ["--writer_model_name", "gemini-pro", "--reflection_model_name", "gemini-pro",
+             "--use_plotting", "true", "--plotting_model_name", "gemini-pro",
+             "--image_model_name", "gemini-image"],
+            "gemini-pro",
+            "gemini-pro",
+        ),
+        (["--writer-model", "gemini-writer", "--fast-model", "gemini-fast"], "gemini-fast",
+         DEFAULT_MODEL),
+        # An explicit --model still sets every role that has no flag of its own.
+        (["--writer-model", "gemini-writer", "--model", "claude-opus-5-5"], "claude-opus-5-5",
+         "claude-opus-5-5"),
+        (["--model", "claude-opus-5-5"], "claude-opus-5-5", "claude-opus-5-5"),
+        (["--reflection-model", "gemini-reviewer"], DEFAULT_MODEL, "gemini-reviewer"),
+    ],
+)  # fmt: skip
+def test_the_fast_model_follows_the_writer_unless_a_model_flag_says_otherwise(
+    flags, fast, reflection, materials, template, tmp_path, recorder
+):
+    result = runner.invoke(
+        cli.app,
+        ["write", "--raw-materials-dir", str(materials), "--template", "demo2026",
+         "--output-dir", str(tmp_path / "out"), *flags],
+    )  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    models = recorder.cfg.models
+    assert (models.fast, models.reflection) == (fast, reflection)
 
 
 def test_write_defaults(materials, template, tmp_path, recorder, monkeypatch):
@@ -249,6 +299,7 @@ def test_write_defaults(materials, template, tmp_path, recorder, monkeypatch):
     assert models.image is None and models.effort == "high"
     assert cfg.research_cutoff == datetime.now().strftime("%Y-%m")
     assert cfg.use_plotting is False and cfg.resume is True and cfg.compute == "local"
+    assert cfg.keep_provided_figures is False
     assert cfg.memory.enabled and cfg.memory.lab and cfg.memory.dream == "stages"
     assert cfg.memory.project_dir is None and cfg.memory.lab_dir is None
 
@@ -345,8 +396,10 @@ def test_help_shows_the_new_flags_only():
     result = runner.invoke(cli.app, ["write", "--help"], env={"COLUMNS": "200"})
 
     assert result.exit_code == 0
-    for flag in ("--raw-materials-dir", "--template", "--lab-memory-dir", "--dream", "--resume"):
+    for flag in ("--raw-materials-dir", "--template", "--lab-memory-dir", "--dream", "--resume",
+                 "--keep-provided-figures"):  # fmt: skip
         assert flag in result.output
+    assert f"[default: ({DEFAULT_MODEL})]" in result.output
     assert "_" not in "".join(w for w in result.output.split() if w.startswith("--"))
 
 
@@ -382,6 +435,7 @@ def test_batch_passes_its_options_on_and_reports_failures(tmp_path, template, mo
         "--n-papers", "3",
         "--max-workers", "2",
         "--plotting",
+        "--keep-provided-figures",
         "--writer-model", "claude-opus-5-5",
     ]  # fmt: skip
 
@@ -394,7 +448,11 @@ def test_batch_passes_its_options_on_and_reports_failures(tmp_path, template, mo
     assert call["output_dir"] == tmp_path / "out"
     assert (call["n_papers"], call["max_workers"]) == (3, 2)
     assert call["cfg"].template_dir == template
-    assert call["cfg"].use_plotting and call["cfg"].models.writer == "claude-opus-5-5"
+    assert call["cfg"].use_plotting and call["cfg"].keep_provided_figures
+    models = call["cfg"].models
+    # Without --model the fast role follows the writer; the others keep the default.
+    assert (models.writer, models.fast) == ("claude-opus-5-5", "claude-opus-5-5")
+    assert (models.reflection, models.plotting) == (DEFAULT_MODEL, DEFAULT_MODEL)
 
     outcome = {
         "a": {"status": "success", "paper_path": "a.pdf"},
@@ -564,6 +622,64 @@ def test_doctor_reports_backends_that_fail_to_load_as_rows(monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_doctor_reports_what_the_compute_backends_say_is_missing(monkeypatch):
+    import paper_orchestra.compute as compute
+
+    problems: dict[str, list[str]] = {
+        "local": ["pdflatex is too old to compile the paper."],
+        "modal": ["Modal is not authenticated on this machine."],
+    }
+    closed: list[str] = []
+
+    class Backend(ComputeBackend):
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def run_python(self, code: str, **kwargs: Any):
+            raise NotImplementedError
+
+        def compile_latex(self, workdir: Any, tex_name: str, **kwargs: Any):
+            raise NotImplementedError
+
+        def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+            return list(problems[self.name])
+
+        def describe(self) -> dict[str, Any]:
+            # Nothing in the description hints at a problem: only the backend's own
+            # readiness check, the one a run is refused on, knows.
+            return {
+                "backend": self.name,
+                "pdflatex": "/usr/bin/pdflatex",
+                "bibtex": "/usr/bin/bibtex",
+                "token_configured": True,
+            }
+
+        def close(self) -> None:
+            closed.append(self.name)
+
+    monkeypatch.setattr(compute, "get_backend", lambda name, **options: Backend(name))
+    register_client("anthropic", DescribedClient({"credential_source": "api_key"}))
+
+    report = doctor_module.collect()
+    assert report["ok"] is True
+    for name in ("local", "modal"):
+        assert report["compute"][name]["available"] is False
+        assert report["compute"][name]["problems"] == problems[name]
+        assert report["compute"][name]["error"] is None
+    assert closed == ["local", "modal"]
+    result = runner.invoke(cli.app, ["doctor"], env={"COLUMNS": "240"})
+    assert result.exit_code == 0, result.output
+    assert "pdflatex is too old to compile the paper." in result.output
+    assert "Modal is not authenticated on this machine." in result.output
+
+    problems = {"local": [], "modal": []}
+    report = doctor_module.collect()
+    assert report["compute"]["local"]["available"] and report["compute"]["modal"]["available"]
+    assert report["compute"]["modal"]["problems"] == []
+    result = runner.invoke(cli.app, ["doctor"], env={"COLUMNS": "240"})
+    assert "pdflatex: /usr/bin/pdflatex" in result.output and "token configured" in result.output
+
+
 def test_doctor_hints_at_optional_providers_from_the_environment(monkeypatch):
     register_client("anthropic", DescribedClient({"credential_source": "api_key"}))
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
@@ -731,14 +847,115 @@ def test_memory_dream_runs_a_forced_consolidation(run_dir):
     assert "[[lessons/latex]]" in (run_dir / "memory" / "MEMORY.md").read_text()
 
 
+def _files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        None,
+        "{ not json",
+        "[]",
+        '{"status": "running"}',
+        '{"config": {"models": {"reflection": ""}}}',
+    ],
+)
+def test_memory_dream_without_credentials_fails_cleanly_before_it_touches_the_memory(
+    state, run_dir
+):
+    Wiki(run_dir / "memory").add_note("something to consolidate", stage="outline")
+    if state is not None:
+        (run_dir / "state.json").write_text(state)
+    before = _files(run_dir)
+
+    # The tests have no credentials, and nothing here names another model than the default.
+    result = runner.invoke(cli.app, ["memory", "dream", "--run-dir", str(run_dir)])
+
+    assert result.exit_code == 1
+    error = " ".join(result.stderr.split())
+    assert error.startswith(
+        f"Error: The consolidation was not started: model '{DEFAULT_MODEL}' cannot be used: "
+        "No Anthropic credentials were found."
+    )
+    assert error.endswith(f"(details: paper-orchestra doctor --model {DEFAULT_MODEL})")
+    # One line, as for every other command; `doctor` has the setup instructions.
+    assert len(result.stderr.strip().splitlines()) == 1 and "Traceback" not in result.output
+    # No failed session was added to the memory's records, and the note is still waiting.
+    assert _files(run_dir) == before
+
+
+def test_memory_dream_defaults_to_the_reflection_model_of_the_run(run_dir):
+    wiki = Wiki(run_dir / "memory")
+    wiki.add_note("cleveref must load after hyperref", stage="section_writing", kind="lesson")
+    write_json(
+        run_dir / "state.json",
+        {
+            "status": "succeeded",
+            "config": {"models": {"writer": "fake-writer", "reflection": "fake-reviewer"}},
+        },
+    )
+    models: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        models.append(request.model)
+        return "Nothing to fold in."
+
+    register_client("fake", FakeLLM(responder))
+
+    # No Anthropic credentials exist here: the run's own model is what makes this work.
+    result = runner.invoke(cli.app, ["memory", "dream", "--run-dir", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    assert set(models) == {"fake-reviewer"}
+
+    # A memory directory leads to the run it belongs to; --focus asks for a session
+    # although no note is pending any more.
+    del models[:]
+    memory_dir = str(run_dir / "memory")
+    result = runner.invoke(
+        cli.app, ["memory", "dream", "--memory-dir", memory_dir, "--focus", "Check the links."]
+    )
+    assert result.exit_code == 0, result.output
+    assert set(models) == {"fake-reviewer"}
+
+    del models[:]
+    result = runner.invoke(
+        cli.app,
+        ["memory", "dream", "--run-dir", str(run_dir), "--model", "fake-dreamer",
+         "--focus", "Check the links."],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert set(models) == {"fake-dreamer"}
+
+
 def test_memory_dream_reports_failures_and_refuses_the_lab_memory(run_dir, tmp_path):
     Wiki(run_dir / "memory").add_note("something to consolidate", stage="outline")
-    # No client is registered for the model, so the consolidation cannot reach a model.
+    # No client is registered for the model: the consolidation is not even started.
     result = runner.invoke(
         cli.app, ["memory", "dream", "--run-dir", str(run_dir), "--model", "fake-dreamer"]
     )
     assert result.exit_code == 1
-    assert "The consolidation did not complete" in result.stderr
+    assert "The consolidation was not started: model 'fake-dreamer' cannot be used" in " ".join(
+        result.stderr.split()
+    )
+    assert "Traceback" not in result.output
+
+    # A session that fails once it is under way is reported after the fact.
+    def overloaded(request: FakeRequest) -> str:
+        raise LLMError("the model is overloaded")
+
+    register_client("fake", FakeLLM(overloaded))
+    result = runner.invoke(
+        cli.app, ["memory", "dream", "--run-dir", str(run_dir), "--model", "fake-dreamer"]
+    )
+    assert result.exit_code == 1
+    assert "The consolidation did not complete: LLMError: the model is overloaded" in " ".join(
+        result.stderr.split()
+    )
     assert "Traceback" not in result.output
 
     lab = Wiki(tmp_path / "lab", name="lab")
@@ -758,10 +975,17 @@ def test_modal_run_passes_the_remaining_arguments_to_modal(monkeypatch):
         return 3
 
     monkeypatch.setattr(subprocess, "call", fake_call)
+    # Only the command line handed to Modal is looked at, so the SDK need not be installed.
+    real = cli.importlib.util.find_spec
+    monkeypatch.setattr(
+        cli.importlib.util,
+        "find_spec",
+        lambda name, *args: object() if name == "modal" else real(name, *args),
+    )
     result = runner.invoke(
         cli.app,
         ["modal", "run", "--detach", "--raw-materials-dir", "raw", "--template", "cvpr2025",
-         "--use-plotting"],
+         "--plotting", "--model", "claude-opus-5-5"],
     )  # fmt: skip
 
     assert result.exit_code == 3
@@ -769,7 +993,8 @@ def test_modal_run_passes_the_remaining_arguments_to_modal(monkeypatch):
         [
             sys.executable, "-m", "modal", "run", "--detach",
             "-m", "paper_orchestra.modal_app::main",
-            "--raw-materials-dir", "raw", "--template", "cvpr2025", "--use-plotting",
+            "--raw-materials-dir", "raw", "--template", "cvpr2025",
+            "--plotting", "--model", "claude-opus-5-5",
         ]
     ]  # fmt: skip
 
@@ -806,7 +1031,21 @@ def test_modal_batch_submits_the_batch_to_the_deployed_app(tmp_path, template, m
         write_json(log, outcome)
         return log
 
+    real_run_batch_on_modal = cli.run_batch_on_modal
     monkeypatch.setattr(cli, "run_batch_on_modal", fake_run)
+    # The deployed function and the way to find a call again are only handed on here.
+    write_paper = object()
+    looked_up: list[tuple[str, str]] = []
+
+    def from_name(app_name: str, name: str) -> Any:
+        looked_up.append((app_name, name))
+        return write_paper
+
+    def from_id(call_id: str) -> Any:
+        raise AssertionError("no call is looked up by the command itself")
+
+    monkeypatch.setattr(modal.Function, "from_name", from_name)
+    monkeypatch.setattr(modal.FunctionCall, "from_id", from_id)
     (tmp_path / "papers" / "a" / "raw_materials").mkdir(parents=True)
     args = [
         "modal", "batch",
@@ -827,15 +1066,40 @@ def test_modal_batch_submits_the_batch_to_the_deployed_app(tmp_path, template, m
     call = calls[0]
     assert call["template_dir"] == template and call["root_input_folder"] == tmp_path / "papers"
     assert call["volume"] is modal_app.volume
-    assert isinstance(call["write_batch"], modal.Function)
+    # One call per paper, and a way to find a call again after the local side lost it.
+    assert call["write_paper"] is write_paper and "write_batch" not in call
+    assert looked_up == [(modal_app.SETTINGS.app_name, "write_paper")]
+    assert call["lookup_call"] is from_id
+    assert call["cancel"] is False
+    # The batch client is replaced above; this is the call it would really have received.
+    arguments = {name: value for name, value in call.items() if name != "options"}
+    inspect.signature(real_run_batch_on_modal).bind(call["options"], **arguments)
     options = call["options"]
     assert options["use_plotting"] is True and options["effort"] == "max"
+    assert options["keep_provided_figures"] is False
     assert options["writer_model"] == options["plotting_model"] == "claude-opus-5-5"
     assert options["fast_model"] == "claude-haiku-5-5" and options["image_model"] is None
     assert (options["memory"], options["lab_memory"], options["dream"]) == (True, False, "end")
     # Exactly the options a job is built from.
     job = modal_app.build_job(run_id="a", **options)
     assert job["models"]["reflection"] == "claude-opus-5-5" and job["memory"]["dream"] == "end"
+
+    # Without --model the fast role follows the writer, as it does for write and batch.
+    result = runner.invoke(
+        cli.app, [*args[:8], "--writer-model", "claude-opus-5-5", "--keep-provided-figures"]
+    )
+    assert result.exit_code == 0, result.output
+    options = calls[-1]["options"]
+    assert (options["writer_model"], options["fast_model"]) == ("claude-opus-5-5",) * 2
+    assert (options["reflection_model"], options["plotting_model"]) == (DEFAULT_MODEL,) * 2
+    assert options["keep_provided_figures"] is True
+    assert modal_app.build_job(run_id="a", **options)["keep_provided_figures"] is True
+
+    outcome = {"a": {"status": "cancelled", "paper_path": "", "call_id": "fc-1"}}
+    result = runner.invoke(cli.app, [*args, "--cancel"])
+    assert result.exit_code == 0, result.output
+    assert calls[-1]["cancel"] is True and calls[-1]["options"] == calls[0]["options"]
+    assert "0 written, 0 failed, 0 in error, 1 cancelled" in result.output
 
     outcome = {"a": {"status": "failed", "paper_path": "", "error": "stage failed"}}
     result = runner.invoke(cli.app, args)
@@ -849,22 +1113,42 @@ def test_modal_batch_submits_the_batch_to_the_deployed_app(tmp_path, template, m
     assert "paper-orchestra modal deploy" in " ".join(result.stderr.split())
 
     # Any other Modal failure is one line, not a traceback.
-    outcome = modal.exception.FunctionTimeoutError("write_batch ran out of time")
+    outcome = modal.exception.FunctionTimeoutError("write_paper ran out of time")
     result = runner.invoke(cli.app, args)
     assert result.exit_code == 1
-    assert "Modal reported FunctionTimeoutError: write_batch ran out of time" in result.stderr
+    assert "Modal reported FunctionTimeoutError: write_paper ran out of time" in result.stderr
 
 
-def test_the_modal_run_help_names_options_the_modal_entrypoint_has():
+def test_modal_help_says_what_the_commands_take():
+    result = runner.invoke(cli.app, ["modal", "run", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    lines = [line.strip() for line in result.output.splitlines()]
+    # Every option of the Modal entrypoint is listed as it is laid out, one per line.
+    for option, text in cli.MODAL_RUN_OPTIONS:
+        assert any(line.startswith(option) and line.endswith(text) for line in lines), option
+    assert "--run-id ID" in result.output and "resume" in result.output
+    assert "--model MODEL" in result.output
+    assert "--detach" in result.output and "--print-command" in result.output
+
+    result = runner.invoke(cli.app, ["modal", "batch", "--help"], env={"COLUMNS": "200"})
+    help_text = " ".join(result.output.split())
+    assert "run id derived from its paper id and the options" in help_text
+    assert "run the command again to re-attach" in help_text
+    assert "--cancel" in help_text and "--keep-provided-figures" in help_text
+
+
+def test_the_modal_run_help_lists_exactly_the_options_of_the_modal_entrypoint():
     pytest.importorskip("modal")
     from paper_orchestra import modal_app
 
-    example = cli.modal_run.__doc__.split("e.g.", 1)[1]
-    flags = [word.rstrip(".") for word in example.split() if word.startswith("--")]
-    assert flags == ["--raw-materials-dir", "--template", "--plotting"]
-    parameters = inspect.signature(modal_app.main.info.raw_f).parameters
-    for flag in flags:
-        assert flag.removeprefix("--").replace("-", "_") in parameters
+    expected = []
+    for name, parameter in inspect.signature(modal_app.main.info.raw_f).parameters.items():
+        flag = name.replace("_", "-")
+        # Modal gives every switch a --no- form; the help shows the one that changes something.
+        expected.append(f"--no-{flag}" if parameter.default is True else f"--{flag}")
+    documented = [option.split()[0] for option, _ in cli.MODAL_RUN_OPTIONS]
+    assert sorted(documented) == sorted(expected)
+    assert {"--run-id", "--model", "--raw-materials-dir", "--template"} <= set(documented)
 
 
 def test_modal_commands_need_the_modal_sdk(monkeypatch):
@@ -900,6 +1184,85 @@ def test_main_loads_the_environment_and_logging_before_dispatch(monkeypatch, cap
     monkeypatch.setattr(cli, "app", dispatch)
     cli.main(["doctor"])
     assert order == ["load_env", "setup_logging", "dispatch ['doctor']"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+def test_main_turns_sigterm_into_the_interrupt_path(monkeypatch):
+    monkeypatch.setattr(cli, "load_env", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda: None)
+    # Left at its default, SIGTERM would end the test process; with this handler in place
+    # a command line that does nothing about SIGTERM is a failing test instead.
+    unhandled: list[int] = []
+    signal.signal(signal.SIGTERM, lambda signum, frame: unhandled.append(signum))
+
+    def command(args: list[str] | None = None) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)  # what kill, timeout and job schedulers send
+        time.sleep(2)
+        raise AssertionError("the command was not interrupted")
+
+    monkeypatch.setattr(cli, "app", command)
+    # KeyboardInterrupt is what `write` and `batch` close their state and workers on.
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["write"])
+    assert unhandled == []
+
+
+#: The real command line and pipeline, with a model whose first answer never comes.
+STUCK_MODEL_DRIVER = """
+import sys
+import time
+from pathlib import Path
+
+from paper_orchestra import cli
+from paper_orchestra.compute.local import LocalBackend
+from paper_orchestra.llm.fake import FakeLLM
+from paper_orchestra.llm.router import register_client
+
+
+def stuck(request):
+    Path(sys.argv[1]).write_text("")
+    time.sleep(120)
+    return "{}"
+
+
+register_client("fake", FakeLLM(stuck))
+# The run is stopped long before anything is compiled, so TeX need not be installed.
+LocalBackend.check = lambda self, **kinds: []
+cli.main(sys.argv[2:])
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+def test_sigterm_on_write_closes_the_run_as_interrupted(materials, template, tmp_path):
+    driver = tmp_path / "driver.py"
+    driver.write_text(STUCK_MODEL_DRIVER)
+    model_called, out = tmp_path / "model-called", tmp_path / "out"
+    proc = subprocess.Popen(
+        [sys.executable, str(driver), str(model_called), "write",
+         "--raw-materials-dir", str(materials), "--template", str(template),
+         "--output-dir", str(out), "--model", "fake-model", "--no-lab-memory"],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )  # fmt: skip
+    try:
+        deadline = time.monotonic() + 60
+        while not model_called.exists():
+            assert proc.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        assert read_json(out / "state.json")["status"] == "running"
+        proc.terminate()  # SIGTERM: kill, timeout, a job scheduler
+        assert proc.wait(timeout=60) == 130
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    # The run was closed the way Ctrl-C closes it, not left looking as if it still ran.
+    state = read_json(out / "state.json")
+    assert state["status"] == "interrupted"
+    assert "interrupted" in {record["status"] for record in state["stages"].values()}
+    assert "running" not in {record["status"] for record in state["stages"].values()}
 
 
 def test_logs_go_to_stderr_so_that_stdout_stays_machine_readable(monkeypatch, capsys):
@@ -966,3 +1329,81 @@ def test_importing_the_cli_loads_no_agent_and_no_provider_sdk(tmp_path):
         check=True,
     )
     assert completed.stdout.strip() == "[]"
+
+
+# -- the repository around the command line ----------------------------------------
+
+
+def test_ci_tests_the_python_version_of_each_matrix_job_with_all_extras(repo_root):
+    workflow = repo_root / ".github" / "workflows" / "ci.yml"
+    if not workflow.is_file():
+        pytest.skip("not running from a checkout")
+    text = workflow.read_text()
+
+    # Without this, `uv run` takes its interpreter from .python-version, whatever the job
+    # is called, and rebuilds the environment on it.
+    assert "UV_PYTHON: ${{ matrix.python-version }}" in text
+    assert "uv sync --all-extras" in text
+    commands = [
+        line.strip()
+        for line in text.splitlines()
+        if "uv run " in line and not line.lstrip().startswith("#")
+    ]
+    # Every step uses the environment as `uv sync --all-extras` left it.  A plain `uv run`
+    # may rebuild it, and then without the extras: the tests of the optional providers,
+    # Modal and the frontend would be skipped without a word.
+    assert commands and all("uv run --no-sync " in command for command in commands)
+    for tool in ("ruff check .", "ruff format --check .", "pytest"):
+        assert any(command.endswith(f"uv run --no-sync {tool}") for command in commands), tool
+
+
+def test_the_output_directories_of_the_documented_commands_are_ignored_by_git(repo_root):
+    readme, gitignore = repo_root / "README.md", repo_root / ".gitignore"
+    if not (readme.is_file() and gitignore.is_file()):
+        pytest.skip("not running from a checkout")
+    patterns = [
+        line.strip().rstrip("/")
+        for line in gitignore.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith(("#", "!"))
+    ]
+    documented = set(re.findall(r"--output-dir[ =]([A-Za-z0-9_.-]+)", readme.read_text()))
+
+    # Generated papers and copies of the raw materials must not show up in `git status`.
+    assert {"paper_output", "batch_output"} <= documented
+    for directory in sorted(documented):
+        assert any(fnmatch.fnmatch(directory, pattern) for pattern in patterns), directory
+
+
+#: The console script with a command that is interrupted while a worker thread is still
+#: inside a long call, the way a stage's thread pool is during a model call.
+BUSY_THREAD_DRIVER = """
+import atexit, sys, threading, time
+from pathlib import Path
+from paper_orchestra import cli
+
+marker = Path(sys.argv[1])
+sys.argv = ["paper-orchestra", "write"]
+
+def command(args=None):
+    threading.Thread(target=time.sleep, args=(120,)).start()  # not a daemon thread
+    atexit.register(lambda: marker.write_text("exit handlers ran"))
+    raise SystemExit(130)  # what the command line turns Ctrl-C into
+
+cli.load_env = lambda: None
+cli.app = command
+cli.main()
+"""
+
+
+def test_an_interrupted_command_does_not_wait_for_calls_in_flight(tmp_path):
+    marker = tmp_path / "marker"
+    started = time.monotonic()
+    finished = subprocess.run(
+        [sys.executable, "-c", BUSY_THREAD_DRIVER, str(marker)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert finished.returncode == 130, finished.stderr
+    assert time.monotonic() - started < 30  # not the two minutes the busy thread would take
+    assert marker.read_text() == "exit handlers ran"  # backends are closed, logs flushed

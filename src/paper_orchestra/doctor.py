@@ -154,15 +154,19 @@ def _compute_report(name: str) -> dict[str, Any]:
         backend = get_backend(name)
         try:
             info = dict(backend.describe())
+            # The backend's own answer, the one a run is refused on before it starts.
+            problems = [str(problem) for problem in backend.check()]
         finally:
             backend.close()
     except Exception as exc:
         return {"backend": name, "available": False, "error": _message(exc)}
-    if name == "local":
-        available = bool(info.get("pdflatex") and info.get("bibtex"))
-    else:
-        available = bool(info.get("token_configured"))
-    return {**info, "backend": name, "available": available, "error": None}
+    return {
+        **info,
+        "backend": name,
+        "available": not problems,
+        "problems": problems,
+        "error": None,
+    }
 
 
 def _memory_report(environ: Mapping[str, str]) -> dict[str, Any]:
@@ -263,19 +267,19 @@ def render(report: Mapping[str, Any], console: Console) -> None:
     if local["available"]:
         row("compute: local", "ok", _details(local, skip=("backend", "available", "error")))
     else:
-        row(
-            "compute: local",
-            "missing",
-            local.get("error")
-            or "pdflatex/bibtex not found on PATH: install TeX Live or use --compute modal",
-        )
+        row("compute: local", "missing", local.get("error") or " ".join(local["problems"]))
     modal = report["compute"]["modal"]
     if modal.get("error"):
         row("compute: modal (optional)", "unavailable", modal["error"])
     elif modal["available"]:
-        row("compute: modal (optional)", "ok", "token configured")
+        # Inside a Modal Function the backend is ready without a token of its own.
+        row(
+            "compute: modal (optional)",
+            "ok",
+            "token configured" if modal.get("token_configured") else "ready",
+        )
     else:
-        row("compute: modal (optional)", "not configured", "no Modal token: run `modal setup`")
+        row("compute: modal (optional)", "not configured", " ".join(modal["problems"]))
     table.add_section()
 
     if report["semantic_scholar_api_key"]:

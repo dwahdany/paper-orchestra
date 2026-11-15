@@ -8,7 +8,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
+from paper_orchestra.compute.base import (
+    BackendUnusable,
+    CompileResult,
+    ComputeBackend,
+    ComputeError,
+    ExecResult,
+)
 
 if TYPE_CHECKING:
     from paper_orchestra.compute.local import LocalBackend
@@ -16,6 +22,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BACKEND_NAMES",
+    "BackendUnusable",
     "CompileResult",
     "ComputeBackend",
     "ComputeError",
