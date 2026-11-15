@@ -655,6 +655,47 @@ def test_generated_bibtex_needs_no_font_encoding_beyond_the_default(tmp_path):
     assert "Jastrzebski" in bbl and "Dorde" in bbl and "Parameter-Efficient" in bbl
 
 
+def test_author_names_bibtex_cannot_parse_are_taken_literally():
+    odd = paper_data(
+        "Odd2020",
+        authors=[
+            "Dept. of Computer Science, Univ. of X, City, Country",  # an affiliation
+            "Ed ] Itor",
+            ",",
+            "Smith, Jr., John",
+            "Ann Author,",
+        ],
+    )
+    assert (
+        "  author={{Dept. of Computer Science, Univ. of X, City, Country} and {Ed ] Itor} "
+        "and Smith, Jr., John and Ann Author},\n"
+    ) in bibtex_entry(odd)
+
+
+@pytest.mark.latex
+def test_generated_bibtex_compiles_with_author_year_citations_and_odd_names(tmp_path):
+    papers = [
+        paper_data(
+            "Odd2020",
+            authors=["Itor ]", "Dept. of Computer Science, Univ. of X, City, Country", ","],
+        ),
+        paper_data("Plain2021", authors=["Stanisław Jastrzębski", "Ann Author"], year=2021),
+    ]
+    (tmp_path / "references.bib").write_text(generate_bibtex(papers), encoding="utf-8")
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\n\\usepackage{natbib}\n\\begin{document}\n"
+        "\\citet{Odd2020} and \\citep{Plain2021}.\n"
+        "\\bibliographystyle{plainnat}\n\\bibliography{references}\n\\end{document}\n",
+        encoding="utf-8",
+    )
+    result = LocalBackend().compile_latex(tmp_path, "paper")
+    assert result.ok and result.errors == [], result.feedback()
+    # Errors raised while the .aux and .bbl are read are only visible in the log itself.
+    log_text = (tmp_path / "paper.log").read_text(errors="replace")
+    assert "Error" not in log_text and "Missing \\endcsname" not in log_text
+    assert "error message" not in (tmp_path / "paper.blg").read_text(errors="replace")
+
+
 # -- the whole stage ---------------------------------------------------------
 
 

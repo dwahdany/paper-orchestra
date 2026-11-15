@@ -21,7 +21,8 @@ Stages run in this order::
 
 Each stage is retried on its own, its outcome is persisted in ``state.json``
 after every transition, and a later invocation in the same directory resumes
-after the last stage that completed (as long as the inputs did not change).
+after the last stage that completed (as long as the inputs did not change and
+the research cutoff did not move earlier).
 Agents are created through the module-level factory functions below, which
 import lazily, so tests can swap in stubs and importing this module stays cheap.
 """
@@ -340,6 +341,22 @@ def _fingerprint(cfg: PipelineConfig, paths: RunPaths) -> str:
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
             add(f"{label}/{path.relative_to(root).as_posix()}", path)
     return digest.hexdigest()
+
+
+def _cutoff_moved_earlier(previous: dict[str, Any], current: str) -> bool:
+    """Whether the earlier run could have collected literature that ``current`` rules out."""
+    from paper_orchestra.utils.scholar import parse_cutoff
+
+    cutoff = parse_cutoff(current)
+    if cutoff is None:
+        return False
+    config = previous.get("config")
+    earlier = config.get("research_cutoff") if isinstance(config, dict) else None
+    try:
+        earlier_cutoff = parse_cutoff(earlier if isinstance(earlier, str) else None)
+    except ValueError:
+        return True
+    return earlier_cutoff is None or cutoff < earlier_cutoff
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +705,15 @@ class _Runner:
                 "The idea, experimental log, figures or template changed since the previous run "
                 "in %s, so every stage runs again. The project memory there is kept; use a new "
                 "output directory for an unrelated paper.",
+                paths.base_dir,
+            )
+            return None
+        if _cutoff_moved_earlier(previous, cfg.research_cutoff):
+            # A later cutoff keeps what was collected valid; an earlier one does not.
+            log.warning(
+                "The research cutoff is now %s, earlier than in the previous run in %s, so "
+                "every stage runs again: the literature collected then may be too recent.",
+                cfg.research_cutoff,
                 paths.base_dir,
             )
             return None

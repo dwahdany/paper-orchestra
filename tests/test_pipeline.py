@@ -945,6 +945,27 @@ def test_changed_inputs_or_no_resume_start_over(cfg, stubs, monkeypatch, change)
     assert rows["outline.OutlineAgent"]["requests"] == 1
 
 
+def test_an_earlier_research_cutoff_invalidates_what_was_collected(cfg, stubs, monkeypatch, caplog):
+    cfg.research_cutoff = "2025-06"
+    run(cfg)
+
+    # A later cutoff (the default moves on every month) keeps the collected literature valid.
+    cfg.research_cutoff = "2025-09"
+    later = StubAgents().install(monkeypatch)
+    assert run(cfg)[0].success and later.calls == []
+
+    # An earlier one does not: papers from the months in between may have been cited.
+    cfg.research_cutoff = "2025-03"
+    earlier = StubAgents().install(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result, _, _ = run(cfg)
+    assert result.success
+    assert earlier.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert not any(record["reused"] for record in result.stages.values())
+    assert "research cutoff is now 2025-03" in caplog.text
+    assert state_of(cfg)["config"]["research_cutoff"] == "2025-03"
+
+
 def test_enabling_plotting_on_resume_reruns_from_the_parallel_stage(cfg, stubs, monkeypatch):
     run(cfg)
     cfg.use_plotting = True

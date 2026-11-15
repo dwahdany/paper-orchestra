@@ -279,8 +279,9 @@ def check_credentials(environ: Mapping[str, str]) -> str:
             raise JobError(
                 f"{' and '.join(static)} is set next to the Workload Identity Federation ids "
                 f"({', '.join(_WIF_REQUIRED)}). The Anthropic SDK would silently use it instead "
-                "of the keyless identity. Remove it from the Modal Secret, or drop the "
-                "federation ids, so that exactly one credential is configured."
+                f"of the keyless identity. Remove it from the Modal Secret (or set {SECRET_ENV}="
+                f"{NO_SECRET} to attach no Secret), or drop the federation ids, so that exactly "
+                "one credential is configured."
             )
         if not any(environ.get(name) for name in _IDENTITY_TOKEN_VARS):
             raise JobError(
