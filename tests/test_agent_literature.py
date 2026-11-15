@@ -628,35 +628,6 @@ def test_generated_bibtex_compiles_with_hostile_metadata(tmp_path):
     assert bbl.count("\\bibitem") == 3 and "{\\L}ukasz" in bbl
 
 
-@pytest.mark.latex
-def test_generated_bibtex_needs_no_font_encoding_beyond_the_default(tmp_path):
-    papers = [
-        paper_data(
-            "Houlsby2019",
-            title="Parameter\u2010Efficient TD(λ): a < b | c > d, 3×3 \u2212 5 µm",
-            authors=[
-                "Stanisław Jastrzębski",
-                "Đorđe Miladinović",
-                "Þór Guðmundsson",
-                "Jonas Kazlauskų",
-            ],
-        )
-    ]
-    (tmp_path / "references.bib").write_text(generate_bibtex(papers), encoding="utf-8")
-    (tmp_path / "paper.tex").write_text(
-        "\\documentclass{article}\n\\begin{document}\nText \\cite{Houlsby2019}.\n"
-        "\\bibliographystyle{plain}\n\\bibliography{references}\n\\end{document}\n",
-        encoding="utf-8",
-    )
-    result = LocalBackend().compile_latex(tmp_path, "paper")
-    assert result.ok and result.errors == [], result.feedback()
-    # The log of the last pass, read directly: nothing went wrong inside the .bbl either.
-    log_text = (tmp_path / "paper.log").read_text(errors="replace")
-    assert "LaTeX Error" not in log_text and "Undefined control sequence" not in log_text
-    bbl = (tmp_path / "paper.bbl").read_text()
-    assert "Jastrzebski" in bbl and "Dorde" in bbl and "Parameter-Efficient" in bbl
-
-
 def test_author_names_bibtex_cannot_parse_are_taken_literally():
     odd = paper_data(
         "Odd2020",
@@ -675,18 +646,29 @@ def test_author_names_bibtex_cannot_parse_are_taken_literally():
 
 
 @pytest.mark.latex
-def test_generated_bibtex_compiles_with_author_year_citations_and_odd_names(tmp_path):
+def test_generated_bibtex_compiles_in_the_default_encoding_with_author_year_citations(tmp_path):
     papers = [
+        paper_data(
+            "Houlsby2019",
+            title="Parameter\u2010Efficient TD(λ): a < b | c > d, 3×3 \u2212 5 µm, Ａ＆Ｂ",
+            authors=[
+                "Stanisław Jastrzębski",
+                "Đorđe Miladinović",
+                "Þór Guðmundsson",
+                "Jonas Kazlauskų",
+            ],
+        ),
         paper_data(
             "Odd2020",
             authors=["Itor ]", "Dept. of Computer Science, Univ. of X, City, Country", ","],
+            year=2021,
         ),
-        paper_data("Plain2021", authors=["Stanisław Jastrzębski", "Ann Author"], year=2021),
     ]
     (tmp_path / "references.bib").write_text(generate_bibtex(papers), encoding="utf-8")
+    # natbib prints the author names where they are cited and puts them in \bibitem[...].
     (tmp_path / "paper.tex").write_text(
         "\\documentclass{article}\n\\usepackage{natbib}\n\\begin{document}\n"
-        "\\citet{Odd2020} and \\citep{Plain2021}.\n"
+        "\\citet{Houlsby2019} and \\citep{Odd2020}.\n"
         "\\bibliographystyle{plainnat}\n\\bibliography{references}\n\\end{document}\n",
         encoding="utf-8",
     )
@@ -694,9 +676,17 @@ def test_generated_bibtex_compiles_with_author_year_citations_and_odd_names(tmp_
     assert result.ok and result.errors == [], result.feedback()
     # The log of the last pass, read directly: the .aux and the .bbl were read cleanly.
     log_text = (tmp_path / "paper.log").read_text(errors="replace")
-    for symptom in ("LaTeX Error", "natbib Error", "Missing \\endcsname"):
+    for symptom in (
+        "LaTeX Error",  # "Command \k unavailable in encoding OT1"
+        "natbib Error",
+        "Undefined control sequence",  # \lamda
+        "Misplaced alignment tab",  # a bare &
+        "Missing \\endcsname",  # a ] that ended \bibitem[...] early
+    ):
         assert symptom not in log_text
     assert "error message" not in (tmp_path / "paper.blg").read_text(errors="replace")
+    bbl = (tmp_path / "paper.bbl").read_text()
+    assert "Jastrzebski" in bbl and "Dorde" in bbl and "Parameter-Efficient" in bbl
 
 
 # -- the whole stage ---------------------------------------------------------
