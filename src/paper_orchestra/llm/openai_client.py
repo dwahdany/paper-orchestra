@@ -446,6 +446,7 @@ class OpenAIClient(LLMClient):
         max_turns: int = 60,
         label: str = "",
         on_event: EventSink | None = None,
+        single_turn: bool = False,
     ) -> Conversation:
         if tools:
             raise LLMConfigError(

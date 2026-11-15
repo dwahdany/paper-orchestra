@@ -318,8 +318,14 @@ class Wiki:
         always_collapse: Sequence[str] = (),
         clock: Callable[[], datetime] | None = None,
         create: bool = True,
+        seed_index: bool = True,
     ) -> None:
-        """``create=False`` opens an existing memory directory without touching it (viewers)."""
+        """``create=False`` opens an existing memory directory without touching it (viewers).
+
+        ``seed_index=False`` creates the directories but leaves writing ``MEMORY.md`` to
+        whoever maintains the wiki: for a wiki that several runs share and only one
+        process may rewrite.
+        """
         self.root = Path(root)
         self.name = name
         self.description = description
@@ -337,10 +343,11 @@ class Wiki:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._cache: dict[str, _Cached] = {}
+        self._seed_index = create and seed_index
         if create:
             for sub in (WIKI_DIR, NOTES_DIR, TRANSCRIPTS_DIR):
                 (self.root / sub).mkdir(parents=True, exist_ok=True)
-            if not (self.root / INDEX_FILE).exists():
+            if seed_index and not (self.root / INDEX_FILE).exists():
                 self.rebuild_index()
 
     # -- paths ---------------------------------------------------------------
@@ -910,7 +917,13 @@ class Wiki:
     def injected_context(self) -> str:
         """The text loaded into every session: ``MEMORY.md``, hard-capped."""
         path = self.root / INDEX_FILE
-        text = path.read_text(encoding="utf-8") if path.is_file() else self.rebuild_index()
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+        elif self._seed_index:
+            text = self.rebuild_index()
+        else:
+            # Not ours to write: say what is known without creating the file.
+            text = f"# Memory index: {self.name}\n\n_Nothing has been consolidated yet._\n"
         lines = text.splitlines()
         truncated = len(lines) > self.index_max_lines
         lines = lines[: self.index_max_lines]

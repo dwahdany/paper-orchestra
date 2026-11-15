@@ -354,6 +354,9 @@ class ContextHarness:
                 index_max_lines=80,
                 index_max_bytes=8_000,
                 standing_max_lines=15,
+                # Where a separate pass maintains the shared wiki, this run must not even
+                # write its first index: it only reads the wiki and adds notes.
+                seed_index=cfg.memory.lab_consolidate,
             )
             if lab_dir is not None
             else None
@@ -445,6 +448,7 @@ class ContextHarness:
         max_turns: int = 60,
         label: str | None = None,
         memory_root: Literal["project", "lab"] = "project",
+        single_turn: bool = False,
     ) -> HarnessConversation:
         """Open a conversation with memory, transcript and usage accounting attached.
 
@@ -530,6 +534,7 @@ class ContextHarness:
             max_turns=max_turns,
             label=label,
             on_event=on_event,
+            single_turn=single_turn,
         )
         return HarnessConversation(
             self,
@@ -580,6 +585,9 @@ class ContextHarness:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 label=label,
+                # One user turn and the conversation is dropped: nothing would read a
+                # cached tail.  (A provider keeps caching when the turn can loop on tools.)
+                single_turn=True,
             )
             try:
                 return conversation.send(

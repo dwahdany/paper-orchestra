@@ -611,3 +611,31 @@ def test_lab_guard_also_vets_edits(tmp_path):
         memory=MemoryPolicy(write="all"),
     ).send("go")
     assert "91.27" not in harness.lab.read_text("wiki/lessons/tables.md")
+
+
+def test_a_run_that_leaves_lab_consolidation_to_others_writes_no_lab_index(tmp_path):
+    cfg = PipelineConfig(
+        base_dir=tmp_path / "run",
+        template_dir=tmp_path,
+        memory=MemoryConfig(lab_dir=tmp_path / "lab", lab_consolidate=False),
+    )
+    client = FakeLLM(lambda request: "ok")
+    harness = ContextHarness.create(cfg, client_for=lambda model: client)
+    harness.generate("task", agent="writer", stage="outline", model="fake")
+    harness.lab.add_note("A lesson.", kind="lesson")
+    harness.refresh()
+    # The run saw an (empty) lab index and added a note, but created no shared index file.
+    assert "Nothing has been consolidated yet" in client.requests[0].system
+    assert not (tmp_path / "lab" / "MEMORY.md").exists()
+    assert len(harness.lab.pending_notes()) == 1
+    # The pass that maintains the lab writes it.
+    maintained = ContextHarness.create(
+        PipelineConfig(
+            base_dir=tmp_path / "other",
+            template_dir=tmp_path,
+            memory=MemoryConfig(lab_dir=tmp_path / "lab", dream="off"),
+        ),
+        client_for=lambda model: client,
+    )
+    maintained.consolidate_lab_memory()
+    assert (tmp_path / "lab" / "MEMORY.md").is_file()

@@ -13,7 +13,8 @@ import json
 import logging
 import os
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -72,6 +73,7 @@ def _hermetic_environment(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(ac, "STREAM_RESTART_DELAY_S", 0.0)
+    monkeypatch.setattr(ac, "TOKEN_RETRY_DELAY_S", 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +114,8 @@ def sse(message: dict[str, Any], *, first_events: int | None = None) -> bytes:
         "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 0},
     }
     start.pop("stop_details", None)
+    # The API names the code-execution container at the end of the stream.
+    start.pop("container", None)
     events: list[dict[str, Any]] = [{"type": "message_start", "message": start}]
     for index, block in enumerate(message["content"]):
         kind = block["type"]
@@ -133,8 +137,9 @@ def sse(message: dict[str, Any], *, first_events: int | None = None) -> bytes:
         events.extend({"type": "content_block_delta", "index": index, "delta": d} for d in deltas)
         events.append({"type": "content_block_stop", "index": index})
     delta: dict[str, Any] = {"stop_reason": message["stop_reason"], "stop_sequence": None}
-    if "stop_details" in message:
-        delta["stop_details"] = message["stop_details"]
+    for late in ("stop_details", "container"):
+        if late in message:
+            delta[late] = message[late]
     events.append({"type": "message_delta", "delta": delta, "usage": usage})
     events.append({"type": "message_stop"})
     return "".join(
@@ -383,6 +388,85 @@ def test_second_turn_extends_the_journal_and_usage_accumulates(api, client):
     assert [turn["role"] for turn in journal] == ["user", "assistant", "user", "assistant"]
     journal.clear()  # a copy: the conversation's own journal is unaffected
     assert len(conversation.journal) == 4
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching
+# ---------------------------------------------------------------------------
+
+EPHEMERAL = {"type": "ephemeral"}
+
+
+def test_one_shot_call_does_not_mark_its_tail_for_caching(api, client):
+    api.script += [msg([text("no json here")]), msg([text('{"score": 4}')])]
+    response = client.generate(
+        "Score this paper.", model=MODEL, system="You review papers.", parser=parse_json
+    )
+    assert response.parsed == {"score": 4}
+    # Each attempt is one request that no later request reads back, so a marker
+    # on its tail would buy the cache-write premium and nothing else.
+    assert ["cache_control" in body for body in api.requests] == [False, False]
+    # The system prompt is shared by every call of its kind; its marker stays.
+    assert [body["system"][0]["cache_control"] for body in api.requests] == [EPHEMERAL] * 2
+
+    api.script.append(msg([text("once")]))
+    client.conversation(model=MODEL, single_turn=True).send("Asked once.")
+    assert "cache_control" not in api.requests[2]
+
+
+def test_one_shot_call_with_web_search_keeps_the_tail_marker(api, client):
+    # A server-tool loop reads the prefix back within the call, and again after a pause.
+    api.script.append(msg([text("found")]))
+    client.generate("Find papers.", model=MODEL, web_search=WebSearch(max_uses=2))
+    assert api.requests[0]["cache_control"] == EPHEMERAL
+
+
+@pytest.mark.parametrize("tool", ["memory", "lookup"])
+def test_single_turn_with_client_tools_marks_the_tail_of_every_request(api, client, tool):
+    if tool == "memory":
+        options: dict[str, Any] = {"memory": DictMemory()}
+        tool_input = {"command": "view", "path": "/memories"}
+    else:
+        schema = {"type": "object", "properties": {}}
+        options = {"tools": [ToolSpec("lookup", "Look a term up.", schema, lambda _: "page text")]}
+        tool_input = {}
+    api.script += [msg([tool_use("tu_1", tool, tool_input)], "tool_use"), msg([text("done")])]
+    conversation = client.conversation(model=MODEL, system="S", single_turn=True, **options)
+    assert conversation.send("Outline it.").text == "done"
+    # One turn, but two requests: the second reads back what the first wrote.
+    assert [body["cache_control"] for body in api.requests] == [EPHEMERAL] * 2
+    assert [body["system"][0]["cache_control"] for body in api.requests] == [EPHEMERAL] * 2
+
+
+def test_multi_turn_conversation_marks_the_tail_of_every_request(api, client):
+    api.script += [msg([text("a draft")]), msg([text("a repaired draft")])]
+    conversation = client.conversation(model=MODEL, system="S")
+    conversation.send("Write the paper.")
+    conversation.send("Fix the compile error.")
+    assert [body["cache_control"] for body in api.requests] == [EPHEMERAL] * 2
+
+
+def test_pipeline_one_shot_calls_mark_the_tail_only_where_a_request_reads_it_back(api, client):
+    # The pipeline's model calls go through the memory harness, not `client.generate`.
+    from paper_orchestra.memory import ContextHarness, MemoryPolicy
+
+    harness = ContextHarness(client_for=lambda _model: client)
+    who: dict[str, Any] = {"agent": "Reviewer", "stage": "refinement", "model": MODEL}
+    plain = MemoryPolicy.none()
+    api.script += [msg([text(reply)]) for reply in ("fine", "found", "a draft", "repaired")]
+
+    # Reviewers, the plot planner, the format review: one request, then dropped.
+    harness.generate("Review the format.", system="You review papers.", memory=plain, **who)
+    assert "cache_control" not in api.requests[0]
+    assert api.requests[0]["system"][0]["cache_control"] == EPHEMERAL
+    # Literature discovery is one-shot and memory-less too, but a server-tool loop.
+    harness.generate("Find papers.", memory=plain, web_search=WebSearch(max_uses=3), **who)
+    assert api.requests[1]["cache_control"] == EPHEMERAL
+    # A writer conversation: the repair turn reads the first turn back.
+    conversation = harness.open(memory=plain, **who)
+    conversation.send("Write the paper.")
+    conversation.send("Fix the compile error.")
+    assert [body["cache_control"] for body in api.requests[2:]] == [EPHEMERAL] * 2
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +1023,82 @@ def test_structured_output_after_a_tool_loop_parses_the_closing_turn(api, client
     assert all("format" in body["output_config"] for body in api.requests)
 
 
+SAVE_NOTE = {"command": "create", "path": "/memories/notes/done.md", "file_text": "decided"}
+
+
+@pytest.mark.parametrize("closing", [[], [thinking("S2")]], ids=["empty", "thinking-only"])
+def test_structured_answer_delivered_before_the_last_tool_call_is_still_returned(
+    api, client, closing
+):
+    # Under a response format the model cannot close with a confirmation sentence:
+    # after saving its note it either repeats the whole JSON or writes nothing.
+    draft = {"title": "Draft", "sections": []}
+    payload = {"title": "T", "sections": ["Intro"]}
+    api.script += [
+        msg(
+            [
+                text(json.dumps(draft)),
+                tool_use("tu_1", "memory", {"command": "view", "path": "/memories"}),
+            ],
+            "tool_use",
+        ),
+        msg([text(json.dumps(payload)), tool_use("tu_2", "memory", SAVE_NOTE)], "tool_use"),
+        msg(closing),
+    ]
+    memory = DictMemory()
+    conversation = client.conversation(model=MODEL, memory=memory)
+    response = conversation.send("Outline it.", schema=Outline)
+    # The newest answer of the exchange, on its own: each turn's text is a whole document.
+    assert response.parsed == Outline(**payload)
+    assert json.loads(response.text) == payload
+    assert response.tool_calls == 2 and len(api.requests) == 3
+    assert memory.files["/memories/notes/done.md"] == "decided"
+
+    # The same holds for a plain JSON schema.
+    api.script += [
+        msg([text('{"score": 4}'), tool_use("tu_3", "memory", SAVE_NOTE)], "tool_use"),
+        msg(closing),
+    ]
+    schema = {"type": "object", "properties": {"score": {"type": "integer"}}, "required": ["score"]}
+    assert conversation.send("Score it.", schema=schema).parsed == {"score": 4}
+
+
+def test_structured_closing_answer_wins_over_an_earlier_one(api, client):
+    class Review(BaseModel):
+        score: int = Field(ge=1, le=5)
+
+    view = {"command": "view", "path": "/memories"}
+    api.script += [
+        msg([text('{"score": 2}'), tool_use("tu_1", "memory", view)], "tool_use"),
+        msg([text('{"score": 4}')]),
+        msg([text('{"score": 3}'), tool_use("tu_2", "memory", view)], "tool_use"),
+        msg([text('{"score": 9}')]),
+    ]
+    conversation = client.conversation(model=MODEL, memory=DictMemory())
+    assert conversation.send("Review.", schema=Review).parsed == Review(score=4)
+    # A closing answer that fails validation is the model's final word and is
+    # reported; handing back the draft it replaced would hide that.
+    with pytest.raises(LLMParseError, match="score") as caught:
+        conversation.send("Review again.", schema=Review)
+    assert caught.value.raw_text == '{"score": 9}'
+
+
+def test_structured_output_without_any_valid_answer_still_fails(api, client):
+    view = {"command": "view", "path": "/memories"}
+    api.script += [
+        msg([tool_use("tu_1", "memory", view)], "tool_use"),
+        msg([]),
+        msg([text('{"title": 7}'), tool_use("tu_2", "memory", view)], "tool_use"),
+        msg([]),
+    ]
+    conversation = client.conversation(model=MODEL, memory=DictMemory())
+    with pytest.raises(LLMParseError) as caught:
+        conversation.send("Outline it.", schema=Outline)
+    assert caught.value.raw_text == ""
+    lenient = conversation.send("Outline it.", schema=Outline, require_parsed=False)
+    assert lenient.parsed is None and lenient.text == ""
+
+
 def test_bad_request_after_the_format_was_accepted_is_not_blamed_on_the_schema(api, client):
     ping = ToolSpec("ping", "Ping.", {"type": "object", "properties": {}}, lambda _: "pong")
     api.script += [
@@ -984,16 +1144,186 @@ def test_max_tokens_raises_truncated_with_the_partial_text(api, client):
         msg([text("Saving."), tool_use("tu_1", "save", {})], "max_tokens"),
         msg([text("too long")], "model_context_window_exceeded"),
     ]
-    conversation = client.conversation(model=MODEL, tools=[tool])
+    # A limit the caller chose is the caller's to change: each truncation is reported at once.
+    conversation = client.conversation(model=MODEL, tools=[tool], max_tokens=1000)
     with pytest.raises(LLMTruncated, match="before it was finished") as caught:
         conversation.send("Write a lot.")
     assert caught.value.partial_text == "The first half of"
+    assert "raise it (up to 128000)" in str(caught.value)
     with pytest.raises(LLMTruncated, match="middle of a tool call"):
         conversation.send("Save it.")
     assert ran == []  # a truncated tool call is never executed
     with pytest.raises(LLMTruncated, match="context window"):
         conversation.send("More.")
     assert conversation.journal == []
+    assert [body["max_tokens"] for body in api.requests] == [1000] * 3
+
+
+def test_default_limit_is_raised_once_after_a_truncation(api, client, caplog):
+    api.script += [
+        msg([thinking("S1"), text("The first half of")], "max_tokens"),
+        msg([thinking("S2"), text("The whole paper.")]),
+        msg([text("Repaired.")]),
+    ]
+    events: list[dict[str, Any]] = []
+    conversation = client.conversation(model=MODEL, system="S", on_event=events.append)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.llm.anthropic_client"):
+        response = conversation.send("Write the paper.")
+
+    assert response.text == "The whole paper."
+    assert [body["max_tokens"] for body in api.requests] == [64000, 128000]
+    # Only the limit differs: the same turns go out again, so nothing in the history is edited.
+    first, second = ({**body, "max_tokens": None} for body in api.requests)
+    assert first == second
+    # The cut-off reply is paid for and counted, but never becomes part of the conversation.
+    assert response.usage.requests == 2 and conversation.usage.requests == 2
+    assert conversation.journal == [
+        {"role": "user", "content": [text("Write the paper.")]},
+        {"role": "assistant", "content": [thinking("S2"), text("The whole paper.")]},
+    ]
+    assert [event["type"] for event in events] == [
+        "request",
+        "assistant",
+        "usage",
+        "assistant",
+        "usage",
+    ]
+    assert events[1]["stop_reason"] == "max_tokens"
+    assert any("max_tokens=128000" in record.getMessage() for record in caplog.records)
+
+    # A document that needed the larger limit once will need it for its repair turn too.
+    conversation.send("Fix the bibliography.")
+    assert api.requests[2]["max_tokens"] == 128000
+
+
+def test_truncation_at_the_model_maximum_is_raised(api, client):
+    api.script += [
+        msg([text("The first half of")], "max_tokens"),
+        msg([text("The first three quarters of")], "max_tokens"),
+        msg([text("short")]),
+    ]
+    conversation = client.conversation(model=MODEL)
+    with pytest.raises(LLMTruncated, match="max_tokens=128000") as caught:
+        conversation.send("Write the paper.")
+    assert caught.value.partial_text == "The first three quarters of"
+    # Nothing larger exists, so the advice no longer is to raise the limit.
+    assert "raise it" not in str(caught.value) and "reasoning effort" in str(caught.value)
+    assert len(api.requests) == 2 and conversation.usage.requests == 2
+    assert conversation.journal == []
+
+    # The failed call left the conversation as it was, default limit included.
+    assert conversation.send("Write an abstract.").text == "short"
+    assert api.requests[2]["max_tokens"] == 64000
+    assert api.requests[2]["messages"] == [
+        {"role": "user", "content": [text("Write an abstract.")]}
+    ]
+
+
+def test_a_chosen_limit_is_not_raised(api, client):
+    api.script += [msg([text("cut")], "max_tokens"), msg([text("off")], "max_tokens")]
+    with pytest.raises(LLMTruncated, match="max_tokens=50"):
+        client.conversation(model=MODEL).send("Write.", max_tokens=50)
+    with pytest.raises(LLMTruncated, match="max_tokens=2000"):
+        client.conversation(model=MODEL, max_tokens=2000).send("Write.")
+    assert [body["max_tokens"] for body in api.requests] == [50, 2000]
+
+
+def test_a_full_context_window_is_not_answered_with_a_larger_limit(api, client):
+    # The response ran out of context, not out of max_tokens: a larger limit changes nothing.
+    api.script += [msg([text("too long")], "model_context_window_exceeded"), msg([text("short")])]
+    conversation = client.conversation(model=MODEL)
+    with pytest.raises(LLMTruncated, match="context window") as caught:
+        conversation.send("More.")
+    assert caught.value.partial_text == "too long"
+    assert [body["max_tokens"] for body in api.requests] == [64000]
+    assert conversation.journal == []
+
+
+def test_a_model_already_at_its_output_limit_is_not_asked_again(api, client):
+    # 64,000 tokens is both the default and all this model can produce.
+    api.script.append(msg([text("cut")], "max_tokens", model="claude-haiku-4-5"))
+    with pytest.raises(LLMTruncated, match="max_tokens=64000") as caught:
+        client.conversation(model="claude-haiku-4-5").send("Write.")
+    assert len(api.requests) == 1
+    assert "raise it" not in str(caught.value)
+
+
+def test_rejected_larger_limit_reports_the_truncation(api, client):
+    api.script += [
+        msg([text("The first half of")], "max_tokens"),
+        lambda _: api_error(
+            400, "invalid_request_error", "max_tokens: 128000 > 64000, the maximum", "req_max"
+        ),
+    ]
+    conversation = client.conversation(model=MODEL)
+    with pytest.raises(LLMTruncated, match="max_tokens=64000") as caught:
+        conversation.send("Write the paper.")
+    assert caught.value.partial_text == "The first half of"
+    assert "req_max" in str(caught.value.__cause__)
+    # The API has just turned the larger limit down: raising it is no advice to give.
+    assert "raise it" not in str(caught.value)
+    assert "max_tokens=128000 was not possible" in str(caught.value)
+    assert [body["max_tokens"] for body in api.requests] == [64000, 128000]
+    assert conversation.journal == []
+
+    # Any other failure of the second attempt is reported as what it is.
+    api.script += [
+        msg([text("The first half of")], "max_tokens"),
+        lambda _: api_error(529, "overloaded_error", "overloaded", "req_529"),
+    ]
+    with pytest.raises(LLMError, match="req_529") as overloaded:
+        conversation.send("Write the paper.")
+    assert not isinstance(overloaded.value, LLMTruncated)
+
+
+def test_truncation_after_a_tool_call_does_not_rerun_the_tool(api, client):
+    ran: list[Any] = []
+
+    def save(tool_input: dict[str, Any]) -> str:
+        ran.append(tool_input)
+        return "saved"
+
+    tool = ToolSpec("save", "Save.", {"type": "object", "properties": {}}, save)
+    api.script += [
+        msg([tool_use("tu_1", "save", {})], "tool_use"),
+        msg([text("The first half of")], "max_tokens"),
+        msg([text("The whole paper.")]),
+    ]
+    conversation = client.conversation(model=MODEL, tools=[tool])
+    response = conversation.send("Save, then write.")
+    assert response.text == "The whole paper." and response.tool_calls == 1
+    assert ran == [{}]
+    assert [body["max_tokens"] for body in api.requests] == [64000, 64000, 128000]
+    assert api.requests[2]["messages"] == api.requests[1]["messages"]
+    assert api.requests[2]["messages"][-1]["content"][0]["type"] == "tool_result"
+
+
+def test_structured_output_cut_off_at_the_default_limit_is_asked_again(api, client):
+    payload = {"title": "T", "sections": ["Intro"]}
+    api.script += [
+        msg([text('{"title": "T", "sec')], "max_tokens"),
+        lambda _: api_error(400, "invalid_request_error", "max_tokens too large", "req_max"),
+    ]
+    conversation = client.conversation(model=MODEL)
+    # The format was accepted with the first reply: a rejection of the larger
+    # limit must not be reported as "structured output is unavailable".
+    with pytest.raises(LLMTruncated):
+        conversation.send("Outline it.", schema=Outline)
+
+    api.script += [
+        msg([text('{"title": "T", "sec')], "max_tokens"),
+        msg([text(json.dumps(payload))]),
+    ]
+    assert conversation.send("Outline it.", schema=Outline).parsed == Outline(**payload)
+    assert all("format" in body["output_config"] for body in api.requests)
+
+
+def test_a_limit_retry_that_uses_up_max_turns_reports_the_truncation(api, client):
+    api.script.append(msg([text("The first half of")], "max_tokens"))
+    conversation = client.conversation(model=MODEL, max_turns=1)
+    with pytest.raises(LLMTruncated, match="max_tokens=64000"):
+        conversation.send("Write the paper.")
+    assert len(api.requests) == 1 and conversation.journal == []
 
 
 def test_pause_turn_is_resumed_without_a_user_message(api, client, monkeypatch):
@@ -1060,6 +1390,109 @@ def test_pause_turn_is_resumed_without_a_user_message(api, client, monkeypatch):
     api.script += [msg(paused, "pause_turn"), msg(paused, "pause_turn")]
     with pytest.raises(LLMError, match="paused its turn"):
         conversation.send("Again.")
+
+
+def in_container(message: dict[str, Any], container_id: str = "container_abc") -> dict[str, Any]:
+    """``message`` as a response whose server tools ran in a code-execution container."""
+    return {**message, "container": {"id": container_id, "expires_at": "2026-12-15T12:00:00Z"}}
+
+
+FILTER_CODE = {
+    "type": "server_tool_use",
+    "id": "srvtoolu_c1",
+    "name": "code_execution",
+    "input": {"code": "hits = search('sparse attention')"},
+}
+
+
+def test_pause_turn_continuation_keeps_the_container(api, client):
+    api.script += [
+        in_container(msg([text("Searching."), FILTER_CODE], "pause_turn")),
+        in_container(msg([text("Found three papers.")])),
+        msg([text("ok")]),
+    ]
+    conversation = client.conversation(model=MODEL, web_search=WebSearch(max_uses=6))
+    assert conversation.send("Find papers.").text == "Searching.\n\nFound three papers."
+    assert "container" not in api.requests[0]
+    # Without the id the continuation runs in a new container, where what the
+    # filter code computed before the pause no longer exists.
+    assert api.requests[1]["container"] == "container_abc"
+    # The container belongs to the turn that used it: the next one starts without.
+    conversation.send("Thanks.")
+    assert "container" not in api.requests[2]
+    # Only the request names the container; the replayed history stays pure messages.
+    assert all(set(turn) == {"role", "content"} for turn in conversation.journal)
+
+
+def test_tool_result_continuation_keeps_the_container(api, client):
+    lookup = ToolSpec("lookup", "Look a term up.", LOOKUP_SCHEMA, lambda _: "page text")
+    filtered = [text("Filtered the hits."), tool_use("tu_1", "lookup", {"q": "x"})]
+    api.script += [
+        in_container(msg(filtered, "tool_use")),
+        in_container(msg([text("Still searching."), FILTER_CODE], "pause_turn"), "container_new"),
+        msg([text("done")]),
+    ]
+    conversation = client.conversation(
+        model=MODEL, tools=[lookup], web_search=WebSearch(max_uses=6)
+    )
+    assert conversation.send("Find papers.").text == "Still searching.\n\ndone"
+    assert api.requests[1]["messages"][-1]["content"][0]["type"] == "tool_result"
+    assert api.requests[1]["container"] == "container_abc"
+    # The id follows whatever container the latest response reports.
+    assert api.requests[2]["container"] == "container_new"
+
+
+def test_rejected_container_is_dropped_and_the_turn_continues(api, client, caplog):
+    def rejected(_: httpx2.Request) -> httpx2.Response:
+        return api_error(400, "invalid_request_error", "container not found", "req_c")
+
+    paused = in_container(msg([text("Searching."), FILTER_CODE], "pause_turn"))
+    still_paused = msg([text("Still searching."), FILTER_CODE], "pause_turn")
+    api.script += [paused, rejected, still_paused, msg([text("done")])]
+    conversation = client.conversation(model=MODEL, web_search=WebSearch(max_uses=6))
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.llm.anthropic_client"):
+        response = conversation.send("Find papers.")
+    assert response.text == "Searching.\n\nStill searching.\n\ndone"
+    assert api.requests[1]["container"] == "container_abc"
+    assert "container" not in api.requests[2]
+    assert api.requests[2]["messages"] == api.requests[1]["messages"]
+    # An id the API turned down is not offered again later in the turn.
+    assert "container" not in api.requests[3]
+    assert sum("without the container" in r.getMessage() for r in caplog.records) == 1
+
+    # A request that is rejected for another reason fails as it did before.
+    del api.requests[:]
+    api.script += [paused, rejected, rejected]
+    with pytest.raises(LLMError, match=r"req_c\]: container not found"):
+        conversation.send("Again.")
+    assert len(api.requests) == 3 and "container" not in api.requests[2]
+    assert len(conversation.journal) == 4
+
+
+def test_larger_limit_rejected_in_a_container_turn_still_reports_the_truncation(api, client):
+    def rejected(_: httpx2.Request) -> httpx2.Response:
+        return api_error(400, "invalid_request_error", "max_tokens: 128000 > 64000", "req_max")
+
+    api.script += [
+        in_container(msg([text("Searching."), FILTER_CODE], "pause_turn")),
+        msg([text("The first half of")], "max_tokens"),
+        rejected,
+        rejected,
+    ]
+    conversation = client.conversation(model=MODEL, web_search=WebSearch(max_uses=6))
+    # A rejected request that names a container is tried once without it.  What
+    # the second rejection means must survive that detour.
+    with pytest.raises(LLMTruncated, match="max_tokens=64000") as caught:
+        conversation.send("Find papers.")
+    assert "req_max" in str(caught.value.__cause__)
+    sent = [(body["max_tokens"], body.get("container")) for body in api.requests]
+    assert sent == [
+        (64000, None),
+        (64000, "container_abc"),
+        (128000, "container_abc"),
+        (128000, None),
+    ]
+    assert conversation.journal == []
 
 
 def test_fallback_turn_usage_sums_iterations_and_replay_drops_the_declined_thinking(api, client):
@@ -1624,41 +2057,73 @@ def test_client_bridges_modal_identity_token_into_the_sdk_chain(monkeypatch, api
     assert api.requests == []
 
 
-def test_workload_identity_exchanges_the_token_and_sends_the_access_token(
-    monkeypatch, api, tmp_path
-):
+class TokenEndpoint:
+    """A scripted ``/v1/oauth/token`` in front of the scripted Messages API.
+
+    ``failures`` are played first, one per exchange: an HTTP status, or an
+    exception the transport raises.  After them every exchange is granted.
+    """
+
+    def __init__(
+        self, api: FakeAPI, failures: Sequence[int | Exception] = (), *, expires_in: int = 3600
+    ) -> None:
+        self.api = api
+        self.failures = list(failures)
+        self.expires_in = expires_in
+        self.exchanges: list[dict[str, Any]] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        if request.url.path != "/v1/oauth/token":
+            return self.api(request)
+        self.exchanges.append(json.loads(request.content))
+        if self.failures:
+            failure = self.failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            body = {"error": {"type": "error", "message": f"token endpoint said {failure}"}}
+            return httpx2.Response(failure, json=body, headers={"request-id": "req_token"})
+        granted = {
+            "access_token": "sk-ant-oat01-minted",
+            "token_type": "Bearer",
+            "expires_in": self.expires_in,
+        }
+        return httpx2.Response(200, json=granted)
+
+
+class Keyless:
+    """Builds clients that authenticate with Workload Identity Federation."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, token_file: Path) -> None:
+        self._monkeypatch = monkeypatch
+        self.token_file = token_file
+
+    def client(self, endpoint: TokenEndpoint, *, max_retries: int = 0) -> AnthropicClient:
+        client = AnthropicClient(
+            http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(endpoint)),
+            max_retries=max_retries,
+        )
+        # The SDK exchanges the token over an HTTP client of its own (not the
+        # one given to the API client), so that one is pointed at the mock too.
+        exchange_client = httpx2.Client(transport=httpx2.MockTransport(endpoint))
+        self._monkeypatch.setattr(client._sdk.credentials, "_http_client", exchange_client)
+        return client
+
+
+@pytest.fixture
+def keyless(monkeypatch, tmp_path) -> Keyless:
     token_file = tmp_path / "token.jwt"
     token_file.write_text("header.payload.signature")
     for name, value in WIF_IDS.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("MODAL_IDENTITY_TOKEN_FILE", str(token_file))
-    exchanges: list[dict[str, Any]] = []
+    return Keyless(monkeypatch, token_file)
 
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        if request.url.path == "/v1/oauth/token":
-            exchanges.append(json.loads(request.content))
-            granted = {
-                "access_token": "sk-ant-oat01-minted",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-            }
-            return httpx2.Response(200, json=granted)
-        return api(request)
 
-    def keyless_client() -> AnthropicClient:
-        client = AnthropicClient(
-            http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(handler)),
-            max_retries=0,
-        )
-        # The SDK exchanges the token over an HTTP client of its own (not the
-        # one given to the API client), so that one is pointed at the mock too.
-        exchange_client = httpx2.Client(transport=httpx2.MockTransport(handler))
-        monkeypatch.setattr(client._sdk.credentials, "_http_client", exchange_client)
-        return client
-
+def test_workload_identity_exchanges_the_token_and_sends_the_access_token(api, keyless):
+    endpoint = TokenEndpoint(api)
     api.script.append(msg([text("keyless hello")]))
-    assert keyless_client().conversation(model=MODEL).send("hi").text == "keyless hello"
-    assert exchanges == [
+    assert keyless.client(endpoint).conversation(model=MODEL).send("hi").text == "keyless hello"
+    assert endpoint.exchanges == [
         {
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": "header.payload.signature",
@@ -1669,7 +2134,97 @@ def test_workload_identity_exchanges_the_token_and_sends_the_access_token(
     assert api.headers[0]["authorization"] == "Bearer sk-ant-oat01-minted"
 
     # A token file that disappears is a configuration problem, not an API error.
-    token_file.unlink()
+    keyless.token_file.unlink()
     with pytest.raises(LLMConfigError, match="credentials could not be used"):
-        keyless_client().conversation(model=MODEL).send("hi")
-    assert len(exchanges) == 1
+        keyless.client(endpoint).conversation(model=MODEL).send("hi")
+    assert len(endpoint.exchanges) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [503, 500, 429, 408, httpx2.ConnectError("no route to host"), httpx2.ReadTimeout("no data")],
+    ids=["503", "500", "429", "408", "connect-error", "timeout"],
+)
+def test_transient_token_exchange_failure_is_retried(api, keyless, caplog, failure):
+    endpoint = TokenEndpoint(api, [failure])
+    api.script.append(msg([text("keyless hello")]))
+    conversation = keyless.client(endpoint, max_retries=2).conversation(model=MODEL)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.llm.anthropic_client"):
+        assert conversation.send("hi").text == "keyless hello"
+    # The exchange precedes the request: nothing reached the Messages API twice.
+    assert len(endpoint.exchanges) == 2 and len(api.requests) == 1
+    assert any("token exchange" in record.getMessage() for record in caplog.records)
+
+
+def test_token_endpoint_outage_is_a_retryable_error_not_a_configuration_error(api, keyless):
+    endpoint = TokenEndpoint(api, [503, 503, 503])
+    api.script.append(msg([text("back again")]))
+    conversation = keyless.client(endpoint, max_retries=2).conversation(model=MODEL)
+    with pytest.raises(LLMError, match=r"token exchange.*HTTP 503") as caught:
+        conversation.send("hi")
+    # Callers stop for good on a configuration error; an outage is worth another try.
+    assert not isinstance(caught.value, LLMConfigError)
+    assert "federation history" not in str(caught.value)
+    # The client's own retry budget: max_retries more attempts, as for an API request.
+    assert len(endpoint.exchanges) == 3 and api.requests == []
+    assert conversation.journal == []
+
+    assert conversation.send("hi").text == "back again"
+    assert api.requests[0]["messages"] == [{"role": "user", "content": [text("hi")]}]
+
+    # A client built without retries does not retry here either.
+    outage = TokenEndpoint(api, [503, 503])
+    with pytest.raises(LLMError, match="HTTP 503") as unretried:
+        keyless.client(outage).conversation(model=MODEL).send("hi")
+    assert not isinstance(unretried.value, LLMConfigError)
+    assert len(outage.exchanges) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "exchanges"),
+    # The SDK itself repeats an exchange once after a 401.
+    [(401, 2), (403, 1), (400, 1), (404, 1)],
+)
+def test_denied_token_exchange_stays_a_configuration_error(api, keyless, status, exchanges):
+    endpoint = TokenEndpoint(api, [status] * 5)
+    client = keyless.client(endpoint, max_retries=3)
+    with pytest.raises(LLMConfigError, match="federation history") as caught:
+        client.conversation(model=MODEL).send("hi")
+    assert f"HTTP {status}" in str(caught.value)
+    assert len(endpoint.exchanges) == exchanges and api.requests == []
+
+
+def test_unusable_identity_token_is_a_configuration_error_without_an_exchange(api, keyless):
+    # The SDK reports this without an HTTP status, like a failed connection,
+    # but no amount of waiting turns a 20 kB file into a token.
+    keyless.token_file.write_text("x" * 20_000)
+    endpoint = TokenEndpoint(api)
+    with pytest.raises(LLMConfigError, match="credentials could not be used"):
+        keyless.client(endpoint, max_retries=3).conversation(model=MODEL).send("hi")
+    assert endpoint.exchanges == [] and api.requests == []
+
+
+def test_token_refresh_in_the_middle_of_a_run_survives_a_blip(api, keyless):
+    # A token this short-lived is exchanged again before every request.
+    endpoint = TokenEndpoint(api, expires_in=20)
+    api.script += [msg([text("first")]), msg([text("second")])]
+    conversation = keyless.client(endpoint, max_retries=2).conversation(model=MODEL)
+    assert conversation.send("one").text == "first"
+    assert len(endpoint.exchanges) == 1
+    endpoint.failures += [httpx2.ConnectError("connection reset"), 502]
+    assert conversation.send("two").text == "second"
+    assert len(endpoint.exchanges) == 4 and len(api.requests) == 2
+    assert [turn["role"] for turn in conversation.journal] == ["user", "assistant"] * 2
+
+
+def test_token_exchange_retries_back_off_like_the_sdk(api, keyless, monkeypatch):
+    waits: list[float] = []
+    monkeypatch.setattr(ac, "TOKEN_RETRY_DELAY_S", 0.5)
+    monkeypatch.setattr(ac.time, "sleep", waits.append)
+    endpoint = TokenEndpoint(api, [503] * 6)
+    with pytest.raises(LLMError):
+        keyless.client(endpoint, max_retries=5).conversation(model=MODEL).send("hi")
+    assert len(endpoint.exchanges) == 6 and len(waits) == 5
+    # 0.5 s doubling up to 8 s, shortened by up to a quarter so that parallel workers spread out.
+    for wait, ceiling in zip(waits, [0.5, 1.0, 2.0, 4.0, 8.0], strict=True):
+        assert 0.75 * ceiling <= wait <= ceiling

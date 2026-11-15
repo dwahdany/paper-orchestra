@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from paper_orchestra.compute.base import CompileResult, ComputeError
+from paper_orchestra.compute.base import BackendUnusable, CompileResult, ComputeError
 from paper_orchestra.compute.local import LocalBackend, safe_relative, scrubbed_env
 from paper_orchestra.utils.latex import (
     bib_keys,
@@ -395,3 +395,15 @@ def test_compile_timeout_is_reported_and_leaves_no_pdf(tmp_path):
     assert result.timed_out and not result.ok and result.pdf_path is None
     assert time.monotonic() - started < 15
     assert "timed out" in result.feedback()
+
+
+def test_a_missing_tex_install_is_reported_as_an_unusable_backend(tmp_path, monkeypatch):
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\\begin{document}x\\end{document}", encoding="utf-8"
+    )
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: False))
+    with pytest.raises(BackendUnusable, match="pdflatex/bibtex not found") as caught:
+        LocalBackend().compile_latex(tmp_path, "paper")
+    # Callers stop instead of retrying: the next attempt would fail the same way.
+    assert caught.value.unusable and isinstance(caught.value, ComputeError)
+    assert ComputeError("the sandbox was preempted").unusable is False

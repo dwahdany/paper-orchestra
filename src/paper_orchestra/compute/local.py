@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from paper_orchestra.compute.base import (
+    BackendUnusable,
     CompileResult,
     ComputeBackend,
     ComputeError,
@@ -261,7 +262,7 @@ class LocalBackend(ComputeBackend):
         if refused is not None:
             return refused
         if not self.latex_available():
-            raise ComputeError(
+            raise BackendUnusable(
                 "pdflatex/bibtex not found on PATH. Install TeX Live, or run with "
                 "--compute modal to compile in a Modal sandbox."
             )

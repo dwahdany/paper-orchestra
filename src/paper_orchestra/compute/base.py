@@ -22,6 +22,16 @@ from typing import Any
 class ComputeError(RuntimeError):
     """The backend itself failed (as opposed to the job exiting non-zero)."""
 
+    #: True when the backend cannot work as configured (a missing tool, no credentials), so
+    #: trying again cannot help and the run should stop with the message.
+    unusable: bool = False
+
+
+class BackendUnusable(ComputeError):
+    """The backend cannot work as configured; retrying will not change that."""
+
+    unusable = True
+
 
 @dataclass
 class ExecResult:

@@ -356,6 +356,7 @@ class LLMClient(ABC):
         max_turns: int = 60,
         label: str = "",
         on_event: EventSink | None = None,
+        single_turn: bool = False,
     ) -> Conversation:
         """Open a conversation.
 
@@ -363,6 +364,9 @@ class LLMClient(ABC):
         when harmless (``temperature`` on models that reject sampling
         parameters) or raise :class:`LLMConfigError` (``tools`` on a provider
         without tool support).
+
+        ``single_turn`` says the caller sends exactly one user turn and then
+        drops the conversation, so a provider may skip caching its tail.
         """
 
     def generate(
@@ -394,6 +398,7 @@ class LLMClient(ABC):
                 max_tokens=max_tokens,
                 label=label,
                 on_event=on_event,
+                single_turn=True,
             )
             try:
                 return conversation.send(

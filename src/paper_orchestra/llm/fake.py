@@ -275,6 +275,7 @@ class FakeLLM(LLMClient):
         max_turns: int = 60,
         label: str = "",
         on_event: EventSink | None = None,
+        single_turn: bool = False,
     ) -> Conversation:
         return _FakeConversation(
             self,

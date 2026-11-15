@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -64,6 +65,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 64_000
 #: Largest output any current Claude model produces; larger requests are capped.
 MAX_OUTPUT_TOKENS = 128_000
+#: Families documented to produce less than that in one response.
+LOWER_OUTPUT_LIMITS = (("claude-haiku-4-5", 64_000),)
 DEFAULT_EFFORT: Effort = "high"
 
 #: Opts a request into server-side fallbacks: a request the model declines for
@@ -88,6 +91,14 @@ def supports_fallbacks(model: str) -> bool:
 
 def supports_effort(model: str) -> bool:
     return not model.startswith(NO_EFFORT_MODEL_PREFIXES)
+
+
+def max_output_tokens(model: str) -> int:
+    """The largest ``max_tokens`` that ``model`` is known to accept."""
+    for prefix, limit in LOWER_OUTPUT_LIMITS:
+        if model.startswith(prefix):
+            return limit
+    return MAX_OUTPUT_TOKENS
 
 
 MEMORY_TOOL_TYPE = "memory_20250818"
@@ -117,6 +128,11 @@ MAX_PAUSES = 8
 STREAM_RESTARTS = 2
 STREAM_RESTART_DELAY_S = 2.0
 SDK_MAX_RETRIES = 4
+#: Wait before a failed token exchange is tried again.  It doubles per attempt
+#: up to the maximum and is shortened by up to a quarter: the schedule the SDK
+#: keeps for API requests, which it does not apply to the exchange.
+TOKEN_RETRY_DELAY_S = 0.5
+TOKEN_RETRY_MAX_DELAY_S = 8.0
 #: A single request at high effort routinely runs for many minutes.
 REQUEST_TIMEOUT_S = 1800.0
 CONNECT_TIMEOUT_S = 10.0
@@ -347,6 +363,19 @@ def _missing_credentials_message(env: Mapping[str, str]) -> str:
         f"{message}\nWorkload Identity Federation is only partly configured: "
         f"{', '.join(present)} set, {', '.join(missing)} missing."
     )
+
+
+def _transient_token_failure(exc: Any) -> bool:
+    """Whether a failed Workload Identity token exchange may succeed if simply repeated."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        # No response at all.  Only a transport failure qualifies: the SDK raises
+        # the same error, also without a status, for problems that waiting never
+        # cures (an identity token that is no JWT, an incomplete profile).
+        import httpx2
+
+        return isinstance(exc.__cause__, httpx2.HTTPError)
+    return status in (408, 429) or status >= 500
 
 
 def structured_outputs_enabled(environ: Mapping[str, str]) -> bool:
@@ -894,6 +923,7 @@ def _select_text(closing: str, everything: str, parser: Parser | None) -> tuple[
     final tool call, such as saving a note, and then closes with a short
     confirmation; when the closing turn alone is empty or does not parse,
     everything the model wrote during the exchange is used instead.
+    :func:`_select_structured` is the counterpart for a response format.
     """
     candidates = [closing] if closing == everything else [closing, everything]
     for candidate in candidates:
@@ -905,6 +935,31 @@ def _select_text(closing: str, everything: str, parser: Parser | None) -> tuple[
         if parsed is not None:
             return candidate, parsed
     return closing, None
+
+
+def _select_structured(
+    schema: Schema, closing: str, earlier: Sequence[str]
+) -> tuple[str, Any, str]:
+    """Pick the structured answer of an exchange; return ``(text, parsed, problem)``.
+
+    The answer normally is the closing turn.  Under a response format the model
+    cannot close with a confirmation after a final tool call: it repeats the
+    whole document or writes nothing.  Only when it wrote nothing is the answer
+    looked for in ``earlier``, the text of the requests before the last tool
+    result, newest first and one request at a time (each is a document of its
+    own, so joining them never validates).  A closing turn that has text but
+    fails validation is the model's final word and is reported as such: an
+    earlier text would be the draft it replaced.
+    """
+    parsed, problem = _parse_structured(schema, closing)
+    if parsed is None and not closing.strip():
+        for text in reversed(earlier):
+            if not text.strip():
+                continue
+            candidate, _ = _parse_structured(schema, text)
+            if candidate is not None:
+                return text, candidate, ""
+    return closing, parsed, problem
 
 
 def _resolve_max_tokens(value: int) -> int:
@@ -943,6 +998,7 @@ class AnthropicConversation(Conversation):
         label: str,
         on_event: EventSink | None,
         structured_outputs: bool,
+        single_turn: bool = False,
     ) -> None:
         if not model or not isinstance(model, str):
             raise LLMConfigError("A conversation needs a model id.")
@@ -963,7 +1019,15 @@ class AnthropicConversation(Conversation):
         )
         self._memory = memory
         self._web_search = web_search
+        # A cache breakpoint on the conversation's tail pays off when a later
+        # request reads it back.  A conversation that is asked once and has no
+        # tools makes one request and is dropped, so its tail would be written
+        # to the cache at a premium and never read.  With tools the one turn is
+        # a loop of requests, each reading what the previous one wrote.
+        self._cache_tail = bool(self._tools) or not single_turn
         self._effort: Effort = effort or DEFAULT_EFFORT
+        # Whether the limit is this module's default rather than the caller's choice.
+        self._default_limit = max_tokens is None
         self._max_tokens = _resolve_max_tokens(
             DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens
         )
@@ -973,6 +1037,9 @@ class AnthropicConversation(Conversation):
         self._structured_outputs = structured_outputs
         self._journal: list[dict[str, Any]] = []
         self._usage = Usage()
+        # The code-execution container that server tools of the turn in progress
+        # ran in.  Never part of the journal: a later turn starts without it.
+        self._container: str | None = None
 
     @property
     def usage(self) -> Usage:
@@ -995,9 +1062,14 @@ class AnthropicConversation(Conversation):
         """Append a user turn and run the tool loop to the model's end of turn.
 
         ``LLMResponse.text`` is what the model wrote after its last tool result
-        (see :func:`_select_text` for the one exception).  ``usage`` covers the
-        requests of this call; :attr:`usage` keeps the running total, including
-        requests that ended in a refusal or a truncation.
+        (see :func:`_select_text` and :func:`_select_structured` for the one
+        exception).  ``usage`` covers the requests of this call; :attr:`usage`
+        keeps the running total, including requests that ended in a refusal or
+        a truncation.
+
+        A response cut off at the default ``max_tokens`` is asked for once more
+        with the most the model can produce; a limit the caller chose, for the
+        conversation or for this call, is kept and the truncation is raised.
         """
         # Checked before anything is sent or recorded, so that the caller can
         # fall back to text parsing on the same, untouched conversation.
@@ -1005,6 +1077,7 @@ class AnthropicConversation(Conversation):
         typed = normalize_parts(parts)
         user_message = {"role": "user", "content": _user_content(typed)}
         limit = self._max_tokens if max_tokens is None else _resolve_max_tokens(max_tokens)
+        may_raise_limit = self._default_limit and max_tokens is None
 
         self._emit(
             {
@@ -1016,7 +1089,13 @@ class AnthropicConversation(Conversation):
         )
         try:
             return self._exchange(
-                user_message, limit, output_format, parser, schema, require_parsed
+                user_message,
+                limit,
+                output_format,
+                parser,
+                schema,
+                require_parsed,
+                may_raise_limit=may_raise_limit,
             )
         except LLMError as exc:
             self._emit({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
@@ -1046,6 +1125,8 @@ class AnthropicConversation(Conversation):
         parser: Parser | None,
         schema: Schema | None,
         require_parsed: bool,
+        *,
+        may_raise_limit: bool = False,
     ) -> LLMResponse:
         turn: list[dict[str, Any]] = [user_message]
         sent = Usage()
@@ -1053,13 +1134,20 @@ class AnthropicConversation(Conversation):
         closing_from = 0
         tool_calls = 0
         pauses = 0
+        # A container belongs to the turn that used it; this one starts without.
+        self._container = None
+        # The truncation being answered with a larger limit, while that request is out.
+        cut_off: LLMTruncated | None = None
+        limit_raised = False
         for step in range(self._max_turns):
             message, request_id = self._request(
                 [*self._journal, *turn],
                 max_tokens,
                 output_format,
                 format_is_untested=output_format is not None and step == 0,
+                rejection=cut_off,
             )
+            cut_off = None
             usage = _usage_of(message)
             sent.add(usage)
             self._usage.add(usage)
@@ -1090,11 +1178,34 @@ class AnthropicConversation(Conversation):
             if stop_reason == "refusal":
                 raise self._refusal(message, request_id)
             if stop_reason in ("max_tokens", "model_context_window_exceeded"):
-                raise self._truncated(stop_reason, max_tokens, content, text, request_id)
+                ceiling = max_output_tokens(self.model)
+                if not (may_raise_limit and stop_reason == "max_tokens" and max_tokens < ceiling):
+                    raise self._truncated(stop_reason, max_tokens, content, text, request_id)
+                # The default limit is a guess that nobody chose, and thinking counts
+                # against it.  The cut-off response is dropped and the same turns go
+                # out again, so the history the model sees is not edited.
+                logger.warning(
+                    "The response hit max_tokens=%d%s; asking again with max_tokens=%d.",
+                    max_tokens,
+                    self._where(request_id),
+                    ceiling,
+                )
+                # Reported only if the larger limit cannot be used (the API rejects it,
+                # or max_turns leaves no request for it): advising to raise it would be wrong.
+                cut_off = self._truncated(
+                    stop_reason, max_tokens, content, text, request_id, retry_limit=ceiling
+                )
+                max_tokens, limit_raised = ceiling, True
+                continue
 
             texts.append(text)
             if content:
                 turn.append({"role": "assistant", "content": content})
+            # The server tools of a turn share one code-execution container.  A request
+            # that continues the turn names it, or it runs in a new, empty one.
+            used = getattr(message, "container", None)
+            if used is not None:
+                self._container = used.id
             if stop_reason == "pause_turn":
                 # A server-tool loop paused: the turn is re-sent as it is and the
                 # model continues it.  No user message goes in between.
@@ -1119,19 +1230,26 @@ class AnthropicConversation(Conversation):
             tool_calls += len(calls)
             closing_from = len(texts)
         else:
+            if cut_off is not None:
+                # The cut-off request was the last one max_turns allowed.
+                raise cut_off
             raise LLMError(
                 f"The model did not finish within max_turns={self._max_turns} requests"
                 f"{self._where(request_id)}."
             )
 
         self._journal.extend(turn)
+        if limit_raised:
+            # What needed the larger limit once (a whole paper) needs it again on
+            # the next turn (its repair); starting low would only pay for another
+            # cut-off response first.
+            self._max_tokens = max_tokens
 
         closing = "\n\n".join(t for t in texts[closing_from:] if t)
         parsed: Any = None
         problem = ""
         if schema is not None:
-            text = closing
-            parsed, problem = _parse_structured(schema, closing)
+            text, parsed, problem = _select_structured(schema, closing, texts[:closing_from])
         else:
             text, parsed = _select_text(closing, "\n\n".join(t for t in texts if t), parser)
         if parsed is None and (schema is not None or parser is not None):
@@ -1172,8 +1290,14 @@ class AnthropicConversation(Conversation):
         output_format: dict[str, Any] | None,
         *,
         format_is_untested: bool,
+        rejection: LLMError | None = None,
     ) -> tuple[Any, str | None]:
-        """Send one request and map SDK failures onto :class:`LLMError`."""
+        """Send one request and map SDK failures onto :class:`LLMError`.
+
+        ``rejection`` is raised in place of the API's own error if the request
+        is rejected as invalid: it is passed when the request repeats an
+        accepted one with nothing but a larger ``max_tokens``.
+        """
         anthropic = _import_sdk()
         output_config: dict[str, Any] = {}
         if supports_effort(self.model):
@@ -1187,10 +1311,13 @@ class AnthropicConversation(Conversation):
             "model": self.model,
             "max_tokens": max_tokens,
             "messages": messages,
+        }
+        if self._cache_tail:
             # Moves a cache breakpoint along the growing conversation; the
             # system block carries its own, so tools and system stay cached.
-            "cache_control": {"type": "ephemeral"},
-        }
+            request["cache_control"] = {"type": "ephemeral"}
+        if self._container is not None:
+            request["container"] = self._container
         if output_config:
             request["output_config"] = output_config
         if supports_fallbacks(self.model):
@@ -1201,7 +1328,7 @@ class AnthropicConversation(Conversation):
         if self._tools:
             request["tools"] = self._tools
         try:
-            response = self._stream(request)
+            response = self._stream_past_exchange_failures(request)
         except anthropic.APIStatusError as exc:
             if exc.status_code == 400 and self._plain_tools is not None:
                 # Strict tools are not available for every model and organization
@@ -1214,8 +1341,32 @@ class AnthropicConversation(Conversation):
                 )
                 self._tools, self._plain_tools = self._plain_tools, None
                 return self._request(
-                    messages, max_tokens, output_format, format_is_untested=format_is_untested
+                    messages,
+                    max_tokens,
+                    output_format,
+                    format_is_untested=format_is_untested,
+                    rejection=rejection,
                 )
+            if exc.status_code == 400 and self._container is not None:
+                # Whether the API still takes the id cannot be known in advance.  A
+                # new container costs the turn the files of the old one; failing the
+                # request over it would cost the whole turn.
+                logger.warning(
+                    "The request was rejected%s (%s); retrying without the container %s.",
+                    self._where(getattr(exc, "request_id", None)),
+                    getattr(exc, "api_message", None) or exc,
+                    self._container,
+                )
+                self._container = None
+                return self._request(
+                    messages,
+                    max_tokens,
+                    output_format,
+                    format_is_untested=format_is_untested,
+                    rejection=rejection,
+                )
+            if exc.status_code == 400 and rejection is not None:
+                raise rejection from exc
             raise self._status_error(exc, format_is_untested=format_is_untested) from exc
         except anthropic.APIConnectionError as exc:
             raise LLMError(
@@ -1234,6 +1385,47 @@ class AnthropicConversation(Conversation):
         # Accepted: the tool definitions now belong to the history.
         self._plain_tools = None
         return response
+
+    def _stream_past_exchange_failures(self, request: dict[str, Any]) -> tuple[Any, str | None]:
+        """:meth:`_stream`, repeated while the token exchange fails for a passing reason.
+
+        With Workload Identity Federation the SDK trades an identity token for an
+        access token before a request goes out, and again whenever that token
+        nears its expiry.  It retries the API request but not the exchange, so a
+        single bad answer from the token endpoint would end a run with hours of
+        work behind it.  The exchange comes before the request it authorises:
+        when it fails no response is lost, and the request can be sent again.
+        The retry budget is the one the SDK client was built with.
+        """
+        anthropic = _import_sdk()
+        retries = self._sdk.max_retries
+        attempt = 0
+        while True:
+            try:
+                return self._stream(request)
+            except anthropic.WorkloadIdentityError as exc:
+                if not _transient_token_failure(exc):
+                    raise
+                if attempt >= retries:
+                    raise LLMError(
+                        f"The Anthropic token exchange failed {attempt + 1} time(s) in a row"
+                        f"{self._where(None)}: {exc}. The token endpoint was unreachable or "
+                        "answered with a temporary error."
+                    ) from exc
+                failure = str(exc)
+            # The exponent is bounded so that a large retry budget cannot overflow a float.
+            delay = min(TOKEN_RETRY_DELAY_S * 2 ** min(attempt, 16), TOKEN_RETRY_MAX_DELAY_S)
+            delay *= 1 - 0.25 * random.random()
+            attempt += 1
+            logger.warning(
+                "The Anthropic token exchange failed%s (%s); trying again in %.1f s (%d of %d).",
+                self._where(None),
+                failure,
+                delay,
+                attempt,
+                retries,
+            )
+            time.sleep(delay)
 
     def _stream(self, request: dict[str, Any]) -> tuple[Any, str | None]:
         """Stream one response to completion, re-issuing it if the stream breaks.
@@ -1357,16 +1549,35 @@ class AnthropicConversation(Conversation):
         content: Sequence[Mapping[str, Any]],
         text: str,
         request_id: str | None,
+        *,
+        retry_limit: int | None = None,
     ) -> LLMTruncated:
+        """The error for a cut-off response.
+
+        ``retry_limit`` is the larger ``max_tokens`` this conversation asks again
+        with; the error then is for the case that this second request cannot be made.
+        """
         if stop_reason == "model_context_window_exceeded":
             cause = "The response ran into the model's context window"
         elif any(block.get("type") == "tool_use" for block in content):
             cause = f"The response hit max_tokens={max_tokens} in the middle of a tool call"
         else:
             cause = f"The response hit max_tokens={max_tokens} before it was finished"
+        ceiling = max_output_tokens(self.model)
+        lower = "lower the reasoning effort or " if supports_effort(self.model) else ""
+        if retry_limit is not None:
+            advice = (
+                f"asking again with max_tokens={retry_limit} was not possible, "
+                f"so {lower}ask for less output"
+            )
+        elif max_tokens < ceiling:
+            advice = f"raise it (up to {ceiling}) or ask for less output"
+        else:
+            advice = (
+                f"{max_tokens} is the most {self.model} produces, so {lower}ask for less output"
+            )
         return LLMTruncated(
-            f"{cause}{self._where(request_id)}. Thinking counts towards max_tokens; raise it "
-            f"(up to {MAX_OUTPUT_TOKENS}) or ask for less output.",
+            f"{cause}{self._where(request_id)}. Thinking counts towards max_tokens; {advice}.",
             partial_text=text,
         )
 
@@ -1472,7 +1683,15 @@ class AnthropicClient(LLMClient):
         max_turns: int = 60,
         label: str = "",
         on_event: EventSink | None = None,
+        single_turn: bool = False,
     ) -> Conversation:
+        """Open a conversation.
+
+        ``single_turn`` says that the conversation will be sent one user turn
+        and then dropped, as :meth:`generate` does.  Unless tools make that one
+        turn a loop of requests, no later request can read its prompt back from
+        the cache, so the conversation's tail is then not written to it.
+        """
         if temperature is not None:
             logger.debug(
                 "temperature=%s is ignored: Claude rejects sampling parameters.", temperature
@@ -1490,6 +1709,7 @@ class AnthropicClient(LLMClient):
             label=label,
             on_event=on_event,
             structured_outputs=self._structured_outputs,
+            single_turn=single_turn,
         )
 
     def describe(self) -> dict[str, Any]:
