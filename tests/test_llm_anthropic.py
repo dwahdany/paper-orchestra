@@ -794,6 +794,37 @@ def test_schemas_native_output_cannot_express_are_rejected_before_any_request(ap
     assert api.requests == [] and conversation.journal == []
 
 
+def test_schemas_the_sdk_transform_fails_on_are_config_errors_not_crashes(api, client):
+    # The SDK's transform_schema asserts on a list-valued "type", and pydantic
+    # raises its own error type for a field it has no JSON schema for.
+    nullable = {
+        "type": "object",
+        "properties": {"note": {"type": ["string", "null"]}},
+        "required": ["note"],
+        "additionalProperties": False,
+    }
+
+    class Hooked(BaseModel):
+        callback: Callable[[int], int]
+
+    conversation = client.conversation(model=MODEL)
+    with pytest.raises(LLMConfigError, match="cannot be used.*AssertionError"):
+        conversation.send("x", schema=nullable)
+    with pytest.raises(LLMConfigError, match="cannot be used.*PydanticInvalidForJsonSchema"):
+        conversation.send("x", schema=Hooked)
+    with pytest.raises(LLMConfigError, match="cannot be used"):
+        conversation.send("x", schema={"type": "object", "properties": ["a", "b"]})
+    assert api.requests == [] and conversation.journal == []
+
+    # The same schema on a tool only costs the tool its strict mode.
+    api.script.append(msg([text("ok")]))
+    tool = ToolSpec("annotate", "Attach a note.", nullable, lambda _: "x")
+    assert client.conversation(model=MODEL, tools=[tool]).send("go").text == "ok"
+    assert api.requests[0]["tools"] == [
+        {"name": "annotate", "description": "Attach a note.", "input_schema": nullable}
+    ]
+
+
 def test_schema_with_web_search_is_rejected_up_front_and_text_parsing_still_works(api, client):
     events: list[dict[str, Any]] = []
     conversation = client.conversation(
@@ -1033,7 +1064,8 @@ def test_fallback_turn_usage_sums_iterations_and_replay_drops_the_declined_think
     response = conversation.send("Question.")
 
     assert response.model == "claude-opus-5"
-    assert response.text == "partial\n\nThe answer."
+    # The fallback model continues the declined model's partial text.
+    assert response.text == "partialThe answer."
     assert response.usage.to_dict() == {
         "input_tokens": 120,
         "output_tokens": 34,
@@ -1050,6 +1082,36 @@ def test_fallback_turn_usage_sums_iterations_and_replay_drops_the_declined_think
         text("The answer."),
     ]
     assert api.requests[1]["model"] == MODEL  # the conversation keeps asking for its own model
+
+
+def test_mid_output_fallback_continues_the_partial_text_without_a_break(api, client):
+    fallback = {
+        "type": "fallback",
+        "from": {"model": MODEL},
+        "to": {"model": "claude-opus-5"},
+        "trigger": {"type": "refusal", "category": "cyber"},
+    }
+    # The handover falls inside a JSON string; a separator there would corrupt it.
+    content = [
+        thinking("FABLE"),
+        text('{"title": "Sparse Att'),
+        fallback,
+        thinking("OPUS"),
+        text('ention", "sections": ["Intro"]}'),
+    ]
+    api.script.append(msg(content, model="claude-opus-5"))
+    response = client.conversation(model=MODEL).send("Outline it.", schema=Outline)
+    assert response.text == '{"title": "Sparse Attention", "sections": ["Intro"]}'
+    assert response.parsed == Outline(title="Sparse Attention", sections=["Intro"])
+
+    # Only text that directly precedes the handover is continued by it.
+    search = {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}}
+    result = {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []}
+    assert ac._text_of([text("Searching."), search, result, fallback, text("Answer.")]) == (
+        "Searching.\n\nAnswer."
+    )
+    assert ac._text_of([fallback, thinking("OPUS"), text("Answer.")]) == "Answer."
+    assert ac._text_of([text("One."), thinking("S"), text("Two.")]) == "One.\n\nTwo."
 
 
 def test_normalize_fallback_turn_keeps_only_replayable_blocks():

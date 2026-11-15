@@ -1092,7 +1092,8 @@ def test_main_builds_the_sandbox_image_then_launches(monkeypatch):
 
     def fake_launch(**kwargs):
         seen.update(kwargs)
-        return {"success": kwargs["run_id"] != "failing"}
+        downloaded = {} if kwargs["run_id"] == "not-downloaded" else {"pdf": "final_paper.pdf"}
+        return {"success": kwargs["run_id"] != "failing", "downloaded": downloaded}
 
     monkeypatch.setattr(modal_app, "launch", fake_launch)
     modal_app.main(
@@ -1115,9 +1116,10 @@ def test_main_builds_the_sandbox_image_then_launches(monkeypatch):
     assert job["models"] == {"writer": "claude-fable-5-2", "effort": "low"}
     assert job["memory"] == {"enabled": True, "lab": False, "dream": "end"}
 
-    with pytest.raises(SystemExit) as raised:
-        modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id="failing")
-    assert raised.value.code == 1
+    for run_id in ("failing", "not-downloaded"):
+        with pytest.raises(SystemExit) as raised:
+            modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id=run_id)
+        assert raised.value.code == 1
 
 
 def test_local_entrypoint_flags_are_understood_by_the_modal_cli():

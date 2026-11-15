@@ -688,9 +688,7 @@ def test_initial_draft_is_repaired_before_it_is_reviewed(tmp_path, repo_root):
     final_pdf = run(ctx)
 
     first, second = requests(client, INITIAL_REPAIR)
-    assert first.system == LATEX_REPAIR_SYSTEM_PROMPT or first.system.startswith(
-        LATEX_REPAIR_SYSTEM_PROMPT
-    )
+    assert first.system.startswith(LATEX_REPAIR_SYSTEM_PROMPT) and "# Memory" in first.system
     assert first.model == ctx.cfg.models.reflection
     assert "Undefined control sequence. [l.40 \\badmacro]" in first.text
     assert f"<paper_tex>\n{broken.strip()}\n</paper_tex>" in first.text

@@ -654,8 +654,12 @@ def upload_inputs(
     return targets[0][1], targets[1][1]
 
 
-def wait_for_result(call: Any, *, poll_seconds: float = 60.0) -> dict[str, Any]:
-    """Block until a spawned ``write_paper`` call finishes, logging a heartbeat meanwhile."""
+def wait_for_result(call: Any, *, poll_seconds: float = 300.0) -> dict[str, Any]:
+    """Block until a spawned ``write_paper`` call finishes, logging a heartbeat meanwhile.
+
+    The run's own log lines are streamed by ``modal run``; the heartbeat only
+    shows that this side is still waiting.
+    """
     started = time.monotonic()
     while True:
         try:
@@ -694,7 +698,7 @@ def launch(
     template: str | Path,
     output_dir: str | Path | None = None,
     run_id: str | None = None,
-    poll_seconds: float = 60.0,
+    poll_seconds: float = 300.0,
     **options: Any,
 ) -> dict[str, Any]:
     """Upload the inputs, run ``function`` (``write_paper``) and download the results.
@@ -863,5 +867,5 @@ def main(
         dream=dream,
         resume=resume,
     )
-    if not summary["success"]:
+    if not summary["success"] or "pdf" not in summary["downloaded"]:
         raise SystemExit(1)

@@ -410,39 +410,34 @@ def _carried_usage(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     try:
-        rows = json.loads(path.read_text(encoding="utf-8")).get("by_label")
-    except (OSError, ValueError, AttributeError) as exc:
-        log.warning("Ignoring unreadable %s (%s); usage restarts from zero.", path, exc)
+        rows = json.loads(path.read_text(encoding="utf-8"))["by_label"]
+        return [
+            {"label": str(row["label"]), "model": str(row["model"]), **_usage_of(row).to_dict()}
+            for row in rows
+        ]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        log.warning("Ignoring unreadable %s (%r); usage restarts from zero.", path, exc)
         return []
-    if not isinstance(rows, list):
-        return []
-    return [r for r in rows if isinstance(r, dict) and "label" in r and "model" in r]
 
 
 def _usage_report(tracker: UsageTracker, carried: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """The run's usage ledger with an estimated cost, including earlier invocations."""
     merged = UsageTracker()
     for row in (*carried, *tracker.to_dict()["by_label"]):
-        merged.record(str(row["label"]), str(row["model"]), _usage_of(row))
+        merged.record(row["label"], row["model"], _usage_of(row))
     report = merged.to_dict()
     try:
         from paper_orchestra.llm.pricing import estimate_cost_usd
     except ImportError:
         return report
-    total = 0.0
-    unpriced: set[str] = set()
-    for row in report["by_label"]:
-        cost = estimate_cost_usd(row["model"], _usage_of(row))
-        if cost is None:
-            unpriced.add(row["model"])
-        else:
-            total += cost
-    all_unpriced = bool(report["by_label"]) and len(unpriced) == len(
-        {row["model"] for row in report["by_label"]}
-    )
-    report["estimated_cost_usd"] = None if all_unpriced else round(total, 4)
-    #: Models missing from the price table; their tokens are not in the estimate.
-    report["unpriced_models"] = sorted(unpriced)
+    costs = [
+        (row["model"], estimate_cost_usd(row["model"], _usage_of(row)))
+        for row in report["by_label"]
+    ]
+    priced = [cost for _, cost in costs if cost is not None]
+    report["estimated_cost_usd"] = round(sum(priced), 4) if priced or not costs else None
+    # Models missing from the price table: their tokens are not part of the estimate.
+    report["unpriced_models"] = sorted({model for model, cost in costs if cost is None})
     return report
 
 

@@ -412,7 +412,8 @@ def test_discovery_answers_tolerate_sloppy_candidates(caplog):
             "candidates": [
                 {"title": "Good Paper", "year": "2021", "reason": "r", "url": "http://x"},
                 {"title": "No Year Given"},
-                {"title": "Odd Year", "year": "circa 2019?", "reason": 3 * "x"},
+                {"title": "Odd Year", "year": "circa 2019?", "reason": None},
+                {"title": "Not A Number", "year": float("nan"), "reason": 7},
                 {"title": None, "year": 2020},
                 {"year": 2020, "reason": "no title"},
                 "A Bare Title",
@@ -424,7 +425,8 @@ def test_discovery_answers_tolerate_sloppy_candidates(caplog):
     assert [(c.title, c.year, c.reason) for c in result.candidates] == [
         ("Good Paper", 2021, "r"),
         ("No Year Given", None, ""),
-        ("Odd Year", 2019, "xxx"),
+        ("Odd Year", 2019, ""),
+        ("Not A Number", None, "7"),
         ("A Bare Title", None, ""),
     ]
     assert "Ignored 4 candidate(s) without a title" in caplog.text
@@ -789,11 +791,14 @@ def test_the_registry_applies_the_cutoff_even_if_the_lookup_did_not(tmp_path):
             return next((p for p in LIBRARY if p["title"] == title), None)
 
     client = FakeLLM(Script())
-    ctx = make_ctx(tmp_path, client, lab=False)
+    ctx = make_ctx(tmp_path, client)
     result = LiteratureAgent(ctx, scholar=LeakyScholar()).run(make_outline())
     assert "Future Widgets" not in {entry["title"] for entry in result.citation_map.values()}
     (event,) = [e for e in ctx.harness.transcripts.events() if e["type"] == "literature"]
     assert event["after_cutoff"] == 1 and event["verified"] == 4
+    lab = ctx.harness.lab
+    cached = "\n".join(lab.read(info.path).body for info in lab.list(CACHE_DIR))
+    assert "A Survey of Widgets" in cached and "Future Widgets" not in cached
 
 
 @pytest.mark.parametrize("cutoff", ["2024", "2024/10", "October 2024"])

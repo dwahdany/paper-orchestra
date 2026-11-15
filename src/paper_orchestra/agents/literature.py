@@ -129,13 +129,14 @@ class CandidatePaper(BaseModel):
     @classmethod
     def _coerce_year(cls, value: Any) -> int | None:
         # "2021", "c. 2021" or a missing year must not invalidate an otherwise good answer.
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return int(value)
         if isinstance(value, str):
             match = re.search(r"\d{4}", value)
             return int(match.group()) if match else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return int(value)
+            except (ValueError, OverflowError):  # NaN, infinity
+                return None
         return None
 
 
@@ -161,7 +162,14 @@ class DiscoveryResult(BaseModel):
             if isinstance(item, CandidatePaper):
                 usable.append(item)
             elif isinstance(item, Mapping) and str(item.get("title") or "").strip():
-                usable.append({"year": None, "reason": "", **item})
+                reason = item.get("reason")
+                usable.append(
+                    {
+                        **item,
+                        "year": item.get("year"),
+                        "reason": "" if reason is None else str(reason),
+                    }
+                )
         if len(usable) < len(value):
             log.warning(
                 "Ignored %d candidate(s) without a title in a discovery answer",
@@ -959,25 +967,24 @@ class LiteratureAgent:
             candidates = candidates[:_MAX_CANDIDATES_PER_TASK]
         return candidates
 
-    def _lookup(
-        self, title: str, year_hint: int | None, found: _Collection
-    ) -> dict[str, Any] | None:
-        """The Semantic Scholar record for ``title``: from the lab cache, else from the API."""
+    def _from_cache(self, title: str, year_hint: int | None) -> dict[str, Any] | None:
+        """A record of the lab cache that is the paper called ``title`` under today's cutoff."""
         cached = self._cache.get(title)
-        if cached is not None:
-            # The same rule as for live results, so the cutoff is applied again on every hit.
-            match = select_match(
-                [_public_record(cached)], title, year_hint=year_hint, cutoff=self._cutoff
-            )
-            if match is not None:
-                found.stats.cache_hits += 1
-                return match
-        found.stats.lookups += 1
+        if cached is None:
+            return None
+        # The same rule as for live results, so the cutoff is applied again on every hit.
+        return select_match(
+            [_public_record(cached)], title, year_hint=year_hint, cutoff=self._cutoff
+        )
+
+    def _from_scholar(self, title: str, year_hint: int | None) -> dict[str, Any] | None:
+        """Ask Semantic Scholar for ``title`` and remember an answer the cutoff allows."""
         match = self._scholar.find_paper(title, year_hint=year_hint, cutoff=self._cutoff)
         if match is None:
             return None
         record = _public_record(match)
-        self._cache.put(title, record)
+        if is_before_cutoff(record["publicationDate"], record["year"], self._cutoff):
+            self._cache.put(title, record)
         return record
 
     def _verify(self, candidate: CandidatePaper, task: SearchTask, found: _Collection) -> None:
@@ -995,25 +1002,31 @@ class LiteratureAgent:
             if known is not None:
                 self._add_section(found.papers[known], task.section)
             return
-        if found.scholar_down:
+
+        record = self._from_cache(title, candidate.year)
+        if record is not None:
+            stats.cache_hits += 1
+        elif found.scholar_down:
             stats.skipped_lookups += 1
             return
-
-        try:
-            record = self._lookup(title, candidate.year, found)
-        except SemanticScholarError as exc:
-            stats.lookup_errors += 1
-            found.consecutive_lookup_failures += 1
-            log.warning("Semantic Scholar lookup failed for '%s': %s", title, exc)
-            if found.consecutive_lookup_failures >= _MAX_CONSECUTIVE_LOOKUP_FAILURES:
-                found.scholar_down = True
-                log.error(
-                    "Semantic Scholar failed %d times in a row; the remaining candidates of "
-                    "this run will not be verified and cannot be cited",
-                    found.consecutive_lookup_failures,
-                )
-            return
-        found.consecutive_lookup_failures = 0
+        else:
+            stats.lookups += 1
+            try:
+                record = self._from_scholar(title, candidate.year)
+            except SemanticScholarError as exc:
+                stats.lookup_errors += 1
+                found.consecutive_lookup_failures += 1
+                log.warning("Semantic Scholar lookup failed for '%s': %s", title, exc)
+                if found.consecutive_lookup_failures >= _MAX_CONSECUTIVE_LOOKUP_FAILURES:
+                    found.scholar_down = True
+                    log.error(
+                        "Semantic Scholar failed %d times in a row; the remaining candidates "
+                        "of this run are only looked up in the cache, and those not found "
+                        "there cannot be cited",
+                        found.consecutive_lookup_failures,
+                    )
+                return
+            found.consecutive_lookup_failures = 0
         found.resolved[wanted] = None
 
         if record is None:

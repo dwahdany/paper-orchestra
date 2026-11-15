@@ -299,7 +299,9 @@ def render_inputs(choices: dict[str, Any]) -> None:
                 key="idea_uploader_main",
             )
             if uploaded_idea:
-                st.session_state.idea_text_main = uploaded_idea.getvalue().decode("utf-8")
+                st.session_state.idea_text_main = uploaded_idea.getvalue().decode(
+                    "utf-8", errors="replace"
+                )
 
     with column_2:
         st.subheader("📊 Experimental Log")
@@ -331,7 +333,9 @@ def render_inputs(choices: dict[str, Any]) -> None:
                 key="log_uploader_main",
             )
             if uploaded_log:
-                st.session_state.log_text_main = uploaded_log.getvalue().decode("utf-8")
+                st.session_state.log_text_main = uploaded_log.getvalue().decode(
+                    "utf-8", errors="replace"
+                )
 
     st.subheader("🖼️ Upload Figures")
     figure_column_1, figure_column_2 = st.columns([1, 2])
@@ -443,6 +447,8 @@ def render_gallery_tab() -> None:
             st.info("No generated figures.")
         return
     for figure in generated:
+        if not isinstance(figure, dict):
+            continue
         image_path = paths.base_dir / str(figure.get("image_path", ""))
         if image_path.is_file():
             st.markdown(f"**{figure.get('title', 'Figure')}**")
@@ -745,8 +751,11 @@ def render_run_status(run: fu.PipelineRun, progress: fu.RunProgress) -> None:
 def render_run() -> None:
     run: fu.PipelineRun = st.session_state.run
     options: fu.RunOptions = st.session_state.run_options
+    # Sampled once: if the run ends while this page is being drawn, the refresh at the
+    # bottom still happens and the next pass shows the final state.
+    was_running = run.running
     progress = fu.read_progress(
-        options.run_dir, use_plotting=options.use_plotting, process_running=run.running
+        options.run_dir, use_plotting=options.use_plotting, process_running=was_running
     )
     render_run_status(run, progress)
 
@@ -785,7 +794,7 @@ def render_run() -> None:
     with tab_memory:
         render_memory_tab()
 
-    if run.running:
+    if was_running:
         time.sleep(fu.POLL_SECONDS)
         st.rerun()
 
