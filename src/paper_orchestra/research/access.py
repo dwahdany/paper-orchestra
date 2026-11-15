@@ -28,15 +28,15 @@ from typing import Any
 
 from paper_orchestra.llm.base import ToolError, ToolSpec
 
-# The private helpers are shared on purpose: a path must be vetted, and a file shown,
-# exactly as the wiki's own memory backend does it.
+# Shared on purpose: a path must be vetted, and a file shown, exactly as the wiki's own
+# memory backend does it.
 from paper_orchestra.memory.tools import (
-    _FRONT_MATTER_LINE,
+    FRONT_MATTER_LINE,
     MAX_VIEW_CHARS,
     VIRTUAL_ROOT,
     WikiMemoryBackend,
-    _front_matter_line_count,
-    _human_size,
+    front_matter_line_count,
+    human_size,
     virtual_path,
 )
 from paper_orchestra.memory.wiki import INDEX_FILE, WIKI_DIR, WikiError, split_front_matter
@@ -257,7 +257,7 @@ class ProjectMemoryBackend:
 
     def _rel(self, path: Any) -> str:
         """Virtual path -> project-relative path (``""`` for the root), vetted."""
-        return self._paths._split(path)[1]
+        return self._paths.split(path)[1]
 
     def _input_file(self, rel: str, path: str) -> Path:
         """The attached file ``rel`` names; never through a symbolic link."""
@@ -316,7 +316,7 @@ class ProjectMemoryBackend:
             below = parts[len(base) :]
             for level in range(1, min(len(below), 2) + 1):
                 entry = "/".join(base + below[:level])
-                entries.setdefault(entry, _human_size(size) if level == len(below) else "4.0K")
+                entries.setdefault(entry, human_size(size) if level == len(below) else "4.0K")
         if not base:
             for top in (WIKI_DIR, INPUTS_DIR):
                 entries.setdefault(top, "4.0K")
@@ -354,7 +354,7 @@ class ProjectMemoryBackend:
         size = target.stat().st_size
         if size > MAX_INPUT_BYTES:
             raise ToolError(
-                f"{path} is {_human_size(size)}, too large to read here. It is data to "
+                f"{path} is {human_size(size)}, too large to read here. It is data to "
                 "analyse in an experiment rather than text to read; the wiki says what it holds."
             )
         data = target.read_bytes()
@@ -637,9 +637,9 @@ class ProjectMemoryBackend:
                 f"range of lines of the file: [0, {len(lines)}]"
             )
         new_lines = insert_text.rstrip("\n").split("\n")
-        header = _front_matter_line_count(lines)
+        header = front_matter_line_count(lines)
         if 0 < insert_line < header and not all(
-            _FRONT_MATTER_LINE.match(line) for line in new_lines
+            FRONT_MATTER_LINE.match(line) for line in new_lines
         ):
             # Free text inside the front matter block would be dropped when the page is saved.
             raise ToolError(
