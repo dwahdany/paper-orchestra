@@ -690,6 +690,16 @@ def test_numbers_are_found_in_the_spellings_results_are_written_in():
         "Write $87.3_{\\pm 0.2}$ in the table.",
     ):
         assert "number" in leak_reason(text, sources), text
+    # The same result as a fraction or a percentage, rounded, or with a decimal comma.
+    results = ["Seen Jaccard 43.43, F-score 0.568."]
+    for text in (
+        "A Jaccard of 0.4343 belongs in the abstract.",
+        "An F-score of 56.8% belongs in the abstract.",
+        "A Jaccard of 43.4 is the headline.",
+        "Putting 43,43 in the abstract raised Clarity.",
+    ):
+        assert "number" in leak_reason(text, results), text
+    assert leak_reason("See sections 3,4 and use 43 points of space, or 0.5.", results) is None
     # Lengths and layout factors are not results, even when the digits coincide.
     layout = "Overfull \\hbox (12.3pt too wide); use \\vspace{2.3em}, 110mm and 0.568\\linewidth."
     assert leak_reason(layout, ["12.3 and 2.3 and 110 and 0.568"]) is None
@@ -710,6 +720,12 @@ def test_names_are_recognised_in_identifiers_plurals_and_with_suffixes():
         "CIFAR-100 needs another table.",
         "PromptWeavers were compared.",
         "Reviewers asked how mAP was computed.",
+        "Reviewers rewarded the tsam ablation.",
+        "Reviewers rewarded the Tsam ablation.",
+        "Explain the Prompt Weaver before the experiments.",
+        "The prompt_weaver figure was too small.",
+        "Typeset \\textsc{Prompt}Weaver consistently.",
+        "Explain TSAM2 before the method.",
     ):
         assert "names something" in scanner.reason(text), text
     # Ordinary words, and LaTeX commands the paper happens to use, are not names.

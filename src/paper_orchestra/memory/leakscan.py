@@ -30,6 +30,7 @@ import json
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,8 @@ _NUMBER = re.compile(
     rf"(?!{_TEX_UNIT})"
     r"(?!\s*\\(?:textwidth|linewidth|columnwidth|textheight|paperwidth|paperheight|hsize|vsize)\b)"
 )
+#: A decimal comma (``43,43``), which the pattern above reads as two list items.
+_DECIMAL_COMMA = re.compile(r"(?<![\w.,])(\d+),(\d{1,2})(?![\w,]|\.\d)")
 _YEAR = re.compile(r"(?:19|20)\d\d")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _HOME_PATH = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\Users\\)[\w.-]+")
@@ -96,7 +99,7 @@ COMMON_TERMS = frozenset(
     IEEE ACM CVPR ICCV ECCV WACV ICLR ICML NeurIPS NIPS AAAI IJCAI ACL EMNLP NAACL COLING
     KDD SIGIR SIGGRAPH TMLR JMLR PMLR TPAMI IJCV
     NumPy SciPy PyTorch TensorFlow JAX CUDA OpenCV
-    SOTA MLP CNN RNN LSTM GRU GAN VAE SGD NLP LLM AUC ROC MSE MAE RMSE
+    SOTA MLP CNN RNN LSTM GRU GAN VAE SGD NLP LLM AUC ROC MSE MAE RMSE BLEU ROUGE
     TODO FIXME NOTE WARNING ERROR EVIDENCE CONFLICT RULE WHY
     """.split()  # noqa: SIM905
 )
@@ -158,6 +161,34 @@ def numbers_in(text: str) -> set[str]:
     found: set[str] = set()
     for raw in _NUMBER.findall(text):
         found.update(_readings(raw))
+    return found
+
+
+def _digits(number: str) -> int:
+    """How many significant digits a canonical number has."""
+    whole, _, fraction = number.partition(".")
+    return len((whole + fraction).lstrip("0"))
+
+
+def _variants(number: str) -> set[str]:
+    """Other ways the same result gets written: as a percentage or as a fraction, and
+    rounded to fewer decimals.  Only for numbers that stay specific (three or more
+    significant digits), so that coincidences remain rare."""
+    found: set[str] = set()
+    try:
+        value = Decimal(number)
+    except InvalidOperation:
+        return found
+    for scaled in (value * 100, value / 100):
+        text = _canonical(format(scaled, "f"))
+        if _digits(text) >= 3 and _digits(number) >= 3:
+            found.add(text)
+    _, _, fraction = number.partition(".")
+    for places in range(len(fraction)):
+        rounded = _canonical(format(value.quantize(Decimal(1).scaleb(-places), ROUND_HALF_UP), "f"))
+        if _digits(rounded) >= 3:
+            found.add(rounded)
+    found.discard(number)
     return found
 
 
@@ -305,12 +336,24 @@ class LeakScanner:
         corpus = "\n".join(sources)
         permitted = "\n".join(allowed)
         self.has_sources = bool(corpus.strip())
-        self._numbers = {n for n in numbers_in(corpus) - numbers_in(permitted) if _identifying(n)}
+        venue_numbers = numbers_in(permitted)
+        self._numbers = {n for n in numbers_in(corpus) - venue_numbers if _identifying(n)}
+        #: The same results as percentages or fractions, and rounded: not in the materials
+        #: in that spelling, but the paper's all the same.
+        self._number_variants = (
+            {variant for number in self._numbers for variant in _variants(number)}
+            - self._numbers
+            - venue_numbers
+        )
         ordinary = _ordinary_words(corpus) | _ordinary_words(permitted)
         self._names = _names(corpus, ordinary).minus(_names(permitted, ordinary))
-        #: Upper-case names of four letters or more, lower-cased: how they appear inside
-        #: identifiers, paths and slugs (``fig:tsam_overview``).
-        self._upper_inside = {name.lower() for name in self._names.upper if len(name) >= 4}
+        #: Upper-case names of four letters or more, lower-cased.  Such a name is matched in
+        #: any case and inside identifiers (``tsam``, ``Tsam``, ``fig:tsam_overview``): its
+        #: lower-case form is known not to be a word the materials use.
+        self._upper_folded = {name.lower() for name in self._names.upper if len(name) >= 4}
+        #: Long mixed-case names, to be found when written apart (``Prompt Weaver``,
+        #: ``prompt_weaver``).
+        self._long_folded = sorted(name for name in self._names.folded if len(name) >= 8)
         worded = corpus if wording is None else "\n".join(wording)
         self._shingles = _shingles(worded) - _shingles(permitted)
 
@@ -327,18 +370,25 @@ class LeakScanner:
         names = self._names
         scan = _CONTROL.sub(" ", text)
         for name in dict.fromkeys(_ACRONYM.findall(scan)):
-            if name in names.upper or name.split("-")[0] in names.upper:
+            base = name.split("-")[0]
+            if (
+                name in names.upper
+                or base in names.upper
+                or base.rstrip("0123456789") in names.upper
+            ):
                 return name
-        for identifier in dict.fromkeys(_IDENTIFIER.findall(scan)):
-            for part in _IDENTIFIER_PART.findall(identifier.replace("_", " ")):
-                if part.lower() in self._upper_inside:
-                    return identifier
         for word in dict.fromkeys(_WORD.findall(scan)):
             singular = word[:-1] if word.endswith("s") else word
-            if word.lower() in names.folded or singular.lower() in names.folded:
+            if {word.lower(), singular.lower()} & (names.folded | self._upper_folded):
                 return word
             if word in names.exact or singular in names.exact or singular in names.upper:
                 return word
+        if self._long_folded:
+            # Written apart, with an underscore or across a LaTeX command.
+            squashed = re.sub(r"[^a-z0-9]+", "", scan.lower())
+            for name in self._long_folded:
+                if name in squashed:
+                    return name
         return None
 
     def reason(self, text: str) -> str | None:
@@ -353,9 +403,14 @@ class LeakScanner:
             return "it contains something that looks like a credential"
         if not self.has_sources:
             return None
-        for raw in dict.fromkeys(_NUMBER.findall(text)):
-            for number in _readings(raw):
-                if number in self._numbers:
+        spelled = [(raw, _readings(raw)) for raw in dict.fromkeys(_NUMBER.findall(text))]
+        spelled += [
+            (match.group(0), [_canonical(f"{match.group(1)}.{match.group(2)}")])
+            for match in _DECIMAL_COMMA.finditer(text)
+        ]
+        for raw, readings in spelled:
+            for number in readings:
+                if number in self._numbers or number in self._number_variants:
                     return f"it repeats a number from this paper's materials ({raw})"
         name = self._named(text)
         if name:
