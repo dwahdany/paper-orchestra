@@ -472,6 +472,10 @@ def test_task_sessions_do_not_see_unchecked_lab_notes(tmp_path):
             request.memory.view("/memories/lab/notes")
         with pytest.raises(ToolError, match="does not exist"):
             request.memory.view("/memories/lab/" + pending)
+        # Whitespace that the wiki would strip must not open a side door.
+        for spelling in ("/memories/lab/ " + pending, "/memories/lab/\t" + pending):
+            with pytest.raises(ToolError, match="does not exist"):
+                request.memory.view(spelling)
         for exact in (False, True):
             found = request.call_tool("wiki_search", {"query": "quokka", "exact": exact})
             assert "/memories/notes/" in found and "/memories/lab" not in found
@@ -639,3 +643,55 @@ def test_a_run_that_leaves_lab_consolidation_to_others_writes_no_lab_index(tmp_p
     )
     maintained.consolidate_lab_memory()
     assert (tmp_path / "lab" / "MEMORY.md").is_file()
+
+
+def test_cache_pages_an_earlier_version_left_in_the_lab_are_unreachable_then_removed(tmp_path):
+    lab_dir = tmp_path / "lab"
+    shard = lab_dir / "wiki" / "literature-cache" / "shard-07.md"
+    shard.parent.mkdir(parents=True)
+    shard.write_text("---\nsummary: cache\n---\nAbstract: quokkas are small wallabies.")
+    cfg = PipelineConfig(
+        base_dir=tmp_path / "run",
+        template_dir=tmp_path / "template",
+        memory=MemoryConfig(lab_dir=lab_dir, dream="end"),
+    )
+
+    def responder(request: FakeRequest) -> str:
+        assert "literature-cache" not in request.system
+        assert "literature-cache" not in request.memory.view("/memories")
+        if request.label == "dream.lab":
+            return "ok"
+        with pytest.raises(ToolError):
+            request.memory.view("/memories/lab/wiki/literature-cache/shard-07.md")
+        assert "quokka" not in request.call_tool("wiki_search", {"query": "quokkas wallabies"})
+        exact = request.call_tool("wiki_search", {"query": "quokkas", "exact": True})
+        assert exact == "No line contains that text verbatim."
+        return "ok"
+
+    harness = ContextHarness.create(cfg, client_for=lambda model: FakeLLM(responder))
+    harness.generate("task", agent="writer", stage="outline", model="fake")
+    assert "literature-cache" not in harness.lab.injected_context()
+    assert shard.exists()  # a run only hides it; removing it is for whoever maintains the lab
+    harness.lab.add_note("Load cleveref last.", kind="lesson")
+    harness.consolidate_lab_memory()
+    assert not shard.parent.exists()
+    assert "literature-cache" not in (lab_dir / "MEMORY.md").read_text()
+
+
+def test_the_push_block_puts_the_newest_lessons_first_and_stays_within_budget(tmp_path):
+    client = FakeLLM(lambda request: "ok", capabilities=PUSH_ONLY)
+    harness = make_harness(tmp_path, client, lab=True)
+    harness.project.write("wiki/lessons/huge.md", "H" * 39_000, {"summary": "s"})
+    harness.project.write("wiki/lessons/also-big.md", "B" * 5_000, {"summary": "s"})
+    harness.note("v3 REJECTED: Overall 6 -> 5", stage="refinement", kind="lesson")
+    harness.generate("task", agent="reviser", stage="refinement", model="fake")
+    request = client.requests[0]
+    block = request.text
+    # The lesson that exists nowhere else comes first; a page that does not fit is left
+    # out with one line instead of a pointer the session could not follow.
+    assert block.index("v3 REJECTED") < block.index("BBBB")
+    assert "HHHH" not in block and 'omitted="' not in block
+    assert "more page(s) did not fit and were left out" in block
+    assert len(block) < 45_000
+    # The lab's pages come with the rule that they are never content for the paper.
+    assert "never a source of content for the paper" in request.system

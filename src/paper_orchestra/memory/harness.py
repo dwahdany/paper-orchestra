@@ -364,6 +364,9 @@ class ContextHarness:
                 # Where a separate pass maintains the shared wiki, this run must not even
                 # write its first index: it only reads the wiki and adds notes.
                 seed_index=cfg.memory.lab_consolidate,
+                # An earlier version kept the bibliographic cache as wiki pages.  Until the
+                # next lab consolidation removes them, no session may reach them.
+                hidden=("wiki/literature-cache/",),
             )
             if lab_dir is not None
             else None
@@ -499,10 +502,18 @@ class ContextHarness:
                     writes.append((scope, rel))
                     self._mark_dirty(scope, rel)
 
-                def on_read(scope: str, rel: str) -> None:
+                def on_read(scope: str, rel: str, complete: bool) -> None:
                     scope = scope_name if lab_only else scope
-                    reads.append((scope, rel))
-                    self.record("memory_read", stage=stage, agent=agent, scope=scope, path=rel)
+                    if complete:
+                        reads.append((scope, rel))
+                    self.record(
+                        "memory_read",
+                        stage=stage,
+                        agent=agent,
+                        scope=scope,
+                        path=rel,
+                        complete=complete,
+                    )
 
                 backend = WikiMemoryBackend(
                     root_wiki,
@@ -623,12 +634,15 @@ class ContextHarness:
         k: int = 6,
         budget_chars: int = 60_000,
         lab_pinned: Sequence[str] = (),
+        pointers: bool = True,
     ) -> str:
         """Render pinned pages plus the top ``k`` search hits for ``query`` as one block.
 
-        Pages are included whole, in order, until the character budget is used;
-        a page that would overflow is replaced by a pointer to its path.
-        ``lab_pinned`` names pages of the lab memory to include after them.
+        Pages are included whole, in order, until the character budget is used.
+        A page that would overflow is replaced by a pointer to its path, or,
+        with ``pointers=False`` (for a session that cannot open pages), left
+        out and counted in one closing line.  ``lab_pinned`` names pages of the
+        lab memory to include after them.
         """
         if self.project is None:
             return ""
@@ -649,6 +663,7 @@ class ContextHarness:
             return ""
         sections: list[str] = []
         used = 0
+        left_out = 0
         for wiki, rel, is_lab in chosen:
             try:
                 text = wiki.read_text(rel).strip()
@@ -656,10 +671,16 @@ class ContextHarness:
                 continue
             path = virtual_path(rel, lab=is_lab)
             if used + len(text) > budget_chars:
-                sections.append(f'<page path="{path}" omitted="too long for this prompt"/>')
+                left_out += 1
+                if pointers:
+                    sections.append(f'<page path="{path}" omitted="too long for this prompt"/>')
                 continue
             used += len(text)
             sections.append(f'<page path="{path}">\n{text}\n</page>')
+        if not sections:
+            return ""
+        if left_out and not pointers:
+            sections.append(f"<!-- {left_out} more page(s) did not fit and were left out -->")
         return "<memory>\n" + "\n".join(sections) + "\n</memory>"
 
     def default_push_block(self, *, lab: bool = True) -> str:
@@ -690,10 +711,13 @@ class ContextHarness:
                 for info in self.lab.list(section)
                 if not self.lab.read(info.path).meta.get("auto")
             ]
+        # The lessons still waiting to be consolidated come first: they are the newest
+        # (the last rejection, the last compile fix) and exist nowhere else.
         return self.context_block(
-            pinned=[*(info.path for info in pages), *notes],
+            pinned=[*notes, *(info.path for info in pages)],
             lab_pinned=lab_pages,
             budget_chars=PUSH_BUDGET_CHARS,
+            pointers=False,
         )
 
     def write_page(
@@ -957,6 +981,9 @@ class ContextHarness:
                 use_model=use_model,
             )
         ]
+        if self.cancelled:
+            # The run was stopped: nothing more is shared or consolidated on its behalf.
+            return reports
         if self.lab is not None:
             # Lessons reach the shared memory as notes that passed a leak scan; the lab
             # session then works from those notes alone and never sees this paper.

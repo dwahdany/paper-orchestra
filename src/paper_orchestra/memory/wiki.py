@@ -319,12 +319,14 @@ class Wiki:
         clock: Callable[[], datetime] | None = None,
         create: bool = True,
         seed_index: bool = True,
+        hidden: Sequence[str] = (),
     ) -> None:
         """``create=False`` opens an existing memory directory without touching it (viewers).
 
         ``seed_index=False`` creates the directories but leaves writing ``MEMORY.md`` to
         whoever maintains the wiki: for a wiki that several runs share and only one
-        process may rewrite.
+        process may rewrite.  ``hidden`` names path prefixes that are treated as if they
+        did not exist: not listed, not searched, not indexed and not addressable.
         """
         self.root = Path(root)
         self.name = name
@@ -344,6 +346,7 @@ class Wiki:
         self._lock = threading.RLock()
         self._cache: dict[str, _Cached] = {}
         self._seed_index = create and seed_index
+        self.hidden = tuple(hidden)
         if create:
             for sub in (WIKI_DIR, NOTES_DIR, TRANSCRIPTS_DIR):
                 (self.root / sub).mkdir(parents=True, exist_ok=True)
@@ -379,6 +382,8 @@ class Wiki:
                 raise WikiError(f"{rel!r} is a directory, not a page")
             if not canonical.endswith(".md"):
                 raise WikiError(f"pages are Markdown files ending in .md: {rel!r}")
+        if canonical.startswith(self.hidden) and self.hidden:
+            raise WikiError(f"no such page: {rel!r}")
         target = (self.root / canonical).resolve()
         if not target.is_relative_to(self.root.resolve()):
             raise WikiError(f"path escapes the memory root: {rel!r}")
@@ -450,6 +455,8 @@ class Wiki:
                 if any(part.startswith(".") for part in PurePosixPath(rel).parts):
                     continue
                 if prefix and not (rel == prefix or rel.startswith(prefix + "/")):
+                    continue
+                if self.hidden and rel.startswith(self.hidden):
                     continue
                 # A symlink could point outside the memory root; never read through one.
                 if path.is_symlink() or not path.resolve().is_relative_to(root):

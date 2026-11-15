@@ -73,10 +73,12 @@ class WikiMemoryBackend:
         lab_write: LabWriteScope = "none",
         author: str = "agent",
         on_write: Callable[[str, str], None] | None = None,
-        on_read: Callable[[str, str], None] | None = None,
+        on_read: Callable[[str, str, bool], None] | None = None,
         guard: Callable[[str, str], str | None] | None = None,
     ) -> None:
         """``guard(scope, text)`` may veto a write by returning the reason (leak checks).
+        ``on_read(scope, path, complete)`` is told of every file view, and whether the
+        view reached the end of the file.
 
         Of a lab wiki mounted beside the project only the pages are visible.  Its
         notes are lessons that no consolidation has checked yet, and they are read
@@ -109,6 +111,9 @@ class WikiMemoryBackend:
         rest = parts[2:]
         if any(part in ("..", ".") or part.startswith(".") for part in rest):
             raise ToolError(f"Path {path} would escape the {VIRTUAL_ROOT} directory")
+        if any(part != part.strip() for part in rest):
+            # The wiki would strip the whitespace and resolve the path after all.
+            raise ToolError(f"The path {path} does not exist. Please provide a valid path.")
         if rest and rest[0] == LAB_PREFIX:
             if self.lab is None:
                 raise ToolError(f"The path {path} does not exist. There is no lab memory here.")
@@ -244,8 +249,6 @@ class WikiMemoryBackend:
             raise ToolError(
                 f"The path {path} does not exist. Please provide a valid path."
             ) from exc
-        if self._on_read is not None:
-            self._on_read("lab" if is_lab else "project", rel)
         lines = text.split("\n")
         start, end = 1, len(lines)
         if view_range is not None:
@@ -269,6 +272,11 @@ class WikiMemoryBackend:
                 break
             numbered.append(line)
             used += len(line) + 1
+        if self._on_read is not None:
+            # A file counts as read only when the view reached its end: what a session saw
+            # of a cut or partial view is not the whole note.
+            complete = truncated_at is None and end == len(lines)
+            self._on_read("lab" if is_lab else "project", rel, complete)
         body = "\n".join(numbered)
         out = f"Here's the content of {path} with line numbers:\n{body}"
         if truncated_at is not None:
@@ -517,10 +525,10 @@ def transcript_search_tool(
             k = max(1, min(int(tool_input.get("k") or 8), 25))
         except (TypeError, ValueError) as exc:
             raise ToolError("k must be an integer") from exc
-        if tool_input.get("exact"):
-            hits = transcripts.grep(query, k=k, stage=stage, exclude_agents=skipped)
-        else:
-            hits = transcripts.search(query, k=k, stage=stage, exclude_agents=skipped)
+        # Only what the run recorded: memory content that passed through the transcript
+        # (pushed pages, memory-tool results) would confirm any claim taken from memory.
+        find = transcripts.grep if tool_input.get("exact") else transcripts.search
+        hits = find(query, k=k, stage=stage, exclude_agents=skipped, evidence_only=True)
         if not hits:
             return "No matching transcript events."
         return "\n".join(

@@ -20,11 +20,9 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import re
 import secrets
-import socket
-import threading
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -46,8 +44,9 @@ from paper_orchestra.memory.leakscan import (  # noqa: F401 - re-exported
     protected_files,
     venue_materials,
 )
+from paper_orchestra.memory.lock import LOCK_FILE, STALE_LOCK_SECONDS, WikiLock  # noqa: F401
 from paper_orchestra.memory.tools import virtual_path
-from paper_orchestra.memory.transcript import TranscriptLog, event_text
+from paper_orchestra.memory.transcript import TranscriptLog, evidence_text
 from paper_orchestra.memory.wiki import (
     INDEX_FILE,
     NOTES_DIR,
@@ -55,6 +54,7 @@ from paper_orchestra.memory.wiki import (
     LintReport,
     PageInfo,
     Wiki,
+    WikiError,
 )
 
 if TYPE_CHECKING:
@@ -62,21 +62,21 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-LOCK_FILE = ".dream.lock"
 PROMOTED_LEDGER = ".promoted.json"
 RUN_TOKEN_FILE = ".run-token"
 DREAM_STATE_FILE = ".dream-state.json"
-#: A lock not refreshed for this long belongs to a session that died.
-STALE_LOCK_SECONDS = 15 * 60
-LOCK_REFRESH_SECONDS = 60
 #: A pending note this short is put into the dream prompt whole, until the budget is used.
 MAX_INLINE_NOTE_CHARS = 4_000
 INLINE_NOTES_BUDGET = 48_000
 NOTE_PREVIEW_CHARS = 300
 #: Notes named in the dream prompt; the rest are counted for the model to open.
 MAX_LISTED_NOTES = 120
+#: Unverified numbers listed in the dream prompt.
+MAX_LISTED_NUMBERS = 30
 #: The agent name of consolidation sessions.  Their events are not evidence about the run.
 DREAMER = "dreamer"
+#: Where an earlier version kept the bibliographic cache, inside the lab wiki.
+LEGACY_CACHE_SECTION = "wiki/literature-cache"
 END_OF_RUN_FOCUS = (
     "The run is over. Consolidate everything it learned that would help if this paper were "
     "revised or the run resumed: which revisions the reviewers rewarded or punished and why, "
@@ -117,113 +117,31 @@ class DreamReport:
 
 
 # ---------------------------------------------------------------------------
-# Locking
-# ---------------------------------------------------------------------------
-
-
-def _process_is_gone(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, OSError):
-        return False
-    return False
-
-
-class _DreamLock:
-    """Exclusive lock file so parallel runs sharing a wiki consolidate one at a time.
-
-    The holder refreshes the file's timestamp while it works, so a long dream is
-    not mistaken for a dead one.  The file names the holder's process and host:
-    a lock left by a process that no longer exists on this host is taken over at
-    once, any other lock after ``STALE_LOCK_SECONDS`` without a refresh.  This
-    is mutual exclusion on a local file system; storage without atomic exclusive
-    create (some network volumes) needs a single consolidating process instead.
-    """
-
-    def __init__(self, root: Path, *, wait_seconds: float = 120.0, poll: float = 1.0) -> None:
-        self.path = root / LOCK_FILE
-        self.wait_seconds = wait_seconds
-        self.poll = poll
-        self.acquired = False
-        self._stop = threading.Event()
-        self._refresher: threading.Thread | None = None
-
-    def _refresh(self) -> None:
-        while not self._stop.wait(LOCK_REFRESH_SECONDS):
-            with contextlib.suppress(OSError):
-                os.utime(self.path, None)
-
-    def _abandoned(self) -> bool:
-        """Whether the existing lock file belongs to a holder that is certainly gone."""
-        try:
-            if time.time() - self.path.stat().st_mtime > STALE_LOCK_SECONDS:
-                return True
-            fields = self.path.read_text(encoding="utf-8").split()
-        except OSError:
-            return False
-        if len(fields) >= 2 and fields[1] == socket.gethostname() and fields[0].isdigit():
-            pid = int(fields[0])
-            return pid != os.getpid() and _process_is_gone(pid)
-        return False
-
-    def __enter__(self) -> _DreamLock:
-        deadline = time.monotonic() + self.wait_seconds
-        while True:
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if self._abandoned():
-                    with contextlib.suppress(OSError):
-                        self.path.unlink(missing_ok=True)
-                    continue
-                if time.monotonic() >= deadline:
-                    return self
-                time.sleep(self.poll)
-                continue
-            with os.fdopen(fd, "w") as handle:
-                handle.write(f"{os.getpid()} {socket.gethostname()}\n")
-            self.acquired = True
-            self._refresher = threading.Thread(target=self._refresh, daemon=True)
-            self._refresher.start()
-            return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._stop.set()
-        if self.acquired:
-            self.path.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
 # Numbers
 # ---------------------------------------------------------------------------
 
 
 def _transcript_numbers(transcripts: TranscriptLog) -> set[str]:
-    """Numbers recorded by the run itself: outputs, tool results, compile and review records.
+    """Numbers the run itself put on record: compile results, review scores, tool output.
 
-    Prompts are left out because they repeat the memory index, notes are left
-    out because they are claims, and memory-tool traffic and consolidation
-    sessions are left out because they quote the pages being checked.
+    Only records that cannot have come out of memory count.  Prompts repeat the
+    memory index, notes are claims, memory-tool traffic and consolidation
+    sessions quote the pages being checked, and a model's own answer may repeat
+    a number it read in memory a moment before.  Usage counters are numbers
+    about the run, not about the paper.
     """
     found: set[str] = set()
     for event in transcripts.events(exclude_agents=(DREAMER,)):
-        kind = event.get("type")
-        if kind in ("request", "note", "memory_read", "dream"):
+        if event.get("type") in ("request", "assistant", "usage", "note", "dream"):
             continue
-        if kind in ("tool_call", "tool_result") and event.get("name") in (
-            "memory",
-            "wiki_search",
-            "transcript_search",
-        ):
-            continue
-        found |= numbers_in(event_text(event))
+        text = evidence_text(event)
+        if text:
+            found |= numbers_in(text)
     return found
 
 
 def unverified_numbers(
-    wiki: Wiki, *, transcripts: TranscriptLog | None = None, limit: int = 40
+    wiki: Wiki, *, transcripts: TranscriptLog | None = None, limit: int = 400
 ) -> list[tuple[str, str]]:
     """``(page, number)`` for numbers in model-written pages that no record contains.
 
@@ -410,6 +328,11 @@ def _note_listing(wiki: Wiki, notes: list[PageInfo]) -> tuple[str, list[str]]:
         )
         if page.meta.get("run"):
             header += f", run {page.meta['run']}"
+        if page.meta.get("presented"):
+            header += (
+                ", already shown to an earlier consolidation: check whether the pages "
+                "hold it before counting it as new evidence"
+            )
         if len(body) <= MAX_INLINE_NOTE_CHARS and used + len(body) <= INLINE_NOTES_BUDGET:
             used += len(body)
             shown.append(info.path)
@@ -439,7 +362,7 @@ def _health_listing(report: LintReport, numbers: list[tuple[str, str]]) -> str:
         lines.append(
             f"- MEMORY.md is over budget ({report.index_lines} lines, {report.index_bytes} bytes)"
         )
-    for page, number in numbers[:30]:
+    for page, number in numbers[:MAX_LISTED_NUMBERS]:
         lines.append(
             f"- {virtual_path(page)} states {number}, which appears in no source, review or "
             "transcript record: check it, and correct or remove it if nothing supports it"
@@ -478,6 +401,18 @@ def _maintain(wiki: Wiki) -> tuple[int, LintReport]:
     repaired = len(wiki.repair_links())
     wiki.rebuild_index()
     return repaired, wiki.lint()
+
+
+def _drop_legacy_cache_pages(wiki: Wiki) -> None:
+    """Remove bibliographic cache pages that an earlier version kept inside the lab wiki.
+
+    The cache now lives beside the wiki, where no session can read it.  Pages
+    left from before would still be searchable by every paper's sessions.
+    """
+    legacy = wiki.root / LEGACY_CACHE_SECTION
+    if legacy.is_dir():
+        shutil.rmtree(legacy, ignore_errors=True)
+        log.info("Removed the bibliographic cache pages an earlier version kept in the lab wiki.")
 
 
 def _reported_numbers(wiki: Wiki) -> set[tuple[str, str]]:
@@ -525,12 +460,11 @@ def dream(
     if wiki is None or harness.project is None:
         return report
 
-    with _DreamLock(wiki.root, wait_seconds=lock_wait) as lock:
-        if not lock.acquired:
-            report.error = "another consolidation of this wiki is in progress"
-            log.warning("dream %s skipped: %s", report.dream_id, report.error)
-        else:
-            try:
+    from paper_orchestra.memory.harness import RunCancelled
+
+    try:
+        with WikiLock(wiki.root, wait_seconds=lock_wait) as lock:
+            if lock.acquired:
                 _run(
                     harness,
                     wiki,
@@ -540,12 +474,16 @@ def dream(
                     use_model=use_model,
                     build=build,
                 )
-            except LLMError as exc:  # no credentials, unknown model: expected, no traceback
-                report.error = f"{type(exc).__name__}: {exc}"
-                log.warning("dream %s failed: %s", report.dream_id, exc)
-            except Exception as exc:  # a dream must never fail the run
-                report.error = f"{type(exc).__name__}: {exc}"
-                log.exception("dream %s failed", report.dream_id)
+            else:
+                report.error = lock.error or "another consolidation of this wiki is in progress"
+                log.warning("dream %s skipped: %s", report.dream_id, report.error)
+    except (LLMError, RunCancelled) as exc:
+        # No credentials, an unknown model, or the run was stopped: expected, no traceback.
+        report.error = f"{type(exc).__name__}: {exc}"
+        log.warning("dream %s did not complete: %s", report.dream_id, exc)
+    except Exception as exc:  # a dream must never fail the run
+        report.error = f"{type(exc).__name__}: {exc}"
+        log.exception("dream %s failed", report.dream_id)
     fields = {key: value for key, value in report.to_dict().items() if key != "stage"}
     harness.record("dream", stage=stage, agent=DREAMER, **fields)
     return report
@@ -566,6 +504,8 @@ def _run(
     scope = report.scope
     lab = scope == "lab"
     transcripts = None if lab else harness.transcripts
+    if lab:
+        _drop_legacy_cache_pages(wiki)
     repaired, lint = _maintain(wiki)
     report.links_repaired = repaired
     notes = wiki.pending_notes()
@@ -573,12 +513,15 @@ def _run(
     numbers = [] if lab else unverified_numbers(wiki, transcripts=transcripts)
 
     handled: list[str] = []
+    shown: list[str] = []
+    listed: list[tuple[str, str]] = []
     model_ok = False
     vetoes = harness.lab_vetoes
+    # A number that an earlier session was already asked about, and kept, is not a reason
+    # to open another session on its own.  New ones come first, so they are always listed.
+    asked = _reported_numbers(wiki)
+    numbers.sort(key=lambda pair: pair in asked)
     if use_model and model is not None:
-        # A number that an earlier session was already asked about, and kept, is not a
-        # reason to open another session on its own.
-        asked = _reported_numbers(wiki)
         has_work = (
             build
             or bool(notes)
@@ -592,6 +535,7 @@ def _run(
             log.info("dream: model %s has no memory tool; maintenance only", model)
         elif has_work:
             listing, shown = _note_listing(wiki, notes)
+            listed = numbers[:MAX_LISTED_NUMBERS]
             conversation = harness.open(
                 agent=DREAMER,
                 stage=report.stage,
@@ -615,7 +559,7 @@ def _run(
                         notes=notes,
                         listing=listing,
                         lint=lint,
-                        numbers=numbers,
+                        numbers=listed,
                     ),
                     require_parsed=False,
                 )
@@ -649,6 +593,12 @@ def _run(
             harness.lab_vetoes - vetoes,
         )
         handled = []
+        # The next consolidation will be shown these notes again.  It is told so, because
+        # some of them may already be in the pages.
+        for rel in shown:
+            with contextlib.suppress(WikiError):
+                page = wiki.read(rel)
+                wiki.write(rel, page.body, {**page.meta, "presented": report.dream_id})
     # Notes are archived only once a model has actually consolidated them; without one they
     # stay pending for the next dream.
     if model_ok and handled:
@@ -660,4 +610,7 @@ def _run(
         remaining = unverified_numbers(wiki, transcripts=transcripts)
         report.unverified_numbers = [list(pair) for pair in remaining]
         if model_ok:
-            _save_reported_numbers(wiki, remaining)
+            # Only what a session was shown and kept is settled; a number the session
+            # itself introduced has not been looked at by anyone.
+            settled = asked | set(listed)
+            _save_reported_numbers(wiki, [pair for pair in remaining if pair in settled])

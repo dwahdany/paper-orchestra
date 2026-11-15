@@ -2,22 +2,24 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
 from paper_orchestra.llm.base import Capabilities, LLMConfigError, LLMError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
+from paper_orchestra.memory import lock as lock_module
 from paper_orchestra.memory.dreaming import (
     LOCK_FILE,
     MAX_INLINE_NOTE_CHARS,
     PROMOTED_LEDGER,
     STALE_LOCK_SECONDS,
     LeakScanner,
+    WikiLock,
     content_sources,
     dream,
     leak_reason,
@@ -40,6 +42,11 @@ def make_harness(tmp_path, client, *, lab=False, dream_mode="stages") -> Context
         dream_mode=dream_mode,
         dream_model="fake",
     )
+
+
+def lock_is_free(root) -> bool:
+    with WikiLock(root, wait_seconds=0) as lock:
+        return lock.acquired
 
 
 def consolidating_responder(request: FakeRequest) -> str:
@@ -90,7 +97,7 @@ def test_project_dream_consolidates_notes_and_maintains_the_wiki(tmp_path):
     assert (
         next(e for e in harness.transcripts.events() if e["type"] == "dream")["notes_archived"] == 2
     )
-    assert not (harness.project.root / LOCK_FILE).exists()
+    assert lock_is_free(harness.project.root)
 
 
 def test_stage_dreams_are_maintenance_only_unless_mode_is_stages(tmp_path):
@@ -133,7 +140,7 @@ def test_failed_model_session_keeps_notes_pending(tmp_path):
     assert not report.llm_used and "overloaded" in report.error
     assert report.notes_archived == 0 and len(harness.project.pending_notes()) == 1
     assert report.lint  # the deterministic post-pass still ran
-    assert not (harness.project.root / LOCK_FILE).exists()
+    assert lock_is_free(harness.project.root)
 
 
 def test_unexpected_errors_never_escape(tmp_path):
@@ -144,7 +151,7 @@ def test_unexpected_errors_never_escape(tmp_path):
     harness.note("n", stage="s")
     report = harness.dream(stage="s", focus="f")
     assert "RuntimeError: boom" in report.error
-    assert not (harness.project.root / LOCK_FILE).exists()
+    assert lock_is_free(harness.project.root)
 
 
 def test_models_without_a_memory_tool_get_maintenance_only(tmp_path):
@@ -274,20 +281,98 @@ def test_finish_with_dreaming_off_only_maintains(tmp_path):
     assert [r.llm_used for r in reports] == [False, False] and client.requests == []
 
 
-def test_lock_serialises_dreams_and_recovers_from_stale_locks(tmp_path):
-    client = FakeLLM(lambda r: "ok")
-    harness = make_harness(tmp_path, client)
+#: A process that takes the consolidation lock of a wiki and keeps it.
+LOCK_HOLDER = """
+import sys, time
+from pathlib import Path
+from paper_orchestra.memory.lock import WikiLock
+
+with WikiLock(Path(sys.argv[1]), wait_seconds=0) as lock:
+    print("held" if lock.acquired else "busy", flush=True)
+    time.sleep(120)
+"""
+
+
+def test_one_consolidation_at_a_time_and_a_dead_holder_frees_the_lock(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "ok"))
     harness.note("n", stage="s")
-    lock = harness.project.root / LOCK_FILE
-    lock.write_text("12345\n")
-    busy = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
-    assert "in progress" in busy.error and not busy.llm_used
-    assert lock.exists() and len(harness.project.pending_notes()) == 1
+    root = harness.project.root
+    holder = subprocess.Popen(
+        [sys.executable, "-c", LOCK_HOLDER, str(root)], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        busy = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
+        assert "in progress" in busy.error and not busy.llm_used
+        assert len(harness.project.pending_notes()) == 1
+        # Killed outright: no handler of the holder runs, yet nothing is left to time out.
+        holder.kill()
+        holder.wait()
+        freed = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
+        assert freed.error is None and freed.llm_used
+    finally:
+        holder.kill()
+        holder.wait()
+    # A lock file that anything left behind (a crash, an earlier version) is not a held lock.
+    (root / LOCK_FILE).write_text("12345 some-other-host\n")
+    harness.note("n", stage="s")
+    again = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
+    assert again.error is None and again.llm_used
+
+
+def test_two_threads_of_one_process_do_not_consolidate_together(tmp_path):
+    with WikiLock(tmp_path, wait_seconds=0) as first:
+        assert first.acquired
+        with WikiLock(tmp_path, wait_seconds=0) as second:
+            assert not second.acquired and second.error is None
+    assert lock_is_free(tmp_path)
+
+
+def test_a_lock_that_cannot_be_taken_is_reported_instead_of_tried_forever(tmp_path, monkeypatch):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "ok"))
+    harness.note("n", stage="s")
+    real_open = os.open
+
+    def refuse(path, *args, **kwargs):
+        if str(path).endswith(LOCK_FILE):  # a read-only memory directory
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse)
+    started = time.monotonic()
+    report = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=60)
+    assert time.monotonic() - started < 10  # did not wait out the minute, let alone spin
+    assert "cannot be opened" in report.error and not report.llm_used
+    assert len(harness.project.pending_notes()) == 1
+
+
+def test_without_kernel_locks_a_stale_lock_file_is_taken_over_or_waited_for(tmp_path, monkeypatch):
+    monkeypatch.setattr(lock_module, "fcntl", None)
+    path = tmp_path / LOCK_FILE
     old = time.time() - STALE_LOCK_SECONDS - 10
-    lock.write_text("12345\n")
-    os.utime(lock, (old, old))
-    recovered = dream(harness, stage="s", focus="f", model="fake", use_model=True)
-    assert recovered.error is None and not lock.exists()
+
+    path.write_text("1 other-host\n")
+    with WikiLock(tmp_path, wait_seconds=0) as lock:
+        assert not lock.acquired  # fresh: a live holder
+    os.utime(path, (old, old))
+    with WikiLock(tmp_path, wait_seconds=0) as lock:
+        assert lock.acquired  # stale: its holder died
+    assert not path.exists()
+
+    # Stale but not removable (another user's file): wait like for a live holder.
+    path.write_text("1 other-host\n")
+    os.utime(path, (old, old))
+    attempts: list[int] = []
+
+    def refuse(self, *args, **kwargs):
+        attempts.append(1)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    started = time.monotonic()
+    with WikiLock(tmp_path, wait_seconds=0.3, poll=0.1) as lock:
+        assert not lock.acquired
+    assert time.monotonic() - started < 5 and 1 <= len(attempts) <= 6
 
 
 # -- what reaches the shared memory -------------------------------------------
@@ -586,26 +671,6 @@ def test_project_dreams_do_not_see_the_lab_memory(tmp_path):
     assert harness.dream(stage="s", focus="f").error is None
 
 
-def test_a_lock_left_by_a_dead_process_is_taken_over_at_once(tmp_path):
-    harness = make_harness(tmp_path, FakeLLM(lambda r: "ok"))
-    harness.note("n", stage="s")
-    finished = subprocess.run(
-        [sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True
-    )
-    dead_pid = int(finished.stdout)
-    lock = harness.project.root / LOCK_FILE
-    lock.write_text(f"{dead_pid} {socket.gethostname()}\n")
-    report = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
-    assert report.error is None and report.llm_used and not lock.exists()
-    # A live holder, or one on another machine, is respected until the lock goes stale.
-    for holder in (f"{os.getppid()} {socket.gethostname()}", f"{dead_pid} some-other-host"):
-        harness.note("n", stage="s")
-        lock.write_text(holder + "\n")
-        busy = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
-        assert "in progress" in busy.error
-        lock.unlink()
-
-
 def test_a_missing_credential_is_reported_without_a_traceback(tmp_path, caplog):
     def no_client(model: str):
         raise LLMConfigError("ANTHROPIC_API_KEY is not set")
@@ -900,3 +965,122 @@ def test_a_refused_lab_write_keeps_the_notes_pending_and_other_runs_lessons_pass
     assert report.notes_archived == 0
     assert [info.path for info in harness.lab.pending_notes()] == [foreign]
     assert [e["type"] for e in harness.transcripts.events()].count("lab_write_blocked") == 2
+    # The next consolidation is shown the note again, and is told so: some of it may
+    # already be in the pages.
+    assert harness.lab.read(foreign).meta["presented"] == report.dream_id
+    prompts_seen: list[str] = []
+    harness._client_for = lambda model: FakeLLM(lambda r: prompts_seen.append(r.text) or "ok")
+    harness.consolidate_lab_memory()
+    assert "already shown to an earlier consolidation" in prompts_seen[0]
+
+
+# -- findings of the second review of the memory layer ------------------------------------
+
+
+def test_a_note_that_was_only_partly_viewed_stays_pending(tmp_path):
+    medium = "\n".join(f"line {i} " + "x" * 60 for i in range(80))  # too long to be shown whole
+    large = "\n".join(f"line {i} " + "x" * 60 for i in range(400))  # longer than one view
+    seen: dict[str, str] = {}
+
+    def responder(request: FakeRequest) -> str:
+        paths = {
+            title: line.split()[1]
+            for line in request.text.splitlines()
+            if "only the beginning is shown" in line
+            for title in ("head", "wrong", "cut", "whole", "edited")
+            if f"-{title}-" in line
+        }
+        seen["head"] = request.memory.view(paths["head"], (1, 3))  # the front matter only
+        with pytest.raises(Exception, match="Invalid view_range"):
+            request.memory.view(paths["wrong"], (9000, 9001))
+        seen["cut"] = request.memory.view(paths["cut"])  # ends with "Truncated at line ..."
+        first = request.memory.view(paths["whole"])
+        resume = int(first.rsplit("Truncated at line ", 1)[1].split()[0])
+        seen["whole"] = request.memory.view(paths["whole"], (resume, -1))  # read to the end
+        request.memory.str_replace(paths["edited"], "line 79 ", "line 79, checked, ")
+        return "done"
+
+    harness = make_harness(tmp_path, FakeLLM(responder))
+    for title, body in (
+        ("head", medium),
+        ("wrong", medium),
+        ("cut", large),
+        ("whole", large),
+        ("edited", medium),
+    ):
+        harness.project.add_note(body, stage="s", title=title)
+    report = harness.dream(stage="s", focus="f")
+    assert "Truncated at line" in seen["cut"] and "Truncated" not in seen["whole"]
+    # Only the note read to its end and the one the session edited were dealt with.
+    assert report.notes_seen == 5 and report.notes_archived == 2
+    pending = sorted(info.path.split("-")[-2] for info in harness.project.pending_notes())
+    assert pending == ["cut", "head", "wrong"]
+
+
+def test_only_records_of_the_run_count_as_evidence_for_a_number(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "ok"))
+    log = harness.transcripts
+    events = [
+        {"type": "request", "agent": "writer", "messages": "memory says 1111.5"},
+        {"type": "assistant", "agent": "writer", "text": "as memory says, 2222.5"},
+        {"type": "usage", "agent": "writer", "input_tokens": 33335},
+        {"type": "tool_result", "agent": "writer", "name": "memory", "content": "4444.5"},
+        {"type": "tool_result", "agent": "dreamer", "name": "lookup", "content": "5555.5"},
+        {"type": "note", "agent": "writer", "text": "6666.5"},
+        {"type": "tool_result", "agent": "plotter", "name": "lookup", "content": "found 7777.5"},
+    ]
+    for event in events:
+        log.record({"stage": "s", **event})
+    harness.record("compile", stage="s", errors=["./paper.tex:1423: Undefined control sequence"])
+    harness.project.write(
+        "wiki/lessons/x.md",
+        "1111.5 2222.5 33335 4444.5 5555.5 6666.5, then line 1423 and 7777.5.",
+        {"summary": "s"},
+    )
+    flagged = [number for _, number in unverified_numbers(harness.project, transcripts=log)]
+    # What the pipeline recorded and what a tool of the run returned are evidence.  A
+    # prompt, a model's own answer, a usage counter, memory-tool traffic, a consolidation
+    # session and a note are not: each can repeat what memory said.
+    assert flagged == ["1111.5", "2222.5", "33335", "4444.5", "5555.5", "6666.5"]
+    assert len(unverified_numbers(harness.project)) == 8  # without the record, all of them
+
+
+def test_a_number_nobody_was_shown_opens_a_session_next_time(tmp_path):
+    def responder(request: FakeRequest) -> str:
+        if request.turn == 0 and "states 4321.5" not in request.text:
+            # The consolidation itself writes a number that no record supports.
+            request.memory.create(
+                "/memories/wiki/lessons/new.md", "---\nsummary: s\n---\nThe gain was 4321.5."
+            )
+        return "ok"
+
+    client = FakeLLM(responder)
+    harness = make_harness(tmp_path, client)
+    harness.note("n", stage="s")
+    first = harness.dream(stage="s", focus="f")
+    assert first.unverified_numbers == [["wiki/lessons/new.md", "4321.5"]]
+    # No session has seen that number yet, so it is not settled: the next dream asks.
+    second = harness.dream(stage="t", focus="f")
+    assert second.llm_used and "states 4321.5" in client.requests[-1].text
+    # Shown and kept: now it no longer opens a session on its own.
+    third = harness.dream(stage="u", focus="f")
+    assert not third.llm_used and len(client.requests) == 2
+
+
+def test_maintenance_alone_never_settles_a_number(tmp_path):
+    client = FakeLLM(lambda request: "ok")
+    harness = make_harness(tmp_path, client, dream_mode="end")
+    harness.project.write("wiki/lessons/x.md", "The gain was 4321.5.", {"summary": "s"})
+    assert not harness.dream(stage="s", focus="f").llm_used  # maintenance only
+    forced = harness.dream(stage="s", focus="f", force=True)
+    assert forced.llm_used and "states 4321.5" in client.requests[0].text
+
+
+def test_a_stopped_run_shares_nothing_and_is_not_logged_as_a_crash(tmp_path, caplog):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "ok"), lab=True, dream_mode="end")
+    harness.project.write("wiki/lessons/a.md", "Load cleveref last.", {"portable": True})
+    harness.note("n", stage="s")
+    harness.cancel()
+    reports = harness.finish()
+    assert len(reports) == 1 and "RunCancelled" in reports[0].error
+    assert harness.lab.pending_notes() == [] and "Traceback" not in caplog.text

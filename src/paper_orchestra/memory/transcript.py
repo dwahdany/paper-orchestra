@@ -9,6 +9,7 @@ One JSON object per line; one file per session.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -72,6 +73,29 @@ def event_text(event: dict[str, Any]) -> str:
         if key not in skip:
             walk(value)
     return "\n".join(chunks)
+
+
+#: Tools whose calls and results carry memory content rather than a record of the run.
+MEMORY_TOOLS = frozenset({"memory", "wiki_search", "transcript_search"})
+_MEMORY_BLOCK = re.compile(
+    r"<(memory|memory_index|lab_memory_index)>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
+
+
+def evidence_text(event: dict[str, Any]) -> str:
+    """The text of ``event`` that is a record of the run, with memory content removed.
+
+    Memory-tool traffic and the memory blocks that the harness puts into prompts
+    are what earlier sessions wrote down, not what happened.  A check of memory
+    against the record must not find memory itself there.  Returns ``""`` for an
+    event that holds nothing else.
+    """
+    kind = event.get("type")
+    if kind == "memory_read":
+        return ""
+    if kind in ("tool_call", "tool_result") and event.get("name") in MEMORY_TOOLS:
+        return ""
+    return _MEMORY_BLOCK.sub(" ", event_text(event))
 
 
 class TranscriptLog:
@@ -168,8 +192,13 @@ class TranscriptLog:
         stage: str | None = None,
         session: str | None = None,
         exclude_agents: Sequence[str] = (),
+        evidence_only: bool = False,
     ) -> list[TranscriptHit]:
-        """Events containing ``needle`` verbatim (case-insensitive), most recent first."""
+        """Events containing ``needle`` verbatim (case-insensitive), most recent first.
+
+        ``evidence_only`` searches :func:`evidence_text`: what the run recorded,
+        without the memory content that passed through it.
+        """
         wanted = needle.lower().strip()
         if not wanted:
             return []
@@ -177,7 +206,7 @@ class TranscriptLog:
         for event in self.events(session=session, exclude_agents=exclude_agents):
             if stage and event.get("stage") != stage:
                 continue
-            text = event_text(event)
+            text = evidence_text(event) if evidence_only else event_text(event)
             position = text.lower().find(wanted)
             if position < 0:
                 continue
@@ -205,6 +234,7 @@ class TranscriptLog:
         types: Sequence[str] | None = None,
         session: str | None = None,
         exclude_agents: Sequence[str] = (),
+        evidence_only: bool = False,
     ) -> list[TranscriptHit]:
         """Rank events by how many query terms they contain (rarer terms first).
 
@@ -222,7 +252,7 @@ class TranscriptLog:
                 continue
             if types and event.get("type") not in types:
                 continue
-            text = event_text(event)
+            text = evidence_text(event) if evidence_only else event_text(event)
             present = terms.intersection(tokenize(text))
             if not present:
                 continue

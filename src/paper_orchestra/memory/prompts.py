@@ -41,6 +41,12 @@ LAYOUT_PUSH = """\
 The index of that wiki is below. You cannot open pages in this session: when pages bear on \
 this task, they are included in the first message inside <memory> tags."""
 
+LAYOUT_LAB_PUSH = """\
+Pages under /memories/lab/ and the lab index come from a memory shared by every paper this \
+pipeline writes. They hold lessons about how to do the work: LaTeX and template pitfalls, \
+venue rules, which kinds of revision helped. They are never a source of content for the \
+paper, which is written only from this run's own materials."""
+
 WRITE_NOTES = """\
 You can add to memory by creating a new file under /memories/notes/. Write a note only for \
 something a later session could not recover from the sources or the wiki: a failure and what \
@@ -126,7 +132,8 @@ when the evidence is thin. A rule about review scores seen in one run is a hypot
 tested once a second, independent run supports it, and keep counts of supporting and \
 contradicting cases. Each note names the run it came from in its `run` field: notes with the \
 same value are one run, count once as evidence, and the latest of them replaces the earlier \
-ones.
+ones. On each lesson page, list the `run` values its evidence came from, so that a note \
+whose run is already listed there is recognised as counted.
 - Merge a new lesson into the page that already covers its topic rather than adding a \
 near-duplicate. When new evidence contradicts a lesson, record the conflict or delete the \
 lesson; do not keep both as if they agreed.
@@ -163,6 +170,8 @@ def memory_block(
             parts += ["", WRITE_NONE]
     else:
         parts.append(LAYOUT_PUSH)
+        if lab_index is not None:
+            parts.append(LAYOUT_LAB_PUSH)
     parts += ["", "<memory_index>", index.strip(), "</memory_index>"]
     if lab_index is not None:
         parts += ["", "<lab_memory_index>", lab_index.strip(), "</lab_memory_index>"]

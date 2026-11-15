@@ -292,3 +292,32 @@ def test_archived_notes_cannot_be_rewritten_by_a_consolidation_session(tmp_path)
         with pytest.raises(ToolError, match="archived note"):
             operation()
     assert "REJECTED" in wiki.read(archived).body
+
+
+def test_transcript_search_does_not_return_memory_that_passed_through_the_run(tmp_path):
+    log = TranscriptLog(tmp_path / "t", session_id="s1")
+    log.record(
+        {
+            "type": "request",
+            "stage": "writing",
+            "agent": "writer",
+            "system": "You write. <memory_index>zebra stripes index</memory_index>",
+            "messages": '<memory>\n<page path="/memories/notes/x.md">the zebra stripes fix '
+            "worked</page>\n</memory>\nWrite the section about okapi habitats.",
+        }
+    )
+    log.record(
+        {
+            "type": "tool_result",
+            "stage": "writing",
+            "agent": "writer",
+            "name": "memory",
+            "content": "zebra stripes lesson page",
+        }
+    )
+    search = transcript_search_tool(log, exclude_agents=("dreamer",)).handler
+    # A claim taken from memory must not be confirmed by memory's own passage through
+    # the transcript (a pushed page, a memory-tool result).
+    assert search({"query": "zebra stripes", "exact": True}) == "No matching transcript events."
+    assert search({"query": "zebra stripes"}) == "No matching transcript events."
+    assert "okapi habitats" in search({"query": "okapi habitats", "exact": True})
