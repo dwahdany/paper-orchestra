@@ -233,7 +233,9 @@ CutoffOption = Annotated[
 PlottingOption = Annotated[
     bool,
     typer.Option(
-        "--use-plotting/--no-use-plotting", help="Generate the figures from the experimental log."
+        "--plotting/--no-plotting",
+        "--use-plotting/--no-use-plotting",
+        help="Generate the figures from the experimental log.",
     ),
 ]
 CriticRoundsOption = Annotated[

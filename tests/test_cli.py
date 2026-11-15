@@ -211,7 +211,7 @@ def test_write_new_flags(materials, template, tmp_path, recorder):
             "--lab-memory-dir", str(tmp_path / "lab"),
             "--dream", "end",
             "--no-resume",
-            "--no-use-plotting",
+            "--no-plotting",
         ],
     )  # fmt: skip
 
@@ -319,6 +319,27 @@ def test_write_maps_an_unavailable_compute_backend_to_exit_code_2(
     assert "Error: The Modal SDK is not installed." in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("--plotting", True),
+        ("--use-plotting", True),
+        ("--no-plotting", False),
+        ("--no-use-plotting", False),
+    ],
+)
+def test_plotting_can_be_switched_with_either_spelling(
+    flag, expected, materials, template, tmp_path, recorder
+):
+    result = runner.invoke(
+        cli.app,
+        ["write", "--raw-materials-dir", str(materials), "--template", "demo2026",
+         "--output-dir", str(tmp_path / "out"), flag],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert recorder.cfg.use_plotting is expected
+
+
 def test_help_shows_the_new_flags_only():
     result = runner.invoke(cli.app, ["write", "--help"], env={"COLUMNS": "200"})
 
@@ -357,7 +378,7 @@ def test_batch_passes_its_options_on_and_reports_failures(tmp_path, template, mo
         "--template", "demo2026",
         "--n-papers", "3",
         "--max-workers", "2",
-        "--use-plotting",
+        "--plotting",
         "--writer-model", "claude-opus-5-5",
     ]  # fmt: skip
 

@@ -858,7 +858,7 @@ class _Runner:
                 log.warning(
                     "No figures (%s) were found in %s and plotting is off, so the paper will "
                     "have no figures. Put the figures there, with an info.json listing each "
-                    "one's name and caption, or enable plotting (--use-plotting).",
+                    "one's name and caption, or enable plotting (--plotting).",
                     ", ".join(FIGURE_SUFFIXES),
                     paths.provided_figures_dir,
                 )

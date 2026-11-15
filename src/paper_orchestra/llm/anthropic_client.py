@@ -1043,8 +1043,11 @@ class AnthropicConversation(Conversation):
             usage = _usage_of(message)
             sent.add(usage)
             self._usage.add(usage)
-            content = normalize_fallback_turn(message.to_dict(warnings=False)["content"])
-            text = _text_of(content)
+            received = message.to_dict(warnings=False)["content"]
+            content = normalize_fallback_turn(received)
+            # Read from the blocks as received: normalisation keeps every text block
+            # but drops what stood between them (a tool call cut off by a fallback).
+            text = _text_of(received)
             stop_reason = message.stop_reason
             self._emit(
                 {

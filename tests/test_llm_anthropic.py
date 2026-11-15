@@ -1119,6 +1119,17 @@ def test_mid_output_fallback_continues_the_partial_text_without_a_break(api, cli
     assert ac._text_of([fallback, thinking("OPUS"), text("Answer.")]) == "Answer."
     assert ac._text_of([text("One."), thinking("S"), text("Two.")]) == "One.\n\nTwo."
 
+    # A tool call the declined model had started is dropped from the replayed turn
+    # and never run, but it still separates the narration before it from the answer.
+    ran: list[Any] = []
+    tool = ToolSpec("lookup", "Look a term up.", LOOKUP_SCHEMA, ran.append)
+    cut_off = [text("Checking."), tool_use("tu_1", "lookup", {"q": "x"}), fallback, text("Answer.")]
+    api.script.append(msg(cut_off, model="claude-opus-5"))
+    conversation = client.conversation(model=MODEL, tools=[tool])
+    assert conversation.send("Question.").text == "Checking.\n\nAnswer."
+    assert conversation.journal[1]["content"] == [text("Checking."), fallback, text("Answer.")]
+    assert ran == []
+
 
 def test_normalize_fallback_turn_keeps_only_replayable_blocks():
     plain = [thinking("A"), text("x")]

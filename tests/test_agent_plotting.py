@@ -450,6 +450,13 @@ def test_diagram_uses_the_image_model_when_it_can_generate_images(tmp_path):
     assert "Produced by: image model fake-image" in page.body
 
 
+class BrokenImageLLM(FakeLLM):
+    """An image provider that fails with an error its client did not map to ``LLMError``."""
+
+    def generate_image(self, prompt, *, model, aspect_ratio="16:9", system=None):
+        raise KeyError("candidates")
+
+
 @pytest.mark.parametrize(
     "image_llm",
     [
@@ -458,8 +465,16 @@ def test_diagram_uses_the_image_model_when_it_can_generate_images(tmp_path):
         FakeLLM({}, image=PNG[: len(PNG) // 2]),
         FakeLLM({}, image=PNG, capabilities=Capabilities(image_generation=False)),
         LLMConfigError("the image provider SDK is not installed"),
+        BrokenImageLLM({}),
     ],
-    ids=["no-image", "not-an-image", "truncated", "cannot-generate", "client-unavailable"],
+    ids=[
+        "no-image",
+        "not-an-image",
+        "truncated",
+        "cannot-generate",
+        "client-unavailable",
+        "unexpected-error",
+    ],
 )
 def test_diagram_falls_back_to_code_when_the_image_model_fails(tmp_path, caplog, image_llm):
     llm = scripted_llm()
@@ -605,6 +620,50 @@ def test_failed_revision_render_keeps_the_previous_figure(tmp_path, caplog):
     assert "keeping the previous render" in caplog.text
     (note,) = notes(ctx)
     assert note.kind == "lesson" and "ValueError: log" in note.body
+
+
+def test_revision_that_breaks_the_backend_keeps_the_previous_figure(tmp_path, caplog):
+    def backend(code: str, call: int) -> ExecResult:
+        if call == 1:
+            return rendered()
+        # Not a ComputeError: the local backend lets OS errors through as they are.
+        raise OSError(28, "No space left on device")
+
+    llm = scripted_llm(critic=revise("Use a log axis.", "log-axis plot"))
+    ctx = make_ctx(tmp_path, llm, FakeCompute(backend))
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        (result,) = PlottingAgent(ctx).run({"plotting_plan": [figure()]})
+
+    assert result["description"] == "styled plan for Title fig_accuracy"
+    assert [entry["outcome"] for entry in result["critic_history"]] == ["render_failed"]
+    assert (ctx.paths.generated_figures_dir / "fig_accuracy.png").read_bytes() == PNG
+    assert "No space left on device" in caplog.text
+    assert "keeping the previous render" in caplog.text
+    (note,) = notes(ctx)
+    assert note.kind == "observation" and "No space left on device" in note.body
+
+
+def test_revision_without_suggestions_is_not_sent_as_no_changes_needed(tmp_path):
+    critic_replies = iter(
+        [revise("", "plan v2"), revise("No changes needed.", "plan v3"), revise("Bolder.", "v4")]
+    )
+    llm = scripted_llm(critic=lambda r: next(critic_replies))
+    ctx = make_ctx(tmp_path, llm)
+
+    (result,) = PlottingAgent(ctx).run({"plotting_plan": [figure()]})
+
+    assert [(entry["suggestions"], entry["outcome"]) for entry in result["critic_history"]] == [
+        ("", "revised"),
+        ("", "revised"),
+        ("Bolder.", "revised"),
+    ]
+    _, second, third, fourth = requests_for(llm, "plotting.code")
+    for request, description in ((second, "plan v2"), (third, "plan v3")):
+        assert "reviewer_suggestions" not in request.text
+        assert "No changes needed" not in request.text
+        assert f"<figure_description>\n{description}\n</figure_description>" in request.text
+    assert "<reviewer_suggestions>\nBolder.\n</reviewer_suggestions>" in fourth.text
 
 
 def test_caption_failure_falls_back_to_the_title(tmp_path, caplog):
@@ -1034,6 +1093,40 @@ def test_epilogue_reports_a_script_that_drew_nothing(tmp_path):
     with pytest.raises(plotting._CodeFailure) as caught:
         run_figure_code(ctx, "raise ValueError('boom')")
     assert "ValueError: boom" in caught.value.output
+
+    # A clean exit before the end skips the epilogue; the model is told where to look.
+    with pytest.raises(plotting._CodeFailure) as caught:
+        run_figure_code(ctx, "import sys\nsys.exit(0)")
+    assert "finished without producing figure.png" in caught.value.problem
+    assert "early exit (sys.exit)" in caught.value.problem
+
+
+def test_epilogue_does_not_depend_on_names_the_script_rebound(tmp_path):
+    ctx = make_ctx(tmp_path, scripted_llm(), LocalBackend())
+    own = image_bytes("purple")
+    # The epilogue shares the script's globals.  A star import of numpy replaces max and
+    # min with array functions, and plot scripts reuse such names for their own values.
+    # A stand-in pyplot keeps this fast and lets the script check what it is asked to save.
+    script = f"""
+import base64, sys, types
+from numpy import *
+
+class Figure:
+    def get_size_inches(self):
+        return array([100.0, 50.0])
+
+    def savefig(self, target, dpi, bbox_inches):
+        assert (dpi, bbox_inches) == (72, "tight"), (dpi, bbox_inches)
+        with open(target, "wb") as handle:
+            handle.write(base64.b64decode({base64.b64encode(own).decode()!r}))
+
+pyplot = types.ModuleType("matplotlib.pyplot")
+pyplot.get_fignums = lambda: [1]
+pyplot.gcf = Figure
+sys.modules["matplotlib.pyplot"] = pyplot
+max = min = int = builtins = os = sys = None
+"""
+    assert run_figure_code(ctx, script) == own
 
 
 def test_epilogue_keeps_a_figure_the_script_saved_itself(tmp_path):
