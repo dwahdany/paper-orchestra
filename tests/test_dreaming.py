@@ -324,6 +324,23 @@ def test_distinctive_names_from_the_paper_are_refused_however_they_are_spelled()
     assert scanner.has_sources and not LeakScanner([]).has_sources
 
 
+def test_the_scan_does_not_mistake_ordinary_writing_for_paper_content():
+    scanner = LeakScanner(
+        [
+            "RESULTS\nOur results do NOT depend on the seed, and we do not tune it. "
+            "We train on 8 GPUs and release PDFs. BERT is the encoder.\n"
+            "\\includegraphics[width=0.48\\textwidth]{fig} reaches 0.48 F1 and 87.3 \\pm 0.2."
+        ]
+    )
+    # Words written loudly, plurals of common abbreviations, and layout factors.
+    assert scanner.reason("Do NOT move the RESULTS table; GPUs and PDFs are fine.") is None
+    assert scanner.reason("Use 0.48\\textwidth for two figures side by side.") is None
+    # The same digits as a result are still the paper's.
+    assert "0.48" in scanner.reason("The method reaches 0.48.")
+    assert "87.3" in scanner.reason("Reported as 87.3 \\pm 0.2.")
+    assert "BERT" in scanner.reason("Mention BERT in the abstract.")
+
+
 def test_the_scan_covers_everything_that_holds_paper_content(tmp_path):
     harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
     harness.write_page("wiki/sources/idea.md", "A sparse method for long documents.")

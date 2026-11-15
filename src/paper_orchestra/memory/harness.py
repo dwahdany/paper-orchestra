@@ -373,7 +373,6 @@ class ContextHarness:
                 paths.latex_dir,
                 paths.refinement_dir,
                 paths.outline,
-                paths.plotting_results,
                 paths.final_tex,
             ),
             **common,

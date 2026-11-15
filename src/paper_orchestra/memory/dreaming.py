@@ -94,7 +94,11 @@ LAB_FOCUS = (
     "Merge each one with what the lab memory already says about its topic."
 )
 
-_NUMBER = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w]|\.\d)")
+#: A number, but not the factor of a LaTeX length (``0.48\textwidth``): layout, not a result.
+_NUMBER = re.compile(
+    r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w]|\.\d)"
+    r"(?!\s*\\(?:textwidth|linewidth|columnwidth|textheight|paperwidth|paperheight|hsize|vsize)\b)"
+)
 _YEAR = re.compile(r"(?:19|20)\d\d")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _HOME_PATH = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\Users\\)[\w.-]+")
@@ -106,6 +110,7 @@ _CAMEL = re.compile(r"\b(?=[A-Za-z0-9]*[a-z])[A-Za-z][A-Za-z0-9]*[A-Z][A-Za-z0-9
 #: Upper-case names of three or more characters, with optional suffixes (CIFAR-10).
 _ACRONYM = re.compile(r"\b[A-Z][A-Z0-9]{2,}(?:-[A-Z0-9]+)*\b")
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9]+")
+_LOWER_WORD = re.compile(r"\b[a-z]{3,}\b")
 
 #: Names that say nothing about a particular paper: tools, formats, venues and the common
 #: vocabulary of the field.  Any other distinctive name found in a paper's materials is
@@ -350,9 +355,29 @@ def _shingles(text: str) -> set[tuple[str, ...]]:
     return {tuple(tokens[i : i + SHINGLE_TOKENS]) for i in range(len(tokens) - SHINGLE_TOKENS + 1)}
 
 
+_COMMON_LOWER = frozenset(term.lower() for term in COMMON_TERMS)
+
+
+def _is_common(name: str) -> bool:
+    """Whether ``name`` is general vocabulary, also in the plural (``GPUs``, ``PDFs``)."""
+    lowered = name.lower()
+    return lowered in _COMMON_LOWER or (lowered.endswith("s") and lowered[:-1] in _COMMON_LOWER)
+
+
 def _names(text: str) -> tuple[set[str], set[str]]:
-    """Distinctive names in ``text``: mixed-case words (lower-cased) and upper-case names."""
-    return {match.lower() for match in _CAMEL.findall(text)}, set(_ACRONYM.findall(text))
+    """Distinctive names in ``text``: mixed-case words (lower-cased) and upper-case names.
+
+    An upper-case word that the text also uses in lower case is an ordinary
+    word written loudly (a heading, ``NOT``), not a name.
+    """
+    ordinary = set(_LOWER_WORD.findall(text))
+    mixed = {match.lower() for match in _CAMEL.findall(text) if not _is_common(match)}
+    upper = {
+        match
+        for match in _ACRONYM.findall(text)
+        if not _is_common(match) and match.lower() not in ordinary
+    }
+    return mixed, upper
 
 
 class LeakScanner:
@@ -377,8 +402,8 @@ class LeakScanner:
         self._numbers = {n for n in numbers_in(corpus) - numbers_in(permitted) if _identifying(n)}
         mixed, upper = _names(corpus)
         permitted_mixed, permitted_upper = _names(permitted)
-        self._mixed = mixed - permitted_mixed - {term.lower() for term in COMMON_TERMS}
-        self._upper = upper - permitted_upper - COMMON_TERMS
+        self._mixed = mixed - permitted_mixed
+        self._upper = upper - permitted_upper
         self._shingles = _shingles(corpus) - _shingles(permitted)
 
     def reason(self, text: str) -> str | None:
