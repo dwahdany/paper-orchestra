@@ -395,8 +395,8 @@ class LocalBackend(ComputeBackend):
         scratch_dir: str | Path | None = None,
     ) -> None:
         """``python`` runs figure code and stands for ``python`` in a job's command;
-        ``memory_limit_mb`` caps the address space of figure code and of jobs that name
-        no limit of their own (``None``: no cap); ``scratch_dir`` is where the working
+        ``memory_limit_mb`` caps the address space of figure code (``None``: no cap; a
+        job is capped only by its own ``JobSpec.memory_mb``); ``scratch_dir`` is where the working
         directories of jobs are made and removed (default: the system's temporary
         directory, which on some machines is small or kept in memory)."""
         self.python = python or sys.executable
@@ -652,7 +652,10 @@ class LocalBackend(ComputeBackend):
         env.update(spec.env)
         preexec = None
         if os.name == "posix":
-            memory_mb = spec.memory_mb or self.memory_limit_mb
+            # Only a limit the job asked for.  The default cap is sized for a plotting
+            # script; numerical libraries reserve far more address space than they use,
+            # and would die of it with a MemoryError that says nothing about the job.
+            memory_mb = spec.memory_mb
             # CPU time, not wall-clock time: a job on every core uses that many seconds
             # per second.  The wall-clock limit is kept by supervise(); this one only
             # ends a job that nobody supervises any more.

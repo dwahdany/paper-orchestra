@@ -4,6 +4,7 @@ import contextlib
 import inspect
 import itertools
 import json
+import mmap
 import os
 import shutil
 import signal
@@ -1116,8 +1117,27 @@ def test_the_memory_limit_of_a_job_is_enforced(job):
     source = job.source("x = bytearray(1024 ** 3)\nprint('allocated')\n")
     result, seen = run_main(LocalBackend(), job, source, spec={"memory_mb": 256})
     assert result.returncode == 1 and "MemoryError" in job.log() and "allocated" not in seen
-    unlimited, seen = run_main(LocalBackend(memory_limit_mb=None), job, source)
+    unlimited, seen = run_main(LocalBackend(), job, source)
     assert unlimited.ok and seen == ["allocated"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reserves address space the Linux way")
+def test_a_job_that_names_no_memory_limit_is_not_capped_by_the_one_for_figure_code(job):
+    # Numerical libraries reserve far more address space than they use (thread arenas,
+    # memory maps).  The 4 GB cap that suits a plotting script would end such a job with a
+    # MemoryError that says nothing about the experiment.
+    # Reserved without being committed, so the test needs no such amount of memory.
+    no_reserve = getattr(mmap, "MAP_NORESERVE", 0x4000)
+    source = job.source(
+        "import mmap\n"
+        f"flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | {no_reserve}\n"
+        "reserved = mmap.mmap(-1, 6 * 1024 ** 3, flags=flags)\n"
+        "print('reserved')\n"
+    )
+    result, seen = run_main(LocalBackend(), job, source)
+    assert result.ok and seen == ["reserved"], job.log()
+    capped, seen = run_main(LocalBackend(), job, source, spec={"memory_mb": 1024})
+    assert capped.returncode == 1 and "reserved" not in seen
 
 
 def test_supports_says_why_a_job_cannot_run_here(backend):
