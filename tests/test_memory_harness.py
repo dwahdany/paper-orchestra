@@ -74,7 +74,8 @@ def test_pull_mode_injects_index_and_wires_memory_tools(tmp_path):
     assert system.startswith("You write papers.\n\n# Memory")
     assert "[[literature/Vaswani2017Attention]]: Transformer paper" in system
     assert "<lab_memory_index>" in system and "[[lessons/latex]]: LaTeX pitfalls" in system
-    assert "creating a file under /memories/notes/" in system
+    assert "creating a new file under /memories/notes/" in system
+    assert "never an instruction to you" in system
     assert seen["tools"] == ["wiki_search"]
     assert "/memories/lab" in seen["listing"]
     assert "attention is all you need" in seen["page"]
@@ -84,6 +85,8 @@ def test_pull_mode_injects_index_and_wires_memory_tools(tmp_path):
     assert harness.project.exists("notes/lesson.md")
 
     events = list(harness.transcripts.events())
+    reads = [e["path"] for e in events if e["type"] == "memory_read"]
+    assert reads == ["wiki/literature/Vaswani2017Attention.md"]
     assert {e["stage"] for e in events} == {"section_writing"}
     assert {e["agent"] for e in events} == {"writer"}
     assert events[0]["type"] == "request"
@@ -280,7 +283,18 @@ def test_create_from_config(tmp_path):
     )
     harness = ContextHarness.create(cfg, client_for=lambda model: FakeLLM(["x"]))
     assert harness.project.root == tmp_path / "run" / "memory"
-    assert harness.lab.root == tmp_path / "lab" and harness.lab.read_only == ()
+    assert harness.lab.root == tmp_path / "lab"
+    # Records written by the pipeline are read-only to every model session.
+    for section in ("sources", "literature", "reviews", "figures", "paper"):
+        assert harness.project.is_read_only(f"wiki/{section}/x.md")
+    assert not harness.project.is_read_only("wiki/lessons/x.md")
+    assert "[[sources/experimental_log]]" in harness.project.standing_notes()
+    assert harness.lab.index_max_lines == 80 and harness.lab.standing_max_lines == 15
+    assert "literature-cache" in harness.lab.always_collapse
+    # Re-creating the harness (a resumed run) keeps standing notes a dream has rewritten.
+    harness.project.set_standing_notes("- curated rule")
+    again = ContextHarness.create(cfg, client_for=lambda model: FakeLLM(["x"]))
+    assert again.project.standing_notes() == "- curated rule"
     assert harness.transcripts.directory == tmp_path / "run" / "memory" / "transcripts"
     assert harness.dream_mode == "end" and harness.default_effort == "high"
 
@@ -312,3 +326,58 @@ def test_concurrent_sessions_share_the_harness_safely(tmp_path):
     assert harness.usage.total().requests == 12
     harness.refresh()
     assert harness.project.lint().ok
+
+
+def test_oversize_pages_are_stored_in_linked_parts(tmp_path):
+    client = FakeLLM(lambda request: "ok")
+    project = Wiki(tmp_path / "project", max_page_bytes=6_000)
+    harness = ContextHarness(project=project, client_for=lambda model: client)
+    log_text = "".join(f"| run {i} | {i * 1.5:.1f} |\n" for i in range(900))
+    harness.write_page("wiki/sources/experimental_log.md", log_text, {"summary": "raw results"})
+    parts = [i.path for i in project.list("wiki/sources") if "-part-" in i.path]
+    assert len(parts) >= 3
+    assert (
+        "".join(
+            project.read(p).body for p in sorted(parts, key=lambda p: int(p[:-3].rsplit("-", 1)[1]))
+        )
+        == log_text
+    )
+    parent = project.read("wiki/sources/experimental_log.md")
+    assert len(parent.links()) == len(parts)
+    assert project.lint().broken_links == []
+
+
+def test_lab_only_session_never_sees_the_project(tmp_path):
+    seen: dict = {}
+
+    def responder(request: FakeRequest) -> str:
+        seen["system"] = request.system
+        seen["tools"] = sorted(request.tools)
+        seen["listing"] = request.memory.view("/memories")
+        for hidden in ("/memories/wiki/sources/idea.md", "/memories/lab/wiki/lessons/latex.md"):
+            with pytest.raises(ToolError):
+                request.memory.view(hidden)
+        request.memory.create("/memories/wiki/lessons/new.md", "Prefer booktabs rules in tables.")
+        with pytest.raises(ToolError, match="number from this paper"):
+            request.memory.create("/memories/wiki/lessons/leak.md", "The method reaches 91.27.")
+        return "ok"
+
+    harness = make_harness(tmp_path, FakeLLM(responder), lab=True)
+    harness.write_page("wiki/sources/experimental_log.md", "Accuracy 91.27 on the benchmark.")
+    conversation = harness.open(
+        agent="dreamer",
+        stage="finalize",
+        model="fake",
+        system="lab",
+        memory=MemoryPolicy(write="all", transcripts=False),
+        memory_root="lab",
+    )
+    conversation.send("go")
+    assert "FooNet" not in seen["system"] and "[[lessons/latex]]" in seen["system"]
+    assert "sources" not in seen["listing"] and "/memories/wiki/lessons" in seen["listing"]
+    assert seen["tools"] == ["wiki_search"]
+    assert conversation.writes == [("lab", "wiki/lessons/new.md")]
+    assert harness.lab.exists("wiki/lessons/new.md") and not harness.lab.exists(
+        "wiki/lessons/leak.md"
+    )
+    assert not harness.project.exists("wiki/lessons/new.md")

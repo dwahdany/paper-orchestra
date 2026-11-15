@@ -111,6 +111,24 @@ def test_notes_scope_allows_only_new_notes(project):
         "File created successfully"
     )
     assert writes == [("project", "notes/compile-fix.md")]
+    # A session may revise the note it just wrote ...
+    backend.str_replace("/memories/notes/compile-fix.md", "cleveref", "cleveref (the package)")
+    # ... but never another session's note: not edit, not delete, not overwrite.
+    other = next(n.path for n in project.pending_notes() if n.path != "notes/compile-fix.md")
+    for operation in (
+        lambda: backend.str_replace(f"/memories/{other}", "pdflatex", "x"),
+        lambda: backend.insert(f"/memories/{other}", 0, "x: y"),
+        lambda: backend.delete(f"/memories/{other}"),
+        lambda: backend.rename(f"/memories/{other}", "/memories/notes/mine.md"),
+        lambda: backend.create(f"/memories/{other}", "overwritten"),
+    ):
+        with pytest.raises(ToolError):
+            operation()
+    assert "cleverref" in project.read(other).body
+    second_session = WikiMemoryBackend(project, write="notes")
+    with pytest.raises(ToolError, match="already exists"):
+        second_session.create("/memories/notes/compile-fix.md", "a different lesson")
+    assert "the package" in project.read("notes/compile-fix.md").body
     for operation in (
         lambda: backend.create("/memories/wiki/lessons/x.md", "text"),
         lambda: backend.create("/memories/MEMORY.md", "text"),
@@ -223,6 +241,13 @@ def test_wiki_search_tool(project, lab):
     assert "notes/" in tool.handler({"query": "cleverref pdflatex", "scope": "project"})
     assert tool.handler({"query": "attention", "section": "sources"}) == "No matching pages."
     assert tool.handler({"query": "zzzzzz"}) == "No matching pages."
+    # Keyword search cannot tell 87.3 from 87.9; exact mode can.
+    project.write("wiki/lessons/numbers.md", "Accuracy was 87.3 on the test split.")
+    assert "87.3" in tool.handler({"query": "87.9 accuracy"})
+    assert tool.handler({"query": "87.9", "exact": True}) == "No line contains that text verbatim."
+    exact = tool.handler({"query": "87.3 on the  test", "exact": True})
+    assert exact.startswith("/memories/wiki/lessons/numbers.md:")
+    assert "87.3 on the test split" in exact
     for bad in (
         {},
         {"query": ""},
@@ -248,3 +273,6 @@ def test_transcript_search_tool(tmp_path):
     )
     with pytest.raises(ToolError):
         tool.handler({"query": None})
+    log.record({"type": "review", "stage": "refinement", "overall": 6, "note": "Clarity 3.25"})
+    assert "seq=2" in tool.handler({"query": "3.25", "exact": True})
+    assert tool.handler({"query": "3.26", "exact": True}) == "No matching transcript events."

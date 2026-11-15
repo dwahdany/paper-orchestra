@@ -147,6 +147,41 @@ class TranscriptLog:
                     if isinstance(event, dict):
                         yield event
 
+    def grep(
+        self,
+        needle: str,
+        *,
+        k: int = 10,
+        stage: str | None = None,
+        session: str | None = None,
+    ) -> list[TranscriptHit]:
+        """Events containing ``needle`` verbatim (case-insensitive), most recent first."""
+        wanted = needle.lower().strip()
+        if not wanted:
+            return []
+        hits: list[TranscriptHit] = []
+        for event in self.events(session=session):
+            if stage and event.get("stage") != stage:
+                continue
+            text = _event_text(event)
+            position = text.lower().find(wanted)
+            if position < 0:
+                continue
+            hits.append(
+                TranscriptHit(
+                    session=str(event.get("session", "")),
+                    seq=int(event.get("seq", 0)),
+                    ts=str(event.get("ts", "")),
+                    type=str(event.get("type", "")),
+                    stage=str(event.get("stage", "")),
+                    agent=str(event.get("agent", "")),
+                    score=1.0,
+                    snippet=_literal_snippet(text, position),
+                )
+            )
+        hits.sort(key=lambda h: (h.ts, h.seq), reverse=True)
+        return hits[: max(1, k)]
+
     def search(
         self,
         query: str,
@@ -197,6 +232,12 @@ class TranscriptLog:
             )
         hits.sort(key=lambda h: (h.score, h.ts, h.seq), reverse=True)
         return hits[: max(1, k)]
+
+
+def _literal_snippet(text: str, position: int, width: int = 320) -> str:
+    start = max(0, position - width // 4)
+    chunk = " ".join(text[start : start + width].split())
+    return ("…" if start > 0 else "") + chunk + ("…" if start + width < len(text) else "")
 
 
 def _snippet(text: str, terms: set[str], width: int = 320) -> str:

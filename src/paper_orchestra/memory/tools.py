@@ -73,13 +73,21 @@ class WikiMemoryBackend:
         lab_write: LabWriteScope = "none",
         author: str = "agent",
         on_write: Callable[[str, str], None] | None = None,
+        on_read: Callable[[str, str], None] | None = None,
+        guard: Callable[[str, str], str | None] | None = None,
     ) -> None:
+        """``guard(scope, text)`` may veto a write by returning the reason (leak checks)."""
         self.project = project
         self.lab = lab
         self.write = write
         self.lab_write = lab_write
         self.author = author
         self._on_write = on_write
+        self._on_read = on_read
+        self._guard = guard
+        #: Notes this session created.  With the ``notes`` scope a session may only revise
+        #: its own notes, never another session's.
+        self._created: set[str] = set()
 
     # -- path handling ---------------------------------------------------------
 
@@ -115,7 +123,9 @@ class WikiMemoryBackend:
                 f"{VIRTUAL_ROOT}/{NOTES_DIR}/ or {VIRTUAL_ROOT}/{WIKI_DIR}/."
             ) from exc
 
-    def _check_write(self, wiki: Wiki, rel: str, is_lab: bool, path: str) -> None:
+    def _check_write(
+        self, wiki: Wiki, rel: str, is_lab: bool, path: str, *, creating: bool = False
+    ) -> None:
         if is_lab:
             if self.lab_write != "all":
                 raise ToolError("The lab memory is read-only in this session.")
@@ -131,6 +141,11 @@ class WikiMemoryBackend:
                     "Wiki pages are maintained by the consolidation pass: write a note that "
                     "says what should change and why."
                 )
+            if not creating and rel not in self._created:
+                raise ToolError(
+                    f"{path} was written by another session. You can add a new note, or edit "
+                    "notes you created in this session."
+                )
         if wiki.is_read_only(rel):
             raise ToolError(f"{path} is read-only ground truth and cannot be changed.")
         if rel.startswith(CONSOLIDATED_DIR + "/"):
@@ -139,6 +154,13 @@ class WikiMemoryBackend:
     def _wrote(self, is_lab: bool, rel: str) -> None:
         if self._on_write is not None:
             self._on_write("lab" if is_lab else "project", rel)
+
+    def _vet(self, is_lab: bool, text: str) -> None:
+        if self._guard is None:
+            return
+        reason = self._guard("lab" if is_lab else "project", text)
+        if reason:
+            raise ToolError(f"This text cannot be written to memory: {reason}")
 
     # -- view ------------------------------------------------------------------
 
@@ -195,6 +217,8 @@ class WikiMemoryBackend:
             raise ToolError(
                 f"The path {path} does not exist. Please provide a valid path."
             ) from exc
+        if self._on_read is not None:
+            self._on_read("lab" if is_lab else "project", rel)
         lines = text.split("\n")
         start, end = 1, len(lines)
         if view_range is not None:
@@ -233,11 +257,18 @@ class WikiMemoryBackend:
         if not isinstance(file_text, str):
             raise ToolError("file_text must be a string")
         wiki, rel, is_lab = self._page(path)
-        self._check_write(wiki, rel, is_lab, path)
+        self._check_write(wiki, rel, is_lab, path, creating=True)
+        if not is_lab and self.write == "notes" and wiki.exists(rel) and rel not in self._created:
+            # Notes are append-only across sessions: overwriting would silently lose the
+            # other session's observation.
+            raise ToolError(f"{path} already exists. Choose a different file name for your note.")
+        self._vet(is_lab, file_text)
         try:
             wiki.write_text(rel, file_text, author=self.author)
         except WikiError as exc:
             raise ToolError(str(exc)) from exc
+        if not is_lab:
+            self._created.add(rel)
         self._wrote(is_lab, rel)
         return f"File created successfully at: {path}"
 
@@ -268,6 +299,7 @@ class WikiMemoryBackend:
                 f"No replacement was performed. Multiple occurrences of old_str `{old_str}` "
                 f"in {path}. Please ensure it is unique."
             )
+        self._vet(is_lab, new_str)
         try:
             wiki.write_text(rel, text.replace(old_str, new_str, 1), author=self.author)
         except WikiError as exc:
@@ -298,6 +330,7 @@ class WikiMemoryBackend:
                 f"Insert body text at line {header} or later."
             )
         lines[insert_line:insert_line] = new_lines
+        self._vet(is_lab, insert_text)
         try:
             wiki.write_text(rel, "\n".join(lines), author=self.author)
         except WikiError as exc:
@@ -317,6 +350,7 @@ class WikiMemoryBackend:
             wiki.delete(rel)
         except WikiError as exc:
             raise ToolError(str(exc)) from exc
+        self._created.discard(rel)
         self._wrote(is_lab, rel)
         return f"Successfully deleted {path}"
 
@@ -326,11 +360,14 @@ class WikiMemoryBackend:
         if wiki is not new_wiki:
             raise ToolError("Cannot move a file between the project memory and the lab memory")
         self._check_write(wiki, old_rel, is_lab, old_path)
-        self._check_write(new_wiki, new_rel, new_is_lab, new_path)
+        self._check_write(new_wiki, new_rel, new_is_lab, new_path, creating=True)
         try:
             wiki.rename(old_rel, new_rel)
         except WikiError as exc:
             raise ToolError(str(exc)) from exc
+        if old_rel in self._created:
+            self._created.discard(old_rel)
+            self._created.add(new_rel)
         self._wrote(is_lab, old_rel)
         self._wrote(is_lab, new_rel)
         return f"Successfully renamed {old_path} to {new_path}"
@@ -353,6 +390,19 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
         except (TypeError, ValueError) as exc:
             raise ToolError("k must be an integer") from exc
         prefix = f"{WIKI_DIR}/{section}" if section else ""
+        if tool_input.get("exact"):
+            lines: list[str] = []
+            if scope in ("project", "all"):
+                lines += [
+                    f"{virtual_path(rel)}:{number}: {line}"
+                    for rel, number, line in project.grep(query, k=k, prefix=prefix)
+                ]
+            if lab is not None and scope in ("lab", "all"):
+                lines += [
+                    f"{virtual_path(rel, lab=True)}:{number}: {line}"
+                    for rel, number, line in lab.grep(query, k=k, prefix=prefix)
+                ]
+            return "\n".join(lines[:k]) if lines else "No line contains that text verbatim."
         hits: list[tuple[float, str]] = []
         if scope in ("project", "all"):
             for hit in project.search(query, k=k, prefix=prefix):
@@ -377,6 +427,13 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
             "description": "Limit the search to one wiki section, for example 'literature'.",
         },
         "k": {"type": "integer", "description": "Maximum number of results (default 8)."},
+        "exact": {
+            "type": "boolean",
+            "description": (
+                "Match the query verbatim instead of by keyword, and return the matching lines "
+                "with line numbers. Use this to check a number or an exact phrase."
+            ),
+        },
     }
     if lab is not None:
         properties["scope"] = {
@@ -392,7 +449,8 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
             "it to find a page when the index does not name it, for example a cited paper by "
             "topic or a lesson about an error message. It searches page text, not the "
             "transcripts, and returns snippets only: open a page with the memory tool to read "
-            "it in full."
+            "it in full. Keyword search treats 87.3 as the words 87 and 3, so set exact to "
+            "true when you are checking a number or a quotation."
         ),
         input_schema={
             "type": "object",
@@ -416,7 +474,10 @@ def transcript_search_tool(transcripts: TranscriptLog) -> ToolSpec:
             k = max(1, min(int(tool_input.get("k") or 8), 25))
         except (TypeError, ValueError) as exc:
             raise ToolError("k must be an integer") from exc
-        hits = transcripts.search(query, k=k, stage=stage)
+        if tool_input.get("exact"):
+            hits = transcripts.grep(query, k=k, stage=stage)
+        else:
+            hits = transcripts.search(query, k=k, stage=stage)
         if not hits:
             return "No matching transcript events."
         return "\n".join(
@@ -444,6 +505,10 @@ def transcript_search_tool(transcripts: TranscriptLog) -> ToolSpec:
                     "description": "Only events from this pipeline stage, e.g. 'refinement'.",
                 },
                 "k": {"type": "integer", "description": "Maximum number of results (default 8)."},
+                "exact": {
+                    "type": "boolean",
+                    "description": "Match the query verbatim (for numbers and exact phrases).",
+                },
             },
             "required": ["query"],
             "additionalProperties": False,

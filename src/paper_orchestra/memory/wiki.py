@@ -47,6 +47,9 @@ TRANSCRIPTS_DIR = "transcripts"
 #: to stay small: wrong or bloated notes there propagate everywhere.
 INDEX_MAX_LINES = 200
 INDEX_MAX_BYTES = 25_000
+#: Budget for the curated standing notes, which every session reads in full.
+STANDING_MAX_LINES = 30
+STANDING_MAX_CHARS = 3_000
 
 STANDING_START = "<!-- standing:start -->"
 STANDING_END = "<!-- standing:end -->"
@@ -254,6 +257,8 @@ class LintReport:
     index_lines: int = 0
     index_bytes: int = 0
     index_over_budget: bool = False
+    standing_lines: int = 0
+    standing_over_budget: bool = False
     pending_notes: int = 0
 
     @property
@@ -270,6 +275,8 @@ class LintReport:
             "index_lines": self.index_lines,
             "index_bytes": self.index_bytes,
             "index_over_budget": self.index_over_budget,
+            "standing_lines": self.standing_lines,
+            "standing_over_budget": self.standing_over_budget,
             "pending_notes": self.pending_notes,
         }
 
@@ -302,6 +309,10 @@ class Wiki:
         soft_page_bytes: int = 40_000,
         index_max_lines: int = INDEX_MAX_LINES,
         index_max_bytes: int = INDEX_MAX_BYTES,
+        standing_max_lines: int = STANDING_MAX_LINES,
+        standing_max_chars: int = STANDING_MAX_CHARS,
+        collapse_over: int = 40,
+        always_collapse: Sequence[str] = (),
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.root = Path(root)
@@ -312,6 +323,12 @@ class Wiki:
         self.soft_page_bytes = soft_page_bytes
         self.index_max_lines = index_max_lines
         self.index_max_bytes = index_max_bytes
+        self.standing_max_lines = standing_max_lines
+        self.standing_max_chars = standing_max_chars
+        #: Sections with more pages than this are listed on their own index page instead of
+        #: in MEMORY.md: the index should say what exists and where, not enumerate it.
+        self.collapse_over = collapse_over
+        self.always_collapse = tuple(always_collapse)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._cache: dict[str, _Cached] = {}
@@ -697,6 +714,28 @@ class Wiki:
             for score, doc in scored[: max(1, k)]
         ]
 
+    def grep(self, needle: str, *, k: int = 20, prefix: str = "") -> list[tuple[str, int, str]]:
+        """Exact (case-insensitive, whitespace-normalised) substring search.
+
+        Returns ``(path, line_number, line)`` for matching lines.  Keyword
+        search splits ``87.3`` into tokens, so checking a number or an exact
+        phrase needs this instead.
+        """
+        wanted = " ".join(needle.lower().split())
+        if not wanted:
+            return []
+        matches: list[tuple[str, int, str]] = []
+        for rel in self._iter_paths(prefix):
+            if rel.startswith(CONSOLIDATED_DIR + "/"):
+                continue
+            for number, line in enumerate(self._load(rel).page.render().split("\n"), 1):
+                if wanted in " ".join(line.lower().split()):
+                    shown = line.strip()
+                    matches.append((rel, number, shown if len(shown) <= 300 else shown[:299] + "…"))
+                    if len(matches) >= k:
+                        return matches
+        return matches
+
     # -- index ---------------------------------------------------------------
 
     def standing_notes(self) -> str:
@@ -746,7 +785,12 @@ class Wiki:
             fixed_lines = len(header) + 4
             fixed_bytes = len("\n".join(header).encode()) + 64
 
-            collapsed: set[str] = set()
+            collapsed: set[str] = {
+                group
+                for group, infos in groups.items()
+                if group != "(top level)"
+                and (group in self.always_collapse or len(infos) > self.collapse_over)
+            }
 
             def render_catalog() -> list[str]:
                 lines = [CATALOG_START, "## Pages", ""]
@@ -855,6 +899,12 @@ class Wiki:
             text = index.read_text(encoding="utf-8")
             report.index_lines = len(text.splitlines())
             report.index_bytes = len(text.encode("utf-8"))
+            standing = self.standing_notes()
+            report.standing_lines = len([ln for ln in standing.splitlines() if ln.strip()])
+            report.standing_over_budget = (
+                report.standing_lines > self.standing_max_lines
+                or len(standing) > self.standing_max_chars
+            )
             report.index_over_budget = (
                 report.index_lines > self.index_max_lines
                 or report.index_bytes > self.index_max_bytes

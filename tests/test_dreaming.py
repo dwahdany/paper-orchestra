@@ -6,7 +6,14 @@ import time
 from paper_orchestra.llm.base import Capabilities, LLMError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
-from paper_orchestra.memory.dreaming import LOCK_FILE, STALE_LOCK_SECONDS, dream
+from paper_orchestra.memory.dreaming import (
+    LOCK_FILE,
+    STALE_LOCK_SECONDS,
+    dream,
+    leak_reason,
+    promote_lessons,
+    unverified_numbers,
+)
 
 
 def make_harness(tmp_path, client, *, lab=False, dream_mode="stages") -> ContextHarness:
@@ -137,34 +144,114 @@ def test_models_without_a_memory_tool_get_maintenance_only(tmp_path):
     assert len(harness.project.pending_notes()) == 1
 
 
-def test_finish_promotes_process_lessons_to_the_lab(tmp_path):
+def test_finish_promotes_portable_lessons_through_a_lab_only_session(tmp_path):
     seen: list[str] = []
 
     def responder(request: FakeRequest) -> str:
         seen.append(request.label)
-        if request.label == "dream.lab":
-            assert "shared by every paper" in request.system
-            assert "generalise" in request.text.lower()
-            try:
-                request.memory.create("/memories/wiki/lessons/x.md", "project is read-only here")
-            except Exception as exc:
-                assert "read-only" in str(exc)
+        if request.label == "dream.project":
             request.memory.create(
-                "/memories/lab/wiki/lessons/latex.md",
-                "---\nsummary: LaTeX pitfalls\n---\nUse cleveref (the package), never cleverref.",
+                "/memories/wiki/lessons/latex.md",
+                "---\nsummary: LaTeX pitfalls\nportable: true\n---\n"
+                "RULE: load cleveref, never cleverref. EVIDENCE: the build failed until fixed.",
             )
-            return "Promoted one LaTeX lesson."
-        request.memory.create("/memories/wiki/lessons/compile.md", "---\nsummary: compile\n---\nx")
-        return "Consolidated."
+            request.memory.create(
+                "/memories/wiki/lessons/this-paper.md",
+                "---\nsummary: paper-specific\n---\nReviewers liked the FooNet ablation.",
+            )
+            return "Consolidated."
+        # The lab session: the lab wiki is its whole memory.
+        assert "shared by every paper" in request.system
+        assert sorted(request.tools) == ["wiki_search"]
+        assert "cleveref" in request.text and "FooNet" not in request.text
+        listing = request.memory.view("/memories")
+        assert "sources" not in listing and "/memories/notes" in listing
+        request.memory.create(
+            "/memories/wiki/lessons/latex.md",
+            "---\nsummary: LaTeX pitfalls\n---\nUse cleveref (the package), never cleverref.",
+        )
+        return "Folded one lesson."
 
     harness = make_harness(tmp_path, FakeLLM(responder), lab=True, dream_mode="end")
+    harness.write_page("wiki/sources/idea.md", "We propose FooNet for long video understanding.")
     harness.note("cleverref typo broke the build", stage="section_writing", kind="lesson")
     project_report, lab_report = harness.finish()
+
     assert seen == ["dream.project", "dream.lab"]
     assert project_report.notes_archived == 1 and project_report.scope == "project"
-    assert lab_report.scope == "lab" and lab_report.pages_changed == ["wiki/lessons/latex.md"]
+    assert lab_report.scope == "lab" and lab_report.llm_used
+    assert lab_report.notes_seen == 1 and lab_report.notes_archived == 1
+    assert lab_report.pages_changed == ["wiki/lessons/latex.md"]
     assert "[[lessons/latex]]: LaTeX pitfalls" in harness.lab.injected_context()
-    assert not harness.project.exists("wiki/lessons/x.md")
+    assert harness.lab.pending_notes() == []
+    promoted = [e for e in harness.transcripts.events() if e["type"] == "promotion"]
+    assert [e["path"] for e in promoted] == ["wiki/lessons/latex.md"]
+    # Finishing again (a resumed run) does not promote the same lesson twice.
+    harness.finish()
+    assert harness.lab.pending_notes() == [] and len(harness.lab.list("notes/consolidated")) == 1
+
+
+def test_lessons_that_carry_paper_content_are_not_promoted(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    harness.write_page(
+        "wiki/sources/idea.md",
+        "We propose FooNet, a sliding window transformer for long video question answering.",
+    )
+    harness.write_page("wiki/sources/experimental_log.md", "FooNet reaches 87.35 accuracy.")
+    lessons = {
+        "number": "Adding the 87.35 result to the abstract raised Clarity.",
+        "wording": "Describe the sliding window transformer for long video question answering early.",
+        "path": "The build failed in /home/alice/paper until cleveref was loaded.",
+        "email": "Ask reviewer@example.org about the template.",
+        "clean": "Answer a reviewer question inside the section it concerns, not in a new paragraph.",
+        "not-portable": "Reviewers liked the ablation.",
+    }
+    for name, text in lessons.items():
+        meta = {"summary": name}
+        if name != "not-portable":
+            meta["portable"] = True
+        harness.project.write(f"wiki/lessons/{name}.md", text, meta)
+
+    added = promote_lessons(harness)
+    assert len(added) == 1
+    assert "inside the section it concerns" in harness.lab.read(added[0]).body
+    blocked = {
+        e["path"]: e["reason"]
+        for e in harness.transcripts.events()
+        if e["type"] == "promotion_blocked"
+    }
+    assert set(blocked) == {f"wiki/lessons/{n}.md" for n in ("number", "wording", "path", "email")}
+    assert "87.35" in blocked["wiki/lessons/number.md"]
+    assert "wording" in blocked["wiki/lessons/wording.md"]
+
+
+def test_leak_reason_ignores_years_and_small_numbers():
+    sources = ["Trained for 100 epochs in 2024 with learning rate 0.1; accuracy 0.9125."]
+    assert (
+        leak_reason("Use dpi 100 and width 0.5 for figures in the 2024 template.", sources) is None
+    )
+    assert "0.9125" in leak_reason("Reached 0.9125.", sources)
+    assert leak_reason("Reached 10.9125 elsewhere.", sources) is None
+    assert "credential" in leak_reason("api_key = abcdef123456", [])
+
+
+def test_numbers_no_record_supports_are_flagged_and_shown_to_the_dream(tmp_path):
+    prompts_seen: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        prompts_seen.append(request.text)
+        request.memory.str_replace("/memories/wiki/lessons/claims.md", "87.9", "87.3")
+        return "Corrected the number."
+
+    harness = make_harness(tmp_path, FakeLLM(responder))
+    harness.write_page("wiki/sources/experimental_log.md", "| Ours | 87.3 |\n| Baseline | 85.0 |")
+    harness.project.write(
+        "wiki/lessons/claims.md", "Ours reaches 87.9 against 85.0 (2 points).", {"summary": "s"}
+    )
+    assert unverified_numbers(harness.project) == [("wiki/lessons/claims.md", "87.9")]
+    report = harness.dream(stage="section_writing", focus="check the numbers")
+    assert report.llm_used and "states 87.9, which appears in no source" in prompts_seen[0]
+    assert report.unverified_numbers == []
 
 
 def test_finish_with_dreaming_off_only_maintains(tmp_path):
