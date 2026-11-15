@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -261,6 +262,46 @@ def test_batch_resumes_and_skips_papers_that_are_already_written(root, cfg, tmp_
     assert run_batch(cfg, root_input_folder=root, output_dir=out) == log_path
     assert third.jobs == [] and third.pool_sizes == []
     assert read_json(log_path) == log
+
+
+def test_an_interrupted_batch_starts_no_further_papers(root, cfg, tmp_path, monkeypatch):
+    workers = Workers(monkeypatch, {"p1": "success", "p2": "success", "p3": "success"})
+    release = threading.Event()
+    real_write = workers.write
+
+    def write(job: dict[str, Any]) -> dict[str, Any]:
+        if job["paper_id"] == "p2":
+            # Still being written when the interrupt arrives.
+            assert release.wait(timeout=10)
+        return real_write(job)
+
+    monkeypatch.setattr(batch, "_write_paper", write)
+    real_write_json = batch.write_json
+
+    def interrupted_after_the_first_paper(path: Path, data: Any) -> Path:
+        result = real_write_json(path, data)
+        if data:
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(batch, "write_json", interrupted_after_the_first_paper)
+    out = tmp_path / "out"
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_batch(cfg, root_input_folder=root, output_dir=out, max_workers=1)
+        # The interrupt came through while p2 was still in progress.
+        assert not release.is_set()
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("ThreadPoolExecutor"):
+                thread.join(timeout=10)
+
+    # p3 was still queued: it is cancelled instead of being written after the interrupt.
+    assert [job["paper_id"] for job in workers.jobs] == ["p1", "p2"]
+    assert read_json(out / "paper_writing_log.json") == {
+        "p1": {"status": "success", "paper_path": str(out / "p1" / "final_paper.pdf")}
+    }
 
 
 def test_batch_rejects_bad_requests(root, cfg, tmp_path, monkeypatch):

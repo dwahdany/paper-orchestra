@@ -416,6 +416,18 @@ def test_p0_wins_when_the_same_paper_is_cited_twice_and_missing_labels_default_t
     assert "1 of 3 reference(s) without a priority" in caplog.text
 
 
+def test_an_answer_that_labels_only_a_few_references_is_not_a_classification():
+    """Filling the gaps with P1 would cache a mostly failed answer as the ground truth."""
+    fake = fake_judge(priorities={"1": "P0", "2": "P1", "77": "P0"})  # 2 of the 5 references
+    retry, sleeps = instant_retry(attempts=3)
+    evaluator = ReferenceF1V1Evaluator(
+        model_name=MODEL, client=fake, scholar=make_lookup(FakeScholarSession()), retry=retry
+    )
+    with pytest.raises(LLMParseError, match="labelled only 2 of 5 references"):
+        evaluator.process_text_to_data(ORIGINAL_REFS, tag="gt", paper_text="body")
+    assert fake.labels().count("eval.citation_priorities") == 3 and len(sleeps) == 2
+
+
 def test_without_paper_text_no_priority_call_is_made_and_everything_is_p1():
     fake = fake_judge()
     evaluator = ReferenceF1V1Evaluator(

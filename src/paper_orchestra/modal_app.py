@@ -8,8 +8,9 @@ From a checkout of this repository (the image is built from its ``uv.lock``)::
 
 ``modal run`` uploads the raw materials and the template, starts ``write_paper``,
 waits for it and downloads ``final_paper.pdf``, ``final_paper.tex`` and
-``usage.json``.  A deployed app exposes ``write_paper(job)`` and
-``write_batch(jobs)`` to ``modal.Function.from_name``.
+``usage.json``.  A deployed app exposes ``write_paper(job)``,
+``write_batch(jobs)`` and ``consolidate_memory(model)`` to
+``modal.Function.from_name``.
 
 Volume layout (``PAPER_ORCHESTRA_MODAL_VOLUME``, default ``paper-orchestra``,
 mounted at ``/vol``)::
@@ -171,7 +172,7 @@ _IDENTITY_TOKEN_VARS = (
 _DEFAULT_TIMEOUT = 6 * 60 * 60
 _MAX_TIMEOUT = 24 * 60 * 60
 _CONSOLIDATE_TIMEOUT = 60 * 60
-#: Volumes (v1) recommend at most five concurrent writers.
+#: Volumes (v1) recommend at most five concurrent writers: four papers and the consolidation.
 _DEFAULT_MAX_CONTAINERS = 4
 _COMMIT_ATTEMPTS = 3
 _COMMIT_RETRY_DELAY = 2.0
@@ -920,7 +921,15 @@ def consolidate_memory(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     return consolidate_lab(model, commit=volume.commit, reload=volume.reload)
 
 
-@app.function(image=image, secrets=[_env_secret], timeout=_MAX_TIMEOUT, memory=1024)
+@app.function(
+    image=image,
+    secrets=[_env_secret],
+    timeout=_MAX_TIMEOUT,
+    memory=1024,
+    # A restart after preemption would map every job again while runs of the first attempt
+    # may still be in flight; this container only waits, so keeping it costs little.
+    nonpreemptible=True,
+)
 def write_batch(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Write several papers, at most ``PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS`` at a time.
 

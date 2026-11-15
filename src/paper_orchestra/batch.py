@@ -254,7 +254,8 @@ def run_batch(
     )
 
     if jobs:
-        with _process_pool(min(max_workers, len(jobs))) as pool:
+        pool = _process_pool(min(max_workers, len(jobs)))
+        try:
             futures = {pool.submit(_write_paper, job): job["paper_id"] for job in jobs}
             for done, future in enumerate(as_completed(futures), start=1):
                 paper_id = futures[future]
@@ -282,6 +283,12 @@ def run_batch(
                         len(jobs),
                         entry.get("error", "no details"),
                     )
+        except BaseException:
+            # An interrupt has to stop the batch.  Leaving the pool the usual way would
+            # start every paper that is still queued and wait for all of them.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown()
     else:
         write_json(log_path, write_log)
 

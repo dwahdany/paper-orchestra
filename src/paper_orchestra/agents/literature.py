@@ -558,11 +558,25 @@ def escape_bibtex(text: str) -> str:
     return " ".join("".join(out).split())
 
 
+def _bibtex_author(name: str) -> str:
+    """One name of a BibTeX ``author`` field (empty when nothing printable is left).
+
+    BibTeX reports an error for a name with more than two commas (in practice an
+    affiliation that was extracted as an author), and a square bracket in a name ends the
+    optional argument of natbib's ``\\bibitem[...]`` early.  Braces make both be taken
+    literally.
+    """
+    escaped = escape_bibtex(name).strip(", ")
+    if escaped.count(",") > 2 or "[" in escaped or "]" in escaped:
+        return "{" + escaped + "}"
+    return escaped
+
+
 def bibtex_entry(paper: PaperData) -> str:
     fields: list[tuple[str, str]] = [
         # The inner braces keep the capitalisation of the title under every bibliography style.
         ("title", "{" + escape_bibtex(paper.title) + "}"),
-        ("author", " and ".join(filter(None, map(escape_bibtex, paper.authors))) or "Unknown"),
+        ("author", " and ".join(filter(None, map(_bibtex_author, paper.authors))) or "Unknown"),
     ]
     # Semantic Scholar files preprints under a journal called "ArXiv" (volume "abs/<id>") and
     # proceedings under a "journal" named after the conference.

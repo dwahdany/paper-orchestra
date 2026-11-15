@@ -26,7 +26,8 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -185,6 +186,23 @@ def pack_tree(root: Path, archive: Path, *, max_file_bytes: int) -> list[str]:
 def _seconds(value: float) -> int:
     # Modal timeouts are uint32 protobuf fields: a float raises TypeError.
     return max(1, math.ceil(value))
+
+
+def _read_tail(stream: Iterable[bytes]) -> bytes:
+    """Drain an output stream of a sandbox process, holding on to its end only.
+
+    Model-written code can print without bound, and what it prints must not
+    exhaust the memory of this process.
+    """
+    budget = 4 * _MAX_CAPTURE  # bytes: room for _MAX_CAPTURE characters of any UTF-8 text
+    chunks: deque[bytes] = deque()
+    held = 0
+    for chunk in stream:
+        chunks.append(chunk)
+        held += len(chunk)
+        while held - len(chunks[0]) >= budget:
+            held -= len(chunks.popleft())
+    return b"".join(chunks)[-budget:]
 
 
 def _decode(data: bytes) -> str:
@@ -468,8 +486,8 @@ class ModalBackend(ComputeBackend):
             # Modal's text mode decodes strictly and LaTeX logs are not always UTF-8.
             text=False,
         )
-        stdout = _decode(process.stdout.read())
-        stderr = _decode(process.stderr.read())
+        stdout = _decode(_read_tail(process.stdout))
+        stderr = _decode(_read_tail(process.stderr))
         returncode = process.wait()
         elapsed = time.monotonic() - started
         # -1: Modal's exec deadline fired.  137: SIGKILL, from `timeout`, the OOM killer or

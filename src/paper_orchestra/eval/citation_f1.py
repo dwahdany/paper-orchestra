@@ -50,7 +50,7 @@ from paper_orchestra.eval.references import (
     extract_paper_title_from_citation,
     get_paper_references_from_pdf,
 )
-from paper_orchestra.llm.base import LLMClient
+from paper_orchestra.llm.base import LLMClient, LLMParseError
 from paper_orchestra.llm.parsing import parse_json_object
 from paper_orchestra.utils.common import write_json
 from paper_orchestra.utils.pdf import load_paper
@@ -395,8 +395,10 @@ class ReferenceF1V1Evaluator:
             "Categorize every reference above as P0 or P1."
         )
         client = resolve_client(self.model_name, self._client)
-        response = call_with_retries(
-            lambda: client.generate(
+        total = len(cleaned_refs)
+
+        def classify() -> dict[str, str]:
+            response = client.generate(
                 prompt,
                 model=self.model_name,
                 system=PRIORITY_SYSTEM_PROMPT,
@@ -404,17 +406,25 @@ class ReferenceF1V1Evaluator:
                 temperature=0.0,
                 label="eval.citation_priorities",
                 parse_retries=0,
-            ),
-            what="citation priority classification",
-            retry=self._retry,
+            )
+            labelled = sum(str(i) in response.parsed for i in range(1, total + 1))
+            if labelled * 2 < total:
+                # Defaulting the rest to P1 would turn a failed answer into a ground truth.
+                raise LLMParseError(
+                    f"the model labelled only {labelled} of {total} references",
+                    raw_text=response.text,
+                )
+            return response.parsed
+
+        priorities = call_with_retries(
+            classify, what="citation priority classification", retry=self._retry
         )
-        priorities: dict[str, str] = response.parsed
-        unlabelled = sum(str(i) not in priorities for i in range(1, len(cleaned_refs) + 1))
+        unlabelled = sum(str(i) not in priorities for i in range(1, total + 1))
         if unlabelled:
             log.warning(
                 "The model left %d of %d reference(s) without a priority; they count as P1.",
                 unlabelled,
-                len(cleaned_refs),
+                total,
             )
         return priorities
 

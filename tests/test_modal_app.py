@@ -828,17 +828,19 @@ def test_run_job_has_the_lab_memory_consolidated_after_a_successful_run(pipeline
 
 
 @pytest.mark.parametrize(
-    "change",
+    ("change", "pipeline_succeeds"),
     [
-        {"memory": {"lab": False}},
-        {"memory": {"enabled": False}},
-        {"memory": {"dream": "off"}},
-        {"success": False},
-        {"run_id": "../escape"},
+        ({"memory": {"lab": False}}, True),
+        ({"memory": {"enabled": False}}, True),
+        ({"memory": {"dream": "off"}}, True),
+        ({}, False),
+        ({"run_id": "../escape"}, True),
     ],
 )
-def test_run_job_skips_the_consolidation_when_there_is_nothing_to_fold_in(pipeline, volume, change):
-    pipeline.success = change.pop("success", True)
+def test_run_job_skips_the_consolidation_when_there_is_nothing_to_fold_in(
+    pipeline, volume, change, pipeline_succeeds
+):
+    pipeline.success = pipeline_succeeds
     calls: list[str] = []
     summary = run_job(
         {**stage_inputs(volume), **change},
@@ -846,7 +848,7 @@ def test_run_job_skips_the_consolidation_when_there_is_nothing_to_fold_in(pipeli
         consolidate=calls.append,
         mount=volume.root,
     )
-    assert calls == [] and summary["success"] is (pipeline.success and "run_id" not in change)
+    assert calls == [] and summary["success"] is (pipeline_succeeds and "run_id" not in change)
 
 
 def test_run_job_survives_a_failed_consolidation(pipeline, volume, logs):
@@ -1367,6 +1369,7 @@ print(json.dumps({
             "max_containers": options.get("max_containers"),
             "single_use": options.get("single_use_containers", False),
             "retries": options.get("retries") is not None,
+            "nonpreemptible": options.get("nonpreemptible", False),
             "timeout": options["timeout"],
             "pipeline_image": options["image"] is m.image,
         }
@@ -1404,7 +1407,8 @@ print(json.dumps({
         "secrets": 1,  # no named Secret was asked for: only the forwarded settings
         "max_containers": 4,
         "single_use": True,
-        "retries": True,
+        "retries": True,  # a retry, or a restart after preemption, resumes the run
+        "nonpreemptible": False,
         "timeout": 21600,
         "pipeline_image": True,
     }
@@ -1415,7 +1419,18 @@ print(json.dumps({
         "max_containers": 1,
         "single_use": True,
         "retries": False,
+        "nonpreemptible": False,
         "timeout": 3600,
         "pipeline_image": True,
     }
-    assert functions["write_batch"]["volumes"] == [] and functions["write_batch"]["secrets"] == 1
+    # The batch driver holds no credentials or volume, and is not restarted halfway through.
+    assert functions["write_batch"] == {
+        "volumes": [],
+        "secrets": 1,
+        "max_containers": None,
+        "single_use": False,
+        "retries": False,
+        "nonpreemptible": True,
+        "timeout": 86400,
+        "pipeline_image": True,
+    }

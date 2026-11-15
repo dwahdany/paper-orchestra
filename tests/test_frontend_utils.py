@@ -1259,3 +1259,17 @@ def test_page_refuses_to_start_with_an_invalid_notification_address(app):
     assert not app.exception
     assert any("email address is not valid" in error.value for error in app.error)
     assert app.commands == [] and not app.run_dir.exists()
+
+
+def test_an_upload_that_is_not_an_image_stays_deletable_and_does_not_break_the_form(app):
+    """Its preview used to raise above the delete and start buttons, leaving the form stuck."""
+    app.run()
+    app.session_state.figures = [
+        {"id": 1, "file": io.BytesIO(b"not an image"), "name": "broken.png", "caption": "c"}
+    ]
+    app.run()
+    assert not app.exception
+    assert any("cannot be shown as an image" in warning.value for warning in app.warning)
+    assert any("Begin Writing" in button.label for button in app.button)
+    next(button for button in app.button if "Delete Image" in button.label).click().run()
+    assert not app.exception and app.session_state.figures == []

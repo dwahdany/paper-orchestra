@@ -419,7 +419,12 @@ def render_uploaded_figures() -> None:
         if figure["name"].lower().endswith(".pdf"):
             st.caption("PDF figure (no preview).")
         else:
-            st.image(figure["file"], width="stretch")
+            try:
+                st.image(figure["file"], width="stretch")
+            except Exception as error:
+                # A file that is not really an image must stay on the page with its delete
+                # button: an exception here would end the script above the rest of the form.
+                st.warning(f"This file cannot be shown as an image ({type(error).__name__}).")
         new_caption = st.text_input(
             "Edit Caption",
             value=figure["caption"],
@@ -777,8 +782,12 @@ def render_tab(render: Callable[..., None], *arguments: Any) -> None:
     try:
         render(*arguments)
     except Exception as error:
-        fu.log.exception("A tab of the demo page could not be drawn.")
-        st.error(f"This tab could not be drawn: {type(error).__name__}: {error}")
+        problem = f"{type(error).__name__}: {error}"
+        # Logged once per problem, not on every refresh of the page.
+        if st.session_state.get(f"tab_problem_{render.__name__}") != problem:
+            st.session_state[f"tab_problem_{render.__name__}"] = problem
+            fu.log.exception("The %s part of the demo page could not be drawn.", render.__name__)
+        st.error(f"This tab could not be drawn: {problem}")
 
 
 def render_run() -> None:

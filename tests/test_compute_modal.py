@@ -8,8 +8,9 @@ import subprocess
 import sys
 import tarfile
 import time
+import tracemalloc
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -38,11 +39,14 @@ BANNER = b"This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2024)\n"
 
 
 class FakeStream:
+    """An output stream of a process: iterating it yields the output in chunks."""
+
     def __init__(self, data: bytes) -> None:
         self._data = data
 
-    def read(self) -> bytes:
-        return self._data
+    def __iter__(self) -> Iterator[bytes]:
+        for start in range(0, len(self._data), 7):
+            yield self._data[start : start + 7]
 
 
 class FakeProcess:
@@ -285,12 +289,14 @@ def real_sdk() -> types.SimpleNamespace:
     """The installed Modal SDK.  Request it before ``fake`` so the real package is imported."""
     modal = pytest.importorskip("modal")
     from modal.container_process import ContainerProcess
+    from modal.io_streams import StreamReader
     from modal.sandbox.sandbox import SandboxFilesystem
     from modal.types import FileInfo
 
     return types.SimpleNamespace(
         modal=modal,
         ContainerProcess=ContainerProcess,
+        StreamReader=StreamReader,
         SandboxFilesystem=SandboxFilesystem,
         FileInfo=FileInfo,
     )
@@ -455,6 +461,31 @@ def test_output_is_decoded_leniently_and_capped(fake, backend, monkeypatch):
     assert result.stdout == "x" * 10
     fake.handlers[:] = [scripted(python=lambda *_: FakeProcess(b"caf\xe9", b""))]
     assert backend.run_python("pass").stdout == "caf\ufffd"
+
+
+def test_runaway_output_is_drained_without_being_held_in_memory(monkeypatch):
+    """Model-written code may print without bound; only the end of it is kept."""
+    kilobyte = b"0123456789abcdef" * 64
+
+    def endless() -> Iterator[bytes]:
+        for index in range(20_000):  # 20 MB
+            yield kilobyte if index else b"first" + kilobyte
+        yield b"the end"
+
+    tracemalloc.start()
+    try:
+        tail = modal_backend._read_tail(endless())
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    budget = 4 * modal_backend._MAX_CAPTURE
+    assert len(tail) == budget and tail.endswith(b"abcdefthe end")
+    assert peak < 4 * budget
+
+    monkeypatch.setattr(modal_backend, "_MAX_CAPTURE", 2)
+    assert modal_backend._read_tail([b"ab", b"cd", b"efgh", b"i"]) == b"bcdefghi"
+    assert modal_backend._read_tail([]) == b""
+    assert modal_backend._read_tail([b"x" * 100]) == b"x" * 8
 
 
 @pytest.mark.parametrize("name", ["/abs/path", "../up.txt", "a/../../b", ""])
@@ -938,3 +969,4 @@ def test_calls_match_the_installed_modal_sdk(real_sdk, fake, backend, tmp_path):
     assert "size" in real_sdk.FileInfo.__dataclass_fields__
     assert callable(real_sdk.ContainerProcess.wait)
     assert {"stdout", "stderr"} <= set(dir(real_sdk.ContainerProcess))
+    assert callable(real_sdk.StreamReader.__iter__)  # output is read chunk by chunk
