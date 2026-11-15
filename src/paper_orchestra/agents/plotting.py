@@ -43,7 +43,6 @@ from typing import Any, Protocol
 from PIL import Image as PILImage
 from pydantic import BaseModel
 
-from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.config import PAPER_BANANA_ENV
 from paper_orchestra.context import RunContext
 from paper_orchestra.llm.base import Image, LLMClient, LLMError, Part, Text
@@ -68,7 +67,8 @@ LABEL_CAPTION = "plotting.caption"
 #: File a figure script leaves behind, relative to its working directory.
 FIGURE_FILE = "figure.png"
 FIGURE_DPI = 200
-#: Upper bound on the longer side of a saved figure, in pixels.
+#: Longer side of a saved figure, in pixels, above which its resolution is lowered
+#: (never below 72 dpi, so that an absurd figure size fails instead of being unreadable).
 MAX_FIGURE_PIXELS = 4096
 CODE_TIMEOUT_SECONDS = 120
 NO_FIGURE_EXIT_CODE = 3
@@ -83,14 +83,20 @@ NO_CHANGES = "No changes needed."
 
 _MAX_ID_CHARS = 80
 _OUTPUT_TAIL_CHARS = 2000
+#: How many per-figure reasons a PlottingError quotes, and how much of each.
+_REASONS_SHOWN = 3
+_REASON_CHARS = 300
 
 # Runs after the model's script, in the same interpreter inside the compute backend.  It
 # looks pyplot up in sys.modules instead of importing it: a script that never imported
-# pyplot cannot have an open figure.
+# pyplot cannot have an open figure.  It shares the script's global namespace, where names
+# such as max or int may have been rebound (``from numpy import *`` does that), so every
+# builtin it needs is reached through the builtins module.
 SAVE_FIGURE_EPILOGUE = f'''
 
 # Appended by PaperOrchestra: save the figure this script drew as {FIGURE_FILE}.
 def _paper_orchestra_save_figure():
+    import builtins
     import os
     import sys
 
@@ -104,10 +110,12 @@ def _paper_orchestra_save_figure():
             + target
             + ". Create the figure with matplotlib.pyplot and leave it open.\\n"
         )
-        raise SystemExit({NO_FIGURE_EXIT_CODE})
+        sys.exit({NO_FIGURE_EXIT_CODE})
     figure = pyplot.gcf()
-    longest_side = max(figure.get_size_inches())
-    dpi = max(72, min({FIGURE_DPI}, int({MAX_FIGURE_PIXELS} / longest_side)))
+    longest_side = builtins.max(figure.get_size_inches())
+    dpi = builtins.max(
+        72, builtins.min({FIGURE_DPI}, builtins.int({MAX_FIGURE_PIXELS} / longest_side))
+    )
     figure.savefig(target, dpi=dpi, bbox_inches="tight")
 
 
@@ -136,6 +144,10 @@ class FigureCritique(BaseModel):
     needs_revision: bool
     critic_suggestions: str = ""
     revised_description: str = ""
+
+
+class PlottingError(RuntimeError):
+    """Figures were planned and not one of them could be produced."""
 
 
 class FigureRenderError(RuntimeError):
@@ -182,6 +194,12 @@ class _Finished:
     png: bytes
     method: str
     examples: int
+
+
+@dataclass(frozen=True)
+class _Skipped:
+    spec: FigureSpec
+    reason: str
 
 
 class _Renderer(Protocol):
@@ -337,7 +355,14 @@ def run_figure_code(ctx: RunContext, code: str) -> bytes:
         raise _CodeFailure(f"It exited with status {result.returncode}.", output)
     data = result.files.get(FIGURE_FILE)
     if not data:
-        raise _CodeFailure(f"It finished without producing {FIGURE_FILE}.", output)
+        # The epilogue saves or fails loudly, so a clean exit without the file means it
+        # never ran or saved somewhere else.
+        raise _CodeFailure(
+            f"It finished without producing {FIGURE_FILE}. The figure is saved only when the "
+            "script runs to its last line in the directory it started in, so look for an "
+            "early exit (sys.exit) or a changed working directory.",
+            output,
+        )
     try:
         return to_png(data)
     except ValueError as exc:
@@ -602,7 +627,11 @@ class PlottingAgent:
         self._vision = True
 
     def run(self, outline: dict[str, Any]) -> list[dict[str, Any]]:
-        """Produce the planned figures; return (and write) the results of those that succeeded."""
+        """Produce the planned figures; return (and write) the results of those that succeeded.
+
+        A figure that fails is skipped.  When figures were planned and every one
+        of them failed, the stage has no output and :class:`PlottingError` is raised.
+        """
         cfg = self.ctx.cfg
         specs = plan_figures(outline.get("plotting_plan"), reserved=self._provided_stems())
         if not specs:
@@ -625,22 +654,32 @@ class PlottingAgent:
         workers = max(1, min(cfg.figure_workers, len(specs)))
         log.info("Plotting %d figure(s) with %d worker(s).", len(specs), workers)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="figure") as pool:
-            outcomes = list(pool.map(self._figure_or_none, specs))
-        finished = [outcome for outcome in outcomes if outcome is not None]
+            outcomes = list(pool.map(self._figure_or_skip, specs))
+        finished = [outcome for outcome in outcomes if isinstance(outcome, _Finished)]
+        skipped = [outcome for outcome in outcomes if isinstance(outcome, _Skipped)]
         results = self._write_outputs(finished)
 
-        skipped = [
-            spec.figure_id for spec, outcome in zip(specs, outcomes, strict=True) if outcome is None
-        ]
-        if skipped:
-            log.warning(
-                "Plotting produced %d of %d figure(s); skipped: %s.",
-                len(finished),
-                len(specs),
-                ", ".join(skipped),
-            )
-        else:
+        if not skipped:
             log.info("Plotting produced all %d figure(s).", len(specs))
+            return results
+        log.warning(
+            "Plotting produced %d of %d figure(s); skipped: %s.",
+            len(finished),
+            len(specs),
+            ", ".join(item.spec.figure_id for item in skipped),
+        )
+        if not finished:
+            # Losing one figure is tolerated; losing all of them points at something every
+            # figure shares (the model, the compute backend), which the caller must see.
+            shown = "; ".join(
+                f"{item.spec.figure_id}: {_one_line(item.reason, _REASON_CHARS)}"
+                for item in skipped[:_REASONS_SHOWN]
+            )
+            more = len(skipped) - _REASONS_SHOWN
+            raise PlottingError(
+                f"none of the {len(specs)} planned figure(s) could be produced ({shown}"
+                + (f"; and {more} more)" if more > 0 else ")")
+            )
         return results
 
     # -- setup -----------------------------------------------------------------
@@ -677,7 +716,7 @@ class PlottingAgent:
 
     # -- one figure --------------------------------------------------------------
 
-    def _figure_or_none(self, spec: FigureSpec) -> _Finished | None:
+    def _figure_or_skip(self, spec: FigureSpec) -> _Finished | _Skipped:
         """Process one figure; a failure is logged and noted, and costs only this figure."""
         try:
             return self._process(spec)
@@ -715,7 +754,7 @@ class PlottingAgent:
                 status="failed",
                 error=_describe(exc),
             )
-            return None
+            return _Skipped(spec, _describe(exc))
 
     def _process(self, spec: FigureSpec) -> _Finished:
         log.info("Figure '%s': planning a %s (%s).", spec.figure_id, spec.task, spec.aspect_ratio)
@@ -738,25 +777,34 @@ class PlottingAgent:
                     exc,
                 )
                 break
-            suggestions = critique.critic_suggestions.strip() or NO_CHANGES
+            suggestions = critique.critic_suggestions.strip()
+            if _is_no_change(suggestions):
+                # Only an accepted figure is recorded with this text: sent along with a
+                # revision it would tell the code model that nothing needs to change.
+                suggestions = ""
             revised = _strip_description_label(critique.revised_description)
             if not critique.needs_revision or not revised or _is_no_change(revised):
-                history.append(_history_entry(round_index, suggestions, description, "accepted"))
+                history.append(
+                    _history_entry(round_index, suggestions or NO_CHANGES, description, "accepted")
+                )
                 log.info(
                     "Figure '%s': accepted in critic round %d.", spec.figure_id, round_index + 1
                 )
                 break
             try:
                 revised_png = renderer.render(revised, suggestions=suggestions)
-            except (FigureRenderError, LLMError, ComputeError) as exc:
+            except Exception as exc:
+                # Whatever broke, the figure already has a valid render: a revision is an
+                # improvement to try, never a reason to lose the figure.
                 history.append(_history_entry(round_index, suggestions, revised, "render_failed"))
                 log.warning(
                     "Figure '%s': the revision of critic round %d could not be rendered (%s); "
                     "keeping the previous render.",
                     spec.figure_id,
                     round_index + 1,
-                    exc,
+                    _describe(exc),
                 )
+                log.debug("Traceback for figure '%s':", spec.figure_id, exc_info=True)
                 self.ctx.harness.note(
                     f"Figure '{spec.figure_id}' ({spec.task}): the description revised by the "
                     "critic could not be rendered, so the previous render was kept: "
@@ -904,12 +952,20 @@ class PlottingAgent:
             image_renderer = _ImageModelRenderer(self.ctx, spec, self._image_client, model)
             try:
                 return image_renderer, image_renderer.render(description)
-            except (FigureRenderError, LLMError) as exc:
+            except Exception as exc:
+                # The code path below can draw any diagram, so no failure of the image
+                # model (its provider's SDK included) is allowed to cost the figure.
+                reason = (
+                    str(exc)
+                    if isinstance(exc, FigureRenderError)
+                    else f"the image model '{model}' failed ({_describe(exc)})"
+                )
                 log.warning(
                     "Figure '%s': %s; drawing the diagram with matplotlib code instead.",
                     spec.figure_id,
-                    exc,
+                    reason,
                 )
+                log.debug("Traceback for figure '%s':", spec.figure_id, exc_info=True)
         code_renderer = _CodeRenderer(self.ctx, spec)
         return code_renderer, code_renderer.render(description)
 

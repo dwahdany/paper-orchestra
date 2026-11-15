@@ -380,15 +380,22 @@ def code_request(
 
 
 def code_revision_request(*, description: str, suggestions: str) -> str:
-    """Follow-up turn after a critic asked for changes to the rendered figure."""
-    return (
+    """Follow-up turn after a critic asked for changes to the rendered figure.
+
+    ``suggestions`` may be empty: a critic can revise the description without commenting.
+    """
+    blocks = [
         "A reviewer looked at the figure your script rendered and asked for changes; the "
-        "description was revised accordingly.\n\n"
-        f"{_tag('reviewer_suggestions', suggestions)}\n\n"
-        f"{_tag('figure_description', description)}\n\n"
+        "description was revised accordingly."
+    ]
+    if suggestions.strip():
+        blocks.append(_tag("reviewer_suggestions", suggestions))
+    blocks += [
+        _tag("figure_description", description),
         "Update the script so that the figure matches the revised description, and reply with "
-        "the complete script."
-    )
+        "the complete script.",
+    ]
+    return "\n\n".join(blocks)
 
 
 def code_repair_request(*, problem: str, output: str) -> str:

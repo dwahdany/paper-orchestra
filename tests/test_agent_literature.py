@@ -1211,6 +1211,26 @@ def test_semantic_scholar_being_down_stops_the_lookups_but_not_the_stage(tmp_pat
     assert kinds == ["observation", "observation"]  # incomplete search + empty bibliography
 
 
+def test_the_cache_still_answers_while_semantic_scholar_is_down(tmp_path):
+    run_agent(tmp_path, name="first")  # fills the cache
+
+    unknown = [{"title": f"Candidate Number {i}", "year": 2020, "reason": ""} for i in range(6)]
+    script = Script(
+        {
+            "widget surveys": [*unknown, DISCOVERY["widget surveys"][0]],
+            "widget drift failure": DISCOVERY["widget drift failure"],
+            ADAM_HINT: DISCOVERY[ADAM_HINT],
+        }
+    )
+    down = FakeS2Session(failing=("Candidate", "Widget", "Adam"))
+    result, ctx, _, _ = run_agent(tmp_path, script, name="second", session=down)
+
+    assert list(result.citation_map) == [SURVEY, DRIFT, ADAM]  # all three from the cache
+    assert len(down.queries) == 5 * 2  # the outage was noticed after five titles
+    (event,) = [e for e in ctx.harness.transcripts.events() if e["type"] == "literature"]
+    assert (event["lookup_errors"], event["skipped_lookups"], event["cache_hits"]) == (5, 1, 3)
+
+
 def test_scholar_errors_are_the_only_lookup_failures_that_are_tolerated(tmp_path):
     class BrokenScholar:
         def find_paper(self, title, *, year_hint=None, cutoff=None):

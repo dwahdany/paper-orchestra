@@ -422,8 +422,7 @@ def test_literature_stage_is_followed_by_a_synthesis_dream(cfg, stubs):
 
 
 def test_state_json_follows_every_transition(cfg, stubs):
-    settled: list[tuple[str, str]] = []
-    result, harness, _ = run(cfg, on_stage=lambda name, rec: settled.append((name, rec["status"])))
+    result, harness, _ = run(cfg)
 
     during_outline = stubs.states["outline"]
     assert during_outline["status"] == "running"
@@ -445,7 +444,6 @@ def test_state_json_follows_every_transition(cfg, stubs):
     order = ["ingest", "outline", "literature", "section_writing", "refinement", "finalize"]
     assert state["status"] == "completed" and state["error"] is None
     assert list(state["stages"]) == order
-    assert settled == [(name, "completed") for name in order]
     assert state["stages"] == result.stages
     assert state["stages"]["refinement"]["outputs"] == [
         "content_refinement_workdir/final_refined_paper.pdf",
@@ -607,7 +605,7 @@ def test_literature_failure_is_fatal_and_plotting_is_still_awaited(cfg, stubs):
     assert "section_writing" not in stubs.calls
 
 
-def test_plotting_failure_is_tolerated(cfg, stubs, caplog):
+def test_plotting_failure_is_tolerated(cfg, stubs, caplog, monkeypatch):
     figures = cfg.base_dir / "raw_materials" / "figures"
     figures.mkdir()
     (figures / "teaser.png").write_bytes(PNG)
@@ -632,6 +630,12 @@ def test_plotting_failure_is_tolerated(cfg, stubs, caplog):
     assert len(bodies) == 2
     assert any("still boom" in body and "continues without" in body for body in bodies)
     assert read_json(RunPaths(cfg.base_dir).time_breakdown)["Parallel_Lit_and_Plot"] >= 0
+
+    # The run accepted that failure, so resuming it has nothing left to do.
+    again = StubAgents().install(monkeypatch)
+    resumed, _, _ = run(cfg)
+    assert resumed.success and again.calls == []
+    assert resumed.stages["plotting"]["status"] == "failed" and resumed.stages["plotting"]["reused"]
 
 
 def test_configuration_errors_inside_a_stage_are_not_retried(cfg, stubs):

@@ -537,9 +537,12 @@ RunDirOption = Annotated[
 
 
 def _memory_root(memory_dir: Path | None, run_dir: Path | None) -> Path:
-    if (memory_dir is None) == (run_dir is None):
+    if memory_dir is not None and run_dir is None:
+        root = memory_dir
+    elif run_dir is not None and memory_dir is None:
+        root = run_dir / "memory"
+    else:
         _fail("Give exactly one of --memory-dir and --run-dir.")
-    root = memory_dir if memory_dir is not None else run_dir / "memory"  # type: ignore[operator]
     # Checked first because opening a wiki creates it where there is none.
     if not (root / "MEMORY.md").is_file():
         _fail(f"No memory found at {root} (there is no {root / 'MEMORY.md'}).")

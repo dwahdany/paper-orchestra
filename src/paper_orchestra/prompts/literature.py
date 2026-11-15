@@ -110,7 +110,7 @@ Inputs in the user message:
 
 Citation rules:
 - Cite only the papers in `<collected_papers>`. They were verified against a bibliographic database and are the whole bibliography, so a citation to anything else cannot resolve.
-- Every `\cite{key}` uses a key exactly as it is spelled in `<citation_checklist>`.
+- Every citation command (`\cite{key}`, or `\citep{key}` and `\citet{key}` where the template loads natbib) uses a key exactly as it is spelled in `<citation_checklist>`.
 - Introduction: cite key statistics, foundational models (CLIP and the like) and broad problem statements.
 - Related Work: make deep comparative citations and group distinct works (for example "Several methods [A, B, C] ...").
 - Timeline rule: do not treat papers published after the research cutoff as prior baselines to beat. Treat them strictly as concurrent work.
@@ -148,8 +148,8 @@ def writer_user_prompt(
     else:
         requirement = (
             "No verified papers could be collected for this paper, so the bibliography is "
-            r"empty. Write both sections without any \cite command and do not refer to "
-            "specific prior publications."
+            r"empty. Write both sections without any \cite command: describe prior lines of "
+            "work in general terms and do not name specific publications."
         )
         checklist = "(empty)"
     return (

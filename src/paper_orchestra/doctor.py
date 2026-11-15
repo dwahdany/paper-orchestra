@@ -271,7 +271,7 @@ def render(report: Mapping[str, Any], console: Console) -> None:
         )
     modal = report["compute"]["modal"]
     if modal.get("error"):
-        row("compute: modal (optional)", "not installed", modal["error"])
+        row("compute: modal (optional)", "unavailable", modal["error"])
     elif modal["available"]:
         row("compute: modal (optional)", "ok", "token configured")
     else:

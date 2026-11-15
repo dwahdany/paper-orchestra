@@ -808,9 +808,9 @@ def test_schemas_the_sdk_transform_fails_on_are_config_errors_not_crashes(api, c
         callback: Callable[[int], int]
 
     conversation = client.conversation(model=MODEL)
-    with pytest.raises(LLMConfigError, match="cannot be used.*AssertionError"):
+    with pytest.raises(LLMConfigError, match=r"cannot be used.*AssertionError"):
         conversation.send("x", schema=nullable)
-    with pytest.raises(LLMConfigError, match="cannot be used.*PydanticInvalidForJsonSchema"):
+    with pytest.raises(LLMConfigError, match=r"cannot be used.*PydanticInvalidForJsonSchema"):
         conversation.send("x", schema=Hooked)
     with pytest.raises(LLMConfigError, match="cannot be used"):
         conversation.send("x", schema={"type": "object", "properties": ["a", "b"]})
@@ -1008,9 +1008,15 @@ def test_pause_turn_is_resumed_without_a_user_message(api, client, monkeypatch):
         "output_tokens": 9,
         "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 0},
     }
-    api.script += [msg(paused, "pause_turn"), msg(resumed, usage=searched)]
+    # Dynamic-filtering web search runs in a container, which the response reports.
+    final = msg(resumed, usage=searched)
+    final["container"] = {"id": "container_1", "expires_at": "2026-11-15T12:00:00Z"}
+    api.script += [msg(paused, "pause_turn"), final]
     conversation = client.conversation(model=MODEL, web_search=WebSearch(max_uses=4))
     response = conversation.send("Survey the field.")
+    # The SDK parses the expiry into a datetime; `raw` stays plain JSON regardless.
+    assert json.loads(json.dumps(response.raw))["container"]["id"] == "container_1"
+    assert isinstance(response.raw["container"]["expires_at"], str)
 
     # Citation-split text blocks are one passage; the paused narration is a separate one.
     assert response.text == "Searching.\n\nRelated work: E shows X."

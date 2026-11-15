@@ -85,8 +85,6 @@ LITERATURE_SYNTHESIS_FOCUS = (
 
 _USAGE_FIELDS = tuple(Usage().to_dict())
 
-StageCallback = Callable[[str, dict[str, Any]], None]
-
 
 class StageError(RuntimeError):
     """A stage finished without producing the files the next stage needs."""
@@ -515,9 +513,8 @@ class _Stage:
 
 
 class _Runner:
-    def __init__(self, ctx: RunContext, on_stage: StageCallback | None) -> None:
+    def __init__(self, ctx: RunContext) -> None:
         self.ctx = ctx
-        self.on_stage = on_stage
         middle = [_Stage("literature", self._literature, after=self._synthesize_literature)]
         if ctx.cfg.use_plotting:
             middle.append(_Stage("plotting", self._plotting, optional=True))
@@ -595,7 +592,7 @@ class _Runner:
                 failure = self._run_groups()
             except BaseException:
                 self.state.close("interrupted", "the run was interrupted")
-                self._write_usage()
+                self._guarded(self._write_usage, "usage report")
                 raise
 
         self.state.close("failed" if failure else "completed", failure)
@@ -648,7 +645,9 @@ class _Runner:
         """Stages whose earlier result stands.
 
         A stage is reused when it completed, its recorded outputs still exist
-        and every stage before it is reused too.
+        and every stage before it is reused too.  An optional stage whose
+        failure the earlier run accepted is settled as well: resuming continues
+        a run, it does not reopen decisions the run already made.
         """
         reuse: set[str] = set()
         if previous is None:
@@ -658,10 +657,13 @@ class _Runner:
             done = []
             for stage in group:
                 record = previous["stages"].get(stage.name)
-                if not isinstance(record, dict) or record.get("status") != "completed":
+                if not isinstance(record, dict):
                     continue
                 outputs = record.get("outputs") or []
-                if outputs and all((base / rel).is_file() for rel in outputs):
+                if record.get("status") == "completed":
+                    if outputs and all((base / rel).is_file() for rel in outputs):
+                        done.append(stage.name)
+                elif stage.optional and record.get("tolerated"):
                     done.append(stage.name)
             reuse.update(done)
             if len(done) < len(group):
@@ -703,7 +705,6 @@ class _Runner:
         name, harness = stage.name, self.ctx.harness
         if name in self.reuse:
             log.info("Stage %s: reusing the result of the earlier run.", name)
-            self._notify(name)
             return True
 
         attempts = self.ctx.cfg.max_stage_attempts
@@ -767,12 +768,10 @@ class _Runner:
             log.info("Stage %s completed in %.1f s.", name, seconds)
             if stage.after is not None:
                 self._guarded(stage.after, f"consolidation after the {name} stage")
-            self._guarded(harness.refresh, f"memory refresh after the {name} stage")
-            self._notify(name)
+            self._settle(name)
             return True
 
-        self._guarded(harness.refresh, f"memory refresh after the {name} stage")
-        self._notify(name)
+        self._settle(name)
         return False
 
     def _note_failure(
@@ -806,17 +805,16 @@ class _Runner:
         )
 
     def _guarded(self, action: Callable[[], Any], what: str) -> None:
-        """Memory upkeep and callbacks must never take the run down with them."""
+        """Memory upkeep and bookkeeping must never take the run down with them."""
         try:
             action()
         except Exception as exc:
             log.warning("The %s failed: %s", what, exc, exc_info=True)
 
-    def _notify(self, name: str) -> None:
+    def _settle(self, name: str) -> None:
+        """After a stage ran: refresh the memory index and persist what the run has spent."""
+        self._guarded(self.ctx.harness.refresh, f"memory refresh after the {name} stage")
         self._guarded(self._write_usage, "usage report")
-        if self.on_stage is not None:
-            record = self.state.record(name)
-            self._guarded(lambda: self.on_stage(name, record), f"stage callback for {name}")
 
     def _write_usage(self) -> dict[str, Any]:
         report = _usage_report(self.ctx.harness.usage, self.carried_usage)
@@ -1072,7 +1070,6 @@ def run_paper(
     *,
     harness: ContextHarness | None = None,
     compute: ComputeBackend | None = None,
-    on_stage: StageCallback | None = None,
 ) -> PaperResult:
     """Write one paper from ``<cfg.base_dir>/raw_materials``.
 
@@ -1082,10 +1079,8 @@ def run_paper(
     credentials, a missing TeX installation or a stage that keeps failing give
     a result with ``success=False``, and ``state.json`` says what went wrong.
 
-    ``on_stage(name, record)`` is called after every stage settles (completed,
-    failed or reused) with that stage's ``state.json`` record, for callers that
-    checkpoint or report progress.  The compute backend is closed on return
-    only when this function created it.
+    ``harness`` and ``compute`` default to what ``cfg`` asks for; a compute
+    backend created here is closed before returning, one passed in is not.
     """
     paths = prepare_run_dir(cfg, None)
     if harness is None:
@@ -1095,7 +1090,7 @@ def run_paper(
         compute = _build_compute(cfg)
     ctx = RunContext(cfg=cfg, paths=paths, harness=harness, compute=compute, usage=harness.usage)
     try:
-        return _Runner(ctx, on_stage).run()
+        return _Runner(ctx).run()
     finally:
         if owns_compute:
             try:

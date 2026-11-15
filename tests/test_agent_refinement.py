@@ -133,6 +133,10 @@ def review_by_cue(request: FakeRequest) -> str:
     return review_json(**scores)
 
 
+def fence(tex: str) -> str:
+    return f"```latex\n{tex}```\n"
+
+
 def revision(tex: str, **plan) -> str:
     plan = plan or {"addressed_weaknesses": ["added ablations"], "actions_taken": ["rewrote 4.2"]}
     return f"```json\n{json.dumps(plan)}\n```\n```latex\n{tex}```\n"
@@ -562,9 +566,7 @@ def test_revision_that_does_not_build_gets_one_repair_turn(tmp_path, repo_root):
     broken = paper(repo_root, "overall=9", extra=" \\badmacro")
     fixed = paper(repo_root, "overall=6", extra=" Fixed macro.")
     plan = {"actions_taken": ["introduced a macro"]}
-    client = FakeLLM(
-        script(**{REVISE: Reviser([revision(broken, **plan), f"```latex\n{fixed}```"])})
-    )
+    client = FakeLLM(script(**{REVISE: Reviser([revision(broken, **plan), fence(fixed)])}))
     ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=1)
 
     run(ctx)
@@ -978,7 +980,6 @@ def test_runs_with_memory_disabled(tmp_path, repo_root):
     v1 = paper(repo_root, "overall=6", extra=" Revised.")
     client = FakeLLM(script(**{REVISE: Reviser(revision(v1))}))
     ctx = make_ctx(tmp_path, repo_root, client, v0, memory=False, max_reflections=2)
-    client.requests.clear()
 
     final_pdf = run(ctx)
 
@@ -988,10 +989,6 @@ def test_runs_with_memory_disabled(tmp_path, repo_root):
 
 
 # -- prompts -------------------------------------------------------------------
-
-
-def fence(tex: str) -> str:
-    return f"```latex\n{tex}```\n"
 
 
 def test_prompts_carry_literal_json_and_latex():

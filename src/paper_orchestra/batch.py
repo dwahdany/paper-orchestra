@@ -122,8 +122,9 @@ def summarize(write_log: dict[str, dict[str, Any]]) -> dict[str, int]:
     """Number of papers per status (``success``, ``failed``, ``error``)."""
     counts = {"success": 0, "failed": 0, "error": 0}
     for entry in write_log.values():
-        status = str(entry.get("status"))
-        counts[status] = counts.get(status, 0) + 1
+        status = entry.get("status")
+        if status in counts:
+            counts[status] += 1
     return counts
 
 
@@ -284,7 +285,7 @@ def run_batch(
     else:
         write_json(log_path, write_log)
 
-    counts = summarize({p["paper_id"]: write_log.get(p["paper_id"], {}) for p in papers})
+    counts = summarize({paper["paper_id"]: write_log[paper["paper_id"]] for paper in papers})
     log.info(
         "Batch finished: %d paper(s), %d written, %d failed, %d in error. Results: %s",
         len(papers),

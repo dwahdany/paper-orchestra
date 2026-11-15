@@ -179,8 +179,8 @@ def judge_revision(old_review: Mapping[str, Any], new_review: Mapping[str, Any])
     """
     before, after = extract_scores(old_review), extract_scores(new_review)
     deltas = {axis: after[axis] - before[axis] for axis in SCORE_AXES if axis not in _NOT_COMPARED}
-    total_gain = sum(delta for delta in deltas.values() if delta > 0)
-    total_drop = sum(-delta for delta in deltas.values() if delta < 0)
+    total_gain = sum((delta for delta in deltas.values() if delta > 0), 0.0)
+    total_drop = sum((-delta for delta in deltas.values() if delta < 0), 0.0)
     if after["Overall"] > before["Overall"]:
         outcome = "ACCEPTED_SCORE_INCREASE"
     elif after["Overall"] < before["Overall"]:
