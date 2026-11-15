@@ -16,7 +16,6 @@ from paper_orchestra import __version__, cli
 from paper_orchestra import doctor as doctor_module
 from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.config import DEFAULT_MODEL, PipelineConfig
-from paper_orchestra.llm.base import LLMClient
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.llm.router import register_client, reset_clients
 from paper_orchestra.memory import Wiki
@@ -265,7 +264,10 @@ def test_write_reports_a_pipeline_failure_with_exit_code_1(
     )  # fmt: skip
 
     assert result.exit_code == 1
-    assert "Error: stage 'outline' failed after 2 attempt(s)" in result.stderr
+    assert (
+        "Error: the paper was not written: stage 'outline' failed after 2 attempt(s)"
+        in result.stderr
+    )
     assert str(out / "state.json") in result.stderr
     assert "Paper written" not in result.output
 
@@ -776,5 +778,18 @@ def test_python_dash_m_runs_the_cli(tmp_path):
     assert completed.stdout == f"paper-orchestra {__version__}\n"
 
 
-def test_fake_client_is_an_llm_client():
-    assert isinstance(DescribedClient({}), LLMClient)
+def test_importing_the_cli_loads_no_agent_and_no_provider_sdk(tmp_path):
+    heavy = ("paper_orchestra.agents.", "anthropic", "modal", "openai", "google.genai", "streamlit")
+    code = (
+        "import sys, paper_orchestra.cli\n"
+        f"print(sorted(m for m in sys.modules if m.startswith({heavy!r})))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+        check=True,
+    )
+    assert completed.stdout.strip() == "[]"

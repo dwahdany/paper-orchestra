@@ -245,10 +245,12 @@ def stubs(monkeypatch: pytest.MonkeyPatch) -> StubAgents:
     return StubAgents().install(monkeypatch)
 
 
-def run(cfg: PipelineConfig, **kwargs: Any) -> tuple[PaperResult, ContextHarness, FakeCompute]:
-    harness = kwargs.pop("harness", None) or make_harness(cfg)
+def run(
+    cfg: PipelineConfig, harness: ContextHarness | None = None
+) -> tuple[PaperResult, ContextHarness, FakeCompute]:
+    harness = harness or make_harness(cfg)
     compute = FakeCompute()
-    return run_paper(cfg, harness=harness, compute=compute, **kwargs), harness, compute
+    return run_paper(cfg, harness=harness, compute=compute), harness, compute
 
 
 def state_of(cfg: PipelineConfig) -> dict[str, Any]:
@@ -521,6 +523,35 @@ def test_harness_and_compute_are_built_from_the_config_and_compute_is_closed(
     assert built[1].closed == 1
 
 
+def test_the_default_factories_build_the_real_agents_harness_and_backend(cfg):
+    ctx = RunContext(
+        cfg=cfg,
+        paths=RunPaths(cfg.base_dir),
+        harness=ContextHarness(client_for=lambda model: FakeLLM(["unused"])),
+        compute=FakeCompute(),
+    )
+    factories = (
+        pipeline._outline_agent,
+        pipeline._literature_agent,
+        pipeline._plotting_agent,
+        pipeline._section_writing_agent,
+        pipeline._refinement_agent,
+    )
+    assert [type(factory(ctx)).__name__ for factory in factories] == [
+        "OutlineAgent",
+        "LiteratureAgent",
+        "PlottingAgent",
+        "SectionWritingAgent",
+        "ContentRefinementAgent",
+    ]
+
+    backend = pipeline._build_compute(cfg)
+    assert backend.name == "local"
+    harness = pipeline._build_harness(cfg)
+    assert harness.project.root == cfg.base_dir / "memory"
+    assert harness.lab is None and harness.dream_mode == "stages"
+
+
 # -- failures --------------------------------------------------------------------
 
 
@@ -636,6 +667,16 @@ def test_plotting_failure_is_tolerated(cfg, stubs, caplog, monkeypatch):
     resumed, _, _ = run(cfg)
     assert resumed.success and again.calls == []
     assert resumed.stages["plotting"]["status"] == "failed" and resumed.stages["plotting"]["reused"]
+
+
+def test_long_error_messages_are_cut_in_state_and_notes(cfg, stubs):
+    stubs.failures["outline"] = [RuntimeError("x" * 50_000), RuntimeError("short")]
+    result, harness, _ = run(cfg)
+
+    assert not result.success and result.stages["outline"]["error"] == "RuntimeError: short"
+    first = events(harness, "stage_end")[1]["error"]
+    assert len(first) < 2_100 and first.endswith("(cut here; the log has the full error)")
+    assert all(info.size < 3_000 for info in harness.project.pending_notes())
 
 
 def test_configuration_errors_inside_a_stage_are_not_retried(cfg, stubs):

@@ -465,8 +465,9 @@ def _strict_tool_definition(definition: Mapping[str, Any]) -> dict[str, Any] | N
     schema = definition["input_schema"]
     if schema.get("additionalProperties") is not False:
         return None
+    transform_schema = _import_sdk().transform_schema
     try:
-        strict_schema = _import_sdk().transform_schema(schema)
+        strict_schema = transform_schema(schema)
     except Exception as exc:
         # The transform has no single error type for a schema it cannot express
         # (it asserts on a list-valued "type", for one).  Strict mode is optional.

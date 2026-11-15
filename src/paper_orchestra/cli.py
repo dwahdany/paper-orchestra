@@ -401,7 +401,12 @@ def write(
     except (FileNotFoundError, ValueError, ComputeError) as exc:
         _fail(str(exc))
     if not result.success:
-        _fail(f"{result.error} (details: {cfg.base_dir / 'state.json'})", code=1)
+        # The log above has the whole story; repeat only its headline.
+        headline = (result.error or "unknown error").splitlines()[0]
+        _fail(
+            f"the paper was not written: {headline} (details: {cfg.base_dir / 'state.json'})",
+            code=1,
+        )
 
     typer.echo(f"Paper written: {result.pdf_path}")
     total = result.usage.get("total", {})

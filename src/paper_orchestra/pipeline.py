@@ -84,6 +84,8 @@ LITERATURE_SYNTHESIS_FOCUS = (
 )
 
 _USAGE_FIELDS = tuple(Usage().to_dict())
+#: A compile log in an exception message should not swamp ``state.json`` or a memory note.
+_MAX_ERROR_CHARS = 2_000
 
 
 class StageError(RuntimeError):
@@ -303,6 +305,14 @@ def _relative(path: Path, base: Path) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _describe(exc: BaseException) -> str:
+    """``Type: message`` for state, notes and results; the log has the full traceback."""
+    text = f"{type(exc).__name__}: {exc}"
+    if len(text) <= _MAX_ERROR_CHARS:
+        return text
+    return text[:_MAX_ERROR_CHARS] + " ... (cut here; the log has the full error)"
 
 
 def _fingerprint(cfg: PipelineConfig, paths: RunPaths) -> str:
@@ -724,7 +734,7 @@ class _Runner:
                     )
             except Exception as exc:
                 seconds += time.monotonic() - started
-                error = f"{type(exc).__name__}: {exc}"
+                error = _describe(exc)
                 # A configuration problem (credentials, SDK, unsupported option) is the
                 # same on every attempt, so it is not retried.
                 retry = attempt < attempts and not isinstance(exc, LLMConfigError)
@@ -792,7 +802,7 @@ class _Runner:
             outcome = "The run stopped here; a resumed run starts again from this stage."
         text = (
             f"The {stage.name} stage failed on attempt {attempt} of {attempts} with "
-            f"{type(exc).__name__}: {exc}{where} {outcome}"
+            f"{_describe(exc)}{where} {outcome}"
         )
         self._guarded(
             lambda: self.ctx.harness.note(

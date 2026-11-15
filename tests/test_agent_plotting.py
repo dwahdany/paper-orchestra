@@ -21,6 +21,7 @@ from paper_orchestra.agents.plotting import (
     FewShotSelection,
     FigureCritique,
     PlottingAgent,
+    PlottingError,
     figure_size,
     normalize_aspect_ratio,
     plan_figures,
@@ -28,7 +29,7 @@ from paper_orchestra.agents.plotting import (
     task_name,
     to_png,
 )
-from paper_orchestra.compute.base import CompileResult, ComputeBackend, ExecResult
+from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.config import PAPER_BANANA_ENV, ModelConfig, PipelineConfig
 from paper_orchestra.context import RunContext, RunPaths
@@ -735,18 +736,37 @@ def test_permanent_code_failure_skips_only_that_figure(tmp_path, caplog):
     assert statuses == {"fig_first": "ok", "fig_broken": "failed", "fig_last": "ok"}
 
 
-def test_every_figure_failing_returns_an_empty_list(tmp_path, caplog):
+def test_every_figure_failing_fails_the_stage(tmp_path, caplog):
     def plan(request: FakeRequest) -> str:
-        raise RuntimeError("planner exploded")
+        raise RuntimeError("planner exploded " + "x" * 1000)
 
     ctx = make_ctx(tmp_path, scripted_llm(plan=plan))
-    with caplog.at_level(logging.WARNING, logger=LOGGER):
-        results = PlottingAgent(ctx).run({"plotting_plan": [figure("a"), figure("b")]})
-    assert results == []
+    plan_ids = ["a", "b", "c", "d", "e"]
+    with caplog.at_level(logging.WARNING, logger=LOGGER), pytest.raises(PlottingError) as caught:
+        PlottingAgent(ctx).run({"plotting_plan": [figure(name) for name in plan_ids]})
+
+    # The error names the stage-level problem and quotes a bounded sample of the reasons.
+    message = str(caught.value)
+    assert message.startswith("none of the 5 planned figure(s) could be produced (a: planner")
+    assert "c: planner exploded" in message and "d: planner" not in message
+    assert message.endswith("; and 2 more)") and len(message) < 1200
+    # What the failed run leaves behind is consistent: no results, no figures, a page each.
     assert json.loads(ctx.paths.plotting_results.read_text("utf-8")) == []
     assert json.loads(ctx.paths.figures_info.read_text("utf-8")) == []
-    assert "Plotting produced 0 of 2 figure(s); skipped: a, b." in caplog.text
+    assert not ctx.paths.generated_figures_dir.exists()
+    assert "Plotting produced 0 of 5 figure(s); skipped: a, b, c, d, e." in caplog.text
     assert {note.kind for note in notes(ctx)} == {"observation"}
+    for name in plan_ids:
+        assert ctx.harness.project.read(f"wiki/figures/{name}.md").meta["status"] == "failed"
+
+
+def test_compute_backend_that_is_down_fails_the_stage(tmp_path):
+    def unreachable(code: str, call: int) -> ExecResult:
+        raise ComputeError("the sandbox could not be created: connection refused")
+
+    ctx = make_ctx(tmp_path, scripted_llm(), FakeCompute(unreachable))
+    with pytest.raises(PlottingError, match="fig_accuracy: the sandbox could not be created"):
+        PlottingAgent(ctx).run({"plotting_plan": [figure()]})
 
 
 def test_missing_material_skips_the_figure(tmp_path, caplog):
