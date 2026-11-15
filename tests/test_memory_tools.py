@@ -276,3 +276,19 @@ def test_transcript_search_tool(tmp_path):
     log.record({"type": "review", "stage": "refinement", "overall": 6, "note": "Clarity 3.25"})
     assert "seq=2" in tool.handler({"query": "3.25", "exact": True})
     assert tool.handler({"query": "3.26", "exact": True}) == "No matching transcript events."
+
+
+def test_archived_notes_cannot_be_rewritten_by_a_consolidation_session(tmp_path):
+    wiki = Wiki(tmp_path, name="project")
+    note = wiki.add_note("v2 REJECTED: Overall 6 -> 5", stage="refinement", kind="lesson")
+    [archived] = wiki.archive_notes([note], "dream-1")
+    backend = WikiMemoryBackend(wiki, write="all")
+    for operation in (
+        lambda: backend.str_replace(f"/memories/{archived}", "REJECTED", "ACCEPTED"),
+        lambda: backend.create(f"/memories/{archived}", "rewritten"),
+        lambda: backend.delete(f"/memories/{archived}"),
+        lambda: backend.rename(f"/memories/{archived}", "/memories/notes/back.md"),
+    ):
+        with pytest.raises(ToolError, match="archived note"):
+            operation()
+    assert "REJECTED" in wiki.read(archived).body

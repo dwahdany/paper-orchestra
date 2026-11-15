@@ -326,8 +326,16 @@ def _isolation_options() -> dict[str, Any]:
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     options: dict[str, Any] = {"start_new_session": True}
     death_signal = _linux_death_signal()
-    if death_signal is not None:
-        options["preexec_fn"] = death_signal
+
+    def prepare_child() -> None:
+        # Stop is delivered as SIGINT.  A server started in the background (nohup, `&`, some
+        # launchers) ignores SIGINT, and a child would inherit that and never see the Stop
+        # button; restoring the default lets Python install its KeyboardInterrupt handler.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        if death_signal is not None:
+            death_signal()
+
+    options["preexec_fn"] = prepare_child
     return options
 
 

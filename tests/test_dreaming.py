@@ -581,3 +581,51 @@ def test_a_missing_credential_is_reported_without_a_traceback(tmp_path, caplog):
     report = harness.dream(stage="s", focus="f")
     assert "ANTHROPIC_API_KEY is not set" in report.error
     assert "Traceback" not in caplog.text and "ANTHROPIC_API_KEY is not set" in caplog.text
+
+
+def test_notes_written_while_a_dream_runs_stay_pending(tmp_path):
+    holder: dict = {}
+
+    def responder(request: FakeRequest) -> str:
+        # What the plotting stage does while the literature synthesis dream is running.
+        holder["late"] = holder["harness"].note("figure 3 failed twice", stage="plotting")
+        return "Consolidated."
+
+    project = Wiki(tmp_path / "project", name="project")
+    harness = ContextHarness(
+        project=project,
+        transcripts=TranscriptLog(project.root / "transcripts", session_id="s1"),
+        client_for=lambda model: FakeLLM(responder),
+        dream_model="fake",
+    )
+    holder["harness"] = harness
+    harness.note("an earlier observation", stage="literature")
+    report = harness.dream(stage="literature", focus="f")
+    assert report.llm_used and report.notes_seen == 1 and report.notes_archived == 1
+    assert [info.path for info in project.pending_notes()] == [holder["late"]]
+
+
+def test_leak_scan_details(tmp_path):
+    assert "credential" in leak_reason("The run used sk-ant-api03-abcdefghijklmnop.", [])
+    assert "path" in leak_reason("The build ran in /Users/alice/paper.", [])
+
+    # An experimental log too large for one page is stored in parts; the scan must read them.
+    project = Wiki(tmp_path / "project", name="project", max_page_bytes=6_000)
+    lab = Wiki(tmp_path / "lab", name="lab", read_only=())
+    harness = ContextHarness(
+        project=project,
+        lab=lab,
+        transcripts=TranscriptLog(project.root / "transcripts", session_id="s1"),
+        client_for=lambda model: FakeLLM(lambda r: "unused"),
+        dream_mode="off",
+    )
+    log_text = "".join(f"| run {i} | {i * 1.375:.3f} |\n" for i in range(900))
+    harness.write_page("wiki/sources/experimental_log.md", log_text, {"summary": "raw results"})
+    assert any("-part-" in info.path for info in project.list("wiki/sources"))
+    project.write(
+        "wiki/lessons/number.md",
+        "Quoting 1234.750 in the abstract raised Clarity.",
+        {"summary": "s", "portable": True},
+    )
+    assert "1234.750" in log_text
+    assert promote_lessons(harness) == []

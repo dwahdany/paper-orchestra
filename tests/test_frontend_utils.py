@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import signal
 import smtplib
 import sys
 import textwrap
@@ -972,6 +973,33 @@ def test_stop_ends_the_whole_process_group_even_children_that_ignore_the_interru
 
 
 @posix_only
+def test_stop_works_when_the_server_itself_ignores_the_interrupt(tmp_path):
+    """A server started with nohup or `&` ignores SIGINT; its children must not inherit that."""
+    command = python_command(
+        """
+        import time
+        print("ready", flush=True)
+        try:
+            time.sleep(120)
+        except KeyboardInterrupt:
+            print("interrupted", flush=True)
+            raise SystemExit(130)
+        """
+    )
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        run = fu.PipelineRun(command, cwd=tmp_path)
+        run.start()
+        assert wait_until(lambda: "ready" in run.log_tail())
+        started = time.monotonic()
+        run.stop(grace=10.0)
+        assert time.monotonic() - started < 10.0
+        assert run.returncode == 130 and "interrupted" in run.log_tail()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+@posix_only
 def test_stop_reaches_children_the_pipeline_started_in_sessions_of_their_own(tmp_path):
     """The local compute backend runs LaTeX and figure code that way; they used to be orphaned."""
     command = python_command(
@@ -1041,7 +1069,9 @@ def test_process_isolation_and_stop_signals_on_macos_and_windows(monkeypatch):
 
     with monkeypatch.context() as patched:
         patched.setattr(fu.sys, "platform", "darwin")
-        assert fu._isolation_options() == {"start_new_session": True}
+        mac_options = fu._isolation_options()
+        assert mac_options["start_new_session"] is True and callable(mac_options["preexec_fn"])
+        assert sorted(mac_options) == ["preexec_fn", "start_new_session"]
 
     process = Process()
     commands: list[tuple[list[str], dict]] = []

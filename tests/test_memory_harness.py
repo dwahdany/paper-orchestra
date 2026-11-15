@@ -541,3 +541,73 @@ def test_a_cancelled_run_stops_at_the_next_model_call(tmp_path):
     # Deterministic bookkeeping still works, so the run can be closed cleanly.
     harness.note("stopped by the user", stage="outline")
     harness.refresh()
+
+
+# -- the session that maintains the shared memory -----------------------------
+
+
+def lab_harness(tmp_path, responder):
+    project = Wiki(tmp_path / "project", name="project")
+    project.write(
+        "wiki/sources/idea.md", "We propose FooNet for long video.", {"summary": "idea"}, force=True
+    )
+    project.write(
+        "wiki/sources/experimental_log.md", "FooNet reaches 91.27.", {"summary": "log"}, force=True
+    )
+    project.rebuild_index()
+    lab = Wiki(tmp_path / "lab", name="lab", read_only=())
+    lab.write("wiki/lessons/latex.md", "Use cleveref.", {"summary": "LaTeX pitfalls"})
+    lab.rebuild_index()
+    return ContextHarness(
+        project=project,
+        lab=lab,
+        transcripts=TranscriptLog(project.root / "transcripts", session_id="s1"),
+        client_for=lambda model: FakeLLM(responder),
+    )
+
+
+def test_lab_only_session_cannot_search_the_project(tmp_path):
+    seen: dict = {}
+
+    def responder(request: FakeRequest) -> str:
+        seen["schema"] = request.tools["wiki_search"].input_schema["properties"]
+        seen["keyword"] = request.call_tool("wiki_search", {"query": "FooNet long video"})
+        seen["exact"] = request.call_tool("wiki_search", {"query": "91.27", "exact": True})
+        seen["own"] = request.call_tool("wiki_search", {"query": "cleveref"})
+        return "ok"
+
+    harness = lab_harness(tmp_path, responder)
+    harness.open(
+        agent="dreamer",
+        stage="finalize",
+        model="fake",
+        memory_root="lab",
+        memory=MemoryPolicy(write="all"),
+    ).send("go")
+    assert seen["keyword"] == "No matching pages."
+    assert seen["exact"] == "No line contains that text verbatim."
+    assert "/memories/wiki/lessons/latex.md" in seen["own"]
+    assert "scope" not in seen["schema"]  # one wiki only: nothing to choose between
+
+
+def test_lab_guard_also_vets_edits(tmp_path):
+
+    def responder(request: FakeRequest) -> str:
+        request.memory.create("/memories/wiki/lessons/tables.md", "Prefer booktabs.\nSecond line.")
+        with pytest.raises(ToolError, match="number from this paper"):
+            request.memory.str_replace(
+                "/memories/wiki/lessons/tables.md", "Prefer booktabs.", "It reached 91.27."
+            )
+        with pytest.raises(ToolError, match="number from this paper"):
+            request.memory.insert("/memories/wiki/lessons/tables.md", 4, "It reached 91.27.")
+        return "ok"
+
+    harness = lab_harness(tmp_path, responder)
+    harness.open(
+        agent="dreamer",
+        stage="finalize",
+        model="fake",
+        memory_root="lab",
+        memory=MemoryPolicy(write="all"),
+    ).send("go")
+    assert "91.27" not in harness.lab.read_text("wiki/lessons/tables.md")

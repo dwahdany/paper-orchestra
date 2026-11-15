@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import shutil
+import time
 
 import pytest
 
@@ -355,3 +357,41 @@ def test_check_reports_a_missing_tex_install(monkeypatch):
     assert backend.check(latex=False) == []
     monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: True))
     assert backend.check() == []
+
+
+def test_run_python_enforces_the_memory_limit_and_stops_at_the_timeout():
+    hungry = "x = bytearray(1024 ** 3)\nprint('allocated')\n"
+    limited = LocalBackend(memory_limit_mb=256).run_python(hungry)
+    assert not limited.ok and "MemoryError" in limited.stderr and "allocated" not in limited.stdout
+
+    spawning = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    started = time.monotonic()
+    slow = LocalBackend().run_python(spawning, timeout=1)
+    assert slow.timed_out and time.monotonic() - started < 10
+    grandchild = int(slow.stdout.split()[0])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the script's own child survived the timeout")
+
+
+@pytest.mark.latex
+def test_compile_timeout_is_reported_and_leaves_no_pdf(tmp_path):
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\\begin{document}\\loop\\iftrue\\repeat\\end{document}"
+    )
+    started = time.monotonic()
+    result = LocalBackend().compile_latex(tmp_path, "paper", timeout=1.5)
+    assert result.timed_out and not result.ok and result.pdf_path is None
+    assert time.monotonic() - started < 15
+    assert "timed out" in result.feedback()

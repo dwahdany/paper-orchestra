@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import socket
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,6 +35,17 @@ def fixed_clock():
         return datetime(2026, 1, 1, 0, 0, state["n"] % 60, tzinfo=UTC)
 
     return clock
+
+
+@pytest.fixture(autouse=True)
+def _restore_main_module(monkeypatch):
+    """Give every test the ``__main__`` module it started with.
+
+    Streamlit's test harness replaces it with the page under test.  Worker
+    processes started with the spawn method re-import the parent's ``__main__``,
+    so without this the outcome of later tests would depend on test order.
+    """
+    monkeypatch.setitem(sys.modules, "__main__", sys.modules["__main__"])
 
 
 @pytest.fixture(autouse=True)

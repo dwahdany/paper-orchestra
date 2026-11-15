@@ -253,17 +253,18 @@ class LocalBackend(ComputeBackend):
         work = Path(workdir)
         if not (work / f"{tex_name}.tex").is_file():
             raise ComputeError(f"{work / (tex_name + '.tex')} does not exist")
+        produced = work / f"{tex_name}.pdf"
+        produced.unlink(missing_ok=True)
+        # Screened first: a document that must not be compiled is refused the same way
+        # whether or not TeX is installed here.
+        refused = refuse_unsafe_document(work, tex_name)
+        if refused is not None:
+            return refused
         if not self.latex_available():
             raise ComputeError(
                 "pdflatex/bibtex not found on PATH. Install TeX Live, or run with "
                 "--compute modal to compile in a Modal sandbox."
             )
-
-        produced = work / f"{tex_name}.pdf"
-        produced.unlink(missing_ok=True)
-        refused = refuse_unsafe_document(work, tex_name)
-        if refused is not None:
-            return refused
         env = latex_env(self._private_tex_home())
 
         deadline = time.monotonic() + timeout
