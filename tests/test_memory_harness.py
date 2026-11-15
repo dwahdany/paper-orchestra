@@ -231,6 +231,8 @@ def test_generate_retries_parse_failures_then_raises(tmp_path):
             parse_retries=1,
             memory=MemoryPolicy.none(),
         )
+    # Failed attempts are still paid for, so they are still counted.
+    assert harness.usage.total().requests == 2
 
 
 def test_pipeline_writes_are_visible_to_the_next_session(tmp_path):

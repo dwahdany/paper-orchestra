@@ -133,6 +133,7 @@ class HarnessConversation:
         self._label = label
         self._first = True
         self._text_schema = text_only_schema
+        self._recorded = Usage()
         #: ``(scope, path)`` of every memory file this session wrote.
         self.writes = writes
         self.model = conversation.model
@@ -160,9 +161,29 @@ class HarnessConversation:
             if block:
                 content = [Text(block), *content]
         self._first = False
-        response = self._send(content, parser, schema, require_parsed, max_tokens)
-        self._harness.usage.record(self._label, self.model, response.usage)
-        return response
+        try:
+            return self._send(content, parser, schema, require_parsed, max_tokens)
+        finally:
+            # Record what was spent even when the turn failed to parse or was refused.
+            self._record_usage()
+
+    def _record_usage(self) -> None:
+        total = self._conversation.usage
+        delta = Usage(
+            input_tokens=total.input_tokens - self._recorded.input_tokens,
+            output_tokens=total.output_tokens - self._recorded.output_tokens,
+            cache_read_input_tokens=(
+                total.cache_read_input_tokens - self._recorded.cache_read_input_tokens
+            ),
+            cache_creation_input_tokens=(
+                total.cache_creation_input_tokens - self._recorded.cache_creation_input_tokens
+            ),
+            requests=total.requests - self._recorded.requests,
+            web_searches=total.web_searches - self._recorded.web_searches,
+        )
+        if delta.requests or delta.input_tokens or delta.output_tokens:
+            self._harness.usage.record(self._label, self.model, delta)
+            self._recorded.add(delta)
 
     def _send(
         self,
