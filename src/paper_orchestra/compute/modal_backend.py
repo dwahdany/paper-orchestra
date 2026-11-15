@@ -32,7 +32,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
+from paper_orchestra.compute.base import (
+    CompileResult,
+    ComputeBackend,
+    ComputeError,
+    ExecResult,
+    refuse_unsafe_document,
+)
 from paper_orchestra.compute.local import LocalBackend, safe_relative
 from paper_orchestra.utils.latex import latex_commands, summarize_build
 
@@ -375,6 +381,11 @@ class ModalBackend(ComputeBackend):
         produced = work / f"{tex_name}.pdf"
         target = Path(output_pdf) if output_pdf else produced
         limit = _seconds(timeout)
+        # The sandbox holds no credentials, but both backends accept the same documents.
+        refused = refuse_unsafe_document(work, tex_name)
+        if refused is not None:
+            produced.unlink(missing_ok=True)
+            return refused
 
         def job(sandbox: Any) -> CompileResult:
             job_dir = f"{_ROOT}/tex-{uuid.uuid4().hex[:12]}"

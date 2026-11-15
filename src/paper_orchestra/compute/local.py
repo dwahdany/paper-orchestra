@@ -25,7 +25,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any
 
-from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
+from paper_orchestra.compute.base import (
+    CompileResult,
+    ComputeBackend,
+    ComputeError,
+    ExecResult,
+    refuse_unsafe_document,
+)
 from paper_orchestra.utils.latex import latex_commands, summarize_build
 
 _PASSTHROUGH_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TZ")
@@ -49,14 +55,16 @@ def scrubbed_env(home: Path) -> dict[str, str]:
     return env
 
 
-def latex_env() -> dict[str, str]:
-    """Environment for TeX: no credentials, no inherited TeX search paths, and
-    file access restricted to the working directory tree (``openin_any`` /
-    ``openout_any`` = paranoid), so a document cannot ``\\input`` files such as
-    ``/proc/self/environ`` or anything given by absolute or parent path."""
-    env = {key: os.environ[key] for key in (*_PASSTHROUGH_ENV, "HOME") if key in os.environ}
+def latex_env(home: Path) -> dict[str, str]:
+    """Environment for TeX: no credentials, no inherited TeX search paths, a private
+    home directory, and file access restricted to the working directory tree
+    (``openin_any`` / ``openout_any`` = paranoid), so a document cannot ``\\input``
+    files such as ``/proc/self/environ`` or anything given by absolute or parent path.
+    Those limits do not cover every pdfTeX primitive, which is why documents are also
+    screened by :func:`refuse_unsafe_document` before they are compiled."""
+    env = {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ}
     env.setdefault("PATH", os.defpath)
-    env.update(openout_any="p", openin_any="p")
+    env.update(HOME=str(home), openout_any="p", openin_any="p")
     return env
 
 
@@ -167,6 +175,21 @@ class LocalBackend(ComputeBackend):
     def __init__(self, *, python: str | None = None, memory_limit_mb: int | None = 4096) -> None:
         self.python = python or sys.executable
         self.memory_limit_mb = memory_limit_mb
+        self._tex_home: tempfile.TemporaryDirectory[str] | None = None
+        self._lock = threading.Lock()
+
+    def _private_tex_home(self) -> Path:
+        """An empty home directory for TeX, so ``~`` never resolves to the user's files."""
+        with self._lock:
+            if self._tex_home is None:
+                self._tex_home = tempfile.TemporaryDirectory(prefix="paper-orchestra-texhome-")
+            return Path(self._tex_home.name)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._tex_home is not None:
+                self._tex_home.cleanup()
+                self._tex_home = None
 
     # -- python ----------------------------------------------------------------
 
@@ -238,7 +261,10 @@ class LocalBackend(ComputeBackend):
 
         produced = work / f"{tex_name}.pdf"
         produced.unlink(missing_ok=True)
-        env = latex_env()
+        refused = refuse_unsafe_document(work, tex_name)
+        if refused is not None:
+            return refused
+        env = latex_env(self._private_tex_home())
 
         deadline = time.monotonic() + timeout
         steps: list[tuple[str, str]] = []

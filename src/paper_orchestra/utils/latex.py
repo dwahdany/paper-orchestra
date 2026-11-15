@@ -33,6 +33,65 @@ _FILE_LINE_ERROR = re.compile(r"^(?:\./)?[^\s:]+\.(?:tex|sty|cls|bib|bst|bbl):\d
 #: pdflatex hard-wraps its log at this many characters.
 _LOG_WRAP = 79
 
+#: TeX primitives and macros that read or write files, run code, or build control
+#: sequence names at run time (which would let a document hide any of the others).
+#: ``openin_any``/``openout_any`` do not cover pdfTeX's ``\pdfobj ... file``, which
+#: embeds an arbitrary file in the PDF, so documents are also screened statically.
+_FORBIDDEN_COMMANDS = (
+    "pdfobj",
+    "pdffiledump",
+    "pdfmdfivesum",
+    "pdffilesize",
+    "pdffilemoddate",
+    "pdfximage",
+    "openin",
+    "openout",
+    "read",
+    "readline",
+    "write",
+    "immediate",
+    "directlua",
+    "latelua",
+    "luaexec",
+    "special",
+    "csname",
+    "begincsname",
+    "catcode",
+    "scantokens",
+    "@nameuse",
+    "@namedef",
+    "@input",
+    "@@input",
+    "UseName",
+    "NameUse",
+    "ExplSyntaxOn",
+    "ShellEscape",
+    "CatchFileDef",
+    "CatchFileEdef",
+    "embedfile",
+    "attachfile",
+    "textattachfile",
+    "includepdf",
+    "verbatiminput",
+    "lstinputlisting",
+    "inputminted",
+)
+_FORBIDDEN_COMMAND = re.compile(
+    r"\\(" + "|".join(re.escape(name) for name in _FORBIDDEN_COMMANDS) + r")(?![A-Za-z@])"
+)
+#: Packages whose whole purpose is embedding or reading external files.
+_FORBIDDEN_PACKAGES = frozenset(
+    {"embedfile", "attachfile", "attachfile2", "navigator", "catchfile", "shellesc",
+     "pdfpages", "bashful", "pythontex", "minted", "write18", "filecontents"}
+)  # fmt: skip
+_USEPACKAGE = re.compile(r"\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}")
+#: Commands whose argument names a file the document pulls in.
+_FILE_ARGUMENT = re.compile(
+    r"\\(input|include|InputIfFileExists|includegraphics|bibliography|addbibresource|"
+    r"subfile|subimport|import)\*?\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}"
+)
+_BARE_INPUT = re.compile(r"\\input\s+([^\s{\\]+)")
+
 #: Placeholder bodies shipped in the bundled templates.  If one survives into a
 #: draft, the corresponding section was never written.
 TEMPLATE_PLACEHOLDERS = (
@@ -96,6 +155,47 @@ def resolve_graphic(workdir: Path, name: str) -> Path | None:
     return None
 
 
+def _outside_workspace(name: str) -> bool:
+    name = name.strip()
+    return (
+        name.startswith(("/", "~", "|", "\\"))
+        or ".." in name.replace("\\", "/").split("/")
+        or re.match(r"^[A-Za-z]:[\\/]", name) is not None
+    )
+
+
+def unsafe_constructs(tex: str) -> list[str]:
+    """Reasons a model-written document must not be compiled as it is (empty = fine).
+
+    A paper needs none of these: commands that read or write files other than its
+    own figures, bibliography and inputs inside the workspace, commands that run
+    code, and commands that assemble control sequence names at run time.  The
+    screen is deliberately conservative; it is a second line of defence next to
+    running TeX without credentials, not a sandbox.
+    """
+    body = strip_comments(tex)
+    problems: list[str] = []
+    for name in dict.fromkeys(_FORBIDDEN_COMMAND.findall(body)):
+        problems.append(
+            f"\\{name} is not allowed in the paper source (it can read or write files, "
+            "run code or hide other commands); remove it"
+        )
+    for packages in _USEPACKAGE.findall(body):
+        for package in (p.strip() for p in packages.split(",")):
+            if package in _FORBIDDEN_PACKAGES:
+                problems.append(f"the package '{package}' is not allowed; remove it")
+    arguments = [m.group(2) for m in _FILE_ARGUMENT.finditer(body)]
+    arguments += _BARE_INPUT.findall(body)
+    for argument in dict.fromkeys(arguments):
+        for name in argument.split(","):
+            if _outside_workspace(name):
+                problems.append(
+                    f"'{name.strip()}' refers to a file outside the paper's own directory; "
+                    "only files inside it may be used"
+                )
+    return problems
+
+
 def unbalanced_environments(tex: str) -> list[str]:
     """Environments whose ``\\begin`` and ``\\end`` counts differ."""
     body = _VERBATIM.sub("", strip_comments(tex))
@@ -120,7 +220,7 @@ def static_check(
     ``allowed_citations`` defaults to the keys of ``<workdir>/references.bib``
     when that file exists.
     """
-    problems: list[str] = []
+    problems: list[str] = unsafe_constructs(tex)
     stripped = strip_comments(tex)
     if "\\documentclass" not in stripped:
         problems.append("missing \\documentclass")

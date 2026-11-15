@@ -67,6 +67,30 @@ class CompileResult:
         return text[:max_chars]
 
 
+def refuse_unsafe_document(workdir: str | Path, tex_name: str) -> CompileResult | None:
+    """A failed result for a document that must not be compiled, else ``None``.
+
+    Every backend calls this before running TeX.  TeX's own file-access limits do
+    not cover every primitive (pdfTeX can embed any readable file in the PDF), so
+    a document that uses file-reading, file-writing or code-running constructs is
+    turned down and the reasons are returned as errors for the author to fix.
+    """
+    from paper_orchestra.utils.latex import unsafe_constructs
+
+    source = Path(workdir) / f"{tex_name}.tex"
+    try:
+        problems = unsafe_constructs(source.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    if not problems:
+        return None
+    return CompileResult(
+        ok=False,
+        errors=problems,
+        log_tail="The document was not compiled because it uses constructs that are not allowed.",
+    )
+
+
 class ComputeBackend(ABC):
     name: str = ""
 

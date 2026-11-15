@@ -13,6 +13,7 @@ from paper_orchestra.utils.latex import (
     parse_latex_log,
     static_check,
     summarize_build,
+    unsafe_constructs,
 )
 
 
@@ -130,42 +131,99 @@ def test_paper_without_citations_builds_clean(backend, tmp_path):
     assert result.ok and result.errors == []
 
 
+UNSAFE_DOCUMENTS = {
+    "pdfobj": "\\immediate\\pdfobj stream file {SECRET}",
+    "filedump": "\\edef\\x{\\pdffiledump length 9 {SECRET}}\\x",
+    "hidden name": "\\csname pdfobj\\endcsname stream file {SECRET}",
+    "nameuse": "\\makeatletter\\@nameuse{pdfobj} stream file {SECRET}",
+    "shell": "\\write18{cat SECRET}",
+    "input absolute": "\\input{SECRET}",
+    "input parent": "\\input{../secret.txt}",
+    "bare input": "\\input ../secret.txt ",
+    "home": "\\includegraphics{~/private.png}",
+    "embedfile": "\\usepackage{embedfile}",
+    "catcode": "\\catcode`\\!=0 !pdfobj stream file {SECRET}",
+}
+
+
+@pytest.mark.parametrize("name", sorted(UNSAFE_DOCUMENTS))
+def test_documents_that_could_read_or_run_things_are_never_compiled(backend, tmp_path, name):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    work = tmp_path / "work"
+    work.mkdir()
+    body = UNSAFE_DOCUMENTS[name].replace("SECRET", str(secret))
+    (work / "paper.tex").write_text(
+        f"\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+    )
+    result = backend.compile_latex(work, "paper")
+    assert not result.ok and result.pdf_path is None and result.errors
+    assert not (work / "paper.pdf").exists() and not (work / "paper.log").exists()
+    assert "not allowed" in result.feedback() or "outside the paper" in result.feedback()
+
+
+def test_unsafe_constructs_does_not_flag_ordinary_papers(repo_root):
+    for template in ("cvpr2025", "iclr2025"):
+        tex = (repo_root / "templates" / template / "template.tex").read_text()
+        assert unsafe_constructs(tex) == []
+    ordinary = (
+        "\\documentclass{article}\\usepackage{graphicx,booktabs,amsmath}\n"
+        "\\newcommand{\\readout}{r}\\newcommand{\\writer}{w} % \\pdfobj in a comment\n"
+        "\\begin{document}\\input{sections/intro}\\includegraphics[width=1in]{figures/a.png}\n"
+        "\\readout \\writer \\bibliography{references}\\end{document}\n"
+    )
+    assert unsafe_constructs(ordinary) == []
+    assert static_check("\\documentclass{a}\\begin{document}\\write18{ls}\\end{document}")
+
+
 @pytest.mark.latex
-def test_tex_cannot_read_outside_its_directory_or_see_credentials(backend, tmp_path, monkeypatch):
+def test_tex_home_is_private_and_removed_on_close(backend, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "private.tex").write_text("HOMESECRET")
+    monkeypatch.setenv("HOME", str(home))
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hi\\end{document}\n"
+    )
+    assert backend.compile_latex(tmp_path, "paper").ok
+    tex_home = backend._private_tex_home()
+    assert tex_home != home and tex_home.is_dir()
+    backend.close()
+    backend.close()
+    assert not tex_home.exists()
+
+
+@pytest.mark.latex
+def test_tex_environment_blocks_reads_outside_its_directory(tmp_path, monkeypatch):
+    """The second line of defence, exercised directly: even a document that got past the
+    static screen cannot \\input files outside its directory or see credentials."""
+    from paper_orchestra.compute import local
+
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-value")
     secret = tmp_path / "secret.txt"
     secret.write_text("TOPSECRET")
     work = tmp_path / "work"
     work.mkdir()
+    home = tmp_path / "texhome"
+    home.mkdir()
     (work / "paper.tex").write_text(
         "\\documentclass{article}\n\\begin{document}\n"
         f"\\input{{{secret}}}\n\\input{{../secret.txt}}\n\\input{{/proc/self/environ}}\n"
         "\\end{document}\n"
     )
-    result = backend.compile_latex(work, "paper")
+    env = local.latex_env(home)
+    assert "ANTHROPIC_API_KEY" not in env and env["HOME"] == str(home)
+    local._run(
+        ["pdflatex", "-interaction=nonstopmode", "-no-shell-escape", "paper.tex"],
+        cwd=work,
+        env=env,
+        timeout=120,
+    )
     log = (work / "paper.log").read_text(errors="replace")
     assert "TOPSECRET" not in log and "sk-secret-value" not in log
-    if result.pdf_path:
-        from paper_orchestra.utils.pdf import PdfError, load_paper
-
-        try:
-            text = load_paper(result.pdf_path, min_size=0)
-        except PdfError:
-            text = ""
-        assert "TOPSECRET" not in text and "sk-secret-value" not in text
-
-
-@pytest.mark.latex
-def test_shell_escape_is_blocked_and_fatal_errors_fail(backend, tmp_path):
-    (tmp_path / "x.tex").write_text(
-        "\\documentclass{article}\\begin{document}"
-        "\\immediate\\write18{touch pwned}hi\\end{document}"
-    )
-    backend.compile_latex(tmp_path, "x")
-    assert not (tmp_path / "pwned").exists()
-    (tmp_path / "y.tex").write_text("\\documentclass{article}\\begin{document}\\input{nofile}")
-    result = backend.compile_latex(tmp_path, "y")
-    assert not result.ok and result.pdf_path is None and result.errors
+    pdf = work / "paper.pdf"
+    if pdf.exists():
+        assert b"TOPSECRET" not in pdf.read_bytes()
 
 
 def test_static_check_catches_common_model_mistakes(tmp_path):
