@@ -11,6 +11,13 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Typer decides once, when its formatting module is first imported, whether to style help
+# and error text for a terminal, and it does so on GitHub Actions (GITHUB_ACTIONS) and
+# whenever colour is forced (FORCE_COLOR, PY_COLORS).  The tests compare that text as
+# plain text, so the decision is taken here, before any test imports the command line,
+# and no longer depends on where the tests run.
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+
 
 #: Set (to anything) where TeX Live is expected, such as CI: the tests that compile real
 #: documents then fail loudly instead of being skipped when TeX is missing.
@@ -46,6 +53,14 @@ def fixed_clock():
         return datetime(2026, 1, 1, 0, 0, state["n"] % 60, tzinfo=UTC)
 
     return clock
+
+
+@pytest.fixture(autouse=True)
+def _plain_output(monkeypatch):
+    """Tables and messages the code prints itself are plain text too, however the shell
+    that started the tests asks for colour."""
+    for name in ("FORCE_COLOR", "PY_COLORS", "CLICOLOR_FORCE"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

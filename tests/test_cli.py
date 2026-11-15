@@ -1407,3 +1407,23 @@ def test_an_interrupted_command_does_not_wait_for_calls_in_flight(tmp_path):
     assert finished.returncode == 130, finished.stderr
     assert time.monotonic() - started < 30  # not the two minutes the busy thread would take
     assert marker.read_text() == "exit handlers ran"  # backends are closed, logs flushed
+
+
+def test_the_command_line_tests_pass_where_output_is_styled_for_a_terminal():
+    """On GitHub Actions Typer colours help and error text.  The escape codes cut option
+    names and messages in pieces, so tests that look for them failed there and nowhere
+    else.  A fresh interpreter is needed: Typer takes the decision when it is imported."""
+    env = {**os.environ, "GITHUB_ACTIONS": "true", "CI": "true", "FORCE_COLOR": "1"}
+    selected = (
+        "test_write_usage_and_validation_errors_exit_with_2 or test_help_shows_the_new_flags_only "
+        "or test_modal_help_says_what_the_commands_take or test_doctor"
+    )
+    finished = subprocess.run(
+        [sys.executable, "-m", "pytest", __file__, "-q", "-p", "no:cacheprovider", "-k", selected],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    # 0 means the selected tests ran and passed; selecting none would be exit code 5.
+    assert finished.returncode == 0, finished.stdout[-4000:]
