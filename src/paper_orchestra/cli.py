@@ -185,7 +185,7 @@ TemplateOption = Annotated[
     typer.Option(
         "--template",
         "--latex-template-dir",
-        help="LaTeX template: a name under templates/ (for example cvpr2025) or a directory.",
+        help="LaTeX template: a bundled name (for example cvpr2025) or a template directory.",
     ),
 ]
 IdeaFilenameOption = Annotated[

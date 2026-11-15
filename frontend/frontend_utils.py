@@ -50,7 +50,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
-from paper_orchestra.config import DEFAULT_MODEL
+from paper_orchestra.config import BUNDLED_TEMPLATES_DIR, DEFAULT_MODEL
 from paper_orchestra.context import RunPaths
 from paper_orchestra.memory import Wiki
 from paper_orchestra.memory.wiki import INDEX_FILE, NOTES_DIR, WIKI_DIR
@@ -59,7 +59,7 @@ log = logging.getLogger("paper_orchestra.frontend")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = Path(__file__).resolve().parent / "examples"
-TEMPLATES_DIR = REPO_ROOT / "templates"
+TEMPLATES_DIR = BUNDLED_TEMPLATES_DIR
 #: Overrides where demo runs are written (default: ``demo_logs`` next to the repository).
 DEMO_DIR_ENV = "PAPER_ORCHESTRA_DEMO_DIR"
 

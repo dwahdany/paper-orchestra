@@ -127,7 +127,7 @@ def test_image_model_is_passed_only_when_chosen(tmp_path):
 def test_template_is_passed_as_a_directory_of_the_repository(tmp_path, template):
     command = fu.build_write_command(fu.RunOptions(run_dir=tmp_path, template=template))
     template_dir = Path(flag_value(command, "--template"))
-    assert template_dir == fu.REPO_ROOT / "templates" / template
+    assert template_dir == fu.TEMPLATES_DIR / template
     assert (template_dir / "template.tex").is_file()
 
 

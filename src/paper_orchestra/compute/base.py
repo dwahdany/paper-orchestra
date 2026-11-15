@@ -128,6 +128,15 @@ class ComputeBackend(ABC):
         listed, matching what a human author would get from ``nonstopmode``.
         """
 
+    def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+        """Why this backend cannot do the named kinds of work, as messages for the user.
+
+        Called once before any model call is paid for; an empty list means it is
+        ready.  Implementations keep this cheap: look for the tools or the
+        credentials, without starting a job.
+        """
+        return []
+
     def close(self) -> None:  # noqa: B027 - optional hook
         """Release remote resources.  Safe to call more than once."""
 

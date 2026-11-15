@@ -74,7 +74,9 @@ def png(color: str = "white") -> bytes:
 
 def finished_paper(repo_root: Path, *, intro_extra: str = "", method_extra: str = "") -> str:
     """The cvpr2025 template with every placeholder section written."""
-    template = (repo_root / "templates" / "cvpr2025" / "template.tex").read_text(encoding="utf-8")
+    template = (
+        repo_root / "src" / "paper_orchestra" / "templates" / "cvpr2025" / "template.tex"
+    ).read_text(encoding="utf-8")
     written = {
         "My Title": "Sparse Routing for Tiny Models",
         "Abstract here.": "We study sparse routing for small models.",
@@ -144,7 +146,7 @@ def make_ctx(
     **overrides,
 ) -> RunContext:
     base = tmp_path / "run"
-    template_dir = repo_root / "templates" / "cvpr2025"
+    template_dir = repo_root / "src" / "paper_orchestra" / "templates" / "cvpr2025"
     cfg = PipelineConfig(base_dir=base, template_dir=template_dir, **overrides)
     paths = RunPaths(base)
     paths.materials_dir.mkdir(parents=True)

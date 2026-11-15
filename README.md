@@ -60,7 +60,7 @@ uv run paper-orchestra write \
 | `experimental_log.md` | Raw results: tables, ablations, metrics (`--experimental-log-filename`). |
 | `figures/` + `figures/info.json` | Optional ready-made figures, as `[{"name": "fig.png", "caption": "..."}]`. Needed when running without `--plotting`. |
 
-`--template` takes the name of a directory under `templates/` (`cvpr2025`, `iclr2025`) or a path to your own template directory containing `template.tex` and `guidelines.md`.
+`--template` takes the name of a bundled template (`cvpr2025`, `iclr2025`), or a path to your own template directory containing `template.tex` and `guidelines.md`. A name is also looked up under `$PAPER_ORCHESTRA_TEMPLATES` and `./templates`.
 
 Useful options:
 
@@ -237,7 +237,7 @@ src/paper_orchestra/
   modal_app.py the pipeline as a Modal app
   cli.py       the paper-orchestra command
 frontend/      Streamlit demo
-templates/     LaTeX templates; add your own as a new subfolder
+src/paper_orchestra/templates/   bundled LaTeX templates (shipped in the wheel)
 tests/         offline test suite
 ```
 

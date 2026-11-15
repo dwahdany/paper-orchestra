@@ -246,8 +246,6 @@ def _needs_copy(source: Path, target: Path) -> bool:
 
 def _preflight(cfg: PipelineConfig, harness: ContextHarness, compute: ComputeBackend) -> str | None:
     """Why the run cannot succeed as configured, found before any model call is paid for."""
-    from paper_orchestra.compute.local import LocalBackend
-
     roles = {
         "writer": cfg.models.writer,
         "reflection": cfg.models.reflection,
@@ -271,12 +269,8 @@ def _preflight(cfg: PipelineConfig, harness: ContextHarness, compute: ComputeBac
         except LLMConfigError as exc:
             # Diagrams fall back to model-written plotting code, so this is not fatal.
             log.warning("The image model '%s' cannot be used: %s", image, exc)
-    if isinstance(compute, LocalBackend) and not compute.latex_available():
-        return (
-            "pdflatex/bibtex were not found on PATH, so the paper cannot be compiled. "
-            "Install TeX Live, or run with --compute modal to compile in a Modal sandbox."
-        )
-    return None
+    problems = compute.check(python=cfg.use_plotting, latex=True)
+    return problems[0] if problems else None
 
 
 # ---------------------------------------------------------------------------

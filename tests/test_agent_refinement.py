@@ -86,7 +86,9 @@ ISSUES = json.dumps(
 
 def paper(repo_root: Path, cue: str, *, extra: str = "") -> str:
     """The cvpr2025 template, written out.  ``cue`` tells the scripted reviewers what to score."""
-    template = (repo_root / "templates" / "cvpr2025" / "template.tex").read_text(encoding="utf-8")
+    template = (
+        repo_root / "src" / "paper_orchestra" / "templates" / "cvpr2025" / "template.tex"
+    ).read_text(encoding="utf-8")
     written = {
         "My Title": "Sparse Routing for Tiny Models",
         "Abstract here.": "We study sparse routing for small models.",
@@ -236,7 +238,7 @@ def make_ctx(
     **overrides,
 ) -> RunContext:
     base = tmp_path / "run"
-    template_dir = repo_root / "templates" / "cvpr2025"
+    template_dir = repo_root / "src" / "paper_orchestra" / "templates" / "cvpr2025"
     cfg = PipelineConfig(base_dir=base, template_dir=template_dir, **overrides)
     paths = RunPaths(base)
     paths.materials_dir.mkdir(parents=True)

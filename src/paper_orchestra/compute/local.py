@@ -302,6 +302,14 @@ class LocalBackend(ComputeBackend):
             timed_out=timed_out,
         )
 
+    def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+        if latex and not self.latex_available():
+            return [
+                "pdflatex/bibtex were not found on PATH, so the paper cannot be compiled. "
+                "Install TeX Live, or run with --compute modal to compile in a Modal sandbox."
+            ]
+        return []
+
     def describe(self) -> dict[str, Any]:
         return {
             "backend": self.name,

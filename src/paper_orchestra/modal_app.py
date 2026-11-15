@@ -94,6 +94,7 @@ from paper_orchestra.compute.modal_backend import (
     python_image,
 )
 from paper_orchestra.config import (
+    BUNDLED_TEMPLATES_DIR,
     DEFAULT_MODEL,
     LAB_MEMORY_ENV,
     TEMPLATES_ENV,
@@ -848,7 +849,7 @@ def _pipeline_image() -> modal.Image:
     # In a checkout this file is src/paper_orchestra/modal_app.py.  Inside the container the
     # path points nowhere, which is fine: image steps are only evaluated when building.
     root = Path(__file__).resolve().parents[2]
-    templates = os.environ.get(TEMPLATES_ENV) or str(root / "templates")
+    templates = os.environ.get(TEMPLATES_ENV) or str(BUNDLED_TEMPLATES_DIR)
     return (
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
         .run_commands(TEXLIVE_INSTALL_COMMAND)

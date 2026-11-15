@@ -61,6 +61,15 @@ log = logging.getLogger(__name__)
 
 WriteScope = Literal["none", "notes", "all"]
 
+
+class RunCancelled(RuntimeError):
+    """The run was stopped (see :meth:`ContextHarness.cancel`).
+
+    Deliberately not an ``LLMError``: nothing should retry it or treat it as a
+    model failure.
+    """
+
+
 #: Sections of the project wiki that pipeline code owns.  They are records (inputs, verified
 #: bibliography, review results), so no model session may edit them.
 CODE_OWNED_SECTIONS = (
@@ -195,6 +204,7 @@ class HarnessConversation:
         A session that cannot open pages itself (push mode) is given the lessons
         and syntheses in memory when the caller names nothing.
         """
+        self._harness._check_cancelled()
         content = normalize_parts(parts)
         if self._first:
             block = ""
@@ -303,6 +313,7 @@ class ContextHarness:
         self._scanner_signature: tuple[Any, ...] | None = None
         self._lock = threading.RLock()
         self._dirty: set[str] = set()
+        self._cancelled = threading.Event()
 
     @classmethod
     def create(
@@ -377,6 +388,23 @@ class ContextHarness:
     def client_for(self, model: str) -> LLMClient:
         return self._client_for(model)
 
+    def cancel(self) -> None:
+        """Stop the run at the next model call.
+
+        After this, opening a conversation or sending a turn raises
+        :class:`RunCancelled`.  A call that is already in flight finishes; work on
+        other threads then stops at its next call instead of running to the end.
+        """
+        self._cancelled.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def _check_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            raise RunCancelled("the run was stopped")
+
     def _wiki(self, scope: str) -> Wiki | None:
         return self.lab if scope == "lab" else self.project
 
@@ -425,6 +453,7 @@ class ContextHarness:
         pages, no transcripts): used to consolidate the shared memory without exposing any
         paper content to that session.
         """
+        self._check_cancelled()
         client = self.client_for(model)
         policy = memory or MemoryPolicy.default()
         label = label or f"{stage}.{agent}"

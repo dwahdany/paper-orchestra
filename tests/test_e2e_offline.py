@@ -329,7 +329,7 @@ def run(tmp_path, repo_root, monkeypatch):
 
     cfg = PipelineConfig(
         base_dir=tmp_path / "run",
-        template_dir=repo_root / "templates" / "cvpr2025",
+        template_dir=repo_root / "src" / "paper_orchestra" / "templates" / "cvpr2025",
         use_plotting=True,
         research_cutoff="2025-01",
         max_reflections=1,

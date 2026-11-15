@@ -51,7 +51,10 @@ def test_memory_dirs(tmp_path, monkeypatch):
 
 
 def test_resolve_template_dir(tmp_path, monkeypatch, repo_root):
-    assert resolve_template_dir("cvpr2025") == repo_root / "templates" / "cvpr2025"
+    assert (
+        resolve_template_dir("cvpr2025")
+        == repo_root / "src" / "paper_orchestra" / "templates" / "cvpr2025"
+    )
     custom = tmp_path / "mine"
     custom.mkdir()
     assert resolve_template_dir(custom) == custom

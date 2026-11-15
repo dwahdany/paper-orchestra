@@ -157,12 +157,15 @@ class PipelineConfig:
         return cls(models=models, memory=memory, **data)
 
 
+#: The templates shipped inside the package, so an installed wheel has them too.
+BUNDLED_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
+
 def resolve_template_dir(template: str | Path) -> Path:
     """Resolve a template name (``cvpr2025``) or path to a template directory.
 
     Search order: the path itself, ``$PAPER_ORCHESTRA_TEMPLATES/<name>``,
-    ``./templates/<name>``, then the ``templates/`` directory next to an
-    editable checkout of this package.
+    ``./templates/<name>``, then the templates shipped with this package.
     """
     candidate = Path(template).expanduser()
     if candidate.is_dir():
@@ -171,9 +174,23 @@ def resolve_template_dir(template: str | Path) -> Path:
     if os.environ.get(TEMPLATES_ENV):
         roots.append(Path(os.environ[TEMPLATES_ENV]).expanduser())
     roots.append(Path.cwd() / "templates")
-    roots.append(Path(__file__).resolve().parents[2] / "templates")
+    roots.append(BUNDLED_TEMPLATES_DIR)
     for root in roots:
         if (root / str(template)).is_dir():
             return root / str(template)
     searched = ", ".join(str(r) for r in roots)
-    raise FileNotFoundError(f"LaTeX template '{template}' not found (searched: {searched})")
+    bundled = ", ".join(bundled_templates()) or "none"
+    raise FileNotFoundError(
+        f"LaTeX template '{template}' not found (searched: {searched}). Pass the path of a "
+        f"directory that contains template.tex, set {TEMPLATES_ENV} to a directory of "
+        f"templates, or use a bundled one: {bundled}."
+    )
+
+
+def bundled_templates() -> list[str]:
+    """Names of the templates shipped with the package."""
+    if not BUNDLED_TEMPLATES_DIR.is_dir():
+        return []
+    return sorted(
+        path.name for path in BUNDLED_TEMPLATES_DIR.iterdir() if (path / "template.tex").is_file()
+    )

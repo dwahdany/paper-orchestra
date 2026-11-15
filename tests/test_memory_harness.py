@@ -16,7 +16,13 @@ from paper_orchestra.llm.base import (
 )
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.llm.parsing import parse_json
-from paper_orchestra.memory import ContextHarness, MemoryPolicy, TranscriptLog, Wiki
+from paper_orchestra.memory import (
+    ContextHarness,
+    MemoryPolicy,
+    RunCancelled,
+    TranscriptLog,
+    Wiki,
+)
 
 PUSH_ONLY = Capabilities(tools=False, memory_tool=False, web_search=False, structured_output=False)
 
@@ -518,3 +524,20 @@ def test_push_mode_supplies_lessons_when_the_caller_names_nothing(tmp_path):
     )
     assert "Use cleveref." not in client.requests[4].text
     assert "lab_memory_index" not in client.requests[4].system
+
+
+def test_a_cancelled_run_stops_at_the_next_model_call(tmp_path):
+    client = FakeLLM(lambda request: "ok")
+    harness = make_harness(tmp_path, client)
+    conversation = harness.open(agent="writer", stage="outline", model="fake")
+    conversation.send("first")
+    assert not harness.cancelled
+    harness.cancel()
+    with pytest.raises(RunCancelled):
+        conversation.send("second")
+    with pytest.raises(RunCancelled):
+        harness.generate("third", agent="writer", stage="outline", model="fake")
+    assert len(client.requests) == 1 and harness.cancelled
+    # Deterministic bookkeeping still works, so the run can be closed cleanly.
+    harness.note("stopped by the user", stage="outline")
+    harness.refresh()

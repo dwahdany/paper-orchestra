@@ -83,7 +83,9 @@ def test_compile_missing_tex_raises(backend, tmp_path):
 @pytest.mark.latex
 @pytest.mark.parametrize("template", ["cvpr2025", "iclr2025"])
 def test_bundled_templates_compile(backend, tmp_path, repo_root, template):
-    shutil.copytree(repo_root / "templates" / template, tmp_path, dirs_exist_ok=True)
+    shutil.copytree(
+        repo_root / "src" / "paper_orchestra" / "templates" / template, tmp_path, dirs_exist_ok=True
+    )
     result = backend.compile_latex(tmp_path, "template", output_pdf=tmp_path / "out" / "paper.pdf")
     assert result.ok and result.pdf_path == tmp_path / "out" / "paper.pdf"
     assert result.pdf_path.read_bytes().startswith(b"%PDF")
@@ -164,7 +166,9 @@ def test_documents_that_could_read_or_run_things_are_never_compiled(backend, tmp
 
 def test_unsafe_constructs_does_not_flag_ordinary_papers(repo_root):
     for template in ("cvpr2025", "iclr2025"):
-        tex = (repo_root / "templates" / template / "template.tex").read_text()
+        tex = (
+            repo_root / "src" / "paper_orchestra" / "templates" / template / "template.tex"
+        ).read_text()
         assert unsafe_constructs(tex) == []
     ordinary = (
         "\\documentclass{article}\\usepackage{graphicx,booktabs,amsmath}\n"
@@ -341,3 +345,13 @@ def test_compile_result_feedback_falls_back_to_log_tail():
     result = CompileResult(ok=False, log_tail="fatal: emergency stop")
     assert "emergency stop" in result.feedback()
     assert "timed out" in CompileResult(ok=False, timed_out=True).feedback()
+
+
+def test_check_reports_a_missing_tex_install(monkeypatch):
+    backend = LocalBackend()
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: False))
+    (problem,) = backend.check()
+    assert "pdflatex/bibtex were not found" in problem and "--compute modal" in problem
+    assert backend.check(latex=False) == []
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: True))
+    assert backend.check() == []
