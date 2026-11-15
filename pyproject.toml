@@ -32,7 +32,14 @@ dependencies = [
 modal = ["modal>=1.6,<2"]
 gemini = ["google-genai>=3.0,<4"]
 openai = ["openai>=3.0,<4"]
-ui = ["streamlit>=1.50"]
+# The web app.  (streamlit is the previous demo and goes away with it.)
+ui = [
+    "fastapi>=0.115",
+    "markdown-it-py>=3.0",
+    "python-multipart>=0.0.9",
+    "streamlit>=1.50",
+    "uvicorn>=0.30",
+]
 all = ["paper-orchestra[modal,gemini,openai,ui]"]
 
 [project.scripts]
@@ -40,6 +47,7 @@ paper-orchestra = "paper_orchestra.cli:main"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.27",  # the test client of the web app
     "pytest>=8.0",
     "ruff>=0.6",
 ]
