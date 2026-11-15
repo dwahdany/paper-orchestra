@@ -9,8 +9,9 @@ Three things shape this module:
   bridges Modal's OIDC token into that chain and reports which source won.
 * **History is append-only.**  Claude Fable 5.2 checks every replayed thinking
   block against the system prompt, tool definitions and messages that preceded
-  it.  A conversation therefore freezes ``system`` and ``tools`` when it is
-  created and keeps a journal of wire-JSON messages that is only appended to.
+  it.  A conversation therefore fixes ``system`` and ``tools`` before its first
+  answered request and keeps a journal of wire-JSON messages that is only
+  appended to.
 * **Nothing provider-specific leaks.**  Callers see the types of
   :mod:`paper_orchestra.llm.base`; the SDK is imported lazily, inside functions.
 """
@@ -320,6 +321,8 @@ def _missing_credentials_message(env: Mapping[str, str]) -> str:
     missing = [name for name in (_ENV_RULE_ID, _ENV_ORGANIZATION_ID) if not env.get(name)]
     if not (env.get(_ENV_IDENTITY_TOKEN_FILE) or env.get(_ENV_IDENTITY_TOKEN)):
         missing.append(f"{_ENV_IDENTITY_TOKEN_FILE} (or {_ENV_IDENTITY_TOKEN})")
+    if not missing:
+        return message
     return (
         f"{message}\nWorkload Identity Federation is only partly configured: "
         f"{', '.join(present)} set, {', '.join(missing)} missing."
@@ -438,28 +441,31 @@ def json_output_format(schema: Schema) -> dict[str, Any]:
     return {"type": "json_schema", "schema": transformed}
 
 
-def _client_tool_definition(tool: ToolSpec, *, strict_allowed: bool) -> dict[str, Any]:
+def _client_tool_definition(tool: ToolSpec) -> dict[str, Any]:
     schema = _plain_json(tool.input_schema, f"input_schema of tool '{tool.name}'")
     if not isinstance(schema, dict) or schema.get("type") != "object":
         raise LLMConfigError(
             f"The input_schema of tool '{tool.name}' must be a JSON schema of type 'object'."
         )
-    definition: dict[str, Any] = {
-        "name": tool.name,
-        "description": tool.description,
-        "input_schema": schema,
-    }
-    # A closed schema opts the tool into strict mode (grammar-constrained
-    # inputs).  Schemas that strict mode cannot express stay non-strict.
-    if strict_allowed and schema.get("additionalProperties") is False:
-        try:
-            strict_schema = _import_sdk().transform_schema(schema)
-        except (TypeError, ValueError):
-            strict_schema = None
-        if strict_schema is not None and not _open_objects(strict_schema):
-            definition["input_schema"] = strict_schema
-            definition["strict"] = True
-    return definition
+    return {"name": tool.name, "description": tool.description, "input_schema": schema}
+
+
+def _strict_tool_definition(definition: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The strict (grammar-constrained input) form of a client tool, if it has one.
+
+    A closed schema (``additionalProperties: false``) opts a tool in.  Schemas
+    that strict mode cannot express keep their plain definition.
+    """
+    schema = definition["input_schema"]
+    if schema.get("additionalProperties") is not False:
+        return None
+    try:
+        strict_schema = _import_sdk().transform_schema(schema)
+    except (TypeError, ValueError):
+        return None
+    if _open_objects(strict_schema):
+        return None
+    return {**definition, "input_schema": strict_schema, "strict": True}
 
 
 def _web_search_definition(web_search: WebSearch) -> dict[str, Any]:
@@ -487,11 +493,17 @@ def _tool_definitions(
     web_search: WebSearch | None,
     *,
     strict_allowed: bool,
-) -> tuple[list[dict[str, Any]], dict[str, ToolSpec]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, dict[str, ToolSpec]]:
+    """Return ``(tools, tools without strict mode, handlers by name)``.
+
+    The second list is ``None`` when no tool is strict, i.e. when it would equal the first.
+    """
     definitions: list[dict[str, Any]] = []
+    plain_definitions: list[dict[str, Any]] = []
     handlers: dict[str, ToolSpec] = {}
     if memory is not None:
         definitions.append({"type": MEMORY_TOOL_TYPE, "name": MEMORY_TOOL_NAME})
+        plain_definitions.append(definitions[-1])
     for tool in tools:
         if not _TOOL_NAME.match(tool.name):
             raise LLMConfigError(
@@ -502,10 +514,15 @@ def _tool_definitions(
         if tool.name in handlers:
             raise LLMConfigError(f"Two tools are named '{tool.name}'; tool names must be unique.")
         handlers[tool.name] = tool
-        definitions.append(_client_tool_definition(tool, strict_allowed=strict_allowed))
+        plain = _client_tool_definition(tool)
+        strict = _strict_tool_definition(plain) if strict_allowed else None
+        definitions.append(strict or plain)
+        plain_definitions.append(plain)
     if web_search is not None:
         definitions.append(_web_search_definition(web_search))
-    return definitions, handlers
+        plain_definitions.append(definitions[-1])
+    has_strict = any(definition.get("strict") for definition in definitions)
+    return definitions, plain_definitions if has_strict else None, handlers
 
 
 def _base64_size(data: bytes) -> int:
@@ -519,11 +536,13 @@ def fit_image(image: Image) -> Image:
     re-encoded, because replayed media must stay byte-identical.
     """
     from PIL import Image as PILImage
-    from PIL import UnidentifiedImageError
 
+    # Pillow reports undecodable data as OSError (unidentified or truncated
+    # files), ValueError or SyntaxError (corrupt chunks), depending on the format.
+    unreadable = (OSError, ValueError, SyntaxError, PILImage.DecompressionBombError)
     try:
         picture = PILImage.open(io.BytesIO(image.data))
-    except (UnidentifiedImageError, OSError, PILImage.DecompressionBombError) as exc:
+    except unreadable as exc:
         raise LLMError(f"An image part could not be decoded: {exc}") from exc
     with picture:
         media_type = _PIL_MEDIA_TYPES.get(picture.format or "")
@@ -537,7 +556,7 @@ def fit_image(image: Image) -> Image:
             )
         try:
             return _reencode(picture)
-        except OSError as exc:
+        except unreadable as exc:
             raise LLMError(f"An image part could not be re-encoded: {exc}") from exc
 
 
@@ -745,6 +764,8 @@ def _check_tool_input(tool: ToolSpec, tool_input: Any) -> None:
     Non-strict tool input is not validated by the API.  This checks what a
     handler relies on most (an object, the required keys, primitive types and
     enums of top-level properties); deeper validation is the handler's own.
+    Enum values are put back into their declared casing, which even
+    grammar-constrained (strict) input does not guarantee.
     """
     if not isinstance(tool_input, dict):
         raise ToolError(f"The input of tool '{tool.name}' must be a JSON object.")
@@ -764,26 +785,35 @@ def _check_tool_input(tool: ToolSpec, tool_input: Any) -> None:
                 f"Tool '{tool.name}' does not accept parameter(s): {', '.join(unknown)}. "
                 f"Accepted parameters: {', '.join(properties) or 'none'}."
             )
-    for name, value in tool_input.items():
+    for name, value in list(tool_input.items()):
         rule = properties.get(name)
         if not isinstance(rule, Mapping) or (value is None and name not in required):
             continue
         declared = rule.get("type")
         names = [declared] if isinstance(declared, str) else declared
-        if isinstance(names, list) and names:
-            accepted = tuple(kind for n in names for kind in _JSON_TYPES.get(n, ()))
-            is_bool_as_number = isinstance(value, bool) and "boolean" not in names
-            if accepted and (not isinstance(value, accepted) or is_bool_as_number):
-                raise ToolError(
-                    f"Parameter '{name}' of tool '{tool.name}' must be of type "
-                    f"{' or '.join(str(n) for n in names)}; got {value!r}."
-                )
+        names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+        accepted = tuple(kind for n in names for kind in _JSON_TYPES.get(n, ()))
+        is_bool_as_number = isinstance(value, bool) and "boolean" not in names
+        if accepted and (not isinstance(value, accepted) or is_bool_as_number):
+            raise ToolError(
+                f"Parameter '{name}' of tool '{tool.name}' must be of type "
+                f"{' or '.join(names)}; got {value!r}."
+            )
         choices = rule.get("enum")
         if isinstance(choices, list) and value not in choices:
-            raise ToolError(
-                f"Parameter '{name}' of tool '{tool.name}' must be one of "
-                f"{', '.join(repr(choice) for choice in choices)}; got {value!r}."
-            )
+            same = [
+                choice
+                for choice in choices
+                if isinstance(choice, str)
+                and isinstance(value, str)
+                and choice.lower() == value.lower()
+            ]
+            if not same:
+                raise ToolError(
+                    f"Parameter '{name}' of tool '{tool.name}' must be one of "
+                    f"{', '.join(repr(choice) for choice in choices)}; got {value!r}."
+                )
+            tool_input[name] = same[0]
 
 
 def _result_text(output: Any) -> str:
@@ -880,7 +910,10 @@ class AnthropicConversation(Conversation):
             if system and system.strip()
             else None
         )
-        self._tools, self._handlers = _tool_definitions(
+        # `_plain_tools` is the fallback without strict mode.  It exists only
+        # until the API has accepted a request of this conversation: from then
+        # on the tool definitions are part of the history and must not change.
+        self._tools, self._plain_tools, self._handlers = _tool_definitions(
             tools, memory, web_search, strict_allowed=structured_outputs
         )
         self._memory = memory
@@ -1067,6 +1100,8 @@ class AnthropicConversation(Conversation):
                 self._where(request_id),
                 reason,
             )
+        elif not text.strip():
+            logger.warning("The model ended its turn without any text%s.", self._where(request_id))
         return LLMResponse(
             text=text,
             parsed=parsed,
@@ -1112,8 +1147,21 @@ class AnthropicConversation(Conversation):
         if self._tools:
             request["tools"] = self._tools
         try:
-            return self._stream(request)
+            response = self._stream(request)
         except anthropic.APIStatusError as exc:
+            if exc.status_code == 400 and self._plain_tools is not None:
+                # Strict tools are not available for every model and organization
+                # and share a complexity budget with the response format.  Nothing
+                # has been answered yet, so the tools can still be declared plainly.
+                logger.warning(
+                    "The first request was rejected%s (%s); retrying without strict tools.",
+                    self._where(getattr(exc, "request_id", None)),
+                    getattr(exc, "api_message", None) or exc,
+                )
+                self._tools, self._plain_tools = self._plain_tools, None
+                return self._request(
+                    messages, max_tokens, output_format, format_is_untested=format_is_untested
+                )
             raise self._status_error(exc, format_is_untested=format_is_untested) from exc
         except anthropic.APIConnectionError as exc:
             raise LLMError(
@@ -1129,6 +1177,9 @@ class AnthropicConversation(Conversation):
             raise LLMError(
                 f"The Anthropic SDK failed{self._where(None)}: {type(exc).__name__}: {exc}"
             ) from exc
+        # Accepted: the tool definitions now belong to the history.
+        self._plain_tools = None
+        return response
 
     def _stream(self, request: dict[str, Any]) -> tuple[Any, str | None]:
         """Stream one response to completion, re-issuing it if the stream breaks.
@@ -1273,7 +1324,8 @@ class AnthropicConversation(Conversation):
         if status == 400 and format_is_untested:
             return LLMConfigError(
                 f"The API rejected a request that asked for native structured output{where}: "
-                f"{detail}. Ask for JSON in the prompt and parse the response text instead."
+                f"{detail}. Ask for JSON in the prompt and parse the response text instead "
+                f"({STRUCTURED_OUTPUTS_ENV}=0 turns native structured output off for good)."
             )
         if status in (401, 403):
             return LLMConfigError(

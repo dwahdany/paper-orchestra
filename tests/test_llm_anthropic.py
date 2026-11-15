@@ -539,6 +539,45 @@ def test_tool_declarations(api, client, monkeypatch):
     ]
 
 
+def test_strict_tools_are_dropped_when_the_first_request_is_rejected(api, client, caplog):
+    def rejected(_: httpx2.Request) -> httpx2.Response:
+        return api_error(400, "invalid_request_error", "tools.0.strict: not supported", "req_s")
+
+    tools = [ToolSpec("lookup", "Look a term up.", LOOKUP_SCHEMA, lambda _: "page text")]
+    plain = [{"name": "lookup", "description": "Look a term up.", "input_schema": LOOKUP_SCHEMA}]
+    api.script += [
+        rejected,
+        msg([tool_use("tu_1", "lookup", {"q": "x"})], "tool_use"),
+        msg([text("done")]),
+    ]
+    conversation = client.conversation(model=MODEL, tools=tools)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.llm.anthropic_client"):
+        assert conversation.send("go").text == "done"
+    assert api.requests[0]["tools"][0]["strict"] is True
+    assert api.requests[1]["tools"] == api.requests[2]["tools"] == plain
+    assert api.requests[1]["messages"] == api.requests[0]["messages"]
+    assert any("without strict tools" in record.getMessage() for record in caplog.records)
+
+    # Only the first request of a conversation may change the tools; a later 400 is final.
+    api.script.append(rejected)
+    with pytest.raises(LLMError, match="req_s"):
+        conversation.send("again")
+    assert len(api.requests) == 4
+
+    # Still rejected without strict tools: the tools were not the problem.
+    api.script += [rejected, rejected]
+    with pytest.raises(LLMConfigError, match="native structured output"):
+        client.conversation(model=MODEL, tools=tools).send("go", schema=Outline)
+    assert len(api.requests) == 6 and api.requests[5]["tools"] == plain
+
+    # Without strict tools there is nothing to retry.
+    api.script.append(rejected)
+    open_tool = ToolSpec("note", "d", {"type": "object", "properties": {}}, lambda _: "x")
+    with pytest.raises(LLMError, match="req_s"):
+        client.conversation(model=MODEL, tools=[open_tool]).send("go")
+    assert len(api.requests) == 7
+
+
 def test_invalid_tool_declarations_are_config_errors(client):
     def tool(name: str, schema: Any = None) -> ToolSpec:
         return ToolSpec(name, "d", schema or {"type": "object", "properties": {}}, lambda _: "x")
@@ -799,6 +838,57 @@ def test_api_rejecting_the_format_is_a_config_error_and_the_caller_can_fall_back
     assert response.parsed == {"title": "T", "sections": []}
     assert "format" not in api.requests[1]["output_config"]
     assert len(api.requests[1]["messages"]) == 1  # the rejected turn was not kept
+
+
+def test_structured_output_after_a_tool_loop_parses_the_closing_turn(api, client):
+    payload = {"title": "T", "sections": ["Intro"]}
+    api.script += [
+        msg(
+            [
+                thinking("S1"),
+                tool_use("tu_1", "lookup", {"q": "x", "scope": "Project"}),
+                tool_use("tu_2", "lookup", {"q": "x", "scope": "galaxy"}),
+            ],
+            "tool_use",
+        ),
+        msg([text(json.dumps(payload))]),
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string"},
+            "scope": {"type": "string", "enum": ["project", "lab"]},
+        },
+        "required": ["q"],
+    }
+    seen: list[dict[str, Any]] = []
+
+    def lookup(tool_input: dict[str, Any]) -> str:
+        seen.append(tool_input)
+        return "found"
+
+    conversation = client.conversation(model=MODEL, tools=[ToolSpec("lookup", "d", schema, lookup)])
+    response = conversation.send("Outline it.", schema=Outline)
+
+    assert response.parsed == Outline(**payload) and response.tool_calls == 2
+    # Enum casing is restored for the handler; the journal keeps what the model wrote.
+    assert seen == [{"q": "x", "scope": "project"}]
+    assert api.requests[1]["messages"][1]["content"][1]["input"] == {"q": "x", "scope": "Project"}
+    rejected = api.requests[1]["messages"][2]["content"][1]
+    assert rejected["is_error"] is True and "must be one of 'project', 'lab'" in rejected["content"]
+    # The format stays on every request of the exchange.
+    assert all("format" in body["output_config"] for body in api.requests)
+
+
+def test_bad_request_after_the_format_was_accepted_is_not_blamed_on_the_schema(api, client):
+    ping = ToolSpec("ping", "Ping.", {"type": "object", "properties": {}}, lambda _: "pong")
+    api.script += [
+        msg([tool_use("tu_1", "ping", {})], "tool_use"),
+        lambda _: api_error(400, "invalid_request_error", "prompt is too long", "req_long"),
+    ]
+    with pytest.raises(LLMError, match="prompt is too long") as caught:
+        client.conversation(model=MODEL, tools=[ping]).send("x", schema=Outline)
+    assert not isinstance(caught.value, LLMConfigError)
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1305,23 @@ def test_failing_event_sink_does_not_lose_the_response(api, client, caplog):
         response = client.conversation(model=MODEL, on_event=sink).send("x")
     assert response.text == "answer"
     assert any("event sink failed" in record.getMessage() for record in caplog.records)
+
+
+def test_empty_response_is_returned_with_a_warning_and_keeps_the_journal_valid(api, client, caplog):
+    api.script += [msg([]), msg([text("now with text")])]
+    conversation = client.conversation(model=MODEL)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.llm.anthropic_client"):
+        assert conversation.send("one").text == ""
+    assert any("without any text" in record.getMessage() for record in caplog.records)
+    # An empty assistant message cannot be replayed, so only the user turn was kept.
+    assert conversation.send("two").text == "now with text"
+    assert api.requests[1]["messages"] == [
+        {"role": "user", "content": [text("one")]},
+        {"role": "user", "content": [text("two")]},
+    ]
+    with pytest.raises(LLMParseError):
+        api.script.append(msg([]))
+        conversation.send("three", parser=parse_json)
 
 
 def test_generate_reasks_from_scratch_when_parsing_fails(api, client):

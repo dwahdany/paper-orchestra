@@ -142,9 +142,7 @@ class Review(BaseModel):
     Soundness: int = Field(description="A rating from 1 to 4 (poor, fair, good, excellent).")
     Presentation: int = Field(description="A rating from 1 to 4 (poor, fair, good, excellent).")
     Contribution: int = Field(description="A rating from 1 to 4 (poor, fair, good, excellent).")
-    Overall: int = Field(
-        description="A rating from 1 to 10 (very strong reject to award quality)."
-    )
+    Overall: int = Field(description="A rating from 1 to 10 (very strong reject to award quality).")
     Confidence: int = Field(
         description="A rating from 1 to 5 (low, medium, high, very high, absolute)."
     )
@@ -280,9 +278,17 @@ def perform_review_agentreview(
     failures: list[BaseException] = []
 
     def write_review(index: int) -> dict[str, Any] | None:
+        member_prompt = prompt
+        if count > 1:
+            # Sampling parameters are not available on every model, so the reviewers are
+            # also told apart in the prompt.
+            member_prompt += (
+                f"\n\nYou are reviewer {index + 1} of {count}. "
+                "The reviewers assess the paper independently of each other."
+            )
         try:
             response = generate(
-                prompt,
+                member_prompt,
                 model=model_name,
                 system=reviewer_system_prompt,
                 schema=Review,
@@ -314,9 +320,12 @@ def perform_review_agentreview(
 
     review = dict(reviews[0])
     if len(reviews) > 1:
-        review = get_meta_review(
-            model_name, temperature, reviews, generate=generate, label=f"{label}.meta"
-        ) or review
+        review = (
+            get_meta_review(
+                model_name, temperature, reviews, generate=generate, label=f"{label}.meta"
+            )
+            or review
+        )
     for axis, limits in SCORE_LIMITS.items():
         scores = [s for r in reviews if (s := _valid_score(r.get(axis), limits)) is not None]
         if scores:

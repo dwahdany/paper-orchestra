@@ -86,7 +86,7 @@ Prevent citation overlap: keep the scope of the Introduction separate from that 
 ### Part 3: Section writing plan and sizing constraints (`section_plan`)
 Outline the remaining sections (Abstract, Methodology, Experiments, Conclusion, Appendix) as a detailed structural plan.
 
-* Structural hierarchy: if subsection X.1 is created, X.2 is mandatory. Do not create orphaned subsections. Omit subsections entirely if a section does not require division.
+* Structural hierarchy: if subsection X.1 is created, X.2 is mandatory. Do not create orphaned subsections. If a section does not require division, do not divide it: give it a single entry in `subsections` that carries its content bullets and citation hints, as the Abstract in the example does.
 * Content specificity: reference the source materials explicitly.
     * Avoid: "Describe the model."
     * Prefer: "Formalize the Temporal-Aware Attention mechanism using Eq. 3 from idea.md."

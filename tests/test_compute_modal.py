@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import shutil
 import subprocess
@@ -335,7 +336,7 @@ def test_get_backend_local_and_unknown_names():
     local = get_backend("local", memory_limit_mb=None)
     assert isinstance(local, LocalBackend) and local.memory_limit_mb is None
     assert BACKEND_NAMES == ("local", "modal")
-    with pytest.raises(ComputeError, match="unknown compute backend 'docker'.*local, modal"):
+    with pytest.raises(ComputeError, match=r"unknown compute backend 'docker'.*local, modal"):
         get_backend("docker")
 
 
@@ -586,7 +587,7 @@ def test_modal_errors_become_compute_errors(fake, backend):
     fake.lookup_error = None
 
     fake.create_error = fake.exception.Error("Insufficient capacity")
-    with pytest.raises(ComputeError, match="could not start a Modal sandbox.*Insufficient"):
+    with pytest.raises(ComputeError, match=r"could not start a Modal sandbox.*Insufficient"):
         backend.run_python("pass")
     fake.create_error = ConnectionError("network down")
     with pytest.raises(ComputeError, match="ConnectionError: network down"):
@@ -655,13 +656,15 @@ def _latex_workspace(root: Path) -> Path:
 def test_compile_latex_uploads_the_workspace_and_fetches_the_outputs(
     fake, backend, tmp_path, monkeypatch, caplog
 ):
+    # An earlier test may have configured the package logger not to propagate.
+    monkeypatch.setattr(logging.getLogger("paper_orchestra"), "propagate", True)
     monkeypatch.setattr(modal_backend, "_MAX_FILE_BYTES", 1024)
     work = _latex_workspace(tmp_path)
-    seen: list[tuple[list[str], set[str], str | None]] = []
+    seen: list[tuple[list[str], set[str], tuple[str | None, str | None]]] = []
 
     def tex(sandbox, command, cwd, env):
         files = {p.relative_to(cwd).as_posix() for p in cwd.rglob("*")}
-        seen.append((command, files, env.get("openout_any")))
+        seen.append((command, files, (env.get("openout_any"), env.get("openin_any"))))
         if command[0] == "bibtex":
             (cwd / "main.blg").write_text("This is BibTeX")
             return FakeProcess(b"This is BibTeX\n")
@@ -691,7 +694,7 @@ def test_compile_latex_uploads_the_workspace_and_fetches_the_outputs(
     assert "$ bibtex main\nThis is BibTeX" in result.log_tail and "caf\ufffd" in result.log_tail
 
     assert [command for command, _, _ in seen] == latex_commands("main")
-    assert {env for _, _, env in seen} == {"p"}
+    assert {policy for _, _, policy in seen} == {("p", "p")}  # paranoid TeX file access
     uploaded = seen[0][1] - {".paper-orchestra-upload.tar"}
     assert uploaded == {
         "main.tex",
@@ -705,7 +708,9 @@ def test_compile_latex_uploads_the_workspace_and_fetches_the_outputs(
     [sandbox] = fake.sandboxes
     assert sandbox.commands[0] == ["tar", "-xf", ".paper-orchestra-upload.tar", "-C", "."]
     kwargs = sandbox.exec_kwargs
-    assert len({k["workdir"] for k in kwargs}) == 1 and kwargs[0]["workdir"].startswith("/work/tex-")
+    assert len({k["workdir"] for k in kwargs}) == 1 and kwargs[0]["workdir"].startswith(
+        "/work/tex-"
+    )
     assert all(isinstance(k["timeout"], int) and k["text"] is False for k in kwargs)
     limits = [int(args[3]) for args, _ in fake.named("Sandbox.exec")][1:]
     assert limits[0] == 101 and all(0 < limit <= 101 for limit in limits)
@@ -761,11 +766,11 @@ def test_compile_latex_failures_of_the_backend_itself_raise(fake, backend, tmp_p
     (tmp_path / "paper.tex").write_text("x")
     missing = FakeProcess(b"", b"timeout: failed to run command 'pdflatex': No such file", 127)
     fake.handlers.append(scripted(pdflatex=lambda *_: missing))
-    with pytest.raises(ComputeError, match="could not run pdflatex.*No such file"):
+    with pytest.raises(ComputeError, match=r"could not run pdflatex.*No such file"):
         backend.compile_latex(tmp_path, "paper")
 
     fake.handlers[:] = [scripted(tar=lambda *_: FakeProcess(b"", b"tar: short read", 2))]
-    with pytest.raises(ComputeError, match="could not unpack.*short read"):
+    with pytest.raises(ComputeError, match=r"could not unpack.*short read"):
         backend.compile_latex(tmp_path, "paper")
     assert len(fake.sandboxes) == 1
 
@@ -778,6 +783,10 @@ def test_latex_local_mode_compiles_on_this_machine(fake, tmp_path, monkeypatch):
         return "local result"
 
     monkeypatch.setattr(LocalBackend, "compile_latex", compile_latex)
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: False))
+    with pytest.raises(ComputeError, match="latex='local' needs pdflatex and bibtex"):
+        ModalBackend(latex="local")
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: True))
     backend = ModalBackend(latex="local")
     result = backend.compile_latex(tmp_path, "paper", output_pdf=tmp_path / "o.pdf", timeout=7)
     assert result == "local result"

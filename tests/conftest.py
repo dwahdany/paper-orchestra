@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import socket
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,8 +37,25 @@ def fixed_clock():
 
 
 @pytest.fixture(autouse=True)
-def _no_provider_credentials(monkeypatch):
-    """Tests never see real credentials or a custom API endpoint."""
+def _offline(monkeypatch):
+    """No test may open a network connection.
+
+    Mock transports do not cover every path (for example an SDK's separate
+    client for credential exchange), so connecting is blocked outright.
+    """
+
+    def refuse(self, address, *args, **kwargs):
+        raise AssertionError(f"test tried to open a network connection to {address!r}")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_provider_credentials(monkeypatch, tmp_path_factory):
+    """Tests never see real credentials, on-disk profiles or a custom API endpoint."""
+    # SDKs fall back to profiles under the home directory; give every test an empty one.
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -49,7 +67,15 @@ def _no_provider_credentials(monkeypatch):
         "ANTHROPIC_WORKSPACE_ID",
         "ANTHROPIC_IDENTITY_TOKEN",
         "ANTHROPIC_IDENTITY_TOKEN_FILE",
+        "ANTHROPIC_CONFIG_DIR",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "PAPER_ORCHESTRA_STRUCTURED_OUTPUTS",
+        "PAPER_ORCHESTRA_MODAL_APP",
+        "PAPER_ORCHESTRA_MODAL_SECRET",
+        "PAPER_ORCHESTRA_MODAL_VOLUME",
+        "PAPER_ORCHESTRA_TEMPLATES",
         "MODAL_IDENTITY_TOKEN",
+        "MODAL_IDENTITY_TOKEN_FILE",
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
         "GEMINI_API_KEY",

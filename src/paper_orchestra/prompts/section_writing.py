@@ -33,7 +33,7 @@ The user message carries the inputs, each inside the tag named here:
 * <experimental_log>: raw data for tables and qualitative analysis for the text.
 * <citation_library>: the reference library, with the BibTeX key, title, authors, year and abstract of each paper.
 * <guidelines>: the conference formatting rules.
-* <figures>: the available figure files with their captions. The raster figures are also attached as images, each introduced by its file path.
+* <figures>: the available figure files with their captions. The figures are also attached as images, each introduced by its file path (a PDF figure is shown as a rendering of its first page).
 * <template>: the LaTeX file to complete.
 
 Instructions:

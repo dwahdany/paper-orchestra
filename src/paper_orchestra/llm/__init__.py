@@ -55,6 +55,8 @@ from paper_orchestra.llm.router import (
 )
 
 #: Provider clients and the module each one lives in, imported on first access.
+#: Only the primary provider is part of ``__all__``: a star import must not
+#: depend on the optional providers' modules.
 _LAZY_CLIENTS = {
     "AnthropicClient": "paper_orchestra.llm.anthropic_client",
     "GeminiClient": "paper_orchestra.llm.gemini_client",
@@ -70,7 +72,6 @@ __all__ = [
     "EventSink",
     "FakeLLM",
     "FakeRequest",
-    "GeminiClient",
     "Image",
     "LLMClient",
     "LLMConfigError",
@@ -80,7 +81,6 @@ __all__ = [
     "LLMResponse",
     "LLMTruncated",
     "MemoryBackend",
-    "OpenAIClient",
     "Parser",
     "Part",
     "Pdf",

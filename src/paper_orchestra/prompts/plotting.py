@@ -346,7 +346,7 @@ How to draw it:
 
 _CODE_CONTRACT = """\
 How the script is run:
-- It runs unattended in a sandbox with a fresh, empty working directory, no network access and no display, and it is stopped after {timeout_seconds} seconds.
+- It runs unattended in a fresh, empty working directory without a display. It must not use the network, and it is stopped after {timeout_seconds} seconds.
 - Only the Python standard library, numpy and matplotlib are guaranteed to be installed, so import nothing else (no seaborn, pandas or scipy). No input files exist: embed every value the figure needs in the script.
 - Create one figure with matplotlib.pyplot and leave it open when the script ends. It is then saved for you as figure.png with a tight bounding box, so do not call plt.show() or plt.close().
 - Use the fonts that ship with matplotlib (DejaVu Sans). LaTeX text rendering (text.usetex) is not available; mathtext ($...$) is.

@@ -44,9 +44,7 @@ log = logging.getLogger(__name__)
 
 APP_ENV = "PAPER_ORCHESTRA_MODAL_APP"
 DEFAULT_APP_NAME = "paper-orchestra"
-INSTALL_HINT = (
-    "The Modal compute backend needs the Modal SDK. Install it with `uv sync --extra modal`."
-)
+INSTALL_HINT = "Install the Modal SDK with `uv sync --extra modal`."
 
 PYTHON_VERSION = "3.12"
 PYTHON_PACKAGES = ("numpy>=1.26", "matplotlib>=3.8", "pandas", "seaborn", "scipy")
@@ -92,6 +90,9 @@ _UNPACK_TIMEOUT = 120
 _MIN_LIFETIME = 300
 _MAX_LIFETIME = 24 * 60 * 60
 _LATEX_ARTIFACTS = (".log", ".blg")
+#: Paranoid file access: TeX may only read and write inside the working directory
+#: (and read its own distribution).
+_TEX_ENV = {"openout_any": "p", "openin_any": "p"}
 
 T = TypeVar("T")
 
@@ -102,7 +103,7 @@ def _import_modal() -> ModuleType:
     except ModuleNotFoundError as exc:
         if exc.name != "modal":
             raise
-        raise ComputeError(INSTALL_HINT) from exc
+        raise ComputeError(f"The Modal compute backend is not available. {INSTALL_HINT}") from exc
     return modal
 
 
@@ -247,6 +248,11 @@ class ModalBackend(ComputeBackend):
             raise ValueError(
                 f"idle_timeout must be positive and at most sandbox_lifetime, got {idle_timeout!r}"
             )
+        if latex == "local" and not LocalBackend.latex_available():
+            raise ComputeError(
+                "latex='local' needs pdflatex and bibtex on PATH. Install TeX Live, or use "
+                "latex='sandbox' to compile in a Modal sandbox."
+            )
         self._modal = _import_modal()
         self.app_name = app_name or os.environ.get(APP_ENV) or DEFAULT_APP_NAME
         self.latex: LatexMode = latex
@@ -316,7 +322,6 @@ class ModalBackend(ComputeBackend):
         notes: list[str],
     ) -> None:
         """Fetch one requested output file if it exists and is small enough to hold in memory."""
-        errors = self._modal.exception
         try:
             info = filesystem.stat(remote)
             if not info.is_file():
@@ -328,7 +333,7 @@ class ModalBackend(ComputeBackend):
                 )
                 return
             produced[name] = filesystem.read_bytes(remote)
-        except errors.SandboxFilesystemNotFoundError:
+        except self._modal.exception.SandboxFilesystemNotFoundError:
             return
 
     # -- latex -----------------------------------------------------------------
@@ -373,8 +378,7 @@ class ModalBackend(ComputeBackend):
                         command,
                         cwd=job_dir,
                         limit=_seconds(remaining),
-                        # Paranoid output: TeX may only write inside the working directory.
-                        env={"openout_any": "p"},
+                        env=_TEX_ENV,
                     )
                     if done.returncode in (126, 127) and not done.timed_out:
                         raise ComputeError(

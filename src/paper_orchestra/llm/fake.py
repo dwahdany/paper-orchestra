@@ -156,7 +156,9 @@ class _FakeConversation(Conversation):
             requests=1,
         )
         self._usage.add(usage)
-        request._emit({"type": "assistant", "text": text, "stop_reason": "end_turn"})
+        request._emit(
+            {"type": "assistant", "text": text, "stop_reason": "end_turn", "model": self.model}
+        )
         request._emit({"type": "usage", **usage.to_dict()})
 
         parsed: Any = None

@@ -19,6 +19,8 @@ None of these strings is rendered with ``str.format``: braces are literal JSON a
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from paper_orchestra.prompts.no_leakage import UNIVERSAL_NO_LEAKAGE_PROMPT
 
 CONTENT_REFINEMENT_SYSTEM_PROMPT = (
@@ -33,6 +35,7 @@ You are the author responsible for the "Rebuttal via Revision" phase. The user m
 * <previous_iterations_log>: the history of previous revisions, including how the review scores moved after each one.
 * <citation_map>: the allowed bibliography.
 * <reviewer_feedback>: a JSON object with the Strengths, Weaknesses, Questions, and Decision from a reviewer.
+* <known_problems> (only when there are any): defects of the current source found by automatic checks, such as a citation key that is not in the bibliography. Your revision should no longer have them.
 
 Your goal:
 1. Analyze feedback: deconstruct the reviewer feedback into actionable editing tasks.
@@ -88,7 +91,7 @@ Return two code blocks in this order (they are parsed by the pipeline):
 
 ## Notes
 - Completeness: always provide the full LaTeX code, not diffs or partial snippets. The file is compiled exactly as you return it.
-- Responsiveness: address every question in the reviewer feedback by improving the presentation, except for questions asking for new experiments or data that are not in the experimental log (ignore those). Never explicitly state a limitation.
+- Responsiveness: address every question in the reviewer feedback by improving the presentation, except for questions asking for new experiments or data that are not in the experimental log (ignore those). Never answer a request by stating a limitation: do not add sentences that concede a missing experiment, a weakness, or future work the reviewer asked for. A limitations discussion that the draft already contains can stay.
 - Safety: do not remove the \documentclass or the essential preamble.
 """
     + "\n"
@@ -106,8 +109,13 @@ def revision_user_prompt(
     experimental_log: str,
     citation_map: str,
     tex: str,
+    known_problems: Sequence[str] = (),
 ) -> str:
     """The user turn of one reflection iteration."""
+    known = ""
+    if known_problems:
+        listing = "\n".join(f"- {problem}" for problem in known_problems)
+        known = f"\n<known_problems>\n{listing}\n</known_problems>\n"
     return f"""This is reflection iteration {iteration}.
 
 <previous_iterations_log>
@@ -133,7 +141,7 @@ def revision_user_prompt(
 <paper_tex>
 {tex.strip()}
 </paper_tex>
-
+{known}
 Revise the paper:
 1. Your goal is to improve the reviewer score (currently {score:g}).
 2. Address the "Weaknesses" and "Questions" in the reviewer feedback above.
