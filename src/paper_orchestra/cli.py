@@ -36,7 +36,7 @@ import typer
 from typer.core import TyperCommand
 
 from paper_orchestra import __version__
-from paper_orchestra.batch import load_papers, run_batch, run_batch_on_modal, summarize
+from paper_orchestra.batch import load_papers, run_batch, summarize
 from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.config import (
     DEFAULT_MODEL,
@@ -47,6 +47,7 @@ from paper_orchestra.config import (
     resolve_template_dir,
 )
 from paper_orchestra.log import LOGGER_NAME, setup_logging
+from paper_orchestra.modal_batch import run_batch_on_modal
 from paper_orchestra.pipeline import prepare_run_dir, run_paper
 from paper_orchestra.utils.common import read_json
 
