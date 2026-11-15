@@ -1043,6 +1043,7 @@ class LiteratureAgent:
         pool = ThreadPoolExecutor(
             max_workers=max(1, cfg.literature_workers), thread_name_prefix="discovery"
         )
+        interrupted = False
         try:
             futures = [
                 pool.submit(self._discover, task, core_problem, web_search) for task in tasks
@@ -1079,12 +1080,14 @@ class LiteratureAgent:
                     self._verify(candidate, task, found)
         except KeyboardInterrupt:
             # Searches in flight are not followed by further calls.
+            interrupted = True
             self.ctx.harness.cancel()
             raise
         finally:
-            # On the normal path everything has finished; after an error or an interrupt this
-            # drops the calls that have not started instead of waiting for them.
-            pool.shutdown(wait=True, cancel_futures=True)
+            # On the normal path everything has finished; after an error this drops the calls
+            # that have not started.  An interrupt is not held up by the calls in flight:
+            # they end on their own and, the run being cancelled, start nothing new.
+            pool.shutdown(wait=not interrupted, cancel_futures=True)
         if last_error is not None and found.stats.failed_tasks == len(tasks):
             raise RuntimeError(
                 f"all {len(tasks)} literature search tasks failed; the last error was: {last_error}"

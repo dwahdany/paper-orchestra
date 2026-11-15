@@ -653,15 +653,19 @@ class PlottingAgent:
         workers = max(1, min(cfg.figure_workers, len(specs)))
         log.info("Plotting %d figure(s) with %d worker(s).", len(specs), workers)
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="figure")
+        interrupted = False
         try:
             outcomes = list(pool.map(self._figure_or_skip, specs))
         except KeyboardInterrupt:
             # Figures in flight stop at their next model call instead of running to the end.
+            interrupted = True
             self.ctx.harness.cancel()
             raise
         finally:
-            # After an error or an interrupt, figures that have not started are dropped.
-            pool.shutdown(wait=True, cancel_futures=True)
+            # After an error or an interrupt, figures that have not started are dropped.  An
+            # interrupt is not held up by the calls in flight: they end on their own and,
+            # the run being cancelled, start nothing new.
+            pool.shutdown(wait=not interrupted, cancel_futures=True)
         finished = [outcome for outcome in outcomes if isinstance(outcome, _Finished)]
         skipped = [outcome for outcome in outcomes if isinstance(outcome, _Skipped)]
         results = self._write_outputs(finished)

@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1314,3 +1315,26 @@ def test_ignored_provided_figures_do_not_rename_generated_ones(tmp_path):
     (kept.paths.provided_figures_dir / "fig_accuracy.png").write_bytes(image_bytes("green"))
     (result,) = PlottingAgent(kept).run({"plotting_plan": [figure("fig_accuracy")]})
     assert result["figure_id"] == "fig_accuracy_2"
+
+
+def test_an_interrupt_is_not_held_up_by_figures_in_flight(tmp_path):
+    release = threading.Event()
+    started = threading.Event()
+
+    def plan(request: FakeRequest) -> str:
+        if title_of(request).endswith("slow"):
+            started.set()
+            release.wait(timeout=30)  # a long model call that is in flight
+            return "**Detailed Description:** a plan"
+        started.wait(timeout=10)
+        raise KeyboardInterrupt  # the stop arrives while the other figure is busy
+
+    ctx = make_ctx(tmp_path, scripted_llm(plan=plan), figure_workers=2)
+    began = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            PlottingAgent(ctx).run({"plotting_plan": [figure("quick"), figure("slow")]})
+        assert time.monotonic() - began < 10  # did not wait for the call in flight
+        assert ctx.harness.cancelled  # which will start nothing new when it returns
+    finally:
+        release.set()
