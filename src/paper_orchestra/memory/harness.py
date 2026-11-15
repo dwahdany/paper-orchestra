@@ -288,6 +288,7 @@ class ContextHarness:
         consolidate_lab: bool = True,
         cache: KeyValueCache | None = None,
         protected: Sequence[Path] = (),
+        venue_dirs: Sequence[Path] = (),
     ) -> None:
         if client_for is None:
             from paper_orchestra.llm.router import get_client
@@ -309,7 +310,13 @@ class ContextHarness:
         self.cache = cache
         #: Files and directories that hold this paper's content, beside the wiki pages.
         self._protected: list[Path] = [Path(path) for path in protected]
+        #: Directories whose files are the venue's (the template as shipped), not the paper's.
+        self._venue_dirs: list[Path] = [Path(path) for path in venue_dirs]
         self._scanner: LeakScanner | None = None
+        #: How many writes to the lab memory the leak scan has refused.
+        self.lab_vetoes = 0
+        #: What the last promotion did: lessons shared with the lab, lessons kept back.
+        self.last_promotion: dict[str, int] = {"shared": 0, "withheld": 0}
         self._scanner_signature: tuple[Any, ...] | None = None
         self._lock = threading.RLock()
         self._dirty: set[str] = set()
@@ -378,6 +385,7 @@ class ContextHarness:
                 paths.outline,
                 paths.final_tex,
             ),
+            venue_dirs=(cfg.template_dir,),
             **common,
         )
 
@@ -815,23 +823,25 @@ class ContextHarness:
 
     def leak_scanner(self) -> LeakScanner:
         """The scanner for text headed to the lab memory, rebuilt when the materials change."""
-        from paper_orchestra.memory.dreaming import (
+        from paper_orchestra.memory.leakscan import (
             CONTENT_SECTIONS,
             LeakScanner,
-            content_sources,
+            paper_materials,
             protected_files,
-            venue_materials,
         )
 
         if self.project is None:
             return LeakScanner(())
         with self._lock:
-            entries: list[tuple[Any, ...]] = [
-                (info.path, info.size, info.updated)
+            files = [
+                self.project.root / info.path
                 for section in CONTENT_SECTIONS
                 for info in self.project.list(section.rstrip("/"))
             ]
-            for file in protected_files(self._protected):
+            files += protected_files(self._protected)
+            files += protected_files(self._venue_dirs)
+            entries: list[tuple[str, int, int]] = []
+            for file in files:
                 try:
                     stat = file.stat()
                 except OSError:
@@ -839,9 +849,8 @@ class ContextHarness:
                 entries.append((str(file), stat.st_size, stat.st_mtime_ns))
             signature = tuple(entries)
             if self._scanner is None or signature != self._scanner_signature:
-                self._scanner = LeakScanner(
-                    content_sources(self.project, self._protected),
-                    venue_materials(self.project, self._protected),
+                self._scanner = LeakScanner.from_materials(
+                    paper_materials(self.project, self._protected, self._venue_dirs)
                 )
                 self._scanner_signature = signature
             return self._scanner
@@ -862,10 +871,36 @@ class ContextHarness:
         )
 
     def _lab_guard(self, scope: str, text: str) -> str | None:
-        """Veto text headed for the shared memory if it carries this paper's content."""
+        """Veto text headed for the shared memory if it carries this paper's content.
+
+        Lessons other runs proposed are not re-judged against this paper: they
+        passed the scan of the run they came from, and a name or number they
+        share with this paper is a coincidence, not a leak.
+        """
         if self.project is None:
             return None
-        return self.leak_scanner().reason(text)
+        foreign = self._foreign_lesson_lines()
+        fresh = "\n".join(line for line in text.splitlines() if line.strip() not in foreign)
+        reason = self.leak_scanner().reason(fresh)
+        if reason:
+            with self._lock:
+                self.lab_vetoes += 1
+            self.record("lab_write_blocked", stage="finalize", agent="dreamer", reason=reason)
+        return reason
+
+    def _foreign_lesson_lines(self) -> set[str]:
+        """Lines of the pending lab notes that came from other runs."""
+        if self.project is None or self.lab is None:
+            return set()
+        from paper_orchestra.memory.dreaming import run_token
+
+        mine = run_token(self.project)
+        lines: set[str] = set()
+        for info in self.lab.pending_notes():
+            page = self.lab.read(info.path)
+            if page.meta.get("run") and str(page.meta["run"]) != mine:
+                lines.update(line.strip() for line in page.body.splitlines() if line.strip())
+        return lines
 
     # -- consolidation ---------------------------------------------------------
 
@@ -926,6 +961,8 @@ class ContextHarness:
             # Lessons reach the shared memory as notes that passed a leak scan; the lab
             # session then works from those notes alone and never sees this paper.
             promote_lessons(self)
+            reports[0].lessons_shared = self.last_promotion["shared"]
+            reports[0].lessons_withheld = self.last_promotion["withheld"]
         if self.lab is not None and self.consolidate_lab:
             reports.append(
                 dream(

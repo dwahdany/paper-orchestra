@@ -162,12 +162,32 @@ class WikiMemoryBackend:
         if self._on_write is not None:
             self._on_write("lab" if is_lab else "project", rel)
 
-    def _vet(self, is_lab: bool, text: str) -> None:
+    def _vet(self, is_lab: bool, text: str, rel: str | None = None) -> None:
+        """Ask the guard about ``text`` and, with ``rel``, about the name of the file.
+
+        A file name becomes a link in the index that every session reads, so it is
+        vetted like the text.
+        """
         if self._guard is None:
             return
-        reason = self._guard("lab" if is_lab else "project", text)
+        subject = text if rel is None else f"{PurePosixPath(rel).stem}\n{text}"
+        reason = self._guard("lab" if is_lab else "project", subject)
         if reason:
             raise ToolError(f"This text cannot be written to memory: {reason}")
+
+    def _added_text(self, wiki: Wiki, rel: str, text: str) -> str:
+        """What ``text`` adds to the page at ``rel``: its lines that are not already there.
+
+        Rewriting a page to merge something in must not put its existing lines on
+        trial again; they were vetted when they were written.
+        """
+        if self._guard is None or not wiki.exists(rel):
+            return text
+        try:
+            existing = {line.strip() for line in wiki.read_text(rel).splitlines()}
+        except WikiError:
+            return text
+        return "\n".join(line for line in text.splitlines() if line.strip() not in existing)
 
     # -- view ------------------------------------------------------------------
 
@@ -269,7 +289,7 @@ class WikiMemoryBackend:
             # Notes are append-only across sessions: overwriting would silently lose the
             # other session's observation.
             raise ToolError(f"{path} already exists. Choose a different file name for your note.")
-        self._vet(is_lab, file_text)
+        self._vet(is_lab, self._added_text(wiki, rel, file_text), rel)
         try:
             wiki.write_text(rel, file_text, author=self.author)
         except WikiError as exc:
@@ -368,6 +388,7 @@ class WikiMemoryBackend:
             raise ToolError("Cannot move a file between the project memory and the lab memory")
         self._check_write(wiki, old_rel, is_lab, old_path)
         self._check_write(new_wiki, new_rel, new_is_lab, new_path, creating=True)
+        self._vet(new_is_lab, "", new_rel)
         try:
             wiki.rename(old_rel, new_rel)
         except WikiError as exc:

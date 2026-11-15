@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -14,6 +15,7 @@ from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
 from paper_orchestra.memory.dreaming import (
     LOCK_FILE,
     MAX_INLINE_NOTE_CHARS,
+    PROMOTED_LEDGER,
     STALE_LOCK_SECONDS,
     LeakScanner,
     content_sources,
@@ -357,43 +359,81 @@ def test_the_scan_covers_everything_that_holds_paper_content(tmp_path):
         "wiki/reviews/v1.md",
         "Weaknesses: the comparison against retrieval baselines omits memory cost entirely.",
     )
-    run = tmp_path / "run"
-    (run / "latex_writeup").mkdir(parents=True)
-    (run / "latex_writeup" / "raw_draft_paper.tex").write_text(
+    shipped = "\\usepackage[review]{venue} % camera ready uses the final option instead\n"
+    template = tmp_path / "template"
+    template.mkdir()
+    (template / "template.tex").write_text(shipped, encoding="utf-8")
+    (template / "macros.tex").write_text("\\newcommand{\\tO}{\\mathbb{O}}", encoding="utf-8")
+    workspace = tmp_path / "run" / "latex_writeup"
+    workspace.mkdir(parents=True)
+    (workspace / "macros.tex").write_text("\\newcommand{\\tO}{\\mathbb{O}}", encoding="utf-8")
+    (workspace / "raw_draft_paper.tex").write_text(
         "\\section{Method} Our router assigns each token bucket a learned sparsity budget.",
         encoding="utf-8",
     )
-    (run / "latex_writeup" / "template.tex").write_text(
-        "\\usepackage[review]{venue} % camera ready uses the final option instead",
+    # After the literature stage the workspace's template.tex holds this paper's
+    # Introduction: whatever its name, it is no longer the venue's file.
+    (workspace / "template.tex").write_text(
+        shipped + "\\section{Introduction} We introduce GlimmerNet, which reaches 54.58 on "
+        "average while halving the latency of dense routing.",
         encoding="utf-8",
     )
-    harness.protect(run / "latex_writeup")
+    harness.protect(workspace)
+    harness._venue_dirs.append(template)
 
-    sources = "\n".join(content_sources(harness.project, [run / "latex_writeup"]))
+    sources = "\n".join(content_sources(harness.project, [workspace], [template]))
     for fragment in ("Sparse Routing", "latency grows", "retrieval baselines", "token bucket"):
         assert fragment in sources
-    assert "eight pages" not in sources and "camera ready" not in sources
-    venue = "\n".join(venue_materials(harness.project, [run / "latex_writeup"]))
-    assert "eight pages" in venue and "camera ready" in venue
+    assert "GlimmerNet" in sources and "eight pages" not in sources
+    assert "mathbb" not in sources  # the workspace copy of a shipped file is the venue's
+    venue = "\n".join(venue_materials(harness.project, [workspace], [template]))
+    assert "eight pages" in venue and "camera ready" in venue and "GlimmerNet" not in venue
 
     lessons = {
         "title": "For Sparse Routing Beats Dense Attention On Long Inputs, lead with speed.",
         "caption": "Captions such as latency grows linearly while quality stays flat read well.",
         "review": "When the comparison against retrieval baselines omits memory cost, add it.",
         "draft": "Say that the router assigns each token bucket a learned sparsity budget.",
+        "intro-name": "Reviewers rewarded naming GlimmerNet in the first sentence.",
+        "intro-number": "Leading with the 54.58 average raised the Clarity score.",
+        "intro-wording": "Say early that it works while halving the latency of dense routing.",
         "venue": "Papers are limited to eight pages excluding references, so cut early.",
         "template": "The camera ready uses the final option instead of review.",
+        "words": "Go to the appendix so the main text stays short; my advice is to cut, etc.",
     }
     for name, text in lessons.items():
         harness.project.write(f"wiki/lessons/{name}.md", text, {"summary": name, "portable": True})
     added = promote_lessons(harness)
     shared = "\n".join(harness.lab.read(note).body for note in added)
-    assert len(added) == 2 and "eight pages" in shared and "camera ready" in shared
+    assert len(added) == 3, shared
+    assert "eight pages" in shared and "camera ready" in shared and "my advice" in shared
     blocked = {e["path"] for e in harness.transcripts.events() if e["type"] == "promotion_blocked"}
-    assert blocked == {f"wiki/lessons/{n}.md" for n in ("title", "caption", "review", "draft")}
+    assert blocked == {
+        f"wiki/lessons/{n}.md"
+        for n in (
+            "title",
+            "caption",
+            "review",
+            "draft",
+            "intro-name",
+            "intro-number",
+            "intro-wording",
+        )
+    }
     # A draft written later is protected too: the scanner follows the files.
-    (run / "latex_writeup" / "v2.tex").write_text("We call the method QuillFeather routing.")
+    (workspace / "v2.tex").write_text("We call the method QuillFeather routing.")
     assert "QuillFeather" in harness.leak_scanner().reason("QuillFeather needs an ablation.")
+
+
+def test_a_template_directory_that_contains_the_run_does_not_whitelist_the_paper(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    workspace = tmp_path / "run" / "latex_writeup"
+    workspace.mkdir(parents=True)
+    (workspace / "raw_draft_paper.tex").write_text("We introduce GlimmerNet.", encoding="utf-8")
+    (tmp_path / "template.tex").write_text("\\usepackage{venue}", encoding="utf-8")
+    harness.protect(workspace)
+    harness._venue_dirs.append(tmp_path)  # a template given as "." or a parent directory
+    assert "GlimmerNet" in harness.leak_scanner().reason("GlimmerNet tables overflow.")
 
 
 def test_nothing_is_shared_when_there_is_nothing_to_scan_against(tmp_path):
@@ -629,3 +669,218 @@ def test_leak_scan_details(tmp_path):
     )
     assert "1234.750" in log_text
     assert promote_lessons(harness) == []
+
+
+# -- the scan, spelling by spelling ------------------------------------------------------
+
+
+def test_numbers_are_found_in_the_spellings_results_are_written_in():
+    sources = [
+        "2.3x faster with 110M parameters at 145ms; $87.3_{\\pm 0.2}$ and an F1 of .568; "
+        "a 9.23pp gain."
+    ]
+    for text in (
+        "A 2.3 times speed-up.",
+        "With 110 million parameters.",
+        "Latency of 145 ms.",
+        "Report 87.3 in the abstract.",
+        "An F1 of 0.568.",
+        "A gain of 9.23 points.",
+        "The 9.23pp gain.",
+        "Write $87.3_{\\pm 0.2}$ in the table.",
+    ):
+        assert "number" in leak_reason(text, sources), text
+    # Lengths and layout factors are not results, even when the digits coincide.
+    layout = "Overfull \\hbox (12.3pt too wide); use \\vspace{2.3em}, 110mm and 0.568\\linewidth."
+    assert leak_reason(layout, ["12.3 and 2.3 and 110 and 0.568"]) is None
+
+
+def test_names_are_recognised_in_identifiers_plurals_and_with_suffixes():
+    scanner = LeakScanner(
+        [
+            "We evaluate TSAM on CIFAR-10 with PromptWeaver and report mAP; the attention map "
+            "is sparse. \\FloatBarrier \\DeclareMathOperator{\\argmax}{argmax}"
+        ]
+    )
+    for text in (
+        "See TSAM_overview.png for the layout.",
+        "The label fig:tsam_overview was undefined.",
+        "TSAMs differ in depth.",
+        "TSAM-B is the larger variant.",
+        "CIFAR-100 needs another table.",
+        "PromptWeavers were compared.",
+        "Reviewers asked how mAP was computed.",
+    ):
+        assert "names something" in scanner.reason(text), text
+    # Ordinary words, and LaTeX commands the paper happens to use, are not names.
+    assert scanner.reason("Map each figure to a section; a bit of care helps.") is None
+    assert scanner.reason("Put \\FloatBarrier before the appendix.") is None
+    assert scanner.reason("Use \\DeclareMathOperator for upright operators.") is None
+
+
+def test_names_a_paper_coins_in_plain_capitals_are_protected():
+    scanner = LeakScanner(
+        [
+            "\\title{Falcon: Fast Routing for Long Inputs}\n"
+            "We propose Kestrel, a sparse router. We present Table 2 and call our method Osprey. "
+            "The table lists every run."
+        ]
+    )
+    assert "Falcon" in scanner.reason("Reviewers rewarded the Falcon ablation.")
+    assert "Kestrel" in scanner.reason("Introduce Kestrel in the first sentence.")
+    assert "Osprey" in scanner.reason("Osprey needs a runtime table.")
+    assert scanner.reason("Table captions go above the table; Fast builds help.") is None
+
+
+def test_the_pipelines_own_record_formats_are_not_paper_wording(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    harness.write_page(
+        "wiki/reviews/v2.md",
+        "Summary: the submission studies sparse routing for very long input sequences.\n\n"
+        "## Outcome\n\nOverall 5 -> 6; sub-axis gain 1, drop 0 (Clarity +1)",
+    )
+    workdir = tmp_path / "run" / "content_refinement_workdir"
+    workdir.mkdir(parents=True)
+    (workdir / "content_refinement_worklog.json").write_text(
+        json.dumps(
+            {
+                "iterations": [
+                    {
+                        "problems": ["Undefined control sequence in the second results table"],
+                        "scores": {
+                            "Originality": 3,
+                            "Quality": 3,
+                            "Clarity": 2,
+                            "Significance": 3,
+                            "Soundness": 3,
+                            "Presentation": 2,
+                            "Contribution": 3,
+                        },
+                        "summary": "Reviewers want the routing budget assumption stated early.",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    harness.protect(workdir)
+    lessons = {
+        "outcome": "Answering one question moved Overall 5 -> 6; sub-axis gain 1, drop 0.",
+        "scores": "Track Originality, Quality, Clarity, Significance, Soundness, Presentation "
+        "and Contribution separately.",
+        "error": "Undefined control sequence in the second results table means a lost package.",
+        "worklog-prose": "Reviewers want the routing budget assumption stated early, so do it.",
+        "review-prose": "The submission studies sparse routing for very long input sequences.",
+    }
+    for name, text in lessons.items():
+        harness.project.write(f"wiki/lessons/{name}.md", text, {"summary": name, "portable": True})
+    added = promote_lessons(harness)
+    shared = "\n".join(harness.lab.read(note).body for note in added)
+    assert len(added) == 3 and "sub-axis gain" in shared and "Soundness" in shared
+    blocked = {e["path"] for e in harness.transcripts.events() if e["type"] == "promotion_blocked"}
+    assert blocked == {"wiki/lessons/worklog-prose.md", "wiki/lessons/review-prose.md"}
+    assert harness.last_promotion == {"shared": 3, "withheld": 2}
+
+
+# -- promotion bookkeeping ----------------------------------------------------------------
+
+
+def test_a_lesson_is_shared_once_whatever_happens_to_its_page_or_the_ledger(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    project = harness.project
+    project.write("wiki/lessons/a.md", "Load cleveref last.", {"summary": "s", "portable": True})
+    assert len(promote_lessons(harness)) == 1
+    # A consolidation renames the page: still the same lesson.
+    project.rename("wiki/lessons/a.md", "wiki/lessons/cleveref.md")
+    assert promote_lessons(harness) == []
+    # A ledger written by an earlier version held digests only; they are not forgotten
+    # when a new lesson is recorded.
+    ledger = project.root / PROMOTED_LEDGER
+    digests = list(json.loads(ledger.read_text())["pages"].values())
+    ledger.write_text(json.dumps(digests))
+    project.write("wiki/lessons/b.md", "Check overfull boxes.", {"summary": "s", "portable": True})
+    assert len(promote_lessons(harness)) == 1
+    assert promote_lessons(harness) == [] and len(harness.lab.pending_notes()) == 2
+
+
+@pytest.mark.parametrize("flag", ["True", "yes", "TRUE", '"true"', "1"])
+def test_portable_is_understood_however_the_model_spells_it(tmp_path, flag):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    harness.project.write_text(
+        "wiki/lessons/a.md", f"---\nsummary: s\nportable: {flag}\n---\nLoad cleveref last."
+    )
+    harness.project.write_text(
+        "wiki/lessons/b.md", "---\nsummary: s\nportable: false\n---\nOnly for this paper."
+    )
+    (note,) = promote_lessons(harness)
+    assert "cleveref" in harness.lab.read(note).body
+
+
+def test_finish_reports_how_many_lessons_were_shared_and_withheld(tmp_path):
+    def responder(request: FakeRequest) -> str:
+        if request.label == "dream.project":
+            request.memory.create(
+                "/memories/wiki/lessons/good.md",
+                "---\nsummary: s\nportable: true\n---\nLoad cleveref last.",
+            )
+            request.memory.create(
+                "/memories/wiki/lessons/bad.md",
+                "---\nsummary: s\nportable: true\n---\nLead with the 91.2 accuracy.",
+            )
+        return "ok"
+
+    harness = make_harness(tmp_path, FakeLLM(responder), lab=True, dream_mode="end")
+    harness.note("n", stage="s")
+    project_report = harness.finish()[0]
+    assert (project_report.lessons_shared, project_report.lessons_withheld) == (1, 1)
+    assert project_report.to_dict()["lessons_withheld"] == 1
+
+
+# -- the lab session's guard --------------------------------------------------------------
+
+
+def test_a_refused_lab_write_keeps_the_notes_pending_and_other_runs_lessons_pass(tmp_path):
+    attempts: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        if request.label != "dream.lab":
+            return "ok"
+        # Folding another run's lesson, which names something this paper also uses.
+        request.memory.create(
+            "/memories/wiki/lessons/optimisers.md",
+            "---\nsummary: optimiser notes\n---\nFooNet-style warmup tables need a units row.",
+        )
+        attempts.append("foreign lesson written")
+        # Merging into a page by rewriting it: the lines already there are not on trial.
+        request.memory.create(
+            "/memories/wiki/lessons/old.md",
+            "---\nsummary: old\n---\nFooNet was the running example in 2023.\nUse booktabs.",
+        )
+        attempts.append("existing page extended")
+        # But this paper's content is still refused, in the text and in the file name.
+        with pytest.raises(Exception, match="names something"):
+            request.memory.create("/memories/wiki/lessons/new.md", "FooNet ablations go first.")
+        with pytest.raises(Exception, match="names something"):
+            request.memory.rename(
+                "/memories/wiki/lessons/optimisers.md", "/memories/wiki/lessons/foonet-tips.md"
+            )
+        return "done"
+
+    harness = make_harness(tmp_path, FakeLLM(responder), lab=True, dream_mode="end")
+    harness.write_page("wiki/sources/idea.md", "We propose FooNet for long video understanding.")
+    harness.lab.write(
+        "wiki/lessons/old.md", "FooNet was the running example in 2023.", {"summary": "old"}
+    )
+    foreign = harness.lab.add_note(
+        "FooNet-style warmup tables need a units row.",
+        kind="lesson",
+        meta={"run": "0123456789ab"},
+    )
+    report = harness.consolidate_lab_memory()
+    assert attempts == ["foreign lesson written", "existing page extended"]
+    assert report.llm_used and harness.lab_vetoes == 2
+    # A write was refused, so nothing is archived: the lesson waits for a consolidation
+    # run for another paper, which will not collide with this one.
+    assert report.notes_archived == 0
+    assert [info.path for info in harness.lab.pending_notes()] == [foreign]
+    assert [e["type"] for e in harness.transcripts.events()].count("lab_write_blocked") == 2

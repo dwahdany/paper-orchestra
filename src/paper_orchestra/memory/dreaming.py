@@ -26,13 +26,26 @@ import secrets
 import socket
 import threading
 import time
-from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from paper_orchestra.llm.base import LLMError
 from paper_orchestra.memory import prompts
+from paper_orchestra.memory.leakscan import (  # noqa: F401 - re-exported
+    _NUMBER,
+    CONTENT_SECTIONS,
+    LeakScanner,
+    Materials,
+    _readings,
+    _significant,
+    content_sources,
+    leak_reason,
+    numbers_in,
+    paper_materials,
+    protected_files,
+    venue_materials,
+)
 from paper_orchestra.memory.tools import virtual_path
 from paper_orchestra.memory.transcript import TranscriptLog, event_text
 from paper_orchestra.memory.wiki import (
@@ -42,7 +55,6 @@ from paper_orchestra.memory.wiki import (
     LintReport,
     PageInfo,
     Wiki,
-    tokenize,
 )
 
 if TYPE_CHECKING:
@@ -65,22 +77,6 @@ NOTE_PREVIEW_CHARS = 300
 MAX_LISTED_NOTES = 120
 #: The agent name of consolidation sessions.  Their events are not evidence about the run.
 DREAMER = "dreamer"
-#: Sections of the project wiki that hold the paper's own content.  Nothing from them may
-#: reach the lab memory.  (The literature section is public bibliographic data.)
-CONTENT_SECTIONS = (
-    "wiki/sources/",
-    "wiki/paper/",
-    "wiki/figures/",
-    "wiki/reviews/",
-    "wiki/drafts/",
-)
-#: Source pages that describe the venue rather than the paper.  Lessons may quote them.
-VENUE_SOURCE_PREFIXES = ("wiki/sources/guidelines", "wiki/sources/template")
-VENUE_FILE_NAMES = frozenset({"template.tex", "guidelines.md"})
-_TEXT_SUFFIXES = frozenset({".md", ".txt", ".tex", ".json", ".csv", ".tsv", ".yaml", ".yml"})
-MAX_PROTECTED_FILE_BYTES = 2_000_000
-SHINGLE_TOKENS = 5
-
 END_OF_RUN_FOCUS = (
     "The run is over. Consolidate everything it learned that would help if this paper were "
     "revised or the run resumed: which revisions the reviewers rewarded or punished and why, "
@@ -94,41 +90,8 @@ LAB_FOCUS = (
     "Merge each one with what the lab memory already says about its topic."
 )
 
+
 #: A number, but not the factor of a LaTeX length (``0.48\textwidth``): layout, not a result.
-_NUMBER = re.compile(
-    r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w]|\.\d)"
-    r"(?!\s*\\(?:textwidth|linewidth|columnwidth|textheight|paperwidth|paperheight|hsize|vsize)\b)"
-)
-_YEAR = re.compile(r"(?:19|20)\d\d")
-_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-_HOME_PATH = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\Users\\)[\w.-]+")
-_CREDENTIAL = re.compile(
-    r"\bsk-[A-Za-z0-9_-]{16,}|(?i:\b(?:api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*\S{6,})"
-)
-#: Words with a capital after the first letter and at least one lower-case letter (FooNet).
-_CAMEL = re.compile(r"\b(?=[A-Za-z0-9]*[a-z])[A-Za-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b")
-#: Upper-case names of three or more characters, with optional suffixes (CIFAR-10).
-_ACRONYM = re.compile(r"\b[A-Z][A-Z0-9]{2,}(?:-[A-Z0-9]+)*\b")
-_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]+")
-_LOWER_WORD = re.compile(r"\b[a-z]{3,}\b")
-
-#: Names that say nothing about a particular paper: tools, formats, venues and the common
-#: vocabulary of the field.  Any other distinctive name found in a paper's materials is
-#: treated as identifying that paper.
-COMMON_TERMS = frozenset(
-    """
-    TeX LaTeX BibTeX BibLaTeX pdfTeX pdfLaTeX XeTeX XeLaTeX LuaTeX LuaLaTeX TikZ PGFPlots PGF
-    CTAN OT1 UTF PDF DVI EPS PNG JPG JPEG SVG GIF DPI RGB CMYK URL DOI ISBN ISSN HTML XML JSON
-    YAML CSV TSV API CLI CPU GPU RAM OOM ASCII arXiv OpenReview GitHub ORCID
-    IEEE ACM CVPR ICCV ECCV WACV ICLR ICML NeurIPS NIPS AAAI IJCAI ACL EMNLP NAACL COLING
-    KDD SIGIR SIGGRAPH TMLR JMLR PMLR TPAMI IJCV
-    NumPy SciPy PyTorch TensorFlow JAX CUDA OpenCV
-    SOTA MLP CNN RNN LSTM GRU GAN VAE SGD NLP LLM AUC ROC MSE MAE RMSE
-    TODO FIXME NOTE WARNING ERROR EVIDENCE CONFLICT RULE WHY
-    """.split()  # noqa: SIM905
-)
-
-
 @dataclass
 class DreamReport:
     dream_id: str
@@ -141,6 +104,10 @@ class DreamReport:
     links_repaired: int = 0
     lint: dict[str, Any] = field(default_factory=dict)
     unverified_numbers: list[list[str]] = field(default_factory=list)
+    #: Lessons this run copied to the lab memory, and lessons the leak scan kept back.  A
+    #: learning loop that has stopped sharing shows here, not only in the log.
+    lessons_shared: int = 0
+    lessons_withheld: int = 0
     summary: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     error: str | None = None
@@ -233,56 +200,6 @@ class _DreamLock:
 # ---------------------------------------------------------------------------
 
 
-def _canonical(raw: str) -> str:
-    """``2,908`` -> ``2908``, ``87.30`` -> ``87.3``, ``007`` -> ``7``."""
-    whole, _, fraction = raw.replace(",", "").partition(".")
-    whole = whole.lstrip("0") or "0"
-    fraction = fraction.rstrip("0")
-    return f"{whole}.{fraction}" if fraction else whole
-
-
-def _readings(raw: str) -> list[str]:
-    """Canonical forms a matched number can stand for.
-
-    ``12,345`` is either one number with a thousands separator or two list
-    items, so both readings are returned, the joined one first.
-    """
-    readings = [_canonical(raw)]
-    if "," in raw:
-        whole, _, fraction = raw.partition(".")
-        parts = whole.split(",")
-        if fraction:
-            parts[-1] = f"{parts[-1]}.{fraction}"
-        readings.extend(_canonical(part) for part in parts)
-    return readings
-
-
-def numbers_in(text: str) -> set[str]:
-    """Every number in ``text`` in canonical form, under each possible reading."""
-    found: set[str] = set()
-    for raw in _NUMBER.findall(text):
-        found.update(_readings(raw))
-    return found
-
-
-def _significant(number: str) -> bool:
-    """Numbers specific enough that a wrong one matters: decimals with three or more
-    digits, or integers of four or more digits that are not calendar years."""
-    whole, _, fraction = number.partition(".")
-    if fraction:
-        return len(whole + fraction) >= 3
-    return len(whole) >= 4 and not _YEAR.fullmatch(whole)
-
-
-def _identifying(number: str) -> bool:
-    """Numbers that could identify a result: at least two significant digits, and for
-    integers at least three digits that are not a round figure or a calendar year."""
-    whole, _, fraction = number.partition(".")
-    if fraction:
-        return len((whole + fraction).lstrip("0")) >= 2
-    return len(whole) >= 3 and len(whole.rstrip("0")) >= 2 and not _YEAR.fullmatch(whole)
-
-
 def _transcript_numbers(transcripts: TranscriptLog) -> set[str]:
     """Numbers recorded by the run itself: outputs, tool results, compile and review records.
 
@@ -346,155 +263,8 @@ def unverified_numbers(
 
 
 # ---------------------------------------------------------------------------
-# Keeping paper content out of the shared memory
+# Sharing lessons with the lab memory
 # ---------------------------------------------------------------------------
-
-
-def _shingles(text: str) -> set[tuple[str, ...]]:
-    tokens = tokenize(text)
-    return {tuple(tokens[i : i + SHINGLE_TOKENS]) for i in range(len(tokens) - SHINGLE_TOKENS + 1)}
-
-
-_COMMON_LOWER = frozenset(term.lower() for term in COMMON_TERMS)
-
-
-def _is_common(name: str) -> bool:
-    """Whether ``name`` is general vocabulary, also in the plural (``GPUs``, ``PDFs``)."""
-    lowered = name.lower()
-    return lowered in _COMMON_LOWER or (lowered.endswith("s") and lowered[:-1] in _COMMON_LOWER)
-
-
-def _names(text: str) -> tuple[set[str], set[str]]:
-    """Distinctive names in ``text``: mixed-case words (lower-cased) and upper-case names.
-
-    An upper-case word that the text also uses in lower case is an ordinary
-    word written loudly (a heading, ``NOT``), not a name.
-    """
-    ordinary = set(_LOWER_WORD.findall(text))
-    mixed = {match.lower() for match in _CAMEL.findall(text) if not _is_common(match)}
-    upper = {
-        match
-        for match in _ACRONYM.findall(text)
-        if not _is_common(match) and match.lower() not in ordinary
-    }
-    return mixed, upper
-
-
-class LeakScanner:
-    """Decides mechanically whether a text may enter the memory shared between papers.
-
-    Built from a paper's own materials (``sources``) and from texts that
-    describe the venue rather than the paper (``allowed``: the template and the
-    guidelines, which lessons legitimately quote).  A text is turned down when
-    it contains an e-mail address, a home-directory path or a credential, or
-    when it repeats something from the paper's materials: a result-like number,
-    a distinctive name (a method, dataset or system), or a run of wording.
-
-    This is a filter on form, not on meaning.  It stops the copies that happen
-    in practice (a lesson that carries its evidence along); it cannot stop a
-    paraphrase that shares no name, number or phrase with the paper.
-    """
-
-    def __init__(self, sources: Sequence[str], allowed: Sequence[str] = ()) -> None:
-        corpus = "\n".join(sources)
-        permitted = "\n".join(allowed)
-        self.has_sources = bool(corpus.strip())
-        self._numbers = {n for n in numbers_in(corpus) - numbers_in(permitted) if _identifying(n)}
-        mixed, upper = _names(corpus)
-        permitted_mixed, permitted_upper = _names(permitted)
-        self._mixed = mixed - permitted_mixed
-        self._upper = upper - permitted_upper
-        self._shingles = _shingles(corpus) - _shingles(permitted)
-
-    def reason(self, text: str) -> str | None:
-        """Why ``text`` must not enter the shared memory, or ``None`` if it may."""
-        match = _EMAIL.search(text)
-        if match:
-            return f"it contains an e-mail address ({match.group(0)})"
-        match = _HOME_PATH.search(text)
-        if match:
-            return f"it contains a personal file-system path ({match.group(0)})"
-        if _CREDENTIAL.search(text):
-            return "it contains something that looks like a credential"
-        if not self.has_sources:
-            return None
-        for raw in dict.fromkeys(_NUMBER.findall(text)):
-            for number in _readings(raw):
-                if number in self._numbers:
-                    return f"it repeats a number from this paper's materials ({raw})"
-        for name in dict.fromkeys(_ACRONYM.findall(text)):
-            if name in self._upper:
-                return f"it names something from this paper's materials ({name})"
-        for word in dict.fromkeys(_WORD.findall(text)):
-            if word.lower() in self._mixed:
-                return f"it names something from this paper's materials ({word})"
-        shared = _shingles(text) & self._shingles
-        if shared:
-            return (
-                "it repeats wording from this paper's materials (\"" + " ".join(min(shared)) + '")'
-            )
-        return None
-
-
-def leak_reason(text: str, sources: Sequence[str], allowed: Sequence[str] = ()) -> str | None:
-    """One-off form of :class:`LeakScanner`: why ``text`` may not be shared, or ``None``."""
-    return LeakScanner(sources, allowed).reason(text)
-
-
-def protected_files(paths: Sequence[Path]) -> Iterator[Path]:
-    for path in paths:
-        if path.is_file():
-            yield path
-        elif path.is_dir():
-            for file in sorted(path.rglob("*")):
-                if file.is_file() and not file.is_symlink():
-                    yield file
-
-
-def _read_protected(file: Path) -> str | None:
-    try:
-        if file.stat().st_size > MAX_PROTECTED_FILE_BYTES:
-            return None
-        return file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-
-def content_sources(project: Wiki, paths: Sequence[Path] = ()) -> list[str]:
-    """Every text that holds the paper's own content.
-
-    From the project wiki: the inputs, the outline, figure captions, reviews
-    and draft records.  From ``paths`` (the run's files and directories that
-    the harness was told to protect): the raw materials and every draft of the
-    paper.  The venue's template and guidelines are not paper content.
-    """
-    texts = [
-        project.read_text(info.path)
-        for section in CONTENT_SECTIONS
-        for info in project.list(section.rstrip("/"))
-        if not info.path.startswith(VENUE_SOURCE_PREFIXES)
-    ]
-    for file in protected_files(paths):
-        if file.suffix.lower() in _TEXT_SUFFIXES and file.name not in VENUE_FILE_NAMES:
-            text = _read_protected(file)
-            if text:
-                texts.append(text)
-    return texts
-
-
-def venue_materials(project: Wiki, paths: Sequence[Path] = ()) -> list[str]:
-    """The venue's template and guidelines: shared by every paper for that venue."""
-    texts = [
-        project.read_text(info.path)
-        for info in project.list("wiki/sources")
-        if info.path.startswith(VENUE_SOURCE_PREFIXES)
-    ]
-    for file in protected_files(paths):
-        if file.name in VENUE_FILE_NAMES:
-            text = _read_protected(file)
-            if text:
-                texts.append(text)
-    return texts
 
 
 def run_token(project: Wiki) -> str:
@@ -515,7 +285,11 @@ def run_token(project: Wiki) -> str:
 
 
 def _load_ledger(path: Path) -> tuple[dict[str, str], set[str]]:
-    """``(page path -> digest promoted, digests promoted by earlier versions)``."""
+    """``(page path -> digest promoted, digests promoted without a page path)``.
+
+    The second set holds what an earlier format of the ledger recorded (digests
+    only); it is carried along so those lessons are not shared a second time.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -523,8 +297,19 @@ def _load_ledger(path: Path) -> tuple[dict[str, str], set[str]]:
     if isinstance(data, list):
         return {}, {str(item) for item in data}
     if isinstance(data, dict) and isinstance(data.get("pages"), dict):
-        return {str(k): str(v) for k, v in data["pages"].items()}, set()
+        digests = data.get("digests")
+        return (
+            {str(k): str(v) for k, v in data["pages"].items()},
+            {str(item) for item in digests} if isinstance(digests, list) else set(),
+        )
     return {}, set()
+
+
+def _is_portable(value: Any) -> bool:
+    """``portable: true`` in the spellings a model writes it (True, yes, "true", 1)."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().strip("\"'").lower() in ("true", "yes", "1")
 
 
 def promote_lessons(harness: ContextHarness) -> list[str]:
@@ -545,8 +330,9 @@ def promote_lessons(harness: ContextHarness) -> list[str]:
         if project.is_read_only(info.path):
             continue
         page = project.read(info.path)
-        if page.meta.get("portable") is True and not page.meta.get("auto"):
+        if _is_portable(page.meta.get("portable")) and not page.meta.get("auto"):
             portable.append(page)
+    harness.last_promotion = {"shared": 0, "withheld": 0}
     if not portable:
         return []
     scanner = harness.leak_scanner()
@@ -554,6 +340,7 @@ def promote_lessons(harness: ContextHarness) -> list[str]:
         reason = "the paper's materials are not available to scan against"
         log.warning("%d lesson(s) not shared with the lab memory: %s", len(portable), reason)
         harness.record("promotion_blocked", stage="finalize", path="*", reason=reason)
+        harness.last_promotion["withheld"] = len(portable)
         return []
 
     ledger_path = project.root / PROMOTED_LEDGER
@@ -562,13 +349,19 @@ def promote_lessons(harness: ContextHarness) -> list[str]:
     added: list[str] = []
     for page in portable:
         text = f"# {page.title}\n\n{page.body.strip()}\n"
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if promoted.get(page.path) == digest or digest in legacy:
+        # The lesson is its body: a page that was only renamed (its title may follow its
+        # path) is the same lesson.
+        digest = hashlib.sha256(page.body.strip().encode("utf-8")).hexdigest()
+        with_title = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        # Already shared: under this path, under another, or by a ledger that recorded
+        # digests of the whole note and no paths.
+        if digest in promoted.values() or {digest, with_title} & legacy:
             continue
         reason = scanner.reason(text)
         if reason:
             log.warning("lesson %s not shared with the lab memory: %s", page.path, reason)
             harness.record("promotion_blocked", stage="finalize", path=page.path, reason=reason)
+            harness.last_promotion["withheld"] += 1
             continue
         note = lab.add_note(
             text,
@@ -582,7 +375,9 @@ def promote_lessons(harness: ContextHarness) -> list[str]:
         added.append(note)
         harness.record("promotion", stage="finalize", path=page.path, lab_note=note)
     if added:
-        ledger_path.write_text(json.dumps({"pages": promoted}, sort_keys=True), encoding="utf-8")
+        ledger = {"pages": promoted, "digests": sorted(legacy)}
+        ledger_path.write_text(json.dumps(ledger, sort_keys=True), encoding="utf-8")
+    harness.last_promotion["shared"] = len(added)
     return added
 
 
@@ -779,6 +574,7 @@ def _run(
 
     handled: list[str] = []
     model_ok = False
+    vetoes = harness.lab_vetoes
     if use_model and model is not None:
         # A number that an earlier session was already asked about, and kept, is not a
         # reason to open another session on its own.
@@ -843,6 +639,16 @@ def _run(
             }
             handled = [n.path for n in notes if n.path in shown or n.path in touched]
 
+    if lab and harness.lab_vetoes > vetoes:
+        # A lesson the session tried to write was turned down, so its note has not reached
+        # a page.  Everything stays pending: the next consolidation, run for another paper,
+        # will not collide with this one.
+        log.warning(
+            "dream %s: %d write(s) to the lab memory were refused; its notes stay pending",
+            report.dream_id,
+            harness.lab_vetoes - vetoes,
+        )
+        handled = []
     # Notes are archived only once a model has actually consolidated them; without one they
     # stay pending for the next dream.
     if model_ok and handled:
