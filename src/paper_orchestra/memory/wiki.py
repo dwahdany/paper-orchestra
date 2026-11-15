@@ -314,7 +314,9 @@ class Wiki:
         collapse_over: int = 40,
         always_collapse: Sequence[str] = (),
         clock: Callable[[], datetime] | None = None,
+        create: bool = True,
     ) -> None:
+        """``create=False`` opens an existing memory directory without touching it (viewers)."""
         self.root = Path(root)
         self.name = name
         self.description = description
@@ -332,10 +334,11 @@ class Wiki:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._cache: dict[str, _Cached] = {}
-        for sub in (WIKI_DIR, NOTES_DIR, TRANSCRIPTS_DIR):
-            (self.root / sub).mkdir(parents=True, exist_ok=True)
-        if not (self.root / INDEX_FILE).exists():
-            self.rebuild_index()
+        if create:
+            for sub in (WIKI_DIR, NOTES_DIR, TRANSCRIPTS_DIR):
+                (self.root / sub).mkdir(parents=True, exist_ok=True)
+            if not (self.root / INDEX_FILE).exists():
+                self.rebuild_index()
 
     # -- paths ---------------------------------------------------------------
 
@@ -824,13 +827,9 @@ class Wiki:
             for group, infos in groups.items():
                 index_rel = f"{WIKI_DIR}/{group}/index.md"
                 if group in collapsed:
-                    body = [f"# {group}: all pages", ""]
-                    body += [
-                        f"- [[{link_for(i.path)}]]: {(i.summary or i.title)[:200]}" for i in infos
-                    ]
                     self.write(
                         index_rel,
-                        "\n".join(body),
+                        self._section_listing(group, infos),
                         {
                             "title": f"{group} index",
                             "summary": f"Every page under {group}/",
@@ -849,6 +848,27 @@ class Wiki:
             text = "\n".join(header + catalog) + "\n"
             self._atomic_write(INDEX_FILE, text)
             return text
+
+    def _section_listing(self, group: str, infos: Sequence[PageInfo]) -> str:
+        """Body of a generated ``<section>/index`` page, kept within the page size limit."""
+        budget = self.max_page_bytes - 2_000
+        for summary_chars in (200, 80, 0):
+            lines = [f"# {group}: all pages", ""]
+            for info in infos:
+                summary = (info.summary or info.title)[:summary_chars]
+                lines.append(f"- [[{link_for(info.path)}]]" + (f": {summary}" if summary else ""))
+            body = "\n".join(lines)
+            if len(body.encode("utf-8")) <= budget:
+                return body
+        kept: list[str] = []
+        size = 0
+        for line in lines:
+            size += len(line.encode("utf-8")) + 1
+            if size > budget:
+                break
+            kept.append(line)
+        kept.append(f"- ... and {len(lines) - len(kept)} more: search the wiki to find them")
+        return "\n".join(kept)
 
     def injected_context(self) -> str:
         """The text loaded into every session: ``MEMORY.md``, hard-capped."""

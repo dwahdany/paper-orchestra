@@ -247,6 +247,7 @@ class ContextHarness:
         default_effort: Effort | None = None,
         dream_mode: DreamMode = "stages",
         dream_model: str | None = None,
+        consolidate_lab: bool = True,
     ) -> None:
         if client_for is None:
             from paper_orchestra.llm.router import get_client
@@ -260,6 +261,10 @@ class ContextHarness:
         self.default_effort = default_effort
         self.dream_mode: DreamMode = dream_mode
         self.dream_model = dream_model
+        #: When False, finish() only adds this run's lessons to the lab memory as notes and
+        #: leaves folding them into pages to a separate, single consolidation (used where
+        #: several runs share the lab memory on storage without file locking).
+        self.consolidate_lab = consolidate_lab
         self._lock = threading.RLock()
         self._dirty: set[str] = set()
 
@@ -278,6 +283,7 @@ class ContextHarness:
             "default_effort": cfg.models.effort,
             "dream_mode": cfg.memory.dream,
             "dream_model": cfg.models.reflection,
+            "consolidate_lab": cfg.memory.lab_consolidate,
         }
         if not cfg.memory.enabled:
             return cls(**common)
@@ -590,6 +596,22 @@ class ContextHarness:
             force=True,
         )
 
+    def delete_page(self, rel: str, *, scope: Literal["project", "lab"] = "project") -> bool:
+        """Remove a page from pipeline code; returns whether it existed."""
+        wiki = self._wiki(scope)
+        if wiki is None or not wiki.exists(rel):
+            return False
+        wiki.delete(rel, force=True)
+        self._mark_dirty(scope, rel)
+        return True
+
+    def list_pages(
+        self, prefix: str = WIKI_DIR, *, scope: Literal["project", "lab"] = "project"
+    ) -> list[str]:
+        """Paths of the pages under ``prefix`` (empty when memory is off)."""
+        wiki = self._wiki(scope)
+        return [info.path for info in wiki.list(prefix)] if wiki is not None else []
+
     def read_page(self, rel: str, *, scope: Literal["project", "lab"] = "project") -> str | None:
         """Body of a page, or ``None`` when memory is off or the page does not exist."""
         wiki = self._wiki(scope)
@@ -629,6 +651,21 @@ class ContextHarness:
             wiki.rebuild_index()
             with self._lock:
                 self._dirty.discard(scope)
+
+    def consolidate_lab_memory(self, *, model: str | None = None) -> DreamReport | None:
+        """Fold pending lab notes into lab pages (the second half of promotion)."""
+        if self.project is None or self.lab is None:
+            return None
+        from paper_orchestra.memory.dreaming import LAB_FOCUS, dream
+
+        return dream(
+            self,
+            stage="finalize",
+            focus=LAB_FOCUS,
+            model=model or self.dream_model,
+            scope="lab",
+            use_model=self.dream_mode in ("stages", "end"),
+        )
 
     def _lab_guard(self, scope: str, text: str) -> str | None:
         """Veto text headed for the shared memory if it carries this paper's content."""
@@ -697,6 +734,7 @@ class ContextHarness:
             # Lessons reach the shared memory as notes that passed a leak scan; the lab
             # session then works from those notes alone and never sees this paper.
             promote_lessons(self)
+        if self.lab is not None and self.consolidate_lab:
             reports.append(
                 dream(
                     self,

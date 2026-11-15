@@ -215,3 +215,23 @@ def test_injected_context_is_hard_capped(tmp_path):
 def test_link_for():
     assert link_for("wiki/literature/x.md") == "literature/x"
     assert link_for("notes/n.md") == "notes/n"
+
+
+def test_generated_section_index_stays_within_the_page_limit(tmp_path):
+    wiki = Wiki(tmp_path, max_page_bytes=6_000, collapse_over=10)
+    for i in range(300):
+        wiki.write(f"wiki/literature/Paper{i:03d}.md", "x", {"summary": "s" * 150})
+    text = wiki.rebuild_index()  # must not raise even though the listing is long
+    assert "**literature/**: 300 pages" in text
+    listing = wiki.read_text("wiki/literature/index.md")
+    assert len(listing.encode()) <= 6_000 and "more: search the wiki" in listing
+    assert wiki.lint().broken_links == []
+
+
+def test_open_existing_memory_without_creating_anything(tmp_path):
+    viewer = Wiki(tmp_path / "absent", create=False)
+    assert not (tmp_path / "absent").exists()
+    assert viewer.list() == [] and viewer.standing_notes() == ""
+    real = Wiki(tmp_path / "real")
+    real.write("wiki/a/x.md", "body", {"summary": "s"})
+    assert [i.path for i in Wiki(tmp_path / "real", create=False).list()] == ["wiki/a/x.md"]

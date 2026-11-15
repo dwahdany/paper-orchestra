@@ -85,6 +85,10 @@ class MemoryConfig:
     lab: bool = True
     lab_dir: Path | None = None
     dream: DreamMode = "stages"
+    #: Fold this run's lessons into lab pages at the end of the run.  Turn off when several
+    #: runs share the lab memory on storage without file locking (Modal volumes): each run
+    #: then only adds notes, and one separate consolidation folds them in.
+    lab_consolidate: bool = True
 
     def resolved_lab_dir(self) -> Path | None:
         if not (self.enabled and self.lab):
@@ -104,6 +108,9 @@ class PipelineConfig:
     use_plotting: bool = False
     plotting_max_critic_rounds: int = 3
     max_reflections: int = 3
+    #: After a rejected revision, go back to the last accepted version and use the remaining
+    #: iterations (with the lesson from the rejection in memory) instead of stopping.
+    retry_after_rejection: bool = True
     max_formatting_rounds: int = 1
     review_ensemble: int = 3
     compute: ComputeName = "local"
@@ -115,6 +122,7 @@ class PipelineConfig:
     max_repair_rounds: int = 3
     literature_workers: int = 6
     figure_workers: int = 4
+    figure_code_timeout: float = 120.0
     latex_timeout: float = 240.0
 
     def __post_init__(self) -> None:

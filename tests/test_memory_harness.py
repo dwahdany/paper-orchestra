@@ -381,3 +381,46 @@ def test_lab_only_session_never_sees_the_project(tmp_path):
         "wiki/lessons/leak.md"
     )
     assert not harness.project.exists("wiki/lessons/new.md")
+
+
+def test_delete_and_list_pages_from_pipeline_code(tmp_path):
+    client = FakeLLM(lambda request: "ok")
+    harness = make_harness(tmp_path, client)
+    assert "wiki/literature/Vaswani2017Attention.md" in harness.list_pages("wiki/literature")
+    assert harness.delete_page("wiki/literature/Vaswani2017Attention.md")
+    assert not harness.delete_page("wiki/literature/Vaswani2017Attention.md")
+    assert harness.list_pages("wiki/literature") == []
+    harness.generate("q", agent="a", stage="s", model="fake")
+    assert "Vaswani2017Attention" not in client.requests[0].system
+    assert ContextHarness(client_for=lambda m: client).list_pages() == []
+
+
+def test_lab_consolidation_can_be_left_to_a_separate_pass(tmp_path):
+    labels: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        labels.append(request.label)
+        if request.label == "dream.project":
+            request.memory.create(
+                "/memories/wiki/lessons/latex.md",
+                "---\nsummary: LaTeX\nportable: true\n---\nLoad cleveref before using it.",
+            )
+        return "ok"
+
+    harness = make_harness(
+        tmp_path,
+        FakeLLM(responder),
+        lab=True,
+        dream_mode="end",
+        dream_model="fake",
+        consolidate_lab=False,
+    )
+    harness.note("cleveref was missing", stage="section_writing", kind="lesson")
+    reports = harness.finish()
+    # The run only adds its lesson to the lab as a note ...
+    assert [r.scope for r in reports] == ["project"] and labels == ["dream.project"]
+    assert len(harness.lab.pending_notes()) == 1
+    # ... and a single later pass folds pending notes into pages.
+    report = harness.consolidate_lab_memory()
+    assert report.scope == "lab" and report.llm_used and report.notes_archived == 1
+    assert labels == ["dream.project", "dream.lab"]
