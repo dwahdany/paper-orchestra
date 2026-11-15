@@ -695,3 +695,53 @@ def test_the_push_block_puts_the_newest_lessons_first_and_stays_within_budget(tm
     assert len(block) < 45_000
     # The lab's pages come with the rule that they are never content for the paper.
     assert "never a source of content for the paper" in request.system
+
+
+def test_a_caller_can_put_its_own_backend_behind_the_memory_tool(tmp_path):
+    class Shelf:
+        """A memory backend of the caller's own."""
+
+        def view(self, path, view_range=None):
+            return "the caller's shelf"
+
+        def create(self, path, file_text):
+            return "created"
+
+        def str_replace(self, path, old_str, new_str):
+            return "replaced"
+
+        def insert(self, path, insert_line, insert_text):
+            return "inserted"
+
+        def delete(self, path):
+            return "deleted"
+
+        def rename(self, old_path, new_path):
+            return "renamed"
+
+    seen: dict = {}
+
+    def responder(request: FakeRequest) -> str:
+        seen["view"] = request.memory.view("/memories")
+        seen["system"] = request.system
+        seen["tools"] = sorted(request.tools)
+        return "ok"
+
+    harness = make_harness(tmp_path, FakeLLM(responder))
+    conversation = harness.open(
+        agent="scout",
+        stage="research",
+        model="fake",
+        system="You research.",
+        memory=MemoryPolicy.none(),
+        memory_backend=Shelf(),
+    )
+    conversation.send("go")
+    # The caller's backend is what the model reads; the harness adds nothing of its own,
+    # and still records the session.
+    assert seen == {"view": "the caller's shelf", "system": "You research.", "tools": []}
+    assert any(e["type"] == "request" for e in harness.transcripts.events())
+    with pytest.raises(LLMConfigError, match="no memory tool"):
+        make_harness(tmp_path / "b", FakeLLM(["x"], capabilities=PUSH_ONLY)).open(
+            agent="scout", stage="research", model="fake", memory_backend=Shelf()
+        )

@@ -31,6 +31,7 @@ from paper_orchestra.llm.base import (
     LLMConfigError,
     LLMParseError,
     LLMResponse,
+    MemoryBackend,
     Parser,
     Part,
     Schema,
@@ -460,12 +461,18 @@ class ContextHarness:
         label: str | None = None,
         memory_root: Literal["project", "lab"] = "project",
         single_turn: bool = False,
+        memory_backend: MemoryBackend | None = None,
     ) -> HarnessConversation:
         """Open a conversation with memory, transcript and usage accounting attached.
 
         ``memory_root="lab"`` makes the lab wiki the session's whole memory (no project
         pages, no transcripts): used to consolidate the shared memory without exposing any
         paper content to that session.
+
+        ``memory_backend`` puts a caller's own backend behind the memory tool instead of
+        the harness's wiki: for a caller that manages what its sessions may read and write
+        itself and describes the layout in its own system prompt.  Pass it together with
+        ``MemoryPolicy.none()``; the session is still recorded and accounted for here.
         """
         self._check_cancelled()
         client = self.client_for(model)
@@ -532,6 +539,12 @@ class ContextHarness:
                         transcript_search_tool(self.transcripts, exclude_agents=(agent,))
                     )
 
+        if memory_backend is not None:
+            if not client.capabilities.memory_tool:
+                raise LLMConfigError(
+                    f"model '{model}' ({client.provider}) has no memory tool, which {label} requires"
+                )
+            backend = memory_backend
         if all_tools and not client.capabilities.tools:
             raise LLMConfigError(
                 f"model '{model}' ({client.provider}) cannot use tools, which {label} requires"
