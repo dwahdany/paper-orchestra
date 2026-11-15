@@ -197,3 +197,22 @@ def test_importing_the_llm_package_imports_no_provider_sdk():
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=60, check=False
     )
     assert result.returncode == 0, result.stderr
+
+
+def scripted_for_test() -> FakeLLM:
+    return FakeLLM(["from the script"])
+
+
+def test_a_scripted_client_can_stand_in_for_every_model_offline(monkeypatch):
+    reset_clients()
+    monkeypatch.setenv("PAPER_ORCHESTRA_SCRIPTED_CLIENT", f"{__name__}:scripted_for_test")
+    try:
+        client = get_client("claude-fable-5-2")
+        assert isinstance(client, FakeLLM) and get_client("gemini-3.1-pro-preview") is client
+        assert client.generate("hi", model="claude-fable-5-2").text == "from the script"
+    finally:
+        reset_clients()
+    monkeypatch.setenv("PAPER_ORCHESTRA_SCRIPTED_CLIENT", "no_such_module_xyz:build")
+    with pytest.raises(LLMConfigError, match="does not name a function"):
+        get_client("claude-fable-5-2")
+    reset_clients()

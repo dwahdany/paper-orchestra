@@ -11,6 +11,7 @@ from paper_orchestra.llm.base import (
     LLMConfigError,
     LLMParseError,
     ToolError,
+    ToolSpec,
     UsageTracker,
     WebSearch,
 )
@@ -745,3 +746,42 @@ def test_a_caller_can_put_its_own_backend_behind_the_memory_tool(tmp_path):
         make_harness(tmp_path / "b", FakeLLM(["x"], capabilities=PUSH_ONLY)).open(
             agent="scout", stage="research", model="fake", memory_backend=Shelf()
         )
+
+
+def test_a_watcher_sees_what_a_session_is_doing_as_it_happens(tmp_path):
+    seen: list[dict] = []
+
+    def responder(request: FakeRequest) -> str:
+        request.call_tool("lookup", {"q": "warmup"})
+        return "done"
+
+    tool = ToolSpec(
+        "lookup", "Look a term up.", {"type": "object", "properties": {}}, lambda _: "x"
+    )
+    harness = make_harness(tmp_path, FakeLLM(responder))
+    harness.open(
+        agent="scout",
+        stage="research",
+        model="fake",
+        memory=MemoryPolicy.none(),
+        tools=[tool],
+        on_event=seen.append,
+    ).send("go")
+    kinds = [event["type"] for event in seen]
+    assert kinds[0] == "request" and "tool_call" in kinds and "assistant" in kinds
+    assert {event["agent"] for event in seen} == {"scout"}
+
+    # A watcher that fails does not disturb the session, and the transcript is still written.
+    def broken(event: dict) -> None:
+        raise RuntimeError("watcher bug")
+
+    reply = harness.open(
+        agent="scout",
+        stage="research",
+        model="fake",
+        memory=MemoryPolicy.none(),
+        tools=[tool],
+        on_event=broken,
+    ).send("again")
+    assert reply.text == "done"
+    assert len([e for e in harness.transcripts.events() if e["type"] == "request"]) == 2

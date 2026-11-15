@@ -462,6 +462,7 @@ class ContextHarness:
         memory_root: Literal["project", "lab"] = "project",
         single_turn: bool = False,
         memory_backend: MemoryBackend | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> HarnessConversation:
         """Open a conversation with memory, transcript and usage accounting attached.
 
@@ -473,6 +474,11 @@ class ContextHarness:
         the harness's wiki: for a caller that manages what its sessions may read and write
         itself and describes the layout in its own system prompt.  Pass it together with
         ``MemoryPolicy.none()``; the session is still recorded and accounted for here.
+
+        ``on_event`` receives every event of the session as it happens (requests, model
+        output, tool calls and results), in addition to the transcript: for a caller that
+        shows a person what a session is doing right now.  An exception it raises is
+        logged and does not disturb the session.
         """
         self._check_cancelled()
         client = self.client_for(model)
@@ -549,11 +555,23 @@ class ContextHarness:
             raise LLMConfigError(
                 f"model '{model}' ({client.provider}) cannot use tools, which {label} requires"
             )
-        on_event = (
+        record = (
             self.transcripts.sink(stage=stage, agent=agent)
             if self.transcripts is not None
             else None
         )
+        watcher = on_event
+
+        def emit(event: dict[str, Any]) -> None:
+            if record is not None:
+                record(event)
+            if watcher is not None:
+                try:
+                    watcher({"stage": stage, "agent": agent, **event})
+                except Exception:
+                    log.warning("%s: the session watcher failed", label, exc_info=True)
+
+        on_event = emit if (record is not None or watcher is not None) else None
         conversation = client.conversation(
             model=model,
             system=system,
