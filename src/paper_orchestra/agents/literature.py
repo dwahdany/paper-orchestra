@@ -500,6 +500,15 @@ _LATEX_SPELLINGS = {
     "…": r"\ldots{}",
     "\u00a0": "~",  # no-break space
 }
+# Greek letters that LaTeX has a math macro for (\alpha, \Gamma); any other Greek letter
+# would be an undefined control sequence, so it is replaced by a Latin letter.
+_GREEK_SMALL_WITH_MACRO = frozenset(
+    {
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        "lambda", "mu", "nu", "xi", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi",
+        "omega",
+    }
+)  # fmt: skip
 _GREEK_CAPITALS_WITH_MACRO = frozenset(
     {"gamma", "delta", "theta", "lambda", "xi", "pi", "sigma", "upsilon", "phi", "psi", "omega"}
 )
@@ -516,15 +525,18 @@ def _latex_for(char: str) -> str:
             base = f"\\{base}"  # an accent above replaces the dot
         return f"{{\\{accent}{{{base}}}}}"
     name = unicodedata.name(char, "")
-    if name.startswith("GREEK SMALL LETTER ") and not marks:
-        letter = name.rsplit(" ", 1)[-1].lower()
-        return "o" if letter == "omicron" else f"{{$\\{letter}$}}"
-    if name.startswith("GREEK CAPITAL LETTER ") and not marks:
-        letter = name.rsplit(" ", 1)[-1].lower()
-        if letter in _GREEK_CAPITALS_WITH_MACRO:
-            return f"{{$\\{letter.capitalize()}$}}"
-        return letter[0].upper()
-    return _ascii(char)
+    if name.startswith(("GREEK SMALL LETTER ", "GREEK CAPITAL LETTER ")) and not marks:
+        # Unicode names the eleventh letter "lamda"; the macro is \lambda.
+        letter = name.rsplit(" ", 1)[-1].lower().replace("lamda", "lambda")
+        if name.startswith("GREEK CAPITAL"):
+            if letter in _GREEK_CAPITALS_WITH_MACRO:
+                return f"{{$\\{letter.capitalize()}$}}"
+            return letter[0].upper()
+        if letter in _GREEK_SMALL_WITH_MACRO:
+            return f"{{$\\{letter}$}}"
+        return letter[0]
+    # A compatibility character can reduce to a LaTeX special (a full-width ampersand to "&").
+    return "".join(_BIBTEX_SPECIALS.get(reduced, reduced) for reduced in _ascii(char))
 
 
 def escape_bibtex(text: str) -> str:

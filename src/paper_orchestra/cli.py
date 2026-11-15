@@ -36,7 +36,7 @@ import typer
 from typer.core import TyperCommand
 
 from paper_orchestra import __version__
-from paper_orchestra.batch import load_papers, run_batch, summarize
+from paper_orchestra.batch import load_papers, run_batch, run_batch_on_modal, summarize
 from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.config import (
     DEFAULT_MODEL,
@@ -275,6 +275,22 @@ ResumeOption = Annotated[
         "--resume/--no-resume", help="Continue an earlier run found in the output directory."
     ),
 ]
+RootInputFolderOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--root-input-folder", help="Folder with one <paper_id>/raw_materials directory per paper."
+    ),
+]
+PaperInfoOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--paper-info",
+        help="JSON list of {paper_id, content_folder, pdf_path} instead of a folder.",
+    ),
+]
+PaperCountOption = Annotated[
+    int, typer.Option("--n-papers", help="Write only the first N papers (-1: all).")
+]
 
 
 def _config(
@@ -428,23 +444,9 @@ def batch(
         typer.Option("--output-dir", help="Batch directory: one run directory per paper."),
     ],
     template: TemplateOption,
-    root_input_folder: Annotated[
-        Path | None,
-        typer.Option(
-            "--root-input-folder",
-            help="Folder with one <paper_id>/raw_materials directory per paper.",
-        ),
-    ] = None,
-    paper_info: Annotated[
-        Path | None,
-        typer.Option(
-            "--paper-info",
-            help="JSON list of {paper_id, content_folder, pdf_path} instead of a folder.",
-        ),
-    ] = None,
-    n_papers: Annotated[
-        int, typer.Option("--n-papers", help="Write only the first N papers (-1: all).")
-    ] = -1,
+    root_input_folder: RootInputFolderOption = None,
+    paper_info: PaperInfoOption = None,
+    n_papers: PaperCountOption = -1,
     max_workers: Annotated[
         int, typer.Option("--max-workers", min=1, help="Papers written in parallel.")
     ] = 4,
@@ -505,6 +507,11 @@ def batch(
         )
     except (FileNotFoundError, ValueError) as exc:
         _fail(str(exc))
+    _report_batch(papers, log_path)
+
+
+def _report_batch(papers: Sequence[dict[str, Any]], log_path: Path) -> None:
+    """Print how the papers of this batch fared; exit with 1 unless all of them were written."""
     # The log also holds papers of earlier batches in this directory; the summary and the
     # exit status are about the papers of this one.
     write_log = read_json(log_path)
@@ -735,6 +742,88 @@ def modal_run(
 def modal_deploy(ctx: typer.Context, print_command: PrintCommandOption = False) -> None:
     """Deploy the app so that write_paper and write_batch can be called by name."""
     _modal("deploy", MODAL_MODULE, ctx.args, detach=False, show=print_command)
+
+
+@modal_app.command("batch")
+def modal_batch(
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            help="Where each paper's PDF, LaTeX source and usage report are downloaded.",
+        ),
+    ],
+    template: TemplateOption,
+    root_input_folder: RootInputFolderOption = None,
+    paper_info: PaperInfoOption = None,
+    n_papers: PaperCountOption = -1,
+    idea_filename: IdeaFilenameOption = "idea_sparse.md",
+    experimental_log_filename: LogFilenameOption = "experimental_log.md",
+    model: ModelOption = DEFAULT_MODEL,
+    writer_model: WriterModelOption = None,
+    reflection_model: ReflectionModelOption = None,
+    plotting_model: PlottingModelOption = None,
+    fast_model: FastModelOption = None,
+    image_model: ImageModelOption = None,
+    effort: EffortOption = _Effort.high,
+    research_cutoff: CutoffOption = None,
+    use_plotting: PlottingOption = False,
+    plotting_max_critic_rounds: CriticRoundsOption = 3,
+    memory: MemoryOption = True,
+    lab_memory: LabMemoryOption = True,
+    dream: DreamOption = _Dream.stages,
+    resume: ResumeOption = True,
+) -> None:
+    """Write many papers with the deployed Modal app, one container per paper.
+
+    Deploy the app first (paper-orchestra modal deploy). Each paper runs under its
+    paper id, so submitting the batch again resumes the papers that did not finish.
+    """
+    if importlib.util.find_spec("modal") is None:
+        _fail("The Modal SDK is not installed. Install it with `uv sync --extra modal`.")
+    import modal
+
+    options = {
+        "idea_filename": idea_filename,
+        "experimental_log_filename": experimental_log_filename,
+        "research_cutoff": research_cutoff,
+        "use_plotting": use_plotting,
+        "plotting_max_critic_rounds": plotting_max_critic_rounds,
+        "writer_model": writer_model or model,
+        "reflection_model": reflection_model or model,
+        "plotting_model": plotting_model or model,
+        "fast_model": fast_model or model,
+        "image_model": image_model,
+        "effort": effort.value,
+        "memory": memory,
+        "lab_memory": lab_memory,
+        "dream": dream.value,
+        "resume": resume,
+    }
+    try:
+        # Imported here: it defines the Modal app and needs the Modal SDK.
+        from paper_orchestra import modal_app as deployed
+
+        papers = load_papers(
+            root_input_folder=root_input_folder, paper_info_path=paper_info, n_papers=n_papers
+        )
+        log_path = run_batch_on_modal(
+            options,
+            template_dir=resolve_template_dir(template),
+            volume=deployed.volume,
+            write_batch=modal.Function.from_name(deployed.SETTINGS.app_name, "write_batch"),
+            root_input_folder=root_input_folder,
+            paper_info_path=paper_info,
+            output_dir=output_dir,
+            n_papers=n_papers,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        _fail(str(exc))
+    except modal.exception.NotFoundError as exc:
+        _fail(f"{exc} Deploy the app first with `paper-orchestra modal deploy`.")
+    except modal.exception.AuthError as exc:
+        _fail(f"Modal is not set up on this machine ({exc}). Run `modal setup` first.")
+    _report_batch(papers, log_path)
 
 
 def _send_logs_to_stderr() -> None:

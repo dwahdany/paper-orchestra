@@ -331,10 +331,76 @@ def _isolation_options() -> dict[str, Any]:
     return options
 
 
-def _signal_tree(process: subprocess.Popen[str], *, force: bool) -> None:
-    """Interrupt (or kill) the child and everything it started."""
+def _process_table(proc: Path = Path("/proc")) -> list[tuple[int, int, int]]:
+    """``(pid, parent pid, process group)`` of every process; empty when it cannot be read.
+
+    Read from ``/proc`` where there is one (Linux), else from ``ps`` (macOS, BSD).
+    """
+    rows: list[tuple[int, int, int]] = []
+    if (proc / "self" / "stat").is_file():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                # "pid (name) state ppid pgrp ...": the name may itself contain spaces and ")".
+                fields = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+                _state, parent, group = fields.rsplit(")", 1)[1].split()[:3]
+                rows.append((int(entry.name), int(parent), int(group)))
+            except (OSError, ValueError, IndexError):
+                continue  # the process ended while the table was being read
+        return rows
     try:
-        if os.name == "nt":
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("Could not list the running processes: %s", exc)
+        return rows
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and all(field.isdigit() for field in fields):
+            rows.append((int(fields[0]), int(fields[1]), int(fields[2])))
+    return rows
+
+
+def _descendant_groups(pid: int) -> set[int]:
+    """Process groups of everything ``pid`` started, directly or not (POSIX).
+
+    The pipeline runs LaTeX and model-written code in sessions of their own,
+    so that it can kill them on a timeout.  Signalling the pipeline's own
+    group therefore misses them, and once the pipeline is gone they can no
+    longer be traced back to it: this has to be looked up while it is alive.
+    """
+    children: dict[int, list[tuple[int, int]]] = {}
+    for child, parent, group in _process_table():
+        children.setdefault(parent, []).append((child, group))
+    groups: set[int] = set()
+    seen = {pid}
+    queue = [pid]
+    while queue:
+        for child, group in children.get(queue.pop(), ()):
+            if child not in seen:
+                seen.add(child)
+                groups.add(group)
+                queue.append(child)
+    # Never the group of this server, whatever a recycled pid may suggest.
+    return groups - {0, 1, os.getpgid(0)}
+
+
+def _signal_tree(
+    process: subprocess.Popen[str], *, force: bool, groups: frozenset[int] = frozenset()
+) -> None:
+    """Interrupt (or kill) the child and everything it started.
+
+    ``groups`` are the process groups of descendants that left the child's
+    own group (see :func:`_descendant_groups`); Windows finds the tree itself.
+    """
+    if os.name == "nt":
+        try:
             if force:
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -343,12 +409,16 @@ def _signal_tree(process: subprocess.Popen[str], *, force: bool) -> None:
                 )
             else:
                 process.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            # The child leads its own session, so its pid is also its process group id.
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGINT)
-    except OSError as exc:
-        # Usually ProcessLookupError: the process group is already gone.
-        log.debug("Could not signal the pipeline process %d: %s", process.pid, exc)
+        except OSError as exc:
+            log.debug("Could not signal the pipeline process %d: %s", process.pid, exc)
+        return
+    # The child leads its own session, so its pid is also its process group id.
+    for group in {process.pid, *groups}:
+        try:
+            os.killpg(group, signal.SIGKILL if force else signal.SIGINT)
+        except OSError as exc:
+            # Usually ProcessLookupError: the process group is already gone.
+            log.debug("Could not signal the process group %d: %s", group, exc)
 
 
 def _stop_active_runs() -> None:
@@ -485,7 +555,7 @@ class PipelineRun:
         return self._finished.wait(timeout)
 
     def stop(self, grace: float = 10.0) -> None:
-        """Interrupt the process group, then kill whatever is left after ``grace`` seconds.
+        """Interrupt the process tree, then kill whatever is left after ``grace`` seconds.
 
         The interrupt lets the pipeline record the run as interrupted in
         ``state.json``; the kill covers children that ignore it.
@@ -494,13 +564,16 @@ class PipelineRun:
         if process is None or process.poll() is not None:
             return
         self.stopped = True
-        _signal_tree(process, force=False)
+        strays = set() if os.name == "nt" else _descendant_groups(process.pid)
+        _signal_tree(process, force=False, groups=frozenset(strays))
         try:
             process.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             log.warning("The pipeline did not stop within %.0f s; killing it.", grace)
-        # Whether or not the leader has exited, nothing of its group may outlive the stop.
-        _signal_tree(process, force=True)
+            if os.name != "nt":
+                strays |= _descendant_groups(process.pid)  # what it started in the meantime
+        # Whether or not the leader has exited, nothing it started may outlive the stop.
+        _signal_tree(process, force=True, groups=frozenset(strays))
         self._finished.wait(timeout=grace)
 
 

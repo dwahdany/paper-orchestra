@@ -468,6 +468,11 @@ def test_citation_keys_are_ascii_and_never_invent_a_year():
     assert make_citation_key(["李 飞飞"], 2009, "ImageNet") == "Unknown2009Imagenet"
     assert make_citation_key([], None, "Of the and") == "UnknownndPaper"
     assert make_citation_key(["Cher"], 2001, "On-line Learning") == "Cher2001OnlineLearning"
+    # Letters that have no base-plus-accent form are transliterated, not dropped.
+    assert make_citation_key(["Anders Søgaard"], 2019, "Æsthetics of Łódź") == (
+        "Sogaard2019AestheticsLodz"
+    )
+    assert make_citation_key(["Đorđe Đurić"], 2019, "Straße") == "Duric2019Strasse"
 
 
 def test_unique_citation_key_ignores_case_and_never_runs_out_of_suffixes():
@@ -515,11 +520,41 @@ def test_escape_bibtex_only_uses_what_the_default_font_encoding_has():
     assert escape_bibtex("Đorđe Þór Guðmundsson") == r"Dorde Th{\'{o}}r Gudmundsson"
     assert "\\k" not in escape_bibtex("ąęįųĄĘĮŲ")
     # Hyphens, minus and multiplication signs of publisher metadata are kept, not deleted.
-    assert escape_bibtex("Parameter‐Efficient non‑local 3×3 − 5 µm OʼNeil") == (
+    publisher_title = "Parameter\u2010Efficient non\u2011local 3×3 \u2212 5 µm O\u02bcNeil"
+    assert escape_bibtex(publisher_title) == (
         r"Parameter-Efficient non-local 3{$\times$}3 - 5 {$\mu$}m O'Neil"
     )
     # In OT1 text a bare < > | prints as an inverted exclamation mark, question mark and dash.
     assert escape_bibtex("a < b > c | d") == r"a \textless{} b \textgreater{} c \textbar{} d"
+
+
+def test_escape_bibtex_only_emits_greek_macros_that_latex_defines():
+    # Unicode calls the letter "lamda"; \lamda would be an undefined control sequence.
+    assert escape_bibtex("TD(λ) with Λ, ο and ϝ") == r"TD({$\lambda$}) with {$\Lambda$}, o and d"
+    defined = {
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        "lambda", "mu", "nu", "xi", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi",
+        "omega", "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi",
+        "Psi", "Omega",
+    }  # fmt: skip
+    greek_and_coptic = "".join(chr(code) for code in range(0x370, 0x400))
+    assert set(re.findall(r"\\([A-Za-z]+)", escape_bibtex(greek_and_coptic))) == defined
+
+
+def test_escape_bibtex_escapes_specials_hidden_in_compatibility_characters():
+    # A full-width ampersand reduces to "&", which must not reach the .bbl unescaped.
+    assert escape_bibtex("Ａ＆Ｂ ５０％ ｛ｘ｝ ＿ ＃") == (
+        r"A\&B 50\% \textbraceleft{}x\textbraceright{} \_ \#"
+    )
+    blocks = (range(0x20, 0x3100), range(0xFB00, 0xFB50), range(0xFE50, 0xFF70))
+    for code in (code for block in blocks for code in block):
+        escaped = escape_bibtex(chr(code))
+        # What is left once the macros are taken out has to be inert text (a bare ~ is a
+        # tie, which is what a no-break space becomes).
+        plain = re.sub(r"\\[A-Za-z]+|\\[^A-Za-z]", "", escaped)
+        assert not set(plain) & set("\\&%#_^<>|"), (hex(code), escaped)
+        assert plain.count("$") % 2 == 0, (hex(code), escaped)
+        assert escaped.count("{") == escaped.count("}"), (hex(code), escaped)
 
 
 def test_bibtex_entry_types_follow_the_source():
@@ -596,7 +631,7 @@ def test_generated_bibtex_needs_no_font_encoding_beyond_the_default(tmp_path):
     papers = [
         paper_data(
             "Houlsby2019",
-            title="Parameter\u2010Efficient Transfer: a < b | c > d, 3×3 \u2212 5 µm",
+            title="Parameter\u2010Efficient TD(λ): a < b | c > d, 3×3 \u2212 5 µm",
             authors=[
                 "Stanisław Jastrzębski",
                 "Đorđe Miladinović",
@@ -615,7 +650,7 @@ def test_generated_bibtex_needs_no_font_encoding_beyond_the_default(tmp_path):
     assert result.ok and result.errors == [], result.feedback()
     # An error raised while the .bbl is read is only visible in the log itself.
     log_text = (tmp_path / "paper.log").read_text(errors="replace")
-    assert "LaTeX Error" not in log_text and "unavailable in encoding" not in log_text
+    assert "LaTeX Error" not in log_text and "Undefined control sequence" not in log_text
     bbl = (tmp_path / "paper.bbl").read_text()
     assert "Jastrzebski" in bbl and "Dorde" in bbl and "Parameter-Efficient" in bbl
 

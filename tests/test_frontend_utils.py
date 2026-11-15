@@ -971,6 +971,46 @@ def test_stop_ends_the_whole_process_group_even_children_that_ignore_the_interru
     assert wait_until(lambda: not process_alive(leader) and not process_alive(child))
 
 
+@posix_only
+def test_stop_reaches_children_the_pipeline_started_in_sessions_of_their_own(tmp_path):
+    """The local compute backend runs LaTeX and figure code that way; they used to be orphaned."""
+    command = python_command(
+        """
+        import subprocess, sys, time
+        detached = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True
+        )
+        print("detached", detached.pid, flush=True)
+        try:
+            detached.communicate(timeout=120)
+        except KeyboardInterrupt:
+            raise SystemExit(130)
+        """
+    )
+    run = fu.PipelineRun(command, cwd=tmp_path)
+    run.start()
+    assert wait_until(lambda: "detached" in run.log_tail())
+    detached = int(run.log_tail().split()[1])
+    assert process_alive(detached) and os.getpgid(detached) != os.getpgid(run._process.pid)
+    assert fu._descendant_groups(run._process.pid) == {os.getpgid(detached)}
+    assert os.getpgid(0) not in fu._descendant_groups(os.getpid())
+
+    run.stop(grace=10.0)
+    assert run.stopped and not run.running
+    assert wait_until(lambda: not process_alive(detached))
+
+
+@posix_only
+def test_the_process_table_can_also_be_read_with_ps(tmp_path):
+    """Systems without /proc (macOS) list processes with ps; both must find this process."""
+    if fu.shutil.which("ps") is None:
+        pytest.skip("ps is not installed")
+    me = (os.getpid(), os.getppid(), os.getpgid(0))
+    assert me in fu._process_table(tmp_path / "no-proc-here")
+    if Path("/proc/self/stat").is_file():
+        assert me in fu._process_table()
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="prctl is Linux-specific")
 def test_the_kernel_is_asked_to_kill_the_pipeline_when_its_parent_dies(tmp_path):
     command = python_command(
@@ -985,6 +1025,43 @@ def test_the_kernel_is_asked_to_kill_the_pipeline_when_its_parent_dies(tmp_path)
     run.start()
     assert run.wait(timeout=30)
     assert "death signal: SIGKILL" in run.log_tail()
+
+
+def test_process_isolation_and_stop_signals_on_macos_and_windows(monkeypatch):
+    """Only Linux gets the prctl hook, and Windows gets neither sessions nor killpg."""
+
+    class Process:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.signals: list[int] = []
+
+        def send_signal(self, number: int) -> None:
+            self.signals.append(number)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(fu.sys, "platform", "darwin")
+        assert fu._isolation_options() == {"start_new_session": True}
+
+    process = Process()
+    commands: list[tuple[list[str], dict]] = []
+    with monkeypatch.context() as patched:
+        patched.setattr(fu.os, "name", "nt")
+        patched.setattr(fu.signal, "CTRL_BREAK_EVENT", 21, raising=False)
+        patched.setattr(fu.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+        patched.setattr(
+            fu.subprocess, "run", lambda command, **options: commands.append((command, options))
+        )
+        patched.setattr(fu.os, "killpg", None, raising=False)  # must not be touched on Windows
+        windows_options = fu._isolation_options()
+        fu._signal_tree(process, force=False)
+        fu._signal_tree(process, force=True)
+
+    assert windows_options == {"creationflags": 0x200}
+    assert process.signals == [21]
+    assert commands == [
+        (["taskkill", "/PID", "4242", "/T", "/F"], {"capture_output": True, "check": False})
+    ]
 
 
 @posix_only

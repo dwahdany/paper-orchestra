@@ -514,6 +514,9 @@ def test_job_spec_maps_a_job_onto_container_paths():
     assert cfg.template_dir == Path("/root/templates/iclr2025")
     assert cfg.project_memory_dir == Path("/vol/runs/r1/memory")
     assert cfg.memory.resolved_lab_dir() == Path("/vol/memory")
+    # Runs only add notes to the shared wiki; consolidate_memory is its one page writer.
+    assert cfg.memory.lab_consolidate is False
+    assert job_spec({"run_id": "r1", "template": "t", "memory": {"lab_consolidate": False}})
     assert cfg.compute == "modal" and cfg.research_cutoff == "2024-11"
     assert cfg.models.writer == DEFAULT_MODEL and cfg.resume is True
 
@@ -556,6 +559,7 @@ def test_job_spec_applies_overrides_and_uploaded_inputs(tmp_path):
         ({"run_id": "a/b"}, "run_id must be"),
         ({"memory": {"lab_dir": "/host/memory"}}, r"memory\.lab_dir cannot be set"),
         ({"memory": {"project_dir": "/x", "lab_dir": "/y"}}, r"memory\.lab_dir and memory\.proj"),
+        ({"memory": {"lab_consolidate": True}}, r"memory\.lab_consolidate cannot be set"),
         ({"memory": "on"}, "'memory' must be a mapping"),
         ({"models": {"wrtier": "claude-fable-5-2"}}, "invalid job options.*wrtier"),
         ({"memory": {"dreams": "off"}}, "invalid job options.*dreams"),
@@ -780,9 +784,9 @@ def test_the_pipeline_gets_a_harness_that_checkpoints_after_every_refresh(
     assert [type(error) for error in pipeline.refresh_errors] == [OSError] * 6
     assert volume.commits == before + 6 + 1  # a failed refresh does not cost the checkpoint
 
-    assert run_job(
-        {**job, "memory": {"enabled": False}}, commit=volume.commit, mount=volume.root
-    )["success"]
+    assert run_job({**job, "memory": {"enabled": False}}, commit=volume.commit, mount=volume.root)[
+        "success"
+    ]
     assert pipeline.runs[-1]["harness"].enabled is False
 
 
@@ -806,6 +810,123 @@ def test_run_job_insists_on_the_final_commit(pipeline, volume):
     volume.commit_errors = [RuntimeError(f"busy {n}") for n in range(3)]
     with pytest.raises(RuntimeError, match="busy 2"):
         run_job(job, commit=volume.commit, mount=volume.root)
+
+
+def test_run_job_has_the_lab_memory_consolidated_after_a_successful_run(pipeline, volume, logs):
+    calls: list[tuple[str, int]] = []
+
+    def consolidate(model: str) -> dict[str, Any]:
+        calls.append((model, volume.commits))
+        return {"notes_archived": 2, "pages_changed": ["wiki/lessons/latex.md"], "error": None}
+
+    job = {**stage_inputs(volume), "models": {"reflection": "claude-opus-4-8"}}
+    summary = run_job(job, commit=volume.commit, consolidate=consolidate, mount=volume.root)
+    assert summary["success"]
+    # With the reflection model, and only after the final commit made the run's notes visible.
+    assert calls == [("claude-opus-4-8", 6 + 1)] and volume.commits == 6 + 1
+    assert "Lab memory consolidated: 2 note(s) folded in, 1 page(s) changed." in logs.text
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"memory": {"lab": False}},
+        {"memory": {"enabled": False}},
+        {"memory": {"dream": "off"}},
+        {"success": False},
+        {"run_id": "../escape"},
+    ],
+)
+def test_run_job_skips_the_consolidation_when_there_is_nothing_to_fold_in(pipeline, volume, change):
+    pipeline.success = change.pop("success", True)
+    calls: list[str] = []
+    summary = run_job(
+        {**stage_inputs(volume), **change},
+        commit=volume.commit,
+        consolidate=calls.append,
+        mount=volume.root,
+    )
+    assert calls == [] and summary["success"] is (pipeline.success and "run_id" not in change)
+
+
+def test_run_job_survives_a_failed_consolidation(pipeline, volume, logs):
+    def crashing(model: str) -> dict[str, Any]:
+        raise TimeoutError("took too long")
+
+    job = stage_inputs(volume)
+    assert run_job(job, commit=volume.commit, consolidate=crashing, mount=volume.root)["success"]
+    assert "Could not consolidate the lab memory (TimeoutError: took too long)" in logs.text
+
+    busy = {"error": "another consolidation of this wiki is in progress"}
+    summary = run_job(job, commit=volume.commit, consolidate=lambda model: busy, mount=volume.root)
+    assert summary["success"]
+    assert "The lab memory was not consolidated: another consolidation" in logs.text
+
+
+@pytest.fixture
+def scripted_model():
+    """Serve model ids starting with "fake" from a scripted client; yields its installer."""
+    yield lambda responder: register_client("fake", FakeLLM(responder))
+    reset_clients()
+
+
+def test_consolidate_lab_folds_the_notes_of_earlier_runs_into_pages(volume, scripted_model):
+    lab = Wiki(volume.root / "memory", name="lab")
+    note = lab.add_note(
+        "Load cleveref after hyperref.", stage="promotion", kind="lesson", title="cleveref order"
+    )
+    seen: dict[str, Any] = {}
+
+    def responder(request: FakeRequest) -> str:
+        seen.update(label=request.label, model=request.model)
+        seen["notes"] = request.memory.view("/memories/notes")
+        request.memory.create(
+            "/memories/wiki/lessons/latex.md",
+            "---\nsummary: LaTeX pitfalls\n---\nLoad cleveref after hyperref.",
+        )
+        return "Folded one lesson into the LaTeX page."
+
+    scripted_model(responder)
+    report = consolidate_lab(
+        "fake-dreamer", commit=volume.commit, reload=volume.reload, mount=volume.root
+    )
+    assert json.loads(json.dumps(report)) == report
+    assert (report["scope"], report["error"], report["llm_used"]) == ("lab", None, True)
+    assert (report["notes_seen"], report["notes_archived"]) == (1, 1)
+    assert report["pages_changed"] == ["wiki/lessons/latex.md"]
+    assert report["summary"] == "Folded one lesson into the LaTeX page."
+    assert (seen["label"], seen["model"]) == ("dream.lab", "fake-dreamer")
+    assert Path(note).name in seen["notes"]
+    page = volume.root / "memory" / "wiki" / "lessons" / "latex.md"
+    assert "Load cleveref after hyperref." in page.read_text()
+    assert lab.pending_notes() == []
+    # It saw the notes other containers committed, and its pages are durable when it returns.
+    assert (volume.reloads, volume.commits) == (1, 1)
+
+
+def test_consolidate_lab_without_pending_notes_asks_no_model(volume, scripted_model):
+    requests: list[FakeRequest] = []
+    scripted_model(lambda request: requests.append(request) or "nothing to do")
+    report = consolidate_lab("fake", commit=volume.commit, mount=volume.root)
+    assert (report["notes_seen"], report["llm_used"], report["error"]) == (0, False, None)
+    assert requests == [] and volume.commits == 1
+
+
+def test_consolidate_lab_reports_a_model_that_cannot_be_used(volume, monkeypatch):
+    Wiki(volume.root / "memory", name="lab").add_note("A lesson.", kind="lesson")
+    report = consolidate_lab("no-such-provider-1", commit=volume.commit, mount=volume.root)
+    assert "LLMConfigError" in report["error"] and report["notes_archived"] == 0
+    assert len(Wiki(volume.root / "memory", name="lab").pending_notes()) == 1
+
+    for name, value in {
+        **WIF_IDS,
+        "MODAL_IDENTITY_TOKEN": "jwt",
+        "ANTHROPIC_API_KEY": "sk",
+    }.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(JobError, match="exactly one credential"):
+        consolidate_lab("fake", commit=volume.commit, mount=volume.root)
+    assert volume.commits == 1
 
 
 @pytest.mark.parametrize(
@@ -1106,6 +1227,7 @@ def test_modal_objects_are_defined_without_credentials():
     assert isinstance(modal_app.app, modal.App)
     assert isinstance(modal_app.write_paper, modal.Function)
     assert isinstance(modal_app.write_batch, modal.Function)
+    assert isinstance(modal_app.consolidate_memory, modal.Function)
     assert isinstance(modal_app.volume, modal.Volume)
     assert isinstance(modal_app.image, modal.Image)
     assert type(modal_app.main).__name__ == "LocalEntrypoint"
@@ -1122,6 +1244,7 @@ def test_fakes_match_the_modal_sdk_calls_the_app_makes():
         (modal.Volume.commit, (), {}),
         (modal.Volume.reload, (), {}),
         (modal.Function.spawn, ({"run_id": "r"},), {}),
+        (modal.Function.remote, (DEFAULT_MODEL,), {}),
         (modal.Function.map, ([{"run_id": "r"}],), {"return_exceptions": True}),
         (modal.FunctionCall.get, (), {"timeout": 60.0}),
         (modal.Image.build, (modal_app.app,), {}),
@@ -1181,6 +1304,7 @@ def test_main_builds_the_sandbox_image_then_launches(monkeypatch):
         with pytest.raises(SystemExit) as raised:
             modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id=run_id)
         assert raised.value.code == 1
+    assert built == [modal_app.app]  # without --plotting no figure code runs: nothing to build
 
 
 def test_local_entrypoint_flags_are_understood_by_the_modal_cli():
@@ -1221,10 +1345,35 @@ def test_local_entrypoint_flags_are_understood_by_the_modal_cli():
 
 def test_module_imports_cleanly_anywhere_without_modal_credentials(tmp_path):
     """Definition smoke test: no deprecated Modal parameters, no cwd or credential dependence."""
-    code = (
-        "import json, paper_orchestra.modal_app as m\n"
-        "print(json.dumps({'settings': list(vars(m.SETTINGS).values()), 'app': m.app.name}))\n"
-    )
+    code = """
+import json, modal
+functions = {}
+decorator_for = modal.App.function
+def recording(self, **options):
+    decorate = decorator_for(self, **options)
+    def wrap(function):
+        functions[function.__name__] = options
+        return decorate(function)
+    return wrap
+modal.App.function = recording
+import paper_orchestra.modal_app as m
+print(json.dumps({
+    "settings": list(vars(m.SETTINGS).values()),
+    "app": m.app.name,
+    "functions": {
+        name: {
+            "volumes": sorted(options.get("volumes", {})),
+            "secrets": len(options["secrets"]),
+            "max_containers": options.get("max_containers"),
+            "single_use": options.get("single_use_containers", False),
+            "retries": options.get("retries") is not None,
+            "timeout": options["timeout"],
+            "pipeline_image": options["image"] is m.image,
+        }
+        for name, options in functions.items()
+    },
+}))
+"""
     env = {
         key: value
         for key, value in os.environ.items()
@@ -1244,7 +1393,29 @@ def test_module_imports_cleanly_anywhere_without_modal_credentials(tmp_path):
         env=env,
     )
     assert done.returncode == 0, done.stderr
-    assert json.loads(done.stdout) == {
+    described = json.loads(done.stdout)
+    functions = described.pop("functions")
+    assert described == {
         "settings": ["smoke.app", "paper-orchestra", None, 21600, 4],
         "app": "smoke.app",
     }
+    assert functions["write_paper"] == {
+        "volumes": ["/vol"],
+        "secrets": 1,  # no named Secret was asked for: only the forwarded settings
+        "max_containers": 4,
+        "single_use": True,
+        "retries": True,
+        "timeout": 21600,
+        "pipeline_image": True,
+    }
+    # One container at a time, each starting from the committed volume: a single page writer.
+    assert functions["consolidate_memory"] == {
+        "volumes": ["/vol"],
+        "secrets": 1,
+        "max_containers": 1,
+        "single_use": True,
+        "retries": False,
+        "timeout": 3600,
+        "pipeline_image": True,
+    }
+    assert functions["write_batch"]["volumes"] == [] and functions["write_batch"]["secrets"] == 1

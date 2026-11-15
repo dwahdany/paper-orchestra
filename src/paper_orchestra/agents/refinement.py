@@ -24,6 +24,10 @@ The agent works in ``RunPaths.refinement_dir``, a copy of the LaTeX workspace:
    problems and apply a formatting-only fix.
 4. Save the surviving version as ``final_refined_paper.tex`` / ``.pdf``.
 
+A revision or formatting candidate only replaces the current version if its build is
+no worse: a PDF that comes with LaTeX errors, unresolved references or static problems
+the current version does not have is turned down (a revision gets one repair turn first).
+
 Once the initial draft compiles there is always a valid version to fall back on, so
 a failure in a later step is logged and recorded and the run continues with the last
 version that was accepted.

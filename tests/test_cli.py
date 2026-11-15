@@ -791,13 +791,69 @@ def test_modal_deploy_and_print_command(monkeypatch):
     )
 
 
+def test_modal_batch_submits_the_batch_to_the_deployed_app(tmp_path, template, monkeypatch):
+    modal = pytest.importorskip("modal")
+    from paper_orchestra import modal_app
+
+    calls: list[dict[str, Any]] = []
+    outcome: dict[str, Any] | Exception = {"a": {"status": "success", "paper_path": "a.pdf"}}
+
+    def fake_run(options: dict[str, Any], **kwargs: Any) -> Path:
+        calls.append({"options": options, **kwargs})
+        if isinstance(outcome, Exception):
+            raise outcome
+        log = Path(kwargs["output_dir"]) / "paper_writing_log.json"
+        write_json(log, outcome)
+        return log
+
+    monkeypatch.setattr(cli, "run_batch_on_modal", fake_run)
+    (tmp_path / "papers" / "a" / "raw_materials").mkdir(parents=True)
+    args = [
+        "modal", "batch",
+        "--root-input-folder", str(tmp_path / "papers"),
+        "--output-dir", str(tmp_path / "out"),
+        "--template", "demo2026",
+        "--plotting",
+        "--model", "claude-opus-5-5",
+        "--fast-model", "claude-haiku-5-5",
+        "--effort", "max",
+        "--dream", "end",
+        "--no-lab-memory",
+    ]  # fmt: skip
+
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert "1 written, 0 failed, 0 in error" in result.output
+    call = calls[0]
+    assert call["template_dir"] == template and call["root_input_folder"] == tmp_path / "papers"
+    assert call["volume"] is modal_app.volume
+    assert isinstance(call["write_batch"], modal.Function)
+    options = call["options"]
+    assert options["use_plotting"] is True and options["effort"] == "max"
+    assert options["writer_model"] == options["plotting_model"] == "claude-opus-5-5"
+    assert options["fast_model"] == "claude-haiku-5-5" and options["image_model"] is None
+    assert (options["memory"], options["lab_memory"], options["dream"]) == (True, False, "end")
+    # Exactly the options a job is built from.
+    job = modal_app.build_job(run_id="a", **options)
+    assert job["models"]["reflection"] == "claude-opus-5-5" and job["memory"]["dream"] == "end"
+
+    outcome = {"a": {"status": "failed", "paper_path": "", "error": "stage failed"}}
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 1
+    assert "0 written, 1 failed, 0 in error" in result.output
+
+    outcome = modal.exception.NotFoundError("App 'paper-orchestra' not found.")
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 2
+    assert "App 'paper-orchestra' not found." in result.stderr
+    assert "paper-orchestra modal deploy" in " ".join(result.stderr.split())
+
+
 def test_the_modal_run_help_names_options_the_modal_entrypoint_has():
     pytest.importorskip("modal")
     from paper_orchestra import modal_app
 
-    result = runner.invoke(cli.app, ["modal", "run", "--help"], env={"COLUMNS": "200"})
-    assert result.exit_code == 0
-    example = result.output.split("e.g.", 1)[1].split("╭", 1)[0]
+    example = cli.modal_run.__doc__.split("e.g.", 1)[1]
     flags = [word.rstrip(".") for word in example.split() if word.startswith("--")]
     assert flags == ["--raw-materials-dir", "--template", "--plotting"]
     parameters = inspect.signature(modal_app.main.info.raw_f).parameters
@@ -814,6 +870,12 @@ def test_modal_commands_need_the_modal_sdk(monkeypatch):
         subprocess, "call", lambda command: pytest.fail("modal must not be started")
     )
     result = runner.invoke(cli.app, ["modal", "deploy"])
+    assert result.exit_code == 2
+    assert "uv sync --extra modal" in result.stderr
+
+    result = runner.invoke(
+        cli.app, ["modal", "batch", "--output-dir", "out", "--template", "cvpr2025"]
+    )
     assert result.exit_code == 2
     assert "uv sync --extra modal" in result.stderr
 

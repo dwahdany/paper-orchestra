@@ -50,10 +50,11 @@ The frontend launches the pipeline as a background process (`python -m paper_orc
 in its own process group.
 
 ### Automatic Cleanup
-- The **Stop Run** button interrupts the pipeline and everything it started.
-- Stopping the Streamlit server with **Ctrl+C** stops any pipeline it started.
+- The **Stop Run** button interrupts the pipeline and everything it started, including a LaTeX
+  compile or figure script that is running at that moment.
+- Stopping the Streamlit server with **Ctrl+C** stops any pipeline it started in the same way.
 - On Linux, the pipeline is also killed if the Streamlit server process dies without a chance to
-  clean up.
+  clean up. A LaTeX compile or figure script it was running then finishes on its own.
 
 ### Manual Cleanup
 If the server was killed on another platform, or a pipeline is left over for any other reason, you
