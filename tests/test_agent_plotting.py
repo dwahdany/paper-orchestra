@@ -238,7 +238,7 @@ def test_plot_is_planned_styled_rendered_reviewed_and_captioned(tmp_path):
     assert call["code"] == CODE + "\n" + SAVE_FIGURE_EPILOGUE
     assert call["outputs"] == [FIGURE_FILE]
     assert call["inputs"] is None
-    assert call["timeout"] == plotting.CODE_TIMEOUT_SECONDS
+    assert call["timeout"] == ctx.cfg.figure_code_timeout == 120
 
     plan, style, code, critic, caption = llm.requests
     assert "<raw_data>\n<experimental_log>\nLOG: FooNet 91.2" in plan.text
@@ -736,6 +736,21 @@ def test_other_render_failures_are_fed_back_too(tmp_path, failure, problem):
     _, repair = requests_for(llm, "plotting.code")
     assert problem in repair.text
     assert (ctx.paths.generated_figures_dir / "fig_accuracy.png").read_bytes() == PNG
+
+
+def test_configured_code_timeout_reaches_the_backend_and_the_model(tmp_path):
+    llm = scripted_llm()
+    compute = FakeCompute(
+        lambda code, call: ExecResult(returncode=-9, timed_out=True) if call == 1 else rendered()
+    )
+    ctx = make_ctx(tmp_path, llm, compute, figure_code_timeout=45.0)
+
+    assert len(PlottingAgent(ctx).run({"plotting_plan": [figure()]})) == 1
+
+    assert [call["timeout"] for call in compute.calls] == [45.0, 45.0]
+    first, repair = requests_for(llm, "plotting.code")
+    assert "it is stopped after 45 seconds" in first.system
+    assert "stopped after the time limit of 45 seconds" in repair.text
 
 
 def test_permanent_code_failure_skips_only_that_figure(tmp_path, caplog):

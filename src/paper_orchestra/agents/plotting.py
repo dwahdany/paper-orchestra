@@ -70,7 +70,6 @@ FIGURE_DPI = 200
 #: Longer side of a saved figure, in pixels, above which its resolution is lowered
 #: (never below 72 dpi, so that an absurd figure size fails instead of being unreadable).
 MAX_FIGURE_PIXELS = 4096
-CODE_TIMEOUT_SECONDS = 120
 NO_FIGURE_EXIT_CODE = 3
 DEFAULT_ASPECT_RATIO = "16:9"
 #: Drawing area of a figure in square inches, whatever its aspect ratio.
@@ -341,16 +340,15 @@ def run_figure_code(ctx: RunContext, code: str) -> bytes:
     Raises :class:`_CodeFailure` when the script exits non-zero, times out, or
     leaves no valid image behind.
     """
+    timeout = ctx.cfg.figure_code_timeout
     result = ctx.compute.run_python(
         code.rstrip() + "\n" + SAVE_FIGURE_EPILOGUE,
         outputs=[FIGURE_FILE],
-        timeout=CODE_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     output = (result.stderr.strip() or result.stdout.strip())[-_OUTPUT_TAIL_CHARS:]
     if result.timed_out:
-        raise _CodeFailure(
-            f"It was stopped after the time limit of {CODE_TIMEOUT_SECONDS} seconds.", output
-        )
+        raise _CodeFailure(f"It was stopped after the time limit of {timeout:g} seconds.", output)
     if result.returncode != 0:
         raise _CodeFailure(f"It exited with status {result.returncode}.", output)
     data = result.files.get(FIGURE_FILE)
@@ -502,7 +500,7 @@ class _CodeRenderer:
                 agent=AGENT,
                 stage=STAGE,
                 model=ctx.cfg.models.plotting,
-                system=prompts.code_system(spec.task, timeout_seconds=CODE_TIMEOUT_SECONDS),
+                system=prompts.code_system(spec.task, timeout_seconds=ctx.cfg.figure_code_timeout),
                 # The one plotting call that reads memory: lessons about figure-code
                 # pitfalls from earlier figures and earlier runs are what it is for.
                 memory=MemoryPolicy.readonly(),

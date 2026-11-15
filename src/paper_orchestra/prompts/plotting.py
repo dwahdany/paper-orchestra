@@ -355,10 +355,10 @@ Reply with the complete Python script in one ```python fenced block and nothing 
 """
 
 
-def code_system(task: TaskName, *, timeout_seconds: int) -> str:
+def code_system(task: TaskName, *, timeout_seconds: float) -> str:
     """System prompt of the call that writes the matplotlib script for a figure."""
     role = _PLOT_CODE_ROLE if task == "plot" else _DIAGRAM_CODE_ROLE
-    return f"{role}\n{_CODE_CONTRACT.format(timeout_seconds=timeout_seconds)}"
+    return f"{role}\n{_CODE_CONTRACT.format(timeout_seconds=f'{timeout_seconds:g}')}"
 
 
 def code_request(
