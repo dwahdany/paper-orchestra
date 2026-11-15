@@ -2328,11 +2328,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=1.0" },
+    { name = "anthropic", specifier = ">=2.8,<3" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=1.0" },
     { name = "json-repair", specifier = ">=0.30" },
     { name = "matplotlib", specifier = ">=3.8" },
-    { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0" },
+    { name = "modal", marker = "extra == 'modal'", specifier = ">=1.6,<2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40" },
     { name = "paper-orchestra", extras = ["modal", "gemini", "openai", "ui"], marker = "extra == 'all'" },

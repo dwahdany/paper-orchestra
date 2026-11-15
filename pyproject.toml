@@ -13,7 +13,7 @@ authors = [
     { name = "Jinsung Yoon" },
 ]
 dependencies = [
-    "anthropic>=1.0",
+    "anthropic>=2.8,<3",
     "json-repair>=0.30",
     "matplotlib>=3.8",
     "numpy>=1.26",
@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-modal = ["modal>=1.0"]
+modal = ["modal>=1.6,<2"]
 gemini = ["google-genai>=1.0"]
 openai = ["openai>=1.40"]
 ui = ["streamlit>=1.36"]

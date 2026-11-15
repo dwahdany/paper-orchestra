@@ -323,6 +323,10 @@ class Conversation(ABC):
         pydantic instance or a dict); otherwise ``parser`` maps the final text
         to ``parsed``.  With ``require_parsed`` a ``None`` parse raises
         :class:`LLMParseError`.
+
+        If the request itself fails (configuration error, refusal, API error),
+        the conversation is left exactly as it was before the call, so the
+        caller may send again.  A parse failure keeps the completed exchange.
         """
 
     @property
