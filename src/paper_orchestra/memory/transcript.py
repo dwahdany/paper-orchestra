@@ -51,7 +51,7 @@ def _clip(value: Any) -> Any:
     return value
 
 
-def _event_text(event: dict[str, Any]) -> str:
+def event_text(event: dict[str, Any]) -> str:
     """The searchable text of an event (its string-valued payload)."""
     skip = {"ts", "seq", "session", "type", "stage", "agent", "model", "label"}
     chunks: list[str] = []
@@ -129,8 +129,21 @@ class TranscriptLog:
 
         return emit
 
-    def events(self, *, session: str | None = None) -> Iterator[dict[str, Any]]:
-        """Events of one session, or of every session in the directory, in order."""
+    def events(
+        self, *, session: str | None = None, exclude_agents: Sequence[str] = ()
+    ) -> Iterator[dict[str, Any]]:
+        """Events of one session, or of every session in the directory, in order.
+
+        ``exclude_agents`` leaves out the events of those agents.  A session that
+        checks claims against the record passes its own name, so that its
+        questions and the snippets it was shown do not come back as evidence.
+        """
+        for event in self._all_events(session):
+            if exclude_agents and event.get("agent") in exclude_agents:
+                continue
+            yield event
+
+    def _all_events(self, session: str | None) -> Iterator[dict[str, Any]]:
         if session:
             files = [self.directory / f"{session}.jsonl"]
         else:
@@ -154,16 +167,17 @@ class TranscriptLog:
         k: int = 10,
         stage: str | None = None,
         session: str | None = None,
+        exclude_agents: Sequence[str] = (),
     ) -> list[TranscriptHit]:
         """Events containing ``needle`` verbatim (case-insensitive), most recent first."""
         wanted = needle.lower().strip()
         if not wanted:
             return []
         hits: list[TranscriptHit] = []
-        for event in self.events(session=session):
+        for event in self.events(session=session, exclude_agents=exclude_agents):
             if stage and event.get("stage") != stage:
                 continue
-            text = _event_text(event)
+            text = event_text(event)
             position = text.lower().find(wanted)
             if position < 0:
                 continue
@@ -190,6 +204,7 @@ class TranscriptLog:
         stage: str | None = None,
         types: Sequence[str] | None = None,
         session: str | None = None,
+        exclude_agents: Sequence[str] = (),
     ) -> list[TranscriptHit]:
         """Rank events by how many query terms they contain (rarer terms first).
 
@@ -202,12 +217,12 @@ class TranscriptLog:
             return []
         candidates: list[tuple[dict[str, Any], str, set[str]]] = []
         doc_freq: dict[str, int] = dict.fromkeys(terms, 0)
-        for event in self.events(session=session):
+        for event in self.events(session=session, exclude_agents=exclude_agents):
             if stage and event.get("stage") != stage:
                 continue
             if types and event.get("type") not in types:
                 continue
-            text = _event_text(event)
+            text = event_text(event)
             present = terms.intersection(tokenize(text))
             if not present:
                 continue

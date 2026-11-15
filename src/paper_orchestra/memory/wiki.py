@@ -32,7 +32,7 @@ import re
 import secrets
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -580,21 +580,24 @@ class Wiki:
         agent: str = "",
         kind: str = "observation",
         title: str | None = None,
+        meta: Mapping[str, Any] | None = None,
     ) -> str:
         """Record a salient observation as its own file and return its path.
 
         Notes are append-only and uniquely named, so parallel agents and
         parallel runs sharing a wiki can all write without losing each other's
         facts.  A later dream verifies them and folds them into pages.
+        ``meta`` adds front-matter fields (for example where the note came from).
         """
         stamp = self._clock().strftime("%Y%m%dT%H%M%SZ")
         first_line = text.strip().splitlines()[0] if text.strip() else "note"
         slug = slugify(title or first_line, 40)
         rel = f"{NOTES_DIR}/{stamp}-{slugify(stage or 'run', 24)}-{slug}-{secrets.token_hex(2)}.md"
-        meta = {"kind": kind, "stage": stage, "agent": agent}
+        fields: dict[str, Any] = {"kind": kind, "stage": stage, "agent": agent}
         if title:
-            meta["title"] = title
-        self.write(rel, text, {k: v for k, v in meta.items() if v})
+            fields["title"] = title
+        fields.update(meta or {})
+        self.write(rel, text, {k: v for k, v in fields.items() if v})
         return rel
 
     def pending_notes(self) -> list[PageInfo]:
@@ -683,6 +686,27 @@ class Wiki:
                 body = _WIKILINK.sub(fix, page.body)
                 if changed:
                     self.write(rel, body, page.meta, author=str(page.meta.get("author") or ""))
+
+            # The standing notes are in every session's context, so their links matter most.
+            standing = self.standing_notes()
+            fixed_standing = False
+
+            def fix_standing(match: re.Match[str]) -> str:
+                nonlocal fixed_standing
+                target = match.group(1).strip()
+                if self.resolve_link(target):
+                    return match.group(0)
+                guess = self._guess_link(target, paths)
+                if not guess:
+                    return match.group(0)
+                fixed_standing = True
+                new_target = link_for(guess)
+                repairs.append((INDEX_FILE, target, new_target))
+                return f"[[{new_target}{match.group(2) or ''}{match.group(3) or ''}]]"
+
+            repaired_standing = _WIKILINK.sub(fix_standing, standing)
+            if fixed_standing:
+                self._write_index(repaired_standing)
         return repairs
 
     # -- search --------------------------------------------------------------
@@ -909,9 +933,11 @@ class Wiki:
         for rel in wiki_paths:
             cached = self._load(rel)
             page = cached.page
-            if cached.size > self.soft_page_bytes:
-                report.oversize.append((rel, cached.size))
             auto = bool(page.meta.get("auto"))
+            # Records and generated pages are as long as their content: only a page that a
+            # consolidation could split is reported.
+            if cached.size > self.soft_page_bytes and not auto and not self.is_read_only(rel):
+                report.oversize.append((rel, cached.size))
             if not auto and not str(page.meta.get("summary") or "").strip():
                 report.missing_summary.append(rel)
             for target in page.links():
@@ -933,6 +959,10 @@ class Wiki:
             report.index_lines = len(text.splitlines())
             report.index_bytes = len(text.encode("utf-8"))
             standing = self.standing_notes()
+            for match in _WIKILINK.finditer(standing):
+                target = match.group(1).strip()
+                if self.resolve_link(target) is None:
+                    report.broken_links.append((INDEX_FILE, target))
             report.standing_lines = len([ln for ln in standing.splitlines() if ln.strip()])
             report.standing_over_budget = (
                 report.standing_lines > self.standing_max_lines

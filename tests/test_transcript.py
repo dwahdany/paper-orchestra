@@ -89,3 +89,17 @@ def test_corrupt_lines_are_skipped(tmp_path):
         handle.write("{not json\n")
     log.record({"type": "b"})
     assert [e["type"] for e in log.events()] == ["a", "b"]
+
+
+def test_search_can_leave_out_the_agent_that_is_asking(tmp_path):
+    log = TranscriptLog(tmp_path / "t", session_id="s1")
+    log.record({"type": "compile", "stage": "writing", "agent": "pipeline", "error": "cleverref"})
+    log.record({"type": "tool_call", "stage": "writing", "agent": "dreamer", "query": "cleverref"})
+    assert len(log.grep("cleverref")) == 2 and len(log.search("cleverref")) == 2
+    for hits in (
+        log.grep("cleverref", exclude_agents=("dreamer",)),
+        log.search("cleverref", exclude_agents=("dreamer",)),
+    ):
+        assert [hit.agent for hit in hits] == ["pipeline"]
+    assert log.grep("cleverref", exclude_agents=("dreamer", "pipeline")) == []
+    assert len(list(log.events(exclude_agents=("pipeline",)))) == 1

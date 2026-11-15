@@ -1,6 +1,7 @@
 """Agent memory: a wiki behind a context harness."""
 
-from paper_orchestra.memory.dreaming import DreamReport, dream
+from paper_orchestra.memory.cache import KeyValueCache
+from paper_orchestra.memory.dreaming import DreamReport, LeakScanner, dream
 from paper_orchestra.memory.harness import ContextHarness, HarnessConversation, MemoryPolicy
 from paper_orchestra.memory.tools import WikiMemoryBackend, transcript_search_tool, wiki_search_tool
 from paper_orchestra.memory.transcript import TranscriptHit, TranscriptLog
@@ -10,6 +11,8 @@ __all__ = [
     "ContextHarness",
     "DreamReport",
     "HarnessConversation",
+    "KeyValueCache",
+    "LeakScanner",
     "LintReport",
     "MemoryPolicy",
     "Page",

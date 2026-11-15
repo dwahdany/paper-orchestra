@@ -11,7 +11,7 @@ import pytest
 
 from paper_orchestra.agents.literature import (
     ABSTRACT_LIMIT,
-    CACHE_DIR,
+    CACHE_NAMESPACE,
     CandidatePaper,
     DiscoveryResult,
     LiteratureAgent,
@@ -32,7 +32,7 @@ from paper_orchestra.config import ModelConfig, PipelineConfig
 from paper_orchestra.context import RunContext, RunPaths
 from paper_orchestra.llm.base import Capabilities, LLMError, WebSearch
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
-from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
+from paper_orchestra.memory import ContextHarness, KeyValueCache, TranscriptLog, Wiki
 from paper_orchestra.prompts.literature import (
     DISCOVERY_SYSTEM_PROMPT,
     WRITER_SYSTEM_PROMPT,
@@ -290,6 +290,7 @@ def make_ctx(
         transcripts=TranscriptLog(base / "memory" / "transcripts"),
         client_for=lambda model: client,
         default_effort="high",
+        cache=KeyValueCache(tmp_path / "lab" / "cache") if lab else None,
     )
     return RunContext(cfg=config, paths=paths, harness=harness, compute=LocalBackend())
 
@@ -307,6 +308,12 @@ def run_agent(
     ctx = make_ctx(tmp_path, client, **ctx_kwargs)
     result = LiteratureAgent(ctx, scholar=make_scholar(session)).run(outline or make_outline())
     return result, ctx, client, session
+
+
+def cache_text(tmp_path: Path) -> str:
+    """Everything stored in the cross-run Semantic Scholar cache."""
+    files = sorted((tmp_path / "lab" / "cache").rglob("*.json"))
+    return "\n".join(file.read_text(encoding="utf-8") for file in files)
 
 
 def discovery_requests(client: FakeLLM) -> list[FakeRequest]:
@@ -932,8 +939,7 @@ def test_the_registry_applies_the_cutoff_even_if_the_lookup_did_not(tmp_path):
     assert "Future Widgets" not in {entry["title"] for entry in result.citation_map.values()}
     (event,) = [e for e in ctx.harness.transcripts.events() if e["type"] == "literature"]
     assert event["after_cutoff"] == 1 and event["verified"] == 4
-    lab = ctx.harness.lab
-    cached = "\n".join(lab.read(info.path).body for info in lab.list(CACHE_DIR))
+    cached = cache_text(tmp_path)
     assert "A Survey of Widgets" in cached and "Future Widgets" not in cached
 
 
@@ -1069,14 +1075,18 @@ def test_the_lab_cache_saves_lookups_across_runs(tmp_path):
     assert len(session.queries) == 7
 
     lab = ctx.harness.lab
-    pages = lab.list(CACHE_DIR)
-    assert pages and all(info.kind == "cache" for info in pages)
-    stored = "\n".join(lab.read(info.path).body for info in pages)
+    stored = cache_text(tmp_path)
     assert "A Survey of Widgets" in stored and "Ada Lovelace" in stored
     assert "paperId" not in stored and "authorId" not in stored  # bibliographic fields only
     assert "Future Widgets" not in stored  # nothing past the cutoff is kept
     assert "WidgetNet" not in stored and "Widgets drift." not in stored  # nothing of our paper
-    assert lab.lint().oversize == []
+    # The cache is beside the lab wiki, not in it: no page, no index line, no search hit,
+    # so another paper's sessions cannot read records that paper never verified.
+    assert lab.list("wiki") == [] and lab.pending_notes() == []
+    assert lab.search("survey widgets") == [] and lab.grep("Lovelace") == []
+    assert "Survey" not in lab.injected_context()
+    lab.rebuild_index()
+    assert "Survey" not in lab.injected_context() and "cache" not in lab.injected_context()
 
     second, _, _, again = run_agent(tmp_path, name="second")
     # Only the titles that have no match before the cutoff are asked for again.
@@ -1109,37 +1119,33 @@ def test_without_a_lab_wiki_every_run_asks_semantic_scholar(tmp_path):
     assert ctx.harness.lab is None and not (tmp_path / "lab").exists()
 
 
-def test_the_cache_stays_bounded_and_survives_a_damaged_page(tmp_path, caplog):
+def test_cache_entries_are_separate_files_and_a_damaged_one_is_ignored(tmp_path, caplog):
     client = FakeLLM(Script())
     harness = make_ctx(tmp_path, client).harness
     cache = _ScholarCache(harness, "2024-10")
-
-    # Enough titles that land on one shard page to overflow it several times.
-    page = _ScholarCache._page(normalize_title("Paper 0"))
-    titles = [
-        f"Paper {i}"
-        for i in range(4000)
-        if _ScholarCache._page(normalize_title(f"Paper {i}")) == page
-    ][:40]
-    assert len(titles) == 40
+    titles = [f"Paper {i}" for i in range(40)]
     for title in titles:
         cache.put(title, {"title": title, "abstract": "```" + "a" * 1500, "year": 2020})
 
-    body = harness.read_page(page, scope="lab")
-    assert len(body) < 40_000  # under the wiki's soft page size, so the linter stays quiet
-    assert cache.get(titles[0]) is None  # the oldest entries were evicted
-    newest = cache.get(titles[-1])
-    assert newest["title"] == titles[-1] and newest["abstract"].startswith("```aaa")
-    assert len(harness.lab.list(CACHE_DIR)) == 1
+    # One file per entry: runs that share the cache never rewrite each other's entries.
+    assert harness.cache.count(CACHE_NAMESPACE) == 40
+    assert all(cache.get(title)["title"] == title for title in titles)
+    assert cache.get(titles[-1])["abstract"].startswith("```aaa")
+    assert cache.get("  PAPER 7 ") == cache.get("Paper 7")  # keyed by the normalised title
 
     cache.put(titles[-1], {"title": "replaced"})
     assert cache.get(titles[-1]) == {"title": "replaced"}
+    assert harness.cache.count(CACHE_NAMESPACE) == 40
 
-    harness.write_page(page, "someone tidied this page up", {"summary": "s"}, scope="lab")
-    assert cache.get(titles[-1]) is None
-    assert "unreadable literature cache page" in caplog.text
-    cache.put(titles[-1], {"title": "again"})
-    assert cache.get(titles[-1]) == {"title": "again"}
+    (entry,) = [
+        path
+        for path in (tmp_path / "lab" / "cache").rglob("*.json")
+        if normalize_title(titles[0]) in path.read_text(encoding="utf-8")
+    ]
+    entry.write_text("someone tidied this file up", encoding="utf-8")
+    assert cache.get(titles[0]) is None
+    assert "unreadable cache entry" in caplog.text
+    assert cache.get(titles[1])["title"] == titles[1]
 
 
 # -- repair turns ------------------------------------------------------------

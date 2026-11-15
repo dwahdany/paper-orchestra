@@ -131,7 +131,7 @@ def test_push_mode_puts_pages_in_the_prompt_for_providers_without_tools(tmp_path
     )
     request = client.requests[0]
     assert request.memory is None and request.tools == {}
-    assert "you cannot open other pages" in request.system
+    assert "You cannot open pages in this session" in request.system
     assert "[[literature/Vaswani2017Attention]]" in request.system
     text = request.text
     assert text.index("<memory>") < text.index("Write the related work.")
@@ -290,7 +290,15 @@ def test_create_from_config(tmp_path):
     assert not harness.project.is_read_only("wiki/lessons/x.md")
     assert "[[sources/experimental_log]]" in harness.project.standing_notes()
     assert harness.lab.index_max_lines == 80 and harness.lab.standing_max_lines == 15
-    assert "literature-cache" in harness.lab.always_collapse
+    # Data kept for pipeline code only sits beside the lab wiki, where no session can read it.
+    assert harness.cache.root == tmp_path / "lab" / "cache"
+    harness.cache.put("semantic-scholar", "a title", {"abstract": "Secret abstract"})
+    assert harness.lab.list("wiki") == [] and harness.lab.grep("Secret") == []
+    # The run's inputs and drafts are scanned before anything is shared with the lab.
+    draft = tmp_path / "run" / "latex_writeup" / "raw_draft_paper.tex"
+    draft.parent.mkdir(parents=True)
+    draft.write_text("We introduce GlimmerNet.", encoding="utf-8")
+    assert "GlimmerNet" in harness.leak_scanner().reason("GlimmerNet tables overflow.")
     # Re-creating the harness (a resumed run) keeps standing notes a dream has rewritten.
     harness.project.set_standing_notes("- curated rule")
     again = ContextHarness.create(cfg, client_for=lambda model: FakeLLM(["x"]))
@@ -424,3 +432,89 @@ def test_lab_consolidation_can_be_left_to_a_separate_pass(tmp_path):
     report = harness.consolidate_lab_memory()
     assert report.scope == "lab" and report.llm_used and report.notes_archived == 1
     assert labels == ["dream.project", "dream.lab"]
+
+
+def test_runs_read_the_lab_index_but_never_rewrite_it(tmp_path):
+    client = FakeLLM(lambda request: "ok")
+    harness = make_harness(tmp_path, client, lab=True)
+    index = harness.lab.root / "MEMORY.md"
+    # Another process (the lab consolidation) changes the shared wiki while this run works.
+    index.write_text(index.read_text().replace("_None yet._", "- Rule from the consolidator."))
+    (harness.lab.root / "wiki" / "lessons" / "new.md").write_text("A [[Latex]] lesson.")
+    consolidated = index.read_text()
+
+    harness.note("a lesson", stage="outline", kind="lesson")
+    harness.write_page("wiki/paper/outline.md", "The outline.", {"summary": "outline"})
+    harness.refresh()
+    harness.generate("task", agent="writer", stage="outline", model="fake")
+    harness.dream(stage="outline", focus="f")
+    harness.refresh()
+
+    assert index.read_text() == consolidated
+    assert (harness.lab.root / "wiki" / "lessons" / "new.md").read_text() == "A [[Latex]] lesson."
+    # The run still sees the consolidator's standing notes, and its own index is maintained.
+    assert "Rule from the consolidator." in client.requests[0].system
+    assert "[[paper/outline]]" in harness.project.injected_context()
+
+
+def test_task_sessions_do_not_see_unchecked_lab_notes(tmp_path):
+    def responder(request: FakeRequest) -> str:
+        listing = request.memory.view("/memories")
+        assert "/memories/lab/wiki" in listing and "/memories/lab/notes" not in listing
+        assert "/memories/notes" in listing  # this run's own notes are visible
+        with pytest.raises(ToolError, match="does not exist"):
+            request.memory.view("/memories/lab/notes")
+        with pytest.raises(ToolError, match="does not exist"):
+            request.memory.view("/memories/lab/" + pending)
+        for exact in (False, True):
+            found = request.call_tool("wiki_search", {"query": "quokka", "exact": exact})
+            assert "/memories/notes/" in found and "/memories/lab" not in found
+        assert "/memories/lab/wiki/lessons/latex.md" in request.call_tool(
+            "wiki_search", {"query": "cleveref", "scope": "lab"}
+        )
+        return "ok"
+
+    harness = make_harness(tmp_path, FakeLLM(responder), lab=True)
+    pending = harness.lab.add_note("An unchecked quokka lesson from another run.", kind="lesson")
+    harness.note("Our own quokka observation.", stage="outline")
+    harness.generate("task", agent="writer", stage="outline", model="fake")
+
+
+def test_push_mode_supplies_lessons_when_the_caller_names_nothing(tmp_path):
+    client = FakeLLM(lambda request: "ok", capabilities=PUSH_ONLY)
+    harness = make_harness(tmp_path, client, lab=True)
+    harness.generate("first task", agent="writer", stage="outline", model="fake")
+    # Nothing has been learned yet: only the lab's lessons are there to give.
+    first = client.requests[0]
+    assert "You cannot open pages in this session" in first.system
+    assert '<page path="/memories/lab/wiki/lessons/latex.md">' in first.text
+    assert "sources/idea" not in first.text  # inputs are in the agents' own prompts
+
+    harness.project.write(
+        "wiki/lessons/revisions.md", "Late limitations paragraphs lowered scores.", {"summary": "s"}
+    )
+    harness.project.write("wiki/synthesis/themes.md", "Two clusters of work.", {"summary": "s"})
+    harness.note("v2 REJECTED: Overall 6 -> 5", stage="refinement", kind="lesson")
+    harness.note("stage finished", stage="refinement", kind="observation")
+    harness.generate("second task", agent="reviser", stage="refinement", model="fake")
+    text = client.requests[1].text
+    for fragment in (
+        "Late limitations paragraphs lowered scores.",
+        "Two clusters of work.",
+        "v2 REJECTED: Overall 6 -> 5",
+        "Use cleveref.",
+    ):
+        assert fragment in text
+    assert "stage finished" not in text and text.rstrip().endswith("second task")
+    # A session with memory off, or one that names its pages, gets exactly what it asked for.
+    harness.generate("plain", agent="a", stage="s", model="fake", memory=MemoryPolicy.none())
+    assert "<memory>" not in client.requests[2].text
+    harness.generate("pinned", agent="a", stage="s", model="fake", pinned=["wiki/sources/idea.md"])
+    assert "We propose FooNet." in client.requests[3].text
+    assert "Late limitations" not in client.requests[3].text
+    # A session that must not see the lab is not handed its pages either.
+    harness.generate(
+        "no lab", agent="a", stage="s", model="fake", memory=MemoryPolicy(write="none", lab=False)
+    )
+    assert "Use cleveref." not in client.requests[4].text
+    assert "lab_memory_index" not in client.requests[4].system

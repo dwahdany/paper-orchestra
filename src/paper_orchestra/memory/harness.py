@@ -19,6 +19,7 @@ import logging
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ValidationError
@@ -42,6 +43,7 @@ from paper_orchestra.llm.base import (
 )
 from paper_orchestra.llm.parsing import parse_json
 from paper_orchestra.memory import prompts
+from paper_orchestra.memory.cache import KeyValueCache
 from paper_orchestra.memory.tools import (
     WikiMemoryBackend,
     transcript_search_tool,
@@ -53,7 +55,7 @@ from paper_orchestra.memory.wiki import INDEX_FILE, WIKI_DIR, Wiki, WikiError, l
 
 if TYPE_CHECKING:
     from paper_orchestra.config import DreamMode, PipelineConfig
-    from paper_orchestra.memory.dreaming import DreamReport
+    from paper_orchestra.memory.dreaming import DreamReport, LeakScanner
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +71,13 @@ CODE_OWNED_SECTIONS = (
     "wiki/paper/",
     "wiki/drafts/",
 )
+
+#: What a session that cannot open pages is given: the knowledge earlier sessions wrote
+#: down (project and lab), and the lessons that are still waiting to be consolidated.
+PUSH_PROJECT_SECTIONS = ("wiki/lessons", "wiki/synthesis")
+PUSH_LAB_SECTIONS = ("wiki/lessons", "wiki/venues")
+PUSH_MAX_NOTES = 12
+PUSH_BUDGET_CHARS = 40_000
 
 #: Seeded into a new project wiki: the facts every session should start from.
 SEED_STANDING_NOTES = """\
@@ -87,6 +96,9 @@ class MemoryPolicy:
     lab_write: Literal["none", "all"] = "none"
     #: Offer ``transcript_search`` (consolidation sessions).
     transcripts: bool = False
+    #: Show the lab memory beside the project memory.  Off for sessions whose output
+    #: becomes material for the paper, which must come from this run alone.
+    lab: bool = True
 
     @classmethod
     def none(cls) -> MemoryPolicy:
@@ -104,7 +116,7 @@ class MemoryPolicy:
     @classmethod
     def dream(cls) -> MemoryPolicy:
         """Consolidation: may edit pages and standing notes, and search transcripts."""
-        return cls(write="all", transcripts=True)
+        return cls(write="all", transcripts=True, lab=False)
 
 
 def _schema_json(schema: Schema) -> str:
@@ -141,7 +153,10 @@ class HarnessConversation:
         client: LLMClient,
         label: str,
         writes: list[tuple[str, str]],
+        reads: list[tuple[str, str]] | None = None,
         text_only_schema: bool = False,
+        push: bool = False,
+        push_lab: bool = False,
     ) -> None:
         self._harness = harness
         self._conversation = conversation
@@ -150,8 +165,13 @@ class HarnessConversation:
         self._first = True
         self._text_schema = text_only_schema
         self._recorded = Usage()
+        #: Push mode: the session cannot open pages, so the harness hands it some.
+        self._push = push
+        self._push_lab = push_lab
         #: ``(scope, path)`` of every memory file this session wrote.
         self.writes = writes
+        #: ``(scope, path)`` of every memory file this session opened.
+        self.reads = reads if reads is not None else []
         self.model = conversation.model
 
     @property
@@ -170,10 +190,18 @@ class HarnessConversation:
         retrieve: str | None = None,
         k: int = 6,
     ) -> LLMResponse:
-        """Send a user turn.  ``pinned``/``retrieve`` add memory pages to the first turn."""
+        """Send a user turn.  ``pinned``/``retrieve`` add memory pages to the first turn.
+
+        A session that cannot open pages itself (push mode) is given the lessons
+        and syntheses in memory when the caller names nothing.
+        """
         content = normalize_parts(parts)
-        if self._first and (pinned or retrieve):
-            block = self._harness.context_block(pinned=pinned, query=retrieve, k=k)
+        if self._first:
+            block = ""
+            if pinned or retrieve:
+                block = self._harness.context_block(pinned=pinned, query=retrieve, k=k)
+            elif self._push:
+                block = self._harness.default_push_block(lab=self._push_lab)
             if block:
                 content = [Text(block), *content]
         self._first = False
@@ -248,6 +276,8 @@ class ContextHarness:
         dream_mode: DreamMode = "stages",
         dream_model: str | None = None,
         consolidate_lab: bool = True,
+        cache: KeyValueCache | None = None,
+        protected: Sequence[Path] = (),
     ) -> None:
         if client_for is None:
             from paper_orchestra.llm.router import get_client
@@ -265,6 +295,12 @@ class ContextHarness:
         #: leaves folding them into pages to a separate, single consolidation (used where
         #: several runs share the lab memory on storage without file locking).
         self.consolidate_lab = consolidate_lab
+        #: Data kept across runs for pipeline code only (never shown to a model).
+        self.cache = cache
+        #: Files and directories that hold this paper's content, beside the wiki pages.
+        self._protected: list[Path] = [Path(path) for path in protected]
+        self._scanner: LeakScanner | None = None
+        self._scanner_signature: tuple[Any, ...] | None = None
         self._lock = threading.RLock()
         self._dirty: set[str] = set()
 
@@ -301,19 +337,36 @@ class ContextHarness:
                 lab_dir,
                 name="lab",
                 description="Process lessons shared across papers. Never paper content.",
-                read_only=("wiki/literature-cache/",),
+                read_only=(),
                 # Both indexes are injected into the same prompt, so the shared one is kept
-                # much smaller, and the bibliographic cache is never enumerated in it.
+                # much smaller.
                 index_max_lines=80,
                 index_max_bytes=8_000,
                 standing_max_lines=15,
-                always_collapse=("literature-cache",),
             )
             if lab_dir is not None
             else None
         )
         transcripts = TranscriptLog(project.root / "transcripts")
-        return cls(project=project, lab=lab, transcripts=transcripts, **common)
+        from paper_orchestra.context import RunPaths
+
+        paths = RunPaths(cfg.base_dir, cfg.idea_filename, cfg.experimental_log_filename)
+        return cls(
+            project=project,
+            lab=lab,
+            transcripts=transcripts,
+            # Beside the wiki, not in it: no memory tool, search or index reaches it.
+            cache=KeyValueCache(lab_dir / "cache") if lab_dir is not None else None,
+            protected=(
+                paths.materials_dir,
+                paths.latex_dir,
+                paths.refinement_dir,
+                paths.outline,
+                paths.plotting_results,
+                paths.final_tex,
+            ),
+            **common,
+        )
 
     # -- basics ----------------------------------------------------------------
 
@@ -332,11 +385,17 @@ class ContextHarness:
             self._dirty.add(scope)
 
     def _index(self, scope: str) -> str:
-        """The injected index of a wiki, regenerated first if pages changed."""
+        """The injected index of a wiki, regenerated first if pages changed.
+
+        Only the project index is regenerated here.  The lab memory is shared
+        between runs, possibly on storage where the last writer wins, so a run
+        reads its index as it is and only ever adds notes; the index is rewritten
+        by the lab consolidation alone, under its lock.
+        """
         wiki = self._wiki(scope)
         assert wiki is not None
         with self._lock:
-            if scope in self._dirty:
+            if scope == "project" and scope in self._dirty:
                 wiki.rebuild_index()
                 self._dirty.discard(scope)
         return wiki.injected_context()
@@ -372,13 +431,17 @@ class ContextHarness:
         writes: list[tuple[str, str]] = []
         all_tools = list(tools)
         backend: WikiMemoryBackend | None = None
+        reads: list[tuple[str, str]] = []
         lab_only = memory_root == "lab"
         root_wiki = self.lab if lab_only else self.project
         scope_name = "lab" if lab_only else "project"
+        push = False
+        mounted_lab: Wiki | None = None
 
         if self.project is not None and root_wiki is not None and policy.read:
             pull = client.capabilities.memory_tool
-            mounted_lab = None if lab_only else self.lab
+            push = not pull and not lab_only
+            mounted_lab = None if lab_only or not policy.lab else self.lab
             if lab_only:
                 block = prompts.lab_memory_block(self._index("lab"))
             else:
@@ -398,6 +461,7 @@ class ContextHarness:
 
                 def on_read(scope: str, rel: str) -> None:
                     scope = scope_name if lab_only else scope
+                    reads.append((scope, rel))
                     self.record("memory_read", stage=stage, agent=agent, scope=scope, path=rel)
 
                 backend = WikiMemoryBackend(
@@ -412,7 +476,10 @@ class ContextHarness:
                 )
                 all_tools.append(wiki_search_tool(root_wiki, mounted_lab))
                 if policy.transcripts and self.transcripts is not None and not lab_only:
-                    all_tools.append(transcript_search_tool(self.transcripts))
+                    # A session that checks claims must not find its own questions.
+                    all_tools.append(
+                        transcript_search_tool(self.transcripts, exclude_agents=(agent,))
+                    )
 
         if all_tools and not client.capabilities.tools:
             raise LLMConfigError(
@@ -442,8 +509,11 @@ class ContextHarness:
             client=client,
             label=label,
             writes=writes,
+            reads=reads,
             # A response format and search citations do not combine: go straight to text.
             text_only_schema=web_search is not None and client.capabilities.web_search,
+            push=push,
+            push_lab=mounted_lab is not None,
         )
 
     def generate(
@@ -508,38 +578,79 @@ class ContextHarness:
         query: str | None = None,
         k: int = 6,
         budget_chars: int = 60_000,
+        lab_pinned: Sequence[str] = (),
     ) -> str:
         """Render pinned pages plus the top ``k`` search hits for ``query`` as one block.
 
         Pages are included whole, in order, until the character budget is used;
         a page that would overflow is replaced by a pointer to its path.
+        ``lab_pinned`` names pages of the lab memory to include after them.
         """
         if self.project is None:
             return ""
-        chosen: list[str] = []
+        chosen: list[tuple[Wiki, str, bool]] = []
+        seen: set[str] = set()
         for rel in pinned:
-            if rel not in chosen and self.project.exists(rel):
-                chosen.append(rel)
+            if rel not in seen and self.project.exists(rel):
+                seen.add(rel)
+                chosen.append((self.project, rel, False))
         if query:
             for hit in self.project.search(query, k=k, prefix=WIKI_DIR):
-                if hit.path not in chosen:
-                    chosen.append(hit.path)
+                if hit.path not in seen:
+                    seen.add(hit.path)
+                    chosen.append((self.project, hit.path, False))
+        if self.lab is not None:
+            chosen.extend((self.lab, rel, True) for rel in lab_pinned if self.lab.exists(rel))
         if not chosen:
             return ""
         sections: list[str] = []
         used = 0
-        for rel in chosen:
+        for wiki, rel, is_lab in chosen:
             try:
-                text = self.project.read_text(rel).strip()
+                text = wiki.read_text(rel).strip()
             except WikiError:
                 continue
-            path = virtual_path(rel)
+            path = virtual_path(rel, lab=is_lab)
             if used + len(text) > budget_chars:
                 sections.append(f'<page path="{path}" omitted="too long for this prompt"/>')
                 continue
             used += len(text)
             sections.append(f'<page path="{path}">\n{text}\n</page>')
         return "<memory>\n" + "\n".join(sections) + "\n</memory>"
+
+    def default_push_block(self, *, lab: bool = True) -> str:
+        """What a session that cannot open pages is given when its caller names nothing.
+
+        The lessons and syntheses that consolidation wrote (newest first), the
+        lesson notes still waiting to be consolidated, and, with ``lab``, the
+        lab memory's lessons and venue rules.  The inputs are not repeated: the
+        agents already put them in their prompts.
+        """
+        if self.project is None:
+            return ""
+        pages = [
+            info
+            for section in PUSH_PROJECT_SECTIONS
+            for info in self.project.list(section)
+            if not self.project.read(info.path).meta.get("auto")
+        ]
+        pages.sort(key=lambda info: info.updated, reverse=True)
+        notes = [
+            info.path for info in reversed(self.project.pending_notes()) if info.kind == "lesson"
+        ][:PUSH_MAX_NOTES]
+        lab_pages: list[str] = []
+        if lab and self.lab is not None:
+            lab_pages = [
+                info.path
+                for section in PUSH_LAB_SECTIONS
+                for info in self.lab.list(section)
+                if not self.lab.read(info.path).meta.get("auto")
+            ]
+        return self.context_block(
+            pinned=[*(info.path for info in pages), *notes],
+            lab_pinned=lab_pages,
+            budget_chars=PUSH_BUDGET_CHARS,
+        )
 
     def write_page(
         self,
@@ -642,15 +753,62 @@ class ContextHarness:
         self.transcripts.record({"type": type, "stage": stage, "agent": agent, **fields})
 
     def refresh(self) -> None:
-        """Repair links and regenerate the index of each wiki."""
-        for scope in ("project", "lab"):
-            wiki = self._wiki(scope)
-            if wiki is None:
-                continue
-            wiki.repair_links()
-            wiki.rebuild_index()
-            with self._lock:
-                self._dirty.discard(scope)
+        """Repair links and regenerate the index of the project wiki.
+
+        The lab wiki is left alone: it is maintained only by its consolidation
+        (see :meth:`_index`).
+        """
+        if self.project is None:
+            return
+        self.project.repair_links()
+        self.project.rebuild_index()
+        with self._lock:
+            self._dirty.discard("project")
+
+    def protect(self, *paths: str | Path) -> None:
+        """Declare files or directories whose text is this paper's content.
+
+        Whatever they contain is kept out of the lab memory by the leak scan,
+        in addition to the content pages of the project wiki.
+        """
+        with self._lock:
+            for path in paths:
+                if Path(path) not in self._protected:
+                    self._protected.append(Path(path))
+            self._scanner = None
+
+    def leak_scanner(self) -> LeakScanner:
+        """The scanner for text headed to the lab memory, rebuilt when the materials change."""
+        from paper_orchestra.memory.dreaming import (
+            CONTENT_SECTIONS,
+            LeakScanner,
+            content_sources,
+            protected_files,
+            venue_materials,
+        )
+
+        if self.project is None:
+            return LeakScanner(())
+        with self._lock:
+            entries: list[tuple[Any, ...]] = [
+                (info.path, info.size, info.updated)
+                for section in CONTENT_SECTIONS
+                for info in self.project.list(section.rstrip("/"))
+            ]
+            for file in protected_files(self._protected):
+                try:
+                    stat = file.stat()
+                except OSError:
+                    continue
+                entries.append((str(file), stat.st_size, stat.st_mtime_ns))
+            signature = tuple(entries)
+            if self._scanner is None or signature != self._scanner_signature:
+                self._scanner = LeakScanner(
+                    content_sources(self.project, self._protected),
+                    venue_materials(self.project, self._protected),
+                )
+                self._scanner_signature = signature
+            return self._scanner
 
     def consolidate_lab_memory(self, *, model: str | None = None) -> DreamReport | None:
         """Fold pending lab notes into lab pages (the second half of promotion)."""
@@ -669,11 +827,9 @@ class ContextHarness:
 
     def _lab_guard(self, scope: str, text: str) -> str | None:
         """Veto text headed for the shared memory if it carries this paper's content."""
-        from paper_orchestra.memory.dreaming import content_sources, leak_reason
-
         if self.project is None:
             return None
-        return leak_reason(text, content_sources(self.project))
+        return self.leak_scanner().reason(text)
 
     # -- consolidation ---------------------------------------------------------
 

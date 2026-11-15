@@ -249,3 +249,30 @@ def test_unreadable_and_symlinked_pages_are_skipped_not_fatal(tmp_path):
     assert "SECRET" not in wiki.rebuild_index()
     assert wiki.search("secret") == [] and wiki.grep("secret") == []
     assert wiki.lint().ok
+
+
+def test_lint_reports_only_what_a_consolidation_can_change(tmp_path):
+    wiki = Wiki(tmp_path / "w", soft_page_bytes=200)
+    wiki.write("wiki/sources/log.md", "x" * 500, {"summary": "the log"}, force=True)
+    wiki.write("wiki/literature/index.md", "y" * 500, {"auto": True}, force=True)
+    wiki.rebuild_index()
+    report = wiki.lint()
+    assert report.oversize == [] and report.ok  # records and generated pages are not flagged
+    wiki.write("wiki/lessons/long.md", "z" * 500, {"summary": "s"})
+    assert [path for path, _ in wiki.lint().oversize] == ["wiki/lessons/long.md"]
+
+
+def test_links_in_the_standing_notes_are_checked_and_repaired(tmp_path):
+    wiki = Wiki(tmp_path / "w")
+    wiki.write("wiki/sources/experimental_log.md", "Accuracy 91.2", {"summary": "log"}, force=True)
+    wiki.set_standing_notes(
+        "- Numbers come from the log -> [[Experimental_Log]]\n- See [[lessons/gone]] too."
+    )
+    assert sorted(wiki.lint().broken_links) == [
+        ("MEMORY.md", "Experimental_Log"),
+        ("MEMORY.md", "lessons/gone"),
+    ]
+    assert wiki.repair_links() == [("MEMORY.md", "Experimental_Log", "sources/experimental_log")]
+    assert "[[sources/experimental_log]]" in wiki.standing_notes()
+    assert wiki.lint().broken_links == [("MEMORY.md", "lessons/gone")]  # nothing to guess from
+    assert wiki.repair_links() == []

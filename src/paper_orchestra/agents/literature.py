@@ -28,9 +28,7 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import itertools
-import json
 import logging
 import re
 import string
@@ -45,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from paper_orchestra.agents.outline import write_outline_page
 from paper_orchestra.llm.base import LLMParseError, WebSearch
-from paper_orchestra.llm.parsing import parse_json_object, parse_latex
+from paper_orchestra.llm.parsing import parse_latex
 from paper_orchestra.memory.harness import MemoryPolicy
 from paper_orchestra.memory.wiki import WikiError
 from paper_orchestra.prompts.literature import (
@@ -78,7 +76,8 @@ AGENT = "LiteratureAgent"
 STAGE = "literature"
 DISCOVERY_LABEL = "literature.discovery"
 LITERATURE_DIR = "wiki/literature"
-CACHE_DIR = "wiki/literature-cache"
+#: Namespace of the cross-run Semantic Scholar cache (see ``memory.cache``).
+CACHE_NAMESPACE = "semantic-scholar"
 
 INTRO_SECTION = "Introduction"
 DEFAULT_VENUE = "arXiv"
@@ -94,8 +93,6 @@ _MAX_CONSECUTIVE_LOOKUP_FAILURES = 5
 
 # The cache is a fixed set of shard pages, each kept under the wiki's soft page size, so it
 # stays bounded however many papers pass through the lab memory.
-_CACHE_SHARDS = 64
-_CACHE_SHARD_CHARS = 30_000
 
 #: Words that are skipped when a citation key is built from a title.
 _KEY_STOPWORDS = frozenset(
@@ -692,39 +689,22 @@ def _record_year(record: Mapping[str, Any]) -> int | None:
 
 
 class _ScholarCache:
-    """Semantic Scholar matches kept in the lab wiki across runs.
+    """Semantic Scholar matches kept across runs, beside the lab memory.
 
     Only public bibliographic metadata is stored, and only for papers that
     passed the cutoff of the run that fetched them.  An entry remembers that
     cutoff: a later run with a later cutoff might be owed a newer paper of the
     same name, so it looks the title up again.  Every hit is re-checked
     against the current cutoff by the caller.
+
+    The entries live in the harness's cache, outside the wiki, so no model
+    session can read them: a paper may only use records that its own
+    literature stage verified against its own cutoff.
     """
 
     def __init__(self, harness: ContextHarness, cutoff: str | None) -> None:
-        self._harness = harness
+        self._store = harness.cache
         self._cutoff = cutoff or None
-
-    @staticmethod
-    def _page(key: str) -> str:
-        shard = hashlib.sha256(key.encode("utf-8")).digest()[0] % _CACHE_SHARDS
-        return f"{CACHE_DIR}/shard-{shard:02d}.md"
-
-    def _entries(self, rel: str) -> list[dict[str, Any]]:
-        body = self._harness.read_page(rel, scope="lab")
-        if body is None:
-            return []
-        entries = (parse_json_object(body) or {}).get("entries")
-        if not isinstance(entries, list):
-            log.warning("Ignoring the unreadable literature cache page %s", rel)
-            return []
-        return [
-            entry
-            for entry in entries
-            if isinstance(entry, dict)
-            and isinstance(entry.get("query"), str)
-            and isinstance(entry.get("paper"), dict)
-        ]
 
     def _covers(self, cached_cutoff: Any) -> bool:
         """Whether a match chosen under ``cached_cutoff`` is still the best choice now."""
@@ -738,40 +718,24 @@ class _ScholarCache:
         return wanted is not None and wanted <= cached
 
     def get(self, title: str) -> dict[str, Any] | None:
-        key = normalize_title(title)
-        for entry in self._entries(self._page(key)):
-            if entry["query"] == key and self._covers(entry.get("cutoff")):
-                return entry["paper"]
+        if self._store is None:
+            return None
+        entry = self._store.get(CACHE_NAMESPACE, normalize_title(title))
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("paper"), dict)
+            and self._covers(entry.get("cutoff"))
+        ):
+            return entry["paper"]
         return None
 
     def put(self, title: str, paper: Mapping[str, Any]) -> None:
-        key = normalize_title(title)
-        rel = self._page(key)
-        entries = [entry for entry in self._entries(rel) if entry["query"] != key]
-        entries.append({"query": key, "cutoff": self._cutoff, "paper": dict(paper)})
-
-        def render() -> str:
-            text = json.dumps({"entries": entries}, indent=1, ensure_ascii=False)
-            # A backtick run inside an abstract must not end the Markdown fence early.
-            return text.replace("`", "\\u0060")
-
-        while len(entries) > 1 and len(render()) > _CACHE_SHARD_CHARS:
-            entries.pop(0)  # oldest first
-        body = (
-            f"# Semantic Scholar cache, {PurePosixPath(rel).stem}\n\n"
-            "Public bibliographic metadata returned by Semantic Scholar title lookups. "
-            "Pipeline code reads and rewrites the JSON below.\n\n"
-            f"```json\n{render()}\n```"
-        )
-        meta = {
-            "title": f"Semantic Scholar cache {PurePosixPath(rel).stem}",
-            "summary": "Machine-readable cache of Semantic Scholar title lookups (public metadata).",
-            "kind": "cache",
-        }
-        try:
-            self._harness.write_page(rel, body, meta, scope="lab")
-        except WikiError as exc:
-            log.warning("Could not update the literature cache page %s: %s", rel, exc)
+        if self._store is not None:
+            self._store.put(
+                CACHE_NAMESPACE,
+                normalize_title(title),
+                {"cutoff": self._cutoff, "paper": dict(paper)},
+            )
 
 
 # ---------------------------------------------------------------------------

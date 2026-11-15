@@ -10,7 +10,7 @@ pages and transcripts is offered as two ordinary tools.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -76,7 +76,12 @@ class WikiMemoryBackend:
         on_read: Callable[[str, str], None] | None = None,
         guard: Callable[[str, str], str | None] | None = None,
     ) -> None:
-        """``guard(scope, text)`` may veto a write by returning the reason (leak checks)."""
+        """``guard(scope, text)`` may veto a write by returning the reason (leak checks).
+
+        Of a lab wiki mounted beside the project only the pages are visible.  Its
+        notes are lessons that no consolidation has checked yet, and they are read
+        by the lab's own consolidation session alone (where the lab is ``project``).
+        """
         self.project = project
         self.lab = lab
         self.write = write
@@ -107,6 +112,8 @@ class WikiMemoryBackend:
         if rest and rest[0] == LAB_PREFIX:
             if self.lab is None:
                 raise ToolError(f"The path {path} does not exist. There is no lab memory here.")
+            if len(rest) > 1 and rest[1] == NOTES_DIR:
+                raise ToolError(f"The path {path} does not exist. Please provide a valid path.")
             return self.lab, "/".join(rest[1:]), True
         return self.project, "/".join(rest), False
 
@@ -170,7 +177,7 @@ class WikiMemoryBackend:
         files: dict[str, int] = {}
         if not rel and (wiki.root / INDEX_FILE).is_file():
             files[INDEX_FILE] = (wiki.root / INDEX_FILE).stat().st_size
-        prefixes = [rel] if rel else [WIKI_DIR, NOTES_DIR]
+        prefixes = [rel] if rel else ([WIKI_DIR] if is_lab else [WIKI_DIR, NOTES_DIR])
         for prefix in prefixes:
             for info in wiki.list(prefix):
                 if info.path.startswith(CONSOLIDATED_DIR + "/") and not rel.startswith(
@@ -374,7 +381,11 @@ class WikiMemoryBackend:
 
 
 def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
-    """Full-text search over wiki pages and unconsolidated notes."""
+    """Full-text search over wiki pages and unconsolidated notes.
+
+    In a lab wiki mounted beside the project only pages are searched: its pending
+    notes are unchecked lessons from other runs.
+    """
     scopes = ["project", "lab", "all"] if lab is not None else ["project"]
 
     def handler(tool_input: dict[str, Any]) -> str:
@@ -390,6 +401,7 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
         except (TypeError, ValueError) as exc:
             raise ToolError("k must be an integer") from exc
         prefix = f"{WIKI_DIR}/{section}" if section else ""
+        lab_prefix = prefix or WIKI_DIR
         if tool_input.get("exact"):
             lines: list[str] = []
             if scope in ("project", "all"):
@@ -400,7 +412,7 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
             if lab is not None and scope in ("lab", "all"):
                 lines += [
                     f"{virtual_path(rel, lab=True)}:{number}: {line}"
-                    for rel, number, line in lab.grep(query, k=k, prefix=prefix)
+                    for rel, number, line in lab.grep(query, k=k, prefix=lab_prefix)
                 ]
             return "\n".join(lines[:k]) if lines else "No line contains that text verbatim."
         hits: list[tuple[float, str]] = []
@@ -408,7 +420,7 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
             for hit in project.search(query, k=k, prefix=prefix):
                 hits.append((hit.score, f"{virtual_path(hit.path)}: {hit.title}\n   {hit.snippet}"))
         if lab is not None and scope in ("lab", "all"):
-            for hit in lab.search(query, k=k, prefix=prefix):
+            for hit in lab.search(query, k=k, prefix=lab_prefix):
                 hits.append(
                     (
                         hit.score,
@@ -446,8 +458,9 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
         description=(
             "Search the memory wiki by keyword. Returns the best-matching pages and "
             "unconsolidated notes with their /memories paths, titles and a matching line. Use "
-            "it to find a page when the index does not name it, for example a cited paper by "
-            "topic or a lesson about an error message. It searches page text, not the "
+            "it to find a page when the index does not name it, for example a paper in this "
+            "run's verified bibliography by topic or a lesson about an error message. It "
+            "searches page text, not the "
             "transcripts, and returns snippets only: open a page with the memory tool to read "
             "it in full. Keyword search treats 87.3 as the words 87 and 3, so set exact to "
             "true when you are checking a number or a quotation."
@@ -462,8 +475,17 @@ def wiki_search_tool(project: Wiki, lab: Wiki | None = None) -> ToolSpec:
     )
 
 
-def transcript_search_tool(transcripts: TranscriptLog) -> ToolSpec:
-    """Search the raw event log, to check a note or page against what happened."""
+def transcript_search_tool(
+    transcripts: TranscriptLog, *, exclude_agents: Sequence[str] = ()
+) -> ToolSpec:
+    """Search the raw event log, to check a note or page against what happened.
+
+    ``exclude_agents`` names the agents whose events are not evidence: the
+    session that is doing the checking.  Its own prompts quote the notes under
+    review and its own searches contain the query, so without this every search
+    would find itself.
+    """
+    skipped = tuple(exclude_agents)
 
     def handler(tool_input: dict[str, Any]) -> str:
         query = tool_input.get("query")
@@ -475,9 +497,9 @@ def transcript_search_tool(transcripts: TranscriptLog) -> ToolSpec:
         except (TypeError, ValueError) as exc:
             raise ToolError("k must be an integer") from exc
         if tool_input.get("exact"):
-            hits = transcripts.grep(query, k=k, stage=stage)
+            hits = transcripts.grep(query, k=k, stage=stage, exclude_agents=skipped)
         else:
-            hits = transcripts.search(query, k=k, stage=stage)
+            hits = transcripts.search(query, k=k, stage=stage, exclude_agents=skipped)
         if not hits:
             return "No matching transcript events."
         return "\n".join(
@@ -494,7 +516,9 @@ def transcript_search_tool(transcripts: TranscriptLog) -> ToolSpec:
             "it to verify a claim before recording it as fact, for example whether a compile "
             "error really occurred and what fixed it, or what scores a revision received. "
             "Returns matching events with their stage, time and a snippet; it does not return "
-            "whole transcripts."
+            "whole transcripts. Consolidation sessions such as this one are left out, so a "
+            "result is evidence from the run itself. An event of type 'note' is a claim some "
+            "session made, not a record of what happened."
         ),
         input_schema={
             "type": "object",

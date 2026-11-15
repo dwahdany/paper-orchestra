@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import os
+import socket
+import subprocess
+import sys
 import time
 
-from paper_orchestra.llm.base import Capabilities, LLMError
+import pytest
+
+from paper_orchestra.llm.base import Capabilities, LLMConfigError, LLMError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
 from paper_orchestra.memory.dreaming import (
     LOCK_FILE,
+    MAX_INLINE_NOTE_CHARS,
     STALE_LOCK_SECONDS,
+    LeakScanner,
+    content_sources,
     dream,
     leak_reason,
+    numbers_in,
     promote_lessons,
     unverified_numbers,
+    venue_materials,
 )
 
 
@@ -276,3 +286,281 @@ def test_lock_serialises_dreams_and_recovers_from_stale_locks(tmp_path):
     os.utime(lock, (old, old))
     recovered = dream(harness, stage="s", focus="f", model="fake", use_model=True)
     assert recovered.error is None and not lock.exists()
+
+
+# -- what reaches the shared memory -------------------------------------------
+
+
+def test_numbers_are_compared_by_value_not_by_spelling():
+    assert numbers_in("2,908 steps, 87.30 and 007") >= {"2908", "87.3", "7"}
+    assert numbers_in("version 3.5.1") == set()  # not a number
+    sources = ["The corpus has 2,908 documents; ours scores 87.30 and 4.2 BLEU on 908 items."]
+    for text in ("We kept 2908 documents.", "Scored 87.3.", "A 4.2 gain.", "Only 908 items."):
+        assert "number" in leak_reason(text, sources), text
+    sources = ["Trained on 2908 documents."]
+    assert "2,908" in leak_reason("Mention the 2,908 documents early.", sources)
+    # Round figures, small integers, years and one-digit decimals identify nothing.
+    sources = ["100 epochs, 12 layers, batch 5000, lr 0.5, in 2024."]
+    assert (
+        leak_reason("Use 100 dpi, 12 pt, 5000 px, width 0.5, per the 2024 template.", sources)
+        is None
+    )
+
+
+def test_distinctive_names_from_the_paper_are_refused_however_they_are_spelled():
+    scanner = LeakScanner(
+        ["We propose FooNet, evaluated on CIFAR-10 and WidgetBench with BLEU, in LaTeX at CVPR."],
+        allowed=["Submissions to the XYZConf use the xyzconf.sty LaTeX style."],
+    )
+    assert "FooNet" in scanner.reason("Reviewers rewarded the FooNet ablation.")
+    assert "foonet" in scanner.reason("Put the foonet ablation first.")
+    assert "CIFAR-10" in scanner.reason("Report CIFAR-10 before the ablation.")
+    assert "WidgetBench" in scanner.reason("WidgetBench tables overflow the column.")
+    # Tools, venues and the field's vocabulary are not paper content, nor is the venue's
+    # own material; an upper-case word is only a name when written in upper case.
+    assert scanner.reason("LaTeX at CVPR needs the review option.") is None
+    assert scanner.reason("The XYZConf style redefines \\cite.") is None
+    assert scanner.reason("We bleu it; cvpr rules apply; add a note.") is None
+    assert scanner.has_sources and not LeakScanner([]).has_sources
+
+
+def test_the_scan_covers_everything_that_holds_paper_content(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    harness.write_page("wiki/sources/idea.md", "A sparse method for long documents.")
+    harness.write_page(
+        "wiki/sources/guidelines.md", "Papers are limited to eight pages excluding references."
+    )
+    harness.write_page(
+        "wiki/paper/outline.md", "Title: Sparse Routing Beats Dense Attention On Long Inputs"
+    )
+    harness.write_page(
+        "wiki/figures/fig-main.md", "Caption: latency grows linearly while quality stays flat"
+    )
+    harness.write_page(
+        "wiki/reviews/v1.md",
+        "Weaknesses: the comparison against retrieval baselines omits memory cost entirely.",
+    )
+    run = tmp_path / "run"
+    (run / "latex_writeup").mkdir(parents=True)
+    (run / "latex_writeup" / "raw_draft_paper.tex").write_text(
+        "\\section{Method} Our router assigns each token bucket a learned sparsity budget.",
+        encoding="utf-8",
+    )
+    (run / "latex_writeup" / "template.tex").write_text(
+        "\\usepackage[review]{venue} % camera ready uses the final option instead",
+        encoding="utf-8",
+    )
+    harness.protect(run / "latex_writeup")
+
+    sources = "\n".join(content_sources(harness.project, [run / "latex_writeup"]))
+    for fragment in ("Sparse Routing", "latency grows", "retrieval baselines", "token bucket"):
+        assert fragment in sources
+    assert "eight pages" not in sources and "camera ready" not in sources
+    venue = "\n".join(venue_materials(harness.project, [run / "latex_writeup"]))
+    assert "eight pages" in venue and "camera ready" in venue
+
+    lessons = {
+        "title": "For Sparse Routing Beats Dense Attention On Long Inputs, lead with speed.",
+        "caption": "Captions such as latency grows linearly while quality stays flat read well.",
+        "review": "When the comparison against retrieval baselines omits memory cost, add it.",
+        "draft": "Say that the router assigns each token bucket a learned sparsity budget.",
+        "venue": "Papers are limited to eight pages excluding references, so cut early.",
+        "template": "The camera ready uses the final option instead of review.",
+    }
+    for name, text in lessons.items():
+        harness.project.write(f"wiki/lessons/{name}.md", text, {"summary": name, "portable": True})
+    added = promote_lessons(harness)
+    shared = "\n".join(harness.lab.read(note).body for note in added)
+    assert len(added) == 2 and "eight pages" in shared and "camera ready" in shared
+    blocked = {e["path"] for e in harness.transcripts.events() if e["type"] == "promotion_blocked"}
+    assert blocked == {f"wiki/lessons/{n}.md" for n in ("title", "caption", "review", "draft")}
+    # A draft written later is protected too: the scanner follows the files.
+    (run / "latex_writeup" / "v2.tex").write_text("We call the method QuillFeather routing.")
+    assert "QuillFeather" in harness.leak_scanner().reason("QuillFeather needs an ablation.")
+
+
+def test_nothing_is_shared_when_there_is_nothing_to_scan_against(tmp_path):
+    project = Wiki(tmp_path / "project", name="project")
+    lab = Wiki(tmp_path / "lab", name="lab", read_only=())
+    harness = ContextHarness(
+        project=project,
+        lab=lab,
+        transcripts=TranscriptLog(project.root / "transcripts"),
+        client_for=lambda model: FakeLLM(["unused"]),
+    )
+    project.write("wiki/lessons/a.md", "Load cleveref last.", {"summary": "s", "portable": True})
+    assert promote_lessons(harness) == [] and lab.pending_notes() == []
+    (event,) = [e for e in harness.transcripts.events() if e["type"] == "promotion_blocked"]
+    assert "not available to scan against" in event["reason"]
+
+
+def test_portable_pages_are_promoted_from_any_section_and_tagged_with_their_run(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "unused"), lab=True, dream_mode="off")
+    harness.project.write(
+        "wiki/process/figures.md",
+        "Save figures as vector graphics so text stays sharp.",
+        {"summary": "s", "portable": True},
+    )
+    (first,) = promote_lessons(harness)
+    token = harness.lab.read(first).meta["run"]
+    assert len(str(token)) == 12 and "project" not in str(token)
+    assert promote_lessons(harness) == []  # unchanged: not shared twice
+    # The same run revising its lesson adds a note with the same run value, so the lab
+    # consolidation can tell it is one run and not independent evidence.
+    harness.project.write(
+        "wiki/process/figures.md",
+        "Save figures as vector graphics; raster only for photographs.",
+        {"summary": "s", "portable": True},
+    )
+    (second,) = promote_lessons(harness)
+    assert harness.lab.read(second).meta["run"] == token and second != first
+    other = make_harness(tmp_path / "other", FakeLLM(lambda r: "unused"), lab=True)
+    other.project.write("wiki/lessons/x.md", "Check overfull boxes.", {"portable": True})
+    (third,) = promote_lessons(other)
+    assert other.lab.read(third).meta["run"] != token
+
+
+def test_lab_dream_prompt_names_the_run_of_each_note(tmp_path):
+    prompts_seen: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        prompts_seen.append(request.text)
+        assert "count once as evidence" in request.system
+        return "ok"
+
+    harness = make_harness(tmp_path, FakeLLM(responder), lab=True, dream_mode="end")
+    harness.lab.add_note("Load cleveref last.", kind="lesson", meta={"run": "abc123abc123"})
+    harness.consolidate_lab_memory()
+    assert "run abc123abc123" in prompts_seen[0]
+
+
+# -- checking claims against the record ---------------------------------------
+
+
+def test_a_dream_never_finds_its_own_questions_in_the_transcript(tmp_path):
+    answers: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        # The note under review is quoted in this session's own prompt, and each search is
+        # recorded before it runs.  Neither may come back as evidence.
+        answers.append(
+            request.call_tool("transcript_search", {"query": "zebra stripes", "exact": True})
+        )
+        answers.append(request.call_tool("transcript_search", {"query": "zebra stripes"}))
+        answers.append(request.call_tool("transcript_search", {"query": "undefined cleverref"}))
+        answers.append(
+            request.call_tool("transcript_search", {"query": "zebra stripes", "exact": True})
+        )
+        return "Nothing supports the zebra note."
+
+    harness = make_harness(tmp_path, FakeLLM(responder))
+    harness.record("compile", stage="section_writing", errors=["Undefined cleverref package"])
+    harness.project.add_note("the zebra stripes fix worked", stage="refinement", kind="lesson")
+    report = harness.dream(stage="refinement", focus="check")
+    assert report.llm_used
+    assert answers[0] == answers[1] == answers[3] == "No matching transcript events."
+    assert "Undefined cleverref package" in answers[2] and "dreamer" not in answers[2]
+    # A second dream of the same run does not find the first one's traffic either.
+    harness.project.add_note("another zebra stripes claim", stage="refinement", kind="lesson")
+    answers.clear()
+    harness.dream(stage="finalize", focus="check")
+    assert answers[0] == "No matching transcript events."
+
+
+def test_only_notes_the_session_actually_read_are_archived(tmp_path):
+    long_fix = "Problem list. " + "x " * (MAX_INLINE_NOTE_CHARS // 2 + 10) + "THE FIX: use cleveref"
+    opened: list[str] = []
+
+    def responder(request: FakeRequest) -> str:
+        assert "short note about tables" in request.text
+        assert "THE FIX" not in request.text  # cut, and the prompt says so
+        assert "only the beginning is shown here" in request.text
+        for line in request.text.splitlines():
+            if "second-long" in line:
+                path = line.split()[1]
+                opened.append(path)
+                assert "THE FIX: use cleveref" in request.memory.view(path)
+        return "done"
+
+    harness = make_harness(tmp_path, FakeLLM(responder))
+    harness.project.add_note("short note about tables", stage="s", title="short")
+    harness.project.add_note(long_fix, stage="s", title="first-long")
+    harness.project.add_note(long_fix, stage="s", title="second-long")
+    report = harness.dream(stage="s", focus="f")
+    assert report.notes_seen == 3 and report.notes_archived == 2 and len(opened) == 1
+    (pending,) = harness.project.pending_notes()
+    assert "first-long" in pending.path  # never read, so it waits for the next dream
+
+
+def test_numbers_the_run_recorded_are_evidence_and_checked_numbers_do_not_reopen(tmp_path):
+    client = FakeLLM(lambda request: "Looked at it; the number stays.")
+    harness = make_harness(tmp_path, client)
+    harness.record("compile", stage="section_writing", errors=["l.1423 Undefined control sequence"])
+    harness.note("line 9999 is where it broke", stage="section_writing")  # a claim, not a record
+    harness.project.write(
+        "wiki/lessons/compile.md",
+        "The build stopped at l.1423; someone claimed line 9999; the delta was 1,234.5.",
+        {"summary": "s"},
+    )
+    flagged = unverified_numbers(harness.project, transcripts=harness.transcripts)
+    assert flagged == [("wiki/lessons/compile.md", "9999"), ("wiki/lessons/compile.md", "1,234.5")]
+    first = harness.dream(stage="section_writing", focus="check")  # one note pending: a session
+    assert first.llm_used and len(first.unverified_numbers) == 2
+    # The session saw those numbers and kept them.  They alone do not open another one.
+    second = harness.dream(stage="refinement", focus="check")
+    assert not second.llm_used and len(client.requests) == 1
+    harness.project.write("wiki/lessons/new.md", "A fresh claim: 77.77.", {"summary": "s"})
+    third = harness.dream(stage="refinement", focus="check")
+    assert third.llm_used and "states 77.77" in client.requests[-1].text
+
+
+def test_project_dreams_do_not_see_the_lab_memory(tmp_path):
+    def responder(request: FakeRequest) -> str:
+        assert "lab_memory_index" not in request.system and "/memories/lab" not in request.system
+        assert "only what the source pages" in request.system  # the isolation rule
+        assert "/memories/lab" not in request.memory.view("/memories")
+        with pytest.raises(Exception, match="no lab memory"):
+            request.memory.view("/memories/lab/wiki/lessons/other.md")
+        return "ok"
+
+    harness = make_harness(tmp_path, FakeLLM(responder), lab=True)
+    harness.lab.write("wiki/lessons/other.md", "From another paper.", {"summary": "s"})
+    harness.note("n", stage="s")
+    assert harness.dream(stage="s", focus="f").error is None
+
+
+def test_a_lock_left_by_a_dead_process_is_taken_over_at_once(tmp_path):
+    harness = make_harness(tmp_path, FakeLLM(lambda r: "ok"))
+    harness.note("n", stage="s")
+    finished = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True
+    )
+    dead_pid = int(finished.stdout)
+    lock = harness.project.root / LOCK_FILE
+    lock.write_text(f"{dead_pid} {socket.gethostname()}\n")
+    report = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
+    assert report.error is None and report.llm_used and not lock.exists()
+    # A live holder, or one on another machine, is respected until the lock goes stale.
+    for holder in (f"{os.getppid()} {socket.gethostname()}", f"{dead_pid} some-other-host"):
+        harness.note("n", stage="s")
+        lock.write_text(holder + "\n")
+        busy = dream(harness, stage="s", focus="f", model="fake", use_model=True, lock_wait=0)
+        assert "in progress" in busy.error
+        lock.unlink()
+
+
+def test_a_missing_credential_is_reported_without_a_traceback(tmp_path, caplog):
+    def no_client(model: str):
+        raise LLMConfigError("ANTHROPIC_API_KEY is not set")
+
+    project = Wiki(tmp_path / "project", name="project")
+    harness = ContextHarness(
+        project=project,
+        transcripts=TranscriptLog(project.root / "transcripts"),
+        client_for=no_client,
+        dream_model="fake",
+    )
+    harness.note("n", stage="s")
+    report = harness.dream(stage="s", focus="f")
+    assert "ANTHROPIC_API_KEY is not set" in report.error
+    assert "Traceback" not in caplog.text and "ANTHROPIC_API_KEY is not set" in caplog.text
