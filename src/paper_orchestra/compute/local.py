@@ -1,18 +1,27 @@
 """Run jobs as subprocesses on this machine.
 
-This backend needs TeX Live on ``PATH`` for LaTeX.  Both kinds of job get a
-minimal environment without credentials, their own process group, a timeout,
-and bounded output capture; model-written Python additionally runs in a
-throw-away working directory under resource limits, and TeX may only read and
-write inside its working directory.  That contains accidents, but it is
-**not** a security sandbox: the code still runs as your user with network
-access.  Use the Modal backend for isolation.
+This backend needs TeX Live on ``PATH`` for LaTeX.  Every kind of job gets a
+minimal environment without credentials, its own process group, a timeout,
+and bounded output capture; model-written Python and experiment jobs
+additionally run in a throw-away working directory under resource limits, and
+TeX may only read and write inside its working directory.  That contains
+accidents, but it is **not** a security sandbox: the code still runs as your
+user with network access.  Use the Modal backend for isolation.
+
+An experiment job runs in a copy of its source directory with the packages
+that are installed here.  It has no GPU, and its network access cannot be
+blocked; ``supports`` and the notes of a result say so.
 """
 
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata
+import importlib.util
+import math
 import os
+import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -21,7 +30,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any
 
@@ -31,7 +40,20 @@ from paper_orchestra.compute.base import (
     ComputeBackend,
     ComputeError,
     ExecResult,
+    JobLog,
+    JobResult,
+    JobSpec,
+    JobStopped,
+    SourceReport,
+    choose_outputs,
+    open_run,
     refuse_unsafe_document,
+    requirement_name,
+    safe_relative,
+    scan_outputs,
+    spec_problems,
+    supervise,
+    walk_source,
 )
 from paper_orchestra.utils.latex import latex_commands, summarize_build
 
@@ -69,24 +91,46 @@ def latex_env(home: Path) -> dict[str, str]:
     return env
 
 
-def safe_relative(name: str) -> Path:
-    """Reject absolute paths and ``..`` in caller-supplied file names."""
-    path = Path(name)
-    if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise ComputeError(f"unsafe file name: {name!r}")
-    return path
+_PR_SET_PDEATHSIG = 1
 
 
-def _limit_resources(cpu_seconds: int, memory_bytes: int | None):  # pragma: no cover - child
-    def apply() -> None:
-        import resource
+def _prctl() -> Any:
+    """libc's ``prctl`` on Linux, else ``None``.  Looked up before a fork, never after."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
 
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
+        return ctypes.CDLL(None).prctl
+    except (ImportError, OSError, AttributeError):  # pragma: no cover - unusual libc
+        return None
+
+
+def _limit_resources(cpu_seconds: int, memory_bytes: int | None, *, die_with_parent: bool = False):
+    """What a child does before it becomes the job: take its resource limits.
+
+    ``die_with_parent`` additionally has the kernel kill the child when the thread
+    that started it ends (Linux only), so that a job does not run on after an
+    orchestrator that was killed and could not stop it.
+    """
+    # Imported here, before the fork: an import in the child can wait forever for a lock
+    # that another thread of the orchestrator held at that moment.
+    import resource
+
+    prctl = _prctl() if die_with_parent else None
+
+    def apply() -> None:  # pragma: no cover - runs in the child
+        # A limit above what this process is allowed itself cannot be set; the job then
+        # runs under the limit it inherits.
+        with contextlib.suppress(ValueError, OSError):
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
         if memory_bytes:
             with contextlib.suppress(ValueError, OSError):
                 resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
         with contextlib.suppress(ValueError, OSError):
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        if prctl is not None:
+            prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
     return apply
 
@@ -112,13 +156,100 @@ class _Tail:
         return data.decode("utf-8", errors="replace")
 
 
-def _kill_group(process: subprocess.Popen[bytes]) -> None:
+def _kill_group(process: subprocess.Popen[bytes], sig: int = signal.SIGKILL) -> None:
+    """Send ``sig`` to the process group of ``process``, which it leads."""
     if os.name == "posix":
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, sig)
     else:  # pragma: no cover - non-posix
         with contextlib.suppress(OSError):
             process.kill()
+
+
+def _kill_job(process: subprocess.Popen[bytes]) -> None:
+    """Kill the job ``process`` leads: its process group, and what left the group.
+
+    Tools such as coreutils ``timeout`` and shells with job control move what they
+    start to a process group of its own, which a signal to the job's group does not
+    reach.  The session is still the job's, so on Linux the processes of the session
+    are looked up and killed too.  Only what starts a session of its own (a daemon)
+    gets away.  Call this before the process is reaped: until then its id cannot
+    have been given to an unrelated process group or session.
+    """
+    _kill_group(process)
+    if not sys.platform.startswith("linux"):
+        return
+    with contextlib.suppress(OSError):
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/stat", "rb") as stat_file:
+                    # "pid (name) state ppid pgrp session ...": the name may hold anything.
+                    fields = stat_file.read().rsplit(b")", 1)[1].split()
+                if int(fields[3]) == process.pid:
+                    os.kill(int(entry.name), signal.SIGKILL)
+            except (OSError, IndexError, ValueError):
+                continue  # it ended while we were looking
+
+
+def _spawn(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    preexec: Any = None,
+    merge_stderr: bool = False,
+) -> subprocess.Popen[bytes]:
+    """Start ``command`` without stdin, in a session and process group of its own, so
+    that it and everything it starts can be signalled together."""
+    posix = os.name == "posix"
+    return subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        start_new_session=posix,
+        preexec_fn=preexec if posix else None,
+    )
+
+
+def _has_exited(process: subprocess.Popen[bytes]) -> bool:
+    """Whether the child has ended, without reaping it.
+
+    Until it is reaped its process group id cannot be handed to another process, so
+    the rest of the group can still be killed without hitting a stranger.
+    """
+    if not hasattr(os, "waitid"):  # pragma: no cover - Windows, macOS before Python 3.13
+        return process.poll() is not None
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return True
+
+
+def _pipe_chunks(stream: IO[bytes]) -> Iterator[bytes]:
+    """The output of a child as it arrives, for :func:`supervise`.
+
+    Yields an empty chunk whenever nothing arrived for a moment, which is what lets
+    the reading thread end when a process that escaped its group keeps the pipe open.
+    """
+    fd = stream.fileno()
+    if os.name != "posix":  # pragma: no cover - pipes cannot be polled there
+        yield from iter(lambda: os.read(fd, 65536), b"")
+        return
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while True:
+            if not selector.select(0.2):
+                yield b""
+                continue
+            data = os.read(fd, 65536)
+            if not data:
+                return
+            yield data
 
 
 def _run(
@@ -134,17 +265,7 @@ def _run(
     The whole group is killed on timeout and also when this call is interrupted
     (for example by Ctrl-C), so no compile or script outlives the pipeline.
     """
-    posix = os.name == "posix"
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=posix,
-        preexec_fn=preexec if posix else None,
-    )
+    process = _spawn(command, cwd=cwd, env=env, preexec=preexec)
     out, err = _Tail(_MAX_CAPTURE), _Tail(_MAX_CAPTURE)
     readers = [
         threading.Thread(target=out.pump, args=(process.stdout,), daemon=True),
@@ -170,12 +291,117 @@ def _run(
     return process.returncode, out.text(), err.text(), timed_out
 
 
+def copy_source(
+    source: Path, dest: Path, should_stop: Callable[[], bool] | None = None
+) -> list[str]:
+    """Copy ``source`` into the new directory ``dest`` for a job to work in.
+
+    What goes in is decided by :func:`walk_source`; the notes say what was left out.
+    Files are copied, never linked: whatever the job does to its working directory,
+    the source stays as it was.  Raises :class:`JobStopped` when ``should_stop``
+    turns true on the way.
+    """
+    report = SourceReport()
+    dest.mkdir(parents=True)
+    for relative, path, kind in walk_source(source, report, should_stop):
+        target = dest / relative
+        if kind == "dir":
+            target.mkdir()
+        elif kind == "link":
+            os.symlink(os.readlink(path), target)
+        else:
+            shutil.copy2(path, target, follow_symlinks=False)
+    return report.notes()
+
+
+def collect_outputs(work: Path, outputs: Sequence[str], run_dir: Path) -> list[str]:
+    """Copy the requested outputs that exist from ``work`` to ``run_dir``.
+
+    Returns notes about what was not copied (see :func:`choose_outputs`).
+    """
+    # More than can be copied is never listed: a job may have left millions of files.
+    listing = scan_outputs(str(work), list(outputs), max_entries=100_000)
+    chosen, notes = choose_outputs(listing["entries"], truncated=listing["truncated"])
+    for relative, _ in chosen:
+        target = run_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(work / relative, target, follow_symlinks=False)
+    return notes
+
+
+#: Import names of well-known distributions whose name does not give them away.  Only
+#: needed for what is not installed: an installed distribution lists its own modules.
+_IMPORT_NAMES = {
+    "attrs": "attr",
+    "beautifulsoup4": "bs4",
+    "faiss-cpu": "faiss",
+    "faiss-gpu": "faiss",
+    "opencv-python": "cv2",
+    "opencv-python-headless": "cv2",
+    "pillow": "PIL",
+    "protobuf": "google.protobuf",
+    "python-dateutil": "dateutil",
+    "pyyaml": "yaml",
+    "scikit-image": "skimage",
+    "scikit-learn": "sklearn",
+}
+
+
+def _canonical(distribution: str) -> str:
+    return re.sub(r"[-_.]+", "-", distribution).lower()
+
+
+def _importable(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+def missing_packages(requirements: Iterable[str]) -> list[str]:
+    """The requirements whose distribution cannot be imported in this interpreter.
+
+    The modules of a distribution are taken from its metadata when it is installed
+    and guessed from its name otherwise.  Versions are not compared.  Strings that
+    are not plain requirements are skipped: ``spec_problems`` reports those.
+    """
+    requirements = list(requirements)
+    if not requirements:
+        return []  # most jobs: reading every installed distribution would be wasted
+    modules: dict[str, list[str]] = {}
+    for module, distributions in importlib.metadata.packages_distributions().items():
+        for distribution in distributions:
+            modules.setdefault(_canonical(distribution), []).append(module)
+    missing: list[str] = []
+    for requirement in requirements:
+        name = requirement_name(requirement)
+        if name is None:
+            continue
+        key = _canonical(name)
+        candidates = modules.get(key) or [_IMPORT_NAMES.get(key, key.replace("-", "_"))]
+        if not any(_importable(module) for module in candidates):
+            missing.append(requirement.strip())
+    return missing
+
+
 class LocalBackend(ComputeBackend):
     name = "local"
 
-    def __init__(self, *, python: str | None = None, memory_limit_mb: int | None = 4096) -> None:
+    def __init__(
+        self,
+        *,
+        python: str | None = None,
+        memory_limit_mb: int | None = 4096,
+        scratch_dir: str | Path | None = None,
+    ) -> None:
+        """``python`` runs figure code and stands for ``python`` in a job's command;
+        ``memory_limit_mb`` caps the address space of figure code and of jobs that name
+        no limit of their own (``None``: no cap); ``scratch_dir`` is where the working
+        directories of jobs are made and removed (default: the system's temporary
+        directory, which on some machines is small or kept in memory)."""
         self.python = python or sys.executable
         self.memory_limit_mb = memory_limit_mb
+        self.scratch_dir = Path(scratch_dir) if scratch_dir is not None else None
         self._tex_home: tempfile.TemporaryDirectory[str] | None = None
         self._lock = threading.Lock()
 
@@ -304,6 +530,187 @@ class LocalBackend(ComputeBackend):
             timed_out=timed_out,
         )
 
+    # -- experiment jobs -------------------------------------------------------
+
+    def supports(self, spec: JobSpec) -> list[str]:
+        reasons = spec_problems(spec)
+        if spec.gpu:
+            reasons.append(
+                f"It asks for a GPU ({spec.gpu}), and the local backend runs on this machine "
+                "without one. Use the Modal backend for GPU jobs."
+            )
+        missing = missing_packages(spec.packages)
+        if missing:
+            reasons.append(
+                "These packages are not installed in the Python that runs local jobs: "
+                f"{', '.join(missing)}. Install them there, or use the Modal backend, which "
+                "installs what a job asks for."
+            )
+        return reasons
+
+    def run_job(
+        self,
+        spec: JobSpec,
+        *,
+        source_dir: Path,
+        run_dir: Path,
+        on_log: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> JobResult:
+        source, run_dir = Path(source_dir), Path(run_dir)
+        log_path = open_run(run_dir, spec.outputs)
+        result = JobResult(returncode=None, backend=self.name, log_path=log_path)
+        result.outputs_dir = run_dir
+        with JobLog(log_path, on_log) as log:
+            reasons = self.supports(spec)
+            if not reasons and not source.is_dir():
+                reasons = [f"The source directory {source} does not exist."]
+            scratch_root = self.scratch_dir or Path(tempfile.gettempdir())
+            if not reasons and scratch_root.resolve().is_relative_to(source.resolve()):
+                # The copy would contain itself, and so on until the path is too long.
+                reasons = [
+                    f"Working directories are made in {scratch_root}, which is inside the "
+                    f"source directory {source}. Set scratch_dir (or TMPDIR) to a directory "
+                    "outside of it."
+                ]
+            if reasons:
+                result.error = "The local backend cannot run this job. " + " ".join(reasons)
+                log.note(result.error)
+                return result
+            result.notes.extend(self._caveats(spec))
+            # The source may be the person's repository: the job only ever sees a copy,
+            # which is gone when this returns, however it returns.
+            try:
+                if self.scratch_dir is not None:
+                    self.scratch_dir.mkdir(parents=True, exist_ok=True)
+                scratch = tempfile.TemporaryDirectory(
+                    prefix="paper-orchestra-job-", dir=self.scratch_dir, ignore_cleanup_errors=True
+                )
+            except OSError as exc:
+                result.error = f"The local backend could not make a working directory: {exc}."
+                log.note(result.error)
+                return result
+            try:
+                with scratch as name:
+                    work, home = Path(name, "work"), Path(name, "home")
+                    home.mkdir()
+                    self._note(result, log, copy_source(source, work, should_stop))
+                    self._execute(spec, work, home, log, should_stop, result)
+                    self._note(result, log, collect_outputs(work, spec.outputs, run_dir))
+            except JobStopped:
+                result.cancelled = True
+                log.note("The job was stopped on request, before it had started.")
+            except (OSError, subprocess.SubprocessError) as exc:
+                result.error = f"The local backend could not run the job: {exc}."
+                log.note(result.error)
+            if os.path.lexists(scratch.name):
+                self._note(
+                    result, log, [f"The working directory {scratch.name} could not be removed."]
+                )
+            result.notes.extend(log.notes())
+        return result
+
+    @staticmethod
+    def _note(result: JobResult, log: JobLog, notes: Sequence[str]) -> None:
+        for note in notes:
+            log.note(note)
+        result.notes.extend(notes)
+
+    @staticmethod
+    def _caveats(spec: JobSpec) -> list[str]:
+        """What a job asks for that this backend cannot give, without that being a reason
+        to refuse it: the local backend is documented as not being a sandbox."""
+        caveats: list[str] = []
+        if not spec.network:
+            caveats.append(
+                "The job was to run without network access. The local backend cannot block the "
+                "network (it is not a sandbox); use the Modal backend where that matters."
+            )
+        if spec.cpu is not None:
+            caveats.append(
+                f"The limit of {spec.cpu:g} CPU cores is not applied by the local backend."
+            )
+        return caveats
+
+    def _execute(
+        self,
+        spec: JobSpec,
+        work: Path,
+        home: Path,
+        log: JobLog,
+        should_stop: Callable[[], bool] | None,
+        result: JobResult,
+    ) -> None:
+        """Run the command in ``work`` and record how it ended in ``result``."""
+        # `python` is the interpreter whose packages `supports` looked at, not whichever
+        # one PATH happens to find first.
+        argv = list(spec.command)
+        if argv[0] in ("python", "python3"):
+            argv[0] = self.python
+        env = scrubbed_env(home)
+        env["PYTHONUNBUFFERED"] = "1"  # prints reach the person watching as they happen
+        env.update(spec.env)
+        preexec = None
+        if os.name == "posix":
+            memory_mb = spec.memory_mb or self.memory_limit_mb
+            # CPU time, not wall-clock time: a job on every core uses that many seconds
+            # per second.  The wall-clock limit is kept by supervise(); this one only
+            # ends a job that nobody supervises any more.
+            cpu_seconds = math.ceil(spec.timeout) * (os.cpu_count() or 1) + 5
+            preexec = _limit_resources(
+                cpu_seconds, memory_mb * 1024 * 1024 if memory_mb else None, die_with_parent=True
+            )
+        started = time.monotonic()
+        try:
+            process = _spawn(argv, cwd=work, env=env, preexec=preexec, merge_stderr=True)
+        except OSError as exc:
+            # The command is the job's own, so this is the job failing, with the status
+            # a shell would give it.
+            log.note(f"The command could not be started: {exc}.")
+            result.returncode = 126 if isinstance(exc, PermissionError) else 127
+            return
+        assert process.stdout is not None
+        try:
+            outcome = supervise(
+                _pipe_chunks(process.stdout),
+                log,
+                timeout=spec.timeout,
+                should_stop=should_stop,
+                interrupt=lambda: _kill_group(process, signal.SIGTERM),
+                kill=lambda: _kill_job(process),
+                exited=lambda: _has_exited(process),
+            )
+        finally:
+            # Also on Ctrl-C and on errors of the callbacks: nothing of the job outlives
+            # this call.  Killed before it is reaped, see _kill_job.
+            _kill_job(process)
+            process.wait()
+            process.stdout.close()
+        result.seconds = time.monotonic() - started
+        code = process.returncode
+        result.returncode = code if code >= 0 else 128 - code
+        if outcome.timed_out:
+            result.timed_out = True
+            log.note(
+                "The job was stopped because it ran longer than its time limit of "
+                f"{spec.timeout:g} s."
+            )
+        elif outcome.cancelled:
+            result.cancelled = True
+            log.note("The job was stopped on request.")
+        if outcome.abandoned:
+            self._note(
+                result,
+                log,
+                [
+                    "Something the job started kept its output open after the job had ended "
+                    "and could not be stopped (it runs in a session of its own). It may still "
+                    "be running on this machine; what it prints from here on is not in the log."
+                ],
+            )
+        if outcome.failure is not None:
+            raise outcome.failure
+
     def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
         if latex and not self.latex_available():
             return [
@@ -319,4 +726,15 @@ class LocalBackend(ComputeBackend):
             "pdflatex": shutil.which("pdflatex"),
             "bibtex": shutil.which("bibtex"),
             "isolation": "none (subprocess with a minimal environment)",
+            "jobs": {
+                "supported": True,
+                "gpu": False,
+                "network_isolation": False,
+                "packages": False,
+                "reattach": False,
+                "summary": (
+                    "Runs on this machine as your user, with the packages installed here. "
+                    "No GPU, and network access cannot be blocked: it is not a sandbox."
+                ),
+            },
         }

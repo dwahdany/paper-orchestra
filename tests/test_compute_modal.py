@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
+import itertools
+import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
+import textwrap
+import threading
 import time
 import tracemalloc
 import types
@@ -17,8 +25,16 @@ from typing import Any
 
 import pytest
 
+import paper_orchestra.compute.base as base
 import paper_orchestra.compute.modal_backend as modal_backend
-from paper_orchestra.compute import BACKEND_NAMES, ComputeBackend, ComputeError, get_backend
+from paper_orchestra.compute import (
+    BACKEND_NAMES,
+    ComputeBackend,
+    ComputeError,
+    JobResult,
+    JobSpec,
+    get_backend,
+)
 from paper_orchestra.compute.base import BackendUnusable
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.compute.modal_backend import (
@@ -60,6 +76,48 @@ class FakeProcess:
 
     def wait(self) -> int:
         return self._returncode
+
+
+def kill_session(session: int) -> None:
+    """Kill every process of a session.  coreutils timeout moves its command to a process
+    group of its own, so the group of the shell that was started is not enough."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(session, signal.SIGKILL)
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            # "pid (name) state ppid pgrp session ...", and the name may hold anything.
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[3]) == session:
+                os.kill(int(entry.name), signal.SIGKILL)
+        except (OSError, IndexError, ValueError):
+            continue
+
+
+class LiveStream:
+    """The output of a process that is still running: iterating blocks until more arrives."""
+
+    def __init__(self, pipe: Any) -> None:
+        self._pipe = pipe
+
+    def __iter__(self) -> Iterator[bytes]:
+        while True:
+            data = os.read(self._pipe.fileno(), 4096)
+            if not data:
+                return
+            yield data
+
+
+class LiveProcess:
+    """A command that `Sandbox.exec` started and that runs on while the caller reads it."""
+
+    def __init__(self, popen: subprocess.Popen) -> None:
+        self.popen = popen
+        self.stdout = LiveStream(popen.stdout)
+        self.stderr = LiveStream(popen.stderr)
+
+    def wait(self) -> int:
+        code = self.popen.wait()
+        return code if code >= 0 else 128 - code
 
 
 class FakeFileInfo:
@@ -165,18 +223,37 @@ class FakeSandbox:
         self.detached = False
         self.commands: list[list[str]] = []
         self.exec_kwargs: list[dict[str, Any]] = []
+        #: Commands started through a shell, which run on after `exec` has returned.
+        self.live: list[subprocess.Popen] = []
+
+    def require_attached(self) -> None:
+        if self.detached:
+            raise self.hub.exception.ClientClosed(
+                "Unable to perform operation on a detached sandbox"
+            )
 
     def require_running(self) -> None:
+        self.require_attached()
         if self.exit_code is not None:
             raise self.hub.exception.NotFoundError("The Sandbox is unavailable")
 
-    def exec(self, *args: str, **kwargs: Any) -> FakeProcess:
+    def stop_processes(self) -> None:
+        """What the end of a sandbox does to everything that runs in it."""
+        for popen in self.live:
+            kill_session(popen.pid)
+            popen.wait()
+
+    def exec(self, *args: str, **kwargs: Any) -> FakeProcess | LiveProcess:
         self.hub.record("Sandbox.exec", *args, **kwargs)
         self.require_running()
         if not isinstance(kwargs.get("timeout"), int):
             raise TypeError("'float' object cannot be interpreted as an integer")
-        assert args[:3] == ("timeout", "--signal=TERM", "--kill-after=5"), args
-        command = list(args[4:])
+        # A shell command is one that outlives the call (a job, or the reading of its
+        # log); everything else runs under coreutils timeout and is waited for.
+        live = args[0] == "sh"
+        if not live:
+            assert args[:3] == ("timeout", "--signal=TERM", "--kill-after=5"), args
+        command = list(args) if live else list(args[4:])
         self.commands.append(command)
         self.exec_kwargs.append(kwargs)
         cwd = self.root / kwargs["workdir"].lstrip("/")
@@ -189,6 +266,18 @@ class FakeSandbox:
             process = handler(self, command, cwd, env)
             if process is not None:
                 return process
+        if live:
+            popen = subprocess.Popen(
+                [sys.executable if a == "python" else a for a in args],
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            self.live.append(popen)
+            return LiveProcess(popen)
         argv = [*args[:4], *(sys.executable if a == "python" else a for a in command)]
         try:
             done = subprocess.run(
@@ -201,13 +290,16 @@ class FakeSandbox:
 
     def poll(self) -> int | None:
         self.hub.record("Sandbox.poll")
+        self.require_attached()
         return self.exit_code
 
     def terminate(self, *, wait: bool = False) -> None:
         self.hub.record("Sandbox.terminate", wait=wait)
+        self.require_attached()
         self.terminated = True
         if self.exit_code is None:
             self.exit_code = 137
+        self.stop_processes()
 
     def detach(self) -> None:
         self.hub.record("Sandbox.detach")
@@ -226,19 +318,23 @@ class FakeModal:
         self.settings: dict[str, str] = {}
         self.lookup_error: Exception | None = None
         self.create_error: Exception | None = None
+        self.from_id_error: Exception | None = None
+        #: When set, `Sandbox.create` blocks until the event is: an image is being built.
+        self.create_gate: threading.Event | None = None
 
         exception = types.ModuleType("modal.exception")
 
         class Error(Exception):
             pass
 
-        for name, base in (
-            ("AuthError", Error),
-            ("InvalidError", Error),
-            ("NotFoundError", Error),
-            ("SandboxFilesystemError", Error),
+        for name in (
+            "AuthError",
+            "ClientClosed",
+            "InvalidError",
+            "NotFoundError",
+            "SandboxFilesystemError",
         ):
-            setattr(exception, name, type(name, (base,), {}))
+            setattr(exception, name, type(name, (Error,), {}))
         exception.Error = Error
         exception.SandboxFilesystemNotFoundError = type(
             "SandboxFilesystemNotFoundError", (exception.SandboxFilesystemError,), {}
@@ -255,7 +351,7 @@ class FakeModal:
         module.config = config
         module.is_local = lambda: self.local
         module.App = types.SimpleNamespace(lookup=self._lookup)
-        module.Sandbox = types.SimpleNamespace(create=self._create)
+        module.Sandbox = types.SimpleNamespace(create=self._create, from_id=self._from_id)
         module.Image = types.SimpleNamespace(debian_slim=self._debian_slim)
         self.module = module
         self.modules = {"modal": module, "modal.exception": exception, "modal.config": config}
@@ -280,11 +376,24 @@ class FakeModal:
         for key in ("timeout", "idle_timeout"):
             if not isinstance(kwargs.get(key), int):
                 raise TypeError("'float' object cannot be interpreted as an integer")
+        if self.create_gate is not None:
+            assert self.create_gate.wait(30)
         if self.create_error is not None:
             raise self.create_error
         sandbox = FakeSandbox(self, len(self.sandboxes), kwargs)
         self.sandboxes.append(sandbox)
         return sandbox
+
+    def _from_id(self, *args: Any, **kwargs: Any) -> FakeSandbox:
+        """A new handle on a sandbox, as another process would get it."""
+        self.record("Sandbox.from_id", *args, **kwargs)
+        if self.from_id_error is not None:
+            raise self.from_id_error
+        for sandbox in self.sandboxes:
+            if sandbox.object_id == args[0]:
+                sandbox.detached = False
+                return sandbox
+        raise self.exception.NotFoundError(f"Sandbox {args[0]} not found")
 
 
 @pytest.fixture
@@ -312,11 +421,13 @@ def no_extra_tex_packages(monkeypatch) -> None:
 
 
 @pytest.fixture
-def fake(monkeypatch, tmp_path) -> FakeModal:
+def fake(monkeypatch, tmp_path) -> Iterator[FakeModal]:
     hub = FakeModal(tmp_path / "modal")
     for name, module in hub.modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    return hub
+    yield hub
+    for sandbox in hub.sandboxes:
+        sandbox.stop_processes()
 
 
 @pytest.fixture
@@ -1014,31 +1125,16 @@ def test_token_detection_uses_the_installed_sdk_configuration(monkeypatch):
     assert modal_token_configured() is True
 
 
-def test_calls_match_the_installed_modal_sdk(real_sdk, fake, backend, tmp_path):
-    """Replay every call the backend made on the fake against the real SDK signatures."""
-    real = real_sdk.modal
-    fake.handlers.append(
-        scripted(
-            python=lambda sandbox, command, cwd, env: (
-                (cwd / "out.txt").write_text("x") and FakeProcess()
-            ),
-            tar=lambda *_: None,
-            pdflatex=lambda sandbox, command, cwd, env: (
-                (cwd / "paper.pdf").write_bytes(b"%PDF") and FakeProcess()
-            ),
-            bibtex=lambda *_: FakeProcess(),
-        )
-    )
-    (tmp_path / "paper.tex").write_text("x")
-    backend.run_python("pass", inputs={"in.txt": b"x"}, outputs=["out.txt"])
-    assert backend.compile_latex(tmp_path, "paper").ok
-    fake.sandboxes[0].exit_code = 124
-    backend.run_python("pass")
-    backend.close()
+def replay_against_the_sdk(real_sdk: types.SimpleNamespace, fake: FakeModal) -> set[str]:
+    """Bind every call recorded on the fake to the signature the installed SDK gives it.
 
+    Returns the names of the calls that were replayed.
+    """
+    real = real_sdk.modal
     targets = {
         "App.lookup": real.App.lookup,
         "Sandbox.create": real.Sandbox.create,
+        "Sandbox.from_id": real.Sandbox.from_id,
         "Sandbox.exec": real.Sandbox.exec,
         "Sandbox.poll": real.Sandbox.poll,
         "Sandbox.terminate": real.Sandbox.terminate,
@@ -1070,7 +1166,50 @@ def test_calls_match_the_installed_modal_sdk(real_sdk, fake, backend, tmp_path):
             args = (None, *args)
         signature.bind(*args, **kwargs)
         replayed.add(name)
-    assert replayed == set(targets)
+    return replayed
+
+
+def test_calls_match_the_installed_modal_sdk(real_sdk, fake, backend, tmp_path):
+    """Replay every call the backend made on the fake against the real SDK signatures."""
+    real = real_sdk.modal
+    fake.handlers.append(
+        scripted(
+            python=lambda sandbox, command, cwd, env: (
+                (cwd / "out.txt").write_text("x") and FakeProcess()
+            ),
+            tar=lambda *_: None,
+            pdflatex=lambda sandbox, command, cwd, env: (
+                (cwd / "paper.pdf").write_bytes(b"%PDF") and FakeProcess()
+            ),
+            bibtex=lambda *_: FakeProcess(),
+        )
+    )
+    (tmp_path / "paper.tex").write_text("x")
+    backend.run_python("pass", inputs={"in.txt": b"x"}, outputs=["out.txt"])
+    assert backend.compile_latex(tmp_path, "paper").ok
+    fake.sandboxes[0].exit_code = 124
+    backend.run_python("pass")
+    backend.close()
+
+    assert replay_against_the_sdk(real_sdk, fake) == {
+        "App.lookup",
+        "Sandbox.create",
+        "Sandbox.exec",
+        "Sandbox.poll",
+        "Sandbox.terminate",
+        "Sandbox.detach",
+        "Image.debian_slim",
+        "Image.uv_pip_install",
+        "Image.run_commands",
+        "Image.env",
+        "filesystem.write_bytes",
+        "filesystem.write_text",
+        "filesystem.read_bytes",
+        "filesystem.stat",
+        "filesystem.copy_from_local",
+        "filesystem.copy_to_local",
+        "filesystem.remove",
+    }
 
     assert not hasattr(real.Sandbox, "__enter__")
     assert issubclass(real.exception.AuthError, real.Error)
@@ -1094,3 +1233,970 @@ def test_a_document_the_screen_refuses_never_reaches_a_sandbox(fake, backend, tm
     assert any("pdfobj is not allowed" in error for error in result.errors)
     assert fake.named("Sandbox.create") == []  # nothing was started, uploaded or run
     assert not (tmp_path / "paper.pdf").exists()
+
+
+# -- experiment jobs ---------------------------------------------------------------------
+
+
+class JobDirs:
+    """A source directory, a run directory and the place temporary files are made in."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.run = root / "runs" / "1"
+        self.scratch = root / "scratch"
+        self.scratch.mkdir()
+
+    def source(self, main: str = "", **files: str) -> Path:
+        source = self.root / "code"
+        source.mkdir(exist_ok=True)
+        (source / "main.py").write_text(textwrap.dedent(main), encoding="utf-8")
+        for name, text in files.items():
+            (source / name).parent.mkdir(parents=True, exist_ok=True)
+            (source / name).write_text(text, encoding="utf-8")
+        return source
+
+    def log(self) -> str:
+        return (self.run / "log.txt").read_bytes().decode("utf-8")
+
+    def output_lines(self, seen: list[str]) -> list[str]:
+        """What the job itself printed, without the lines the backend added."""
+        return [line for line in seen if not line.startswith("[paper-orchestra]")]
+
+
+@pytest.fixture
+def job(tmp_path, monkeypatch) -> Iterator[JobDirs]:
+    """Directories for one job.  Afterwards nothing temporary may be left on this machine."""
+    dirs = JobDirs(tmp_path)
+    monkeypatch.setattr(tempfile, "tempdir", str(dirs.scratch))
+    yield dirs
+    assert list(dirs.scratch.iterdir()) == [], "temporary files were left behind"
+
+
+def run_main(
+    backend: ModalBackend, job: JobDirs, source: Path, **options
+) -> tuple[JobResult, list]:
+    spec = JobSpec(command=["python", "main.py"], **options.pop("spec", {}))
+    seen: list[str] = []
+    options.setdefault("on_log", seen.append)
+    result = backend.run_job(spec, source_dir=source, run_dir=job.run, **options)
+    return result, seen
+
+
+def assert_gone(pid: int, within: float = 5.0) -> None:
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"process {pid} is still running")
+
+
+@needs_coreutils
+def test_run_job_round_trip_in_a_sandbox_built_for_the_job(fake, backend, job):
+    source = job.source(
+        """
+        import json, os, sys
+        from pathlib import Path
+
+        print("seed:", os.environ["SEED"], "unbuffered:", os.environ["PYTHONUNBUFFERED"])
+        print("home:", Path.home().name, "cwd:", Path.cwd().name, "stdin:", repr(sys.stdin.read()))
+        print(Path("data/in.txt").read_text())
+        Path("data/in.txt").write_text("changed by the job")
+        Path("artifacts/deep").mkdir(parents=True)
+        Path("artifacts/curve.png").write_bytes(b"\\x89PNG")
+        Path("artifacts/deep/table.csv").write_text("a,b\\n1,2\\n")
+        Path("metrics.json").write_text(json.dumps({"accuracy": 0.91}))
+        print("to stderr", file=sys.stderr)
+        """,
+        **{"data/in.txt": "payload"},
+    )
+    spec = JobSpec(
+        command=["python", "main.py"],
+        timeout=60.5,
+        gpu="T4",
+        packages=("torch>=2.4", "einops"),
+        env={"SEED": "7"},
+        cpu=4,
+        memory_mb=8192,
+    )
+    seen: list[str] = []
+    result = backend.run_job(spec, source_dir=source, run_dir=job.run, on_log=seen.append)
+
+    assert result.ok and result.returncode == 0, job.log()
+    assert (result.timed_out, result.cancelled, result.error) == (False, False, None)
+    assert (result.backend, result.handle) == ("modal", "sb-fake-0")
+    assert result.log_path == job.run / "log.txt" and result.outputs_dir == job.run
+    assert 0 < result.seconds < 30
+    assert (job.run / "handle.txt").read_text() == "sb-fake-0\n"
+    assert seen[0].startswith("[paper-orchestra] Starting a Modal sandbox")
+    assert job.output_lines(seen) == [
+        "seed: 7 unbuffered: 1",
+        "home: home cwd: src stdin: ''",
+        "payload",
+        "to stderr",
+    ]
+    assert job.log().splitlines() == seen
+    assert json.loads((job.run / "metrics.json").read_text()) == {"accuracy": 0.91}
+    assert (job.run / "artifacts" / "curve.png").read_bytes() == b"\x89PNG"
+    assert (job.run / "artifacts" / "deep" / "table.csv").read_text() == "a,b\n1,2\n"
+    assert sorted(p.name for p in job.run.iterdir()) == [
+        "artifacts",
+        "handle.txt",
+        "log.txt",
+        "metrics.json",
+    ]
+    assert (source / "data" / "in.txt").read_text() == "payload"
+
+    # One sandbox, made for this job and for nothing else, and gone afterwards.
+    [(args, created)] = fake.named("Sandbox.create")
+    assert args == ("sleep", "infinity") and created["app"] == "app:paper-orchestra"
+    assert created["gpu"] == "T4"
+    assert created["block_network"] is True
+    assert created["include_oidc_identity_token"] is False
+    assert not created.get("secrets") and not created.get("env") and not created.get("volumes")
+    assert not {k for k in created if "allowlist" in k or k.endswith("_ports")}
+    assert created["cpu"] == (0.5, 4) and created["memory"] == (1024, 8192)
+    assert (created["timeout"], created["idle_timeout"]) == (61 + 900, 600)
+    image = created["image"]
+    assert image.steps[0] == ("Image.debian_slim", (), {"python_version": "3.12"})
+    base_packages, job_packages = image.named("Image.uv_pip_install")
+    assert "numpy>=1.26" in base_packages and job_packages == ("torch>=2.4", "einops")
+    [sandbox] = fake.sandboxes
+    assert sandbox.terminated and sandbox.detached
+    assert len(fake.named("Sandbox.terminate")) == 1
+
+    [runner] = [
+        (a, k) for a, k in fake.named("Sandbox.exec") if a[:2] == ("sh", "-c") and "main.py" in a
+    ]
+    runner_args, runner_kwargs = runner
+    assert runner_args[-4:] == ("61", "5", "python", "main.py")
+    assert runner_kwargs["workdir"] == "/work/job/src"
+    assert runner_kwargs["env"] == {
+        "HOME": "/work/job/home",
+        "TMPDIR": "/work/job/home",
+        "PYTHONUNBUFFERED": "1",
+        "SEED": "7",
+    }
+    assert "secrets" not in runner_kwargs and runner_kwargs["text"] is False
+    assert all(isinstance(k["timeout"], int) for _, k in fake.named("Sandbox.exec"))
+
+    # The estimate: the time the sandbox existed, at the prices of the table.
+    per_second = 0.000164 + 4 * 0.00003942 + 8 * 0.00000667
+    assert result.cost_usd is not None and 0 < result.cost_usd < 60 * per_second
+    assert result.cost_usd >= round(result.seconds * per_second, 6)
+
+
+@needs_coreutils
+def test_the_handle_is_on_disk_before_anything_runs_in_the_sandbox(fake, backend, job):
+    recorded: list[str] = []
+
+    def spy(sandbox, command, cwd, env):
+        recorded.append((job.run / "handle.txt").read_text())
+
+    fake.handlers.append(spy)
+    result, _ = run_main(backend, job, job.source("print('ok')\n"))
+    assert result.ok and len(recorded) >= 4
+    assert set(recorded) == {"sb-fake-0\n"}
+    # ...and before anything is written into it, too.
+    first_write = next(i for i, call in enumerate(fake.calls) if call[0].startswith("filesystem."))
+    created = next(i for i, call in enumerate(fake.calls) if call[0] == "Sandbox.create")
+    assert first_write > created
+
+
+@needs_coreutils
+def test_the_network_is_open_only_when_the_job_asks_for_it(fake, job):
+    backend = ModalBackend(cpu=1.5, memory_mb=3000, idle_timeout=120)
+    source = job.source("print('ok')\n")
+    result, _ = run_main(backend, job, source, spec={"network": True, "timeout": 30})
+    assert result.ok
+    [(_, created)] = fake.named("Sandbox.create")
+    assert created["block_network"] is False and created["include_oidc_identity_token"] is False
+    assert created.get("gpu") is None and not created.get("secrets")
+    assert created["cpu"] == (0.5, 1.5) and created["memory"] == (1024, 3000)
+    assert (created["timeout"], created["idle_timeout"]) == (930, 120)
+    # No packages asked for: the image is the one figure code runs in.
+    assert len(created["image"].named("Image.uv_pip_install")) == 1
+    assert result.cost_usd is not None and result.cost_usd >= 0
+
+
+@needs_coreutils
+def test_job_output_is_streamed_while_the_job_runs(fake, backend, job):
+    source = job.source(
+        """
+        import time
+        print("first")
+        time.sleep(1.5)
+        print("second")
+        """
+    )
+    seen: list[tuple[str, float, str]] = []
+
+    def on_log(line: str) -> None:
+        if not line.startswith("[paper-orchestra]"):
+            seen.append((line, time.monotonic(), job.log()))
+
+    result, _ = run_main(backend, job, source, on_log=on_log)
+    assert result.ok
+    (first, first_at, log_then), (second, second_at, _) = seen
+    assert (first, second) == ("first", "second")
+    assert second_at - first_at > 0.8
+    assert log_then.endswith("first\n")
+
+
+@needs_coreutils
+def test_a_stop_request_terminates_the_sandbox(fake, backend, job):
+    source = job.source("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(60)\n")
+    seen: list[str] = []
+    asked: list[float] = []
+
+    def should_stop() -> bool:
+        asked.append(time.monotonic())
+        return bool(job.output_lines(seen)) and len(asked) > 3
+
+    started = time.monotonic()
+    result, _ = run_main(backend, job, source, on_log=seen.append, should_stop=should_stop)
+    assert result.cancelled and not result.timed_out and not result.ok
+    assert result.returncode is None and result.error is None
+    assert time.monotonic() - started < 10
+    assert max(b - a for a, b in itertools.pairwise(asked)) < 1.0
+    [sandbox] = fake.sandboxes
+    assert sandbox.terminated and len(fake.named("Sandbox.terminate")) == 1
+    assert_gone(int(job.output_lines(seen)[0]))
+    assert seen[-1] == "[paper-orchestra] The job was stopped on request."
+    assert job.log().endswith(seen[-1] + "\n")
+    assert result.cost_usd is not None
+    # The time it ran counts against the project's budget although nothing came of it.
+    assert 0.5 < result.seconds < 10
+
+
+def test_a_stop_request_is_heard_while_the_sandbox_is_being_built(fake, backend, job):
+    """Building an image takes minutes; the person who cancels does not wait for it."""
+    fake.create_gate = threading.Event()
+    asked: list[float] = []
+
+    def should_stop() -> bool:
+        asked.append(time.monotonic())
+        return len(asked) >= 3
+
+    started = time.monotonic()
+    result, seen = run_main(
+        backend, job, job.source("print('never runs')\n"), should_stop=should_stop
+    )
+    assert time.monotonic() - started < 5
+    assert result.cancelled and result.returncode is None and result.error is None
+    assert result.handle is None and result.cost_usd is None and result.seconds == 0.0
+    assert seen[-1] == "[paper-orchestra] The job was stopped on request, before it had started."
+    assert not (job.run / "handle.txt").exists() and fake.sandboxes == []
+
+    # The sandbox that Modal hands over later has nobody waiting for it: it is ended.
+    fake.create_gate.set()
+    deadline = time.monotonic() + 5
+    while not (fake.sandboxes and fake.sandboxes[0].terminated):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    assert fake.sandboxes[0].commands == [] and fake.sandboxes[0].detached
+
+    # The same while the source is uploaded: the job never starts.
+    fake.create_gate = None
+    uploading = threading.Event()
+
+    def slow_upload(sandbox, command, cwd, env):
+        uploading.set()
+        time.sleep(1.5)
+
+    fake.handlers.append(slow_upload)
+    result, _ = run_main(
+        backend, job, job.source("print('never runs')\n"), should_stop=uploading.is_set
+    )
+    assert result.cancelled and result.handle == "sb-fake-1" and result.cost_usd is not None
+    assert fake.sandboxes[1].terminated
+    assert not any("main.py" in command for command in fake.sandboxes[1].commands)
+
+
+def test_a_stop_request_is_heard_while_the_source_is_packed(fake, backend, job):
+    result, seen = run_main(backend, job, job.source("print('x')\n"), should_stop=lambda: True)
+    assert result.cancelled and result.error is None and result.handle is None
+    assert seen == ["[paper-orchestra] The job was stopped on request, before it had started."]
+    assert fake.calls == []
+
+
+def test_an_interrupt_while_the_sandbox_is_being_built_does_not_leak_it(fake, backend, job):
+    fake.create_gate = threading.Event()
+    asked: list[int] = []
+
+    def should_stop() -> bool:
+        asked.append(1)
+        if len(asked) > 1:  # the source is packed; Modal is building the image
+            raise KeyboardInterrupt
+        return False
+
+    with pytest.raises(KeyboardInterrupt):
+        run_main(backend, job, job.source("print('never runs')\n"), should_stop=should_stop)
+    fake.create_gate.set()
+    deadline = time.monotonic() + 5
+    while not (fake.sandboxes and fake.sandboxes[0].terminated):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+
+@needs_coreutils
+def test_a_job_that_runs_too_long_is_stopped_inside_the_sandbox(fake, backend, job):
+    source = job.source(
+        """
+        import time
+        open("metrics.json", "w").write('{"steps": 3}')
+        for index in range(50):
+            print("step", index)
+        print("half a li", end="", flush=True)
+        time.sleep(60)
+        """
+    )
+    started = time.monotonic()
+    result, seen = run_main(backend, job, source, spec={"timeout": 2})
+    assert result.timed_out and not result.cancelled and not result.ok and result.error is None
+    assert result.returncode == 124 and 2 <= result.seconds < 10
+    assert time.monotonic() - started < 20
+    lines = job.output_lines(seen)
+    assert lines == [*(f"step {index}" for index in range(50)), "half a li"]
+    assert seen[-1] == (
+        "[paper-orchestra] The job was stopped because it ran longer than its time limit of 2 s."
+    )
+    # What it had written by then is still fetched.
+    assert json.loads((job.run / "metrics.json").read_text()) == {"steps": 3}
+    assert fake.sandboxes[0].terminated
+
+
+@needs_coreutils
+def test_an_interrupt_terminates_the_sandbox_and_leaves_nothing_behind(fake, backend, job):
+    source = job.source("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(60)\n")
+    pids: list[int] = []
+
+    def on_log(line: str) -> None:
+        if not line.startswith("[paper-orchestra]"):
+            pids.append(int(line))
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_main(backend, job, source, on_log=on_log)
+    [sandbox] = fake.sandboxes
+    assert sandbox.terminated and sandbox.detached
+    assert_gone(pids[0])
+    assert list(job.scratch.iterdir()) == []
+    assert (job.run / "handle.txt").read_text() == "sb-fake-0\n"
+
+
+@needs_coreutils
+def test_a_sandbox_that_is_lost_is_the_backends_failure_not_the_jobs(fake, backend, job):
+    source = job.source("import time\nprint('running', flush=True)\ntime.sleep(60)\n")
+
+    def on_log(line: str) -> None:
+        if line == "running":
+            # Preempted, or stopped from the dashboard: not by this process.
+            fake.sandboxes[0].exit_code = 137
+            fake.sandboxes[0].stop_processes()
+
+    started = time.monotonic()
+    result, _ = run_main(backend, job, source, on_log=on_log)
+    assert time.monotonic() - started < 15
+    assert result.returncode is None and not result.ok
+    assert not result.timed_out and not result.cancelled
+    assert "stopped before the job finished" in result.error and "137" in result.error
+    assert result.error in job.log() and "running\n" in job.log()
+    assert result.handle == "sb-fake-0" and fake.sandboxes[0].detached
+
+
+def test_authentication_failures_stop_the_run_and_other_failures_are_results(fake, backend, job):
+    source = job.source("print('never runs')\n")
+    fake.create_error = fake.exception.AuthError("Token expired")
+    with pytest.raises(BackendUnusable, match="Modal is not authenticated"):
+        run_main(backend, job, source)
+    fake.create_error = None
+    fake.lookup_error = fake.exception.AuthError("Token missing")
+    with pytest.raises(BackendUnusable, match="modal token new"):
+        run_main(ModalBackend(), job, source)
+    fake.lookup_error = None
+
+    fake.create_error = fake.exception.Error("Insufficient capacity")
+    result, seen = run_main(backend, job, source)
+    assert result.returncode is None and result.handle is None and result.cost_usd is None
+    assert result.error.startswith("The Modal backend could not run the job: ")
+    assert "could not start a Modal sandbox" in result.error and "Insufficient" in result.error
+    assert seen[-1] == f"[paper-orchestra] {result.error}"
+    assert fake.sandboxes == []
+
+    fake.create_error = None
+
+    def broken(sandbox, command, cwd, env):
+        raise fake.exception.Error("exec failed")
+
+    fake.handlers.append(broken)
+    result, _ = run_main(backend, job, source)
+    assert "Error: exec failed" in result.error and result.handle == "sb-fake-0"
+    assert fake.sandboxes[0].terminated  # nothing is left running after a failure
+    assert result.cost_usd is not None
+
+
+@needs_coreutils
+def test_a_job_whose_orchestrator_died_can_be_picked_up_again(fake, job, monkeypatch):
+    source = job.source(
+        """
+        import json, time
+        print("one")
+        print("two")
+        time.sleep(1.5)
+        print("three")
+        json.dump({"accuracy": 0.5}, open("metrics.json", "w"))
+        print("four")
+        """
+    )
+
+    class Died(BaseException):
+        """The orchestrator is killed: nothing after this point runs in it."""
+
+    first: list[str] = []
+
+    def on_log(line: str) -> None:
+        first.append(line)
+        if line == "two":
+            raise Died
+
+    with monkeypatch.context() as crash:
+        # A killed process terminates nothing: the sandbox stays up.
+        crash.setattr(ModalBackend, "_terminate", lambda self, sandbox: None)
+        with pytest.raises(Died):
+            run_main(ModalBackend(), job, source, on_log=on_log, spec={"gpu": "L4"})
+    [sandbox] = fake.sandboxes
+    assert not sandbox.terminated and "four" not in job.log()
+    handle = (job.run / "handle.txt").read_text().strip()
+
+    # A new process finds the handle next to the run and picks the job up.
+    second: list[str] = []
+    backend = ModalBackend()
+    result = backend.attach(handle, run_dir=job.run, on_log=second.append)
+    assert result.ok and result.returncode == 0 and result.error is None
+    assert (result.backend, result.handle) == ("modal", "sb-fake-0")
+    assert result.seconds >= 1.5 and result.outputs_dir == job.run
+    # Each line is reported once across the two processes...
+    assert job.output_lines(first) == ["one", "two"]
+    assert second == ["three", "four"]
+    # ...and the log is whole.
+    assert job.output_lines(job.log().splitlines()) == ["one", "two", "three", "four"]
+    assert json.loads((job.run / "metrics.json").read_text()) == {"accuracy": 0.5}
+    assert sandbox.terminated and sandbox.detached
+    assert fake.named("Sandbox.from_id") == [(("sb-fake-0",), {})]
+    # The price is that of the sandbox the job was started in, since it was started.
+    assert result.cost_usd is not None and result.cost_usd > 0.000222 * 1.5
+
+
+def test_a_job_that_was_never_started_is_not_waited_for(fake, job, monkeypatch):
+    """The orchestrator died between making the sandbox and starting the command."""
+
+    class Died(BaseException):
+        pass
+
+    def dies_during_the_upload(sandbox, command, cwd, env):
+        raise Died
+
+    fake.handlers.append(dies_during_the_upload)
+    with monkeypatch.context() as crash:
+        crash.setattr(ModalBackend, "_terminate", lambda self, sandbox: None)
+        with pytest.raises(Died):
+            run_main(ModalBackend(), job, job.source("print('never runs')\n"))
+    fake.handlers.clear()
+    [sandbox] = fake.sandboxes
+    assert not sandbox.terminated
+
+    started = time.monotonic()
+    result = ModalBackend().attach("sb-fake-0", run_dir=job.run)
+    assert time.monotonic() - started < 5
+    assert result.returncode is None and "had not been started" in result.error
+    assert "run the experiment again" in result.error
+    assert sandbox.terminated  # it was ours, and of no use
+
+
+@needs_coreutils
+def test_attaching_to_a_job_that_cannot_be_recovered_keeps_the_log(fake, backend, job):
+    job.run.mkdir(parents=True)
+    (job.run / "log.txt").write_text("epoch 1\nepo")
+    seen: list[str] = []
+
+    gone = backend.attach("sb-unknown", run_dir=job.run, on_log=seen.append)
+    assert gone.returncode is None and gone.handle == "sb-unknown" and not gone.ok
+    assert "no sandbox sb-unknown" in gone.error and "Run the experiment again" in gone.error
+    assert job.log() == f"epoch 1\nepo\n[paper-orchestra] {gone.error}\n"
+    assert seen == [f"[paper-orchestra] {gone.error}"]
+
+    result, _ = run_main(backend, job, job.source("print('done')\n"))
+    assert result.ok
+    ended = backend.attach(result.handle, run_dir=job.run)
+    assert "is no longer running" in ended.error and "137" in ended.error
+    assert "done\n" in job.log()  # the log of the run is still there
+
+    # A sandbox of this backend that holds no job (it runs figure code) is left alone.
+    backend.run_python("pass")
+    other = fake.sandboxes[-1]
+    foreign = backend.attach(other.object_id, run_dir=job.run)
+    assert "does not hold a job" in foreign.error and not other.terminated
+
+    fake.from_id_error = fake.exception.AuthError("Token expired")
+    with pytest.raises(BackendUnusable, match="Modal is not authenticated"):
+        backend.attach("sb-fake-0", run_dir=job.run)
+    fake.from_id_error = ConnectionError("network down")
+    offline = backend.attach("sb-fake-0", run_dir=job.run)
+    assert "ConnectionError: network down" in offline.error
+
+
+@needs_coreutils
+def test_outputs_of_a_sandbox_are_fetched_with_the_same_rules_as_local_ones(
+    fake, backend, job, monkeypatch
+):
+    monkeypatch.setattr(base, "MAX_OUTPUT_BYTES", 20_000)
+    source = job.source(
+        """
+        import os
+        os.makedirs("artifacts")
+        open("metrics.json", "w").write('{"loss": 0.5}')
+        open("artifacts/a_huge.bin", "wb").write(b"x" * 500_000)
+        open("artifacts/b_small.txt", "w").write("small")
+        open("artifacts/-starts-with-a-dash.txt", "w").write("dash")
+        os.symlink("../../job.json", "artifacts/leak.txt")
+        os.symlink("/", "artifacts/root")
+        os.symlink("../job.json", "metrics2.json")
+        os.mkfifo("artifacts/pipe")
+        """
+    )
+    result, _ = run_main(
+        backend, job, source, spec={"outputs": ("metrics.json", "metrics2.json", "artifacts")}
+    )
+    assert result.ok, job.log()
+    copied = sorted(p.relative_to(job.run).as_posix() for p in job.run.rglob("*"))
+    assert copied == [
+        "artifacts",
+        "artifacts/-starts-with-a-dash.txt",
+        "artifacts/b_small.txt",
+        "handle.txt",
+        "log.txt",
+        "metrics.json",
+    ]
+    assert not any(p.is_symlink() for p in job.run.rglob("*"))
+    notes = "\n".join(result.notes)
+    for name in ("artifacts/leak.txt", "artifacts/root", "metrics2.json", "artifacts/pipe"):
+        assert name in notes
+    assert "symbolic links are never followed" in notes
+    assert "a_huge.bin (488 KB)" in notes and "limited to 20 KB in total" in notes
+    assert "a_huge.bin (488 KB)" in job.log()
+    # The big file never left the sandbox.
+    [(_, local)] = [args for args, _ in fake.named("filesystem.copy_to_local")]
+    assert Path(local).parent.parent == job.scratch
+
+
+@needs_coreutils
+def test_hard_linked_outputs_are_all_fetched(fake, backend, job):
+    """tar stores the second name of a file as a link to the first, and links are not
+    taken from an archive that untrusted code made."""
+    source = job.source(
+        """
+        import os
+        os.makedirs("artifacts")
+        open("artifacts/a.csv", "w").write("a,b\\n")
+        os.link("artifacts/a.csv", "artifacts/b.csv")
+        """
+    )
+    result, _ = run_main(backend, job, source)
+    assert result.ok, job.log()
+    assert not any("could not be fetched" in note for note in result.notes), result.notes
+    assert (job.run / "artifacts" / "a.csv").read_text() == "a,b\n"
+    assert (job.run / "artifacts" / "b.csv").read_text() == "a,b\n"
+
+
+@needs_coreutils
+def test_an_output_behind_a_linked_directory_is_not_fetched(fake, backend, job):
+    """The output is named with a directory, and the job made that directory a link."""
+    source = job.source("import os\nos.symlink('..', 'results')\n")
+    result, _ = run_main(backend, job, source, spec={"outputs": ("results/job.json",)})
+    assert result.ok, job.log()
+    assert sorted(p.name for p in job.run.iterdir()) == ["handle.txt", "log.txt"]
+    [note] = [note for note in result.notes if "symbolic links are never followed" in note]
+    assert "results" in note and note in job.log()
+    assert fake.named("filesystem.copy_to_local") == []  # nothing was asked of the sandbox
+
+
+def test_a_sandbox_cannot_talk_the_backend_into_writing_elsewhere(fake, backend, job):
+    """Everything that comes back from a sandbox is the work of untrusted code."""
+    job.run.mkdir(parents=True)
+    (job.run / "run.json").write_text('{"status": "running"}')
+    victim = job.root / "victim.txt"
+    victim.write_text("untouched")
+
+    def lying_scan(sandbox, command, cwd, env):
+        if command[:2] != ["python", "-I"]:
+            return None
+        listing = [
+            ["metrics.json", "file", 2],
+            ["run.json", "file", 2],
+            ["log.txt", "file", 2],
+            ["../../victim.txt", "file", 2],
+            ["/etc/passwd", "file", 2],
+            ["artifacts/ok.txt", "file", 2],
+            ["artifacts/grown.txt", "file", 2],
+            ["artifacts/link.txt", "file", 2],
+            ["elsewhere/x.txt", "file", 2],
+        ]
+        return FakeProcess(json.dumps({"entries": listing, "truncated": False}).encode())
+
+    def lying_tar(sandbox, command, cwd, env):
+        if command[:2] != ["tar", "-cf"]:
+            return None
+        with tarfile.open(cwd.parent / "outputs.tar", "w") as tar:
+
+            def add(name: str, data: bytes = b"{}", **fields: Any) -> None:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                for key, value in fields.items():
+                    setattr(info, key, value)
+                tar.addfile(info, io.BytesIO(data) if info.isreg() else None)
+
+            add("./metrics.json")
+            add("./artifacts/ok.txt", b"ok")
+            add("./artifacts/grown.txt", b"x" * 5000)
+            add("./artifacts/link.txt", b"", type=tarfile.SYMTYPE, linkname=str(victim))
+            add("./run.json", b"{}")
+            add("../../victim.txt", b"overwritten")
+            add(str(victim), b"overwritten")
+            add("./artifacts/extra.txt", b"not listed")
+        return FakeProcess()
+
+    fake.handlers.extend(
+        [
+            scripted(sh=lambda sandbox, command, cwd, env: _finished_job(cwd, command)),
+            lying_scan,
+            lying_tar,
+        ]
+    )
+    result, _ = run_main(backend, job, job.source("print('unused')\n"))
+    assert result.returncode == 0 and result.error is None
+    copied = sorted(p.relative_to(job.run).as_posix() for p in job.run.rglob("*") if p.is_file())
+    assert copied == ["artifacts/ok.txt", "handle.txt", "log.txt", "metrics.json", "run.json"]
+    assert (job.run / "run.json").read_text() == '{"status": "running"}'
+    assert victim.read_text() == "untouched"
+    assert any("could not be fetched" in note for note in result.notes)
+    # Only what was asked for was ever named to the sandbox.
+    [(names, _)] = [
+        args for args, _ in fake.named("filesystem.write_bytes") if args[1].endswith("outputs.list")
+    ]
+    assert names.split(b"\0") == [
+        b"./metrics.json",
+        b"./artifacts/ok.txt",
+        b"./artifacts/grown.txt",
+        b"./artifacts/link.txt",
+        b"",
+    ]
+
+
+def test_only_a_link_is_accepted_above_a_requested_output(fake, backend, job):
+    """A link on the way to an output is reported so that the person hears of it; a
+    sandbox cannot use that to have a file of another name fetched."""
+    listing: list[list] = []
+
+    def lying_scan(sandbox, command, cwd, env):
+        if command[:2] != ["python", "-I"]:
+            return None
+        return FakeProcess(json.dumps({"entries": listing, "truncated": False}).encode())
+
+    fake.handlers.extend(
+        [
+            scripted(sh=lambda sandbox, command, cwd, env: _finished_job(cwd, command)),
+            lying_scan,
+        ]
+    )
+    source = job.source("print('unused')\n")
+    spec = {"outputs": ("deep/metrics.json",)}
+
+    listing[:] = [["deep", "file", 2], ["deeper", "link", 0], ["deep/metrics.json2", "link", 0]]
+    result, _ = run_main(backend, job, source, spec=spec)
+    assert result.returncode == 0 and result.error is None and result.notes == []
+
+    listing[:] = [["deep", "link", 0]]
+    result, _ = run_main(backend, job, source, spec=spec)
+    assert result.returncode == 0 and result.error is None
+    [note] = result.notes
+    assert "symbolic links are never followed" in note and "deep" in note
+    # Either way nothing was asked of the sandbox.
+    assert fake.named("filesystem.copy_to_local") == []
+    assert sorted(p.name for p in job.run.iterdir()) == ["handle.txt", "log.txt"]
+
+
+def _finished_job(cwd: Path, command: list[str]) -> FakeProcess:
+    """Stands in for both shell commands of a job: the job itself, which ended at once
+    with status 0, and the reading of its (empty) log."""
+    if "main.py" in command:
+        (cwd.parent / "status").write_text("0 100.0 100.5\n")
+    return FakeProcess()
+
+
+@pytest.mark.parametrize(
+    ("status", "returncode", "seconds", "timed_out", "error"),
+    [
+        ("0 100.0 100.5\n", 0, 0.5, False, None),
+        ("3 100.0 100.5\n", 3, 0.5, False, None),
+        ("124 100.0 160.0\n", 124, 60.0, True, None),  # stopped by its time limit
+        ("124 100.0 100.5\n", 124, 0.5, False, None),  # exited with 124 by itself
+        ("137 100.0 165.0\n", 137, 65.0, True, None),  # had to be killed
+        ("124 100.N 160.N\n", 124, 0.0, True, None),  # a `date` without fractions
+        ("0\n", 0, 0.0, False, None),
+        ("garbage\n", None, 0.0, False, "how the job ended is unreadable"),
+        ("", None, 0.0, False, "how the job ended is unreadable"),
+    ],
+)
+def test_how_a_job_ended_is_read_from_its_record(
+    fake, backend, job, status, returncode, seconds, timed_out, error
+):
+    def ended(sandbox, command, cwd, env):
+        if "main.py" in command:
+            (cwd.parent / "status").write_text(status)
+        return FakeProcess()
+
+    fake.handlers.append(scripted(sh=ended, python=lambda *_: FakeProcess(b'{"entries": []}')))
+    result, _ = run_main(backend, job, job.source("print('unused')\n"), spec={"timeout": 60})
+    assert (result.returncode, result.seconds, result.timed_out) == (returncode, seconds, timed_out)
+    if error is None:
+        assert result.error is None or "outputs" in result.error
+    else:
+        assert error in result.error
+    assert fake.sandboxes[0].terminated
+
+
+def test_a_sandbox_that_answers_nonsense_is_a_failure_of_the_backend(fake, backend, job):
+    fake.handlers.append(
+        scripted(sh=lambda sandbox, command, cwd, env: _finished_job(cwd, command))
+    )
+    fake.handlers.append(
+        lambda sandbox, command, cwd, env: (
+            FakeProcess(b"not json", b"Traceback: boom") if command[0] == "python" else None
+        )
+    )
+    result, _ = run_main(backend, job, job.source("print('unused')\n"))
+    assert "could not list the job's outputs" in result.error and "boom" in result.error
+    assert result.returncode == 0  # the job did end; its outputs are what is missing
+    assert fake.sandboxes[0].terminated
+
+
+@needs_coreutils
+def test_the_source_is_uploaded_without_repository_data_or_credentials(fake, backend, job):
+    source = job.source(
+        """
+        import json, os
+        names = sorted(
+            os.path.join(root, name)[2:] for root, dirs, files in os.walk(".") for name in dirs + files
+        )
+        print(json.dumps(names))
+        print(os.readlink("sub/link"), os.listdir("sub/link"), os.access("tool.sh", os.X_OK))
+        print(sorted(os.listdir("..")))
+        """,
+        **{
+            ".git/config": "[core]",
+            ".env": "API_KEY=sk-secret",
+            "pkg/__pycache__/mod.cpython-312.pyc": "bytecode",
+            "pkg/mod.py": "VALUE = 1",
+            ".gitignore": "*.pyc",
+            "tool.sh": "#!/bin/sh\n",
+            "data/big.bin": "x" * 300_000,
+        },
+    )
+    (source / "tool.sh").chmod(0o755)
+    (source / "sub").mkdir()
+    (source / "sub" / "link").symlink_to("../data")
+    (source / "abs_link").symlink_to(job.root)
+    result, seen = run_main(backend, job, source)
+    assert result.ok, job.log()
+    lines = job.output_lines(seen)
+    assert json.loads(lines[0]) == [
+        ".gitignore",
+        "data",
+        "data/big.bin",
+        "main.py",
+        "pkg",
+        "pkg/mod.py",
+        "sub",
+        "sub/link",
+        "tool.sh",
+    ]
+    assert lines[1] == "../data ['big.bin'] True"
+    # Next to the working directory: the job's record, its home, its log.  No archive.
+    assert lines[2] == "['home', 'job.json', 'log.txt', 'src', 'started']"
+    notes = "\n".join(result.notes)
+    for name in (".git", ".env", "pkg/__pycache__", "abs_link"):
+        assert name in notes
+    assert "sk-secret" not in "".join(
+        path.read_text(errors="replace")
+        for path in fake.sandboxes[0].root.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_pack_source_leaves_the_persons_identity_and_links_out(tmp_path):
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    (source / "main.py").write_text("print('x')")
+    (source / "sub" / "inside").symlink_to("../main.py")
+    (source / "outside").symlink_to(tmp_path)
+    (source / ".env").write_text("SECRET=1")
+    archive = tmp_path / "source.tar"
+    notes = modal_backend.pack_source(source, archive, max_bytes=1000)
+    assert len(notes) == 2 and ".env" in notes[0] and "outside" in notes[1]
+    with tarfile.open(archive) as tar:
+        members = {member.name: member for member in tar.getmembers()}
+    assert set(members) == {"src", "home", "src/main.py", "src/sub", "src/sub/inside"}
+    assert members["src/sub/inside"].issym() and members["src/sub/inside"].linkname == "../main.py"
+    assert {(m.uid, m.gid, m.uname, m.gname) for m in members.values()} == {(0, 0, "", "")}
+
+    (source / "big.bin").write_bytes(b"x" * 2000)
+    with pytest.raises(ComputeError, match="more than 1000 bytes") as raised:
+        modal_backend.pack_source(source, archive, max_bytes=1000)
+    assert "Modal backend uploads" in str(raised.value)
+
+
+def test_a_source_that_is_too_large_never_reaches_modal(fake, backend, job, monkeypatch):
+    monkeypatch.setattr(modal_backend, "_MAX_UPLOAD_BYTES", 10_000)
+    source = job.source("print('x')\n", **{"data/big.bin": "x" * 50_000})
+    result, _ = run_main(backend, job, source)
+    assert result.returncode is None and "more than 10 KB" in result.error
+    assert fake.calls == []
+
+
+def test_supports_says_what_modal_cannot_run(fake, backend):
+    everything = JobSpec(
+        command=["python", "train.py"],
+        timeout=6 * 3600,
+        gpu="A100-80GB:2",
+        network=True,
+        packages=("torch>=2.4", "scikit-learn"),
+        cpu=8,
+        memory_mb=65536,
+    )
+    assert backend.supports(everything) == []
+    [too_long] = backend.supports(JobSpec(command=["x"], timeout=24 * 3600))
+    assert "85500 s" in too_long and "24 hours" in too_long
+    assert backend.supports(JobSpec(command=["x"], timeout=85500)) == []
+    [malformed] = backend.supports(JobSpec(command=["x"], packages=("--pre torch",)))
+    assert "'--pre torch'" in malformed
+    assert fake.calls == []  # answered without contacting Modal
+
+
+def test_a_job_modal_cannot_run_is_refused_before_a_sandbox_exists(fake, backend, job):
+    source = job.source("print('x')\n")
+    spec = JobSpec(command=["python", "main.py"], timeout=10**6)
+    result = backend.run_job(spec, source_dir=source, run_dir=job.run)
+    assert result.returncode is None and result.handle is None
+    assert result.error.startswith("The Modal backend cannot run this job.")
+    assert result.error in job.log()
+    missing = backend.run_job(
+        JobSpec(command=["python", "main.py"]), source_dir=job.root / "nowhere", run_dir=job.run
+    )
+    assert "does not exist" in missing.error
+    assert fake.calls == []
+
+
+def test_the_cost_estimate_follows_the_price_table():
+    from paper_orchestra.compute.modal_backend import (
+        MODAL_PRICES_AS_OF,
+        MODAL_PRICES_USD_PER_SECOND,
+        estimate_cost,
+    )
+
+    assert MODAL_PRICES_AS_OF == "2026-11-15"
+    prices = MODAL_PRICES_USD_PER_SECOND
+    hour = 3600 * (2 * prices["cpu_core"] + 4 * prices["memory_gib"])
+    assert estimate_cost(3600, gpu=None, cpu=2, memory_mb=4096) == round(hour, 6)
+    assert estimate_cost(3600, gpu="T4", cpu=2, memory_mb=4096) == round(hour + 3600 * 0.000164, 6)
+    assert estimate_cost(3600, gpu="h100!:2", cpu=2, memory_mb=4096) == round(
+        hour + 2 * 3600 * prices["gpu"]["H100"], 6
+    )
+    assert estimate_cost(3600, gpu="A10G", cpu=2, memory_mb=4096) == estimate_cost(
+        3600, gpu="a10", cpu=2, memory_mb=4096
+    )
+    # A resource without a price in the table: no estimate, rather than a wrong one.
+    assert estimate_cost(3600, gpu="ANY", cpu=2, memory_mb=4096) is None
+    assert estimate_cost(3600, gpu="QUANTUM-9000", cpu=2, memory_mb=4096) is None
+    assert estimate_cost(0, gpu="T4", cpu=2, memory_mb=4096) == 0
+    assert estimate_cost(-5, gpu=None, cpu=2, memory_mb=4096) == 0
+
+
+@needs_coreutils
+def test_closing_the_backend_ends_a_job_that_is_running(fake, backend, job):
+    source = job.source("import time\nprint('running', flush=True)\ntime.sleep(60)\n")
+    running = threading.Event()
+    outcome: list[JobResult] = []
+
+    def on_log(line: str) -> None:
+        if line == "running":
+            running.set()
+
+    worker = threading.Thread(
+        target=lambda: outcome.append(run_main(backend, job, source, on_log=on_log)[0])
+    )
+    worker.start()
+    assert running.wait(20)
+    backend.close()
+    worker.join(20)
+    assert not worker.is_alive()
+    [result] = outcome
+    assert result.returncode is None and "stopped before the job finished" in result.error
+    assert fake.sandboxes[0].terminated and len(fake.named("Sandbox.terminate")) == 1
+
+
+def test_modal_describe_says_what_jobs_can_ask_for(fake, backend):
+    described = backend.describe()
+    jobs = described["jobs"]
+    assert {key: jobs[key] for key in ("supported", "gpu", "network_isolation", "packages")} == {
+        "supported": True,
+        "gpu": True,
+        "network_isolation": True,
+        "packages": True,
+    }
+    assert jobs["reattach"] is True and jobs["prices_as_of"] == "2026-11-15"
+    assert jobs["max_timeout_s"] == 85500 and "summary" in jobs
+    assert fake.calls == []
+
+
+@needs_coreutils
+def test_job_calls_match_the_installed_modal_sdk(real_sdk, fake, job):
+    """Everything a job does with Modal exists in the installed SDK with that signature."""
+    real = real_sdk.modal
+    backend = ModalBackend()
+    source = job.source("open('metrics.json', 'w').write('{}')\nprint('ok')\n")
+    spec = {"gpu": "T4", "packages": ("einops",), "network": True}
+    result, _ = run_main(backend, job, source, spec=spec)
+    assert result.ok, job.log()
+    backend.attach(result.handle, run_dir=job.run)
+
+    replayed = replay_against_the_sdk(real_sdk, fake)
+    assert {
+        "App.lookup",
+        "Sandbox.create",
+        "Sandbox.from_id",
+        "Sandbox.exec",
+        "Sandbox.poll",
+        "Sandbox.terminate",
+        "Sandbox.detach",
+        "Image.uv_pip_install",
+        "filesystem.write_bytes",
+        "filesystem.read_bytes",
+        "filesystem.stat",
+        "filesystem.copy_from_local",
+        "filesystem.copy_to_local",
+        "filesystem.remove",
+    } <= replayed
+
+    create = inspect.signature(real.Sandbox.create).parameters
+    assert {"gpu", "block_network", "cpu", "memory", "timeout", "idle_timeout"} <= set(create)
+    assert create["include_oidc_identity_token"].default is False
+    assert create["secrets"].default is None  # nothing is passed, so nothing is injected
+    assert create["block_network"].default is False  # which is why it is always passed
+    assert inspect.signature(real.Sandbox.exec).parameters["text"].default is True
+    assert issubclass(real.exception.ClientClosed, real.Error)
+    assert issubclass(real.exception.NotFoundError, real.Error)
+    assert callable(real.Sandbox.from_id) and hasattr(real.Sandbox, "object_id")
