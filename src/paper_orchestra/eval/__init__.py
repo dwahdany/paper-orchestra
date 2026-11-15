@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -282,17 +283,22 @@ def run_batch(
 # ---------------------------------------------------------------------------
 
 _WINNERS = ("paper_1", "paper_2", "tie")
+_TIE_WORD = re.compile(r"(?<![a-z])tie(?![a-z])")
 
 
 def normalize_winner(value: Any) -> Any:
-    """Map spellings such as ``"Paper 1"`` onto ``paper_1`` / ``paper_2`` / ``tie``."""
+    """Map spellings such as ``"Paper 1"`` onto ``paper_1`` / ``paper_2`` / ``tie``.
+
+    Anything else is returned unchanged, so validation rejects it instead of
+    a verdict being guessed.
+    """
     if not isinstance(value, str):
         return value
     text = "_".join(value.strip().lower().split())
-    for winner in _WINNERS:
+    for winner in ("paper_1", "paper_2"):
         if winner in text:
             return winner
-    return value
+    return "tie" if _TIE_WORD.search(text) else value
 
 
 Winner = Annotated[Literal["paper_1", "paper_2", "tie"], BeforeValidator(normalize_winner)]

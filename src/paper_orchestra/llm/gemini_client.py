@@ -30,6 +30,7 @@ conversation exactly as it was, so the caller may send the same turn again.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import random
@@ -156,20 +157,43 @@ def _import_sdk() -> SimpleNamespace:
     return SimpleNamespace(genai=genai, types=types, errors=errors, auth=auth_exceptions)
 
 
-def _transport_errors() -> tuple[type[Exception], ...]:
-    """Connection-level exceptions of the HTTP library under the SDK.
+def _require_sendable(name: str, secret: str) -> None:
+    """Refuse a credential that cannot travel in an HTTP header.
+
+    The HTTP library rejects such a value with an error that quotes it in
+    full, which would carry the secret into logs and transcripts.
+    """
+    if not (secret.isascii() and secret.isprintable()):
+        raise LLMConfigError(
+            f"{name} contains a line break, a control character or a non-ASCII character, so "
+            "it cannot be sent as a credential. Copy the key again from the provider's console."
+        )
+
+
+def _transport_errors() -> tuple[tuple[type[Exception], ...], tuple[type[Exception], ...]]:
+    """Exceptions of the HTTP library under the SDK: ``(worth retrying, all of them)``.
 
     google-genai lets them through unwrapped and, depending on its version, is
     built on ``httpx`` or on the ``httpx2`` fork, whose classes are unrelated.
+    A fault of the local setup (an unsupported URL scheme, a header that
+    cannot be sent) is not worth retrying: asking again cannot fix it.
     """
-    found: list[type[Exception]] = []
+    transient: list[type[Exception]] = []
+    every: list[type[Exception]] = []
     for name in ("httpx2", "httpx"):
         try:
             module = importlib.import_module(name)
         except ImportError:
             continue
-        found += [module.TimeoutException, module.NetworkError, module.RemoteProtocolError]
-    return tuple(found)
+        transient += [
+            module.TimeoutException,
+            module.NetworkError,
+            module.ProxyError,
+            module.RemoteProtocolError,
+            module.DecodingError,
+        ]
+        every.append(module.HTTPError)
+    return tuple(transient), tuple(every)
 
 
 def _retry_delay_hint(details: Any) -> float | None:
@@ -274,6 +298,9 @@ def _first_image(response: genai_types.GenerateContentResponse) -> bytes | None:
     for candidate in response.candidates or []:
         content = candidate.content
         for part in (content.parts if content is not None else None) or []:
+            if part.thought:
+                # A thinking image model shows interim drafts as thought parts.
+                continue
             blob = part.inline_data
             if blob is not None and blob.data and (blob.mime_type or "image/").startswith("image/"):
                 return blob.data
@@ -450,6 +477,7 @@ class GeminiClient(LLMClient):
                     "Only one of VERTEX_AI_PROJECT and VERTEX_AI_LOCATION is set, so Vertex AI "
                     "is not used; Gemini falls back to GEMINI_API_KEY."
                 )
+            _require_sendable("GEMINI_API_KEY", api_key)
             # vertexai=False pins the Gemini API even when GOOGLE_GENAI_USE_VERTEXAI is set.
             self._sdk = sdk.genai.Client(vertexai=False, api_key=api_key, http_options=http_options)
             log.info("Gemini uses the Gemini API with GEMINI_API_KEY.")
@@ -463,7 +491,8 @@ class GeminiClient(LLMClient):
         self._types = sdk.types
         self._errors = sdk.errors
         self._auth_error: type[Exception] = sdk.auth.GoogleAuthError
-        self._transport_errors = _transport_errors()
+        self._auth_transport_error: type[Exception] = sdk.auth.TransportError
+        self._transient_transport_errors, self._transport_errors = _transport_errors()
         self._retry = retry or RetryPolicy()
         self._sleep = sleep
         self._rng = rng
@@ -656,17 +685,35 @@ class GeminiClient(LLMClient):
             return self._sdk.models.generate_content(model=model, contents=contents, config=config)
         except self._errors.APIError as exc:
             raise self._translate(exc) from exc
-        except self._transport_errors as exc:
+        except self._transient_transport_errors as exc:
             raise _TransientError(f"connection error ({type(exc).__name__}: {exc})") from exc
-        except self._errors.UnknownApiResponseError as exc:
+        except self._transport_errors as exc:
+            raise LLMError(
+                f"The Gemini request could not be sent ({type(exc).__name__}: {exc})."
+            ) from exc
+        except (json.JSONDecodeError, self._errors.UnknownApiResponseError) as exc:
+            # The SDK decodes a 200 body without a guard; a gateway's HTML error page lands here.
             raise _TransientError("the API returned a body that is not JSON") from exc
         except self._auth_error as exc:
-            if getattr(exc, "retryable", False):
+            if self._auth_failure_is_transient(exc):
                 raise _TransientError(f"could not refresh Google credentials: {exc}") from exc
             raise LLMConfigError(
                 f"Google credentials for Vertex AI are not usable ({exc}). Run `gcloud auth "
                 "application-default login` or set GOOGLE_APPLICATION_CREDENTIALS."
             ) from exc
+
+    def _auth_failure_is_transient(self, exc: Exception) -> bool:
+        """Whether a google-auth failure is a network problem rather than bad credentials.
+
+        google-auth marks only some token-endpoint answers as retryable; a
+        token endpoint or metadata server it could not reach at all surfaces
+        as a ``TransportError``, sometimes wrapped in a ``RefreshError``.
+        """
+        return (
+            bool(getattr(exc, "retryable", False))
+            or isinstance(exc, self._auth_transport_error)
+            or isinstance(exc.__cause__, self._auth_transport_error)
+        )
 
     @staticmethod
     def _translate(exc: Any) -> Exception:

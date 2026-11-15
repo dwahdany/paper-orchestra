@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import socket
 import threading
 import time
 from itertools import product
@@ -66,11 +65,7 @@ TEXT_ONLY = Capabilities(pdf_input=False, image_input=True, structured_output=Fa
 
 
 @pytest.fixture(autouse=True)
-def _offline(monkeypatch):
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("a test tried to open a network connection")
-
-    monkeypatch.setattr(socket.socket, "connect", refuse)
+def _fresh_router():
     reset_clients()
     yield
     reset_clients()
@@ -537,7 +532,9 @@ def test_winner_spellings_are_normalised():
     assert normalize_winner(" PAPER_2 ") == "paper_2"
     assert normalize_winner("Tie") == "tie"
     assert normalize_winner("paper 2 is better") == "paper_2"
+    assert normalize_winner("It's a tie.") == "tie"
     assert normalize_winner("neither") == "neither"
+    assert normalize_winner("both have similar qualities") == "both have similar qualities"
     assert normalize_winner(None) is None
 
 

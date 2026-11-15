@@ -203,6 +203,9 @@ def _validate_settings(cfg: PipelineConfig) -> None:
             raise ValueError(
                 f"{label} must be a file name inside the raw materials directory, got {name!r}"
             )
+    from paper_orchestra.utils.scholar import parse_cutoff
+
+    parse_cutoff(cfg.research_cutoff)
 
 
 def _validate_template(template_dir: Path) -> None:
@@ -236,8 +239,10 @@ def _needs_copy(source: Path, target: Path) -> bool:
     return True
 
 
-def _check_models(cfg: PipelineConfig, harness: ContextHarness) -> None:
-    """Fail before any stage runs when a configured model has no usable client."""
+def _preflight(cfg: PipelineConfig, harness: ContextHarness, compute: ComputeBackend) -> str | None:
+    """Why the run cannot succeed as configured, found before any model call is paid for."""
+    from paper_orchestra.compute.local import LocalBackend
+
     roles = {
         "writer": cfg.models.writer,
         "reflection": cfg.models.reflection,
@@ -253,7 +258,7 @@ def _check_models(cfg: PipelineConfig, harness: ContextHarness) -> None:
         try:
             harness.client_for(model)
         except LLMConfigError as exc:
-            raise LLMConfigError(f"The {role} model '{model}' cannot be used: {exc}") from exc
+            return f"the {role} model '{model}' cannot be used: {exc}"
     image = cfg.models.image
     if cfg.use_plotting and image and image not in checked:
         try:
@@ -261,18 +266,12 @@ def _check_models(cfg: PipelineConfig, harness: ContextHarness) -> None:
         except LLMConfigError as exc:
             # Diagrams fall back to model-written plotting code, so this is not fatal.
             log.warning("The image model '%s' cannot be used: %s", image, exc)
-
-
-def _check_compute(compute: ComputeBackend) -> None:
-    """Fail before spending on model calls when the paper could never be compiled."""
-    from paper_orchestra.compute.base import ComputeError
-    from paper_orchestra.compute.local import LocalBackend
-
     if isinstance(compute, LocalBackend) and not compute.latex_available():
-        raise ComputeError(
+        return (
             "pdflatex/bibtex were not found on PATH, so the paper cannot be compiled. "
             "Install TeX Live, or run with --compute modal to compile in a Modal sandbox."
         )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +394,6 @@ def _provided_figures(paths: RunPaths) -> tuple[list[dict[str, Any]], list[str]]
             "what they show"
         )
     return entries, problems
-
-
-def _figure_known(name: str, entries: Sequence[dict[str, Any]]) -> bool:
-    names = {str(entry.get("name")) for entry in entries}
-    return name in names or Path(name).stem in names
 
 
 # ---------------------------------------------------------------------------
@@ -561,9 +555,9 @@ class _Runner:
         names = [stage.name for group in self.groups for stage in group]
         to_run = [name for name in names if name not in self.reuse]
 
+        failure: str | None = None
         if to_run:
-            _check_models(cfg, harness)
-            _check_compute(ctx.compute)
+            failure = _preflight(cfg, harness, ctx.compute)
             # A deliverable left by an earlier run must not pass for this one's.
             for stale in (paths.final_pdf, paths.final_tex, paths.time_breakdown):
                 stale.unlink(missing_ok=True)
@@ -601,12 +595,13 @@ class _Runner:
             reused=sorted(self.reuse),
         )
 
-        try:
-            failure = self._run_groups()
-        except BaseException:
-            self.state.close("interrupted", "the run was interrupted")
-            self._write_usage()
-            raise
+        if failure is None:
+            try:
+                failure = self._run_groups()
+            except BaseException:
+                self.state.close("interrupted", "the run was interrupted")
+                self._write_usage()
+                raise
 
         self.state.close("failed" if failure else "completed", failure)
         harness.record("run_end", status="failed" if failure else "completed", error=failure)
@@ -938,9 +933,12 @@ class _Runner:
             )
 
     def _outline(self) -> list[Path]:
-        paths = self.ctx.paths
+        cfg, paths = self.ctx.cfg, self.ctx.paths
         for stale in (paths.outline, self.pristine_outline):
             stale.unlink(missing_ok=True)
+        # The outline is planned against the template as shipped, also when an earlier run
+        # already filled sections in.
+        _atomic_copy(cfg.template_dir / "template.tex", paths.template_tex)
         _outline_agent(self.ctx).run()
         if not paths.outline.is_file():
             raise StageError(f"the outline agent did not write {paths.outline}")
@@ -971,8 +969,8 @@ class _Runner:
         missing = [str(path) for path in produced if not path.is_file()]
         if missing:
             raise StageError(f"the literature agent did not write {', '.join(missing)}")
-        # The section writer reads these from the workspace; put them there whether or not
-        # the agent already did.
+        # The agent puts these in the workspace itself; copying them again keeps the handover
+        # to the section writer independent of that.
         for source, target in in_place.items():
             _atomic_copy(source, target)
         return [*produced, *in_place.values()]
@@ -986,58 +984,31 @@ class _Runner:
 
     def _plotting(self) -> list[Path]:
         paths = self.ctx.paths
-        paths.plotting_results.unlink(missing_ok=True)
-        _reset_dir(paths.generated_figures_dir)
+        self._reset_figure_workspace()
         _plotting_agent(self.ctx).run(self._outline_for_agents())
-        return [paths.plotting_results]
+        return [paths.plotting_results, paths.figures_info]
 
-    def _reconcile_figures(self) -> None:
-        """Make ``figures/info.json`` list every figure the writer can use.
-
-        Provided figures and generated ones end up in the same list, whatever
-        the plotting agent wrote there and even when plotting failed part-way.
-        """
-        cfg, paths = self.ctx.cfg, self.ctx.paths
-        entries, problem = _read_figure_list(paths.figures_info)
-        if problem:
-            log.warning("Rebuilding the figure list: %s.", problem)
-        changed = problem is not None or not paths.figures_info.is_file()
+    def _reset_figure_workspace(self) -> None:
+        """Undo what an earlier plotting attempt left: only the provided figures remain listed."""
+        paths = self.ctx.paths
         provided, _ = _provided_figures(paths)
-        for entry in provided:
-            if not _figure_known(entry["name"], entries):
-                entries.append(entry)
-                changed = True
-        if cfg.use_plotting and paths.plotting_results.is_file():
-            results = read_json(paths.plotting_results)
-            for result in results if isinstance(results, list) else []:
-                image = result.get("image_path") if isinstance(result, dict) else None
-                if not image or not (paths.base_dir / image).is_file():
-                    continue
-                source = paths.base_dir / image
-                if not (paths.figures_dir / source.name).is_file():
-                    _atomic_copy(source, paths.figures_dir / source.name)
-                if not _figure_known(source.name, entries):
-                    caption = str(result.get("caption") or "")
-                    entries.append({"name": source.name, "caption": caption})
-                    changed = True
-        if changed:
-            write_json(paths.figures_info, entries)
+        keep = {entry["name"] for entry in provided}
+        if paths.generated_figures_dir.is_dir():
+            for stale in paths.generated_figures_dir.iterdir():
+                if stale.name not in keep:
+                    (paths.figures_dir / stale.name).unlink(missing_ok=True)
+        _reset_dir(paths.generated_figures_dir)
+        paths.plotting_results.unlink(missing_ok=True)
+        write_json(paths.figures_info, provided)
 
     def _section_writing(self) -> list[Path]:
         paths = self.ctx.paths
-        self._reconcile_figures()
         paths.raw_draft_tex.unlink(missing_ok=True)
         _section_writing_agent(self.ctx).run()
         return [paths.raw_draft_tex]
 
     def _refinement(self) -> list[Path]:
-        paths = self.ctx.paths
-        # Every attempt reviews and rewrites files in place, so each one starts from a clean
-        # copy of the LaTeX workspace.
-        if paths.refinement_dir.exists():
-            shutil.rmtree(paths.refinement_dir)
-        shutil.copytree(paths.latex_dir, paths.refinement_dir)
-        pdf = Path(_refinement_agent(self.ctx).run(paths.raw_draft_tex))
+        pdf = Path(_refinement_agent(self.ctx).run(self.ctx.paths.raw_draft_tex))
         return [pdf, pdf.with_suffix(".tex")]
 
     def _finalize(self) -> list[Path]:
@@ -1110,10 +1081,11 @@ def run_paper(
 ) -> PaperResult:
     """Write one paper from ``<cfg.base_dir>/raw_materials``.
 
-    Missing inputs and unusable configuration raise right away
-    (``FileNotFoundError``, ``ValueError``, ``LLMConfigError``,
-    ``ComputeError``).  A stage that keeps failing does not raise: the result
-    has ``success=False`` and ``state.json`` shows which stage failed and why.
+    Missing or invalid inputs raise right away (``FileNotFoundError``,
+    ``ValueError``), and so does a compute backend that cannot be built
+    (``ComputeError``).  Nothing else raises: a model without usable
+    credentials, a missing TeX installation or a stage that keeps failing give
+    a result with ``success=False``, and ``state.json`` says what went wrong.
 
     ``on_stage(name, record)`` is called after every stage settles (completed,
     failed or reused) with that stage's ``state.json`` record, for callers that

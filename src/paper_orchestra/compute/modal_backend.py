@@ -529,6 +529,9 @@ class ModalBackend(ComputeBackend):
         )
         try:
             return modal.Sandbox.create(
+                # Keeps the sandbox up between jobs whatever the image's default command is.
+                "sleep",
+                "infinity",
                 app=self._lookup_app(),
                 image=python_image() if kind == "python" else latex_image(),
                 timeout=_seconds(self.sandbox_lifetime),

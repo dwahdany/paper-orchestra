@@ -33,6 +33,7 @@ conversation exactly as it was, so the caller may send the same turn again.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -158,6 +159,19 @@ def _import_sdk() -> Any:
     return openai
 
 
+def _require_sendable(name: str, secret: str) -> None:
+    """Refuse a credential that cannot travel in an HTTP header.
+
+    The HTTP library rejects such a value with an error that quotes it in
+    full, which would carry the secret into logs and transcripts.
+    """
+    if not (secret.isascii() and secret.isprintable()):
+        raise LLMConfigError(
+            f"{name} contains a line break, a control character or a non-ASCII character, so "
+            "it cannot be sent as a credential. Copy the key again from the provider's console."
+        )
+
+
 def _is_o_series(model: str) -> bool:
     return _O_SERIES.match(model) is not None
 
@@ -189,10 +203,11 @@ def _usage_of(completion: ChatCompletion) -> Usage:
     details = getattr(reported, "prompt_tokens_details", None)
     cached = getattr(details, "cached_tokens", None) or 0
     written = getattr(details, "cache_write_tokens", None) or 0
-    usage.input_tokens = max(0, reported.prompt_tokens - cached - written)
+    # The SDK does not validate responses, so a count the server left out arrives as None.
+    usage.input_tokens = max(0, (reported.prompt_tokens or 0) - cached - written)
     usage.cache_read_input_tokens = cached
     usage.cache_creation_input_tokens = written
-    usage.output_tokens = reported.completion_tokens
+    usage.output_tokens = reported.completion_tokens or 0
     return usage
 
 
@@ -200,7 +215,11 @@ def _read_reply(completion: ChatCompletion, model: str) -> _Reply:
     """Turn a completion into a reply, raising for refusals, truncation and empty answers."""
     choice = completion.choices[0] if completion.choices else None
     message = choice.message if choice is not None else None
-    text = (message.content if message is not None else None) or ""
+    content = message.content if message is not None else None
+    if isinstance(content, list):
+        # OpenAI-compatible servers may answer with typed parts instead of a string.
+        content = "".join(part.get("text") or "" for part in content if isinstance(part, dict))
+    text = content if isinstance(content, str) else ""
     finish = choice.finish_reason if choice is not None else None
 
     if message is not None and message.refusal:
@@ -391,6 +410,7 @@ class OpenAIClient(LLMClient):
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
             raise LLMConfigError("OpenAI models need credentials: set OPENAI_API_KEY.")
+        _require_sendable("OPENAI_API_KEY", api_key)
         self._openai = openai
         # Retries are done here (max_retries=0) so that one policy, with an
         # injectable clock, covers every failure mode.
@@ -494,7 +514,16 @@ class OpenAIClient(LLMClient):
         openai = self._openai
         while True:
             try:
-                return self._sdk.chat.completions.create(model=model, messages=messages, **options)
+                completion = self._sdk.chat.completions.create(
+                    model=model, messages=messages, **options
+                )
+                # The SDK hands back a 200 body it cannot read as a completion unchanged
+                # (the HTML error page of a gateway arrives as a plain string).
+                if not isinstance(completion, openai.types.chat.ChatCompletion):
+                    raise _TransientError("the API returned a body that is not a chat completion")
+                return completion
+            except json.JSONDecodeError as exc:
+                raise _TransientError("the API returned a body that is not JSON") from exc
             except openai.BadRequestError as exc:
                 rejected = _REJECTABLE.get(exc.param or "")
                 if rejected is None or rejected not in options:

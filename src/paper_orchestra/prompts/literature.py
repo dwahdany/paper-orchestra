@@ -103,6 +103,7 @@ Inputs in the user message:
 * `<template>`: template.tex.
 * `<intro_related_work_plan>`: your primary guide for structure and arguments.
 * `<idea>` and `<experimental_log>`: use them so that the Introduction frames the technical contribution and the results accurately.
+* `<guidelines>`: the venue's writing guidelines. Follow them where they apply to these two sections (for example anonymity and how to refer to prior work).
 * `<collected_papers>`: the papers collected for citation, each with its citation key and abstract.
 * `<citation_checklist>`: the citation keys you may use.
 * `<research_cutoff>`: the month at which the literature search stopped.
@@ -131,6 +132,7 @@ def writer_user_prompt(
     plan: Mapping[str, Any],
     idea: str,
     experimental_log: str,
+    guidelines: str,
     papers: Sequence[Mapping[str, Any]],
     citation_keys: Sequence[str],
     cutoff: str,
@@ -157,6 +159,7 @@ def writer_user_prompt(
         "</intro_related_work_plan>\n\n"
         f"<idea>\n{idea.strip()}\n</idea>\n\n"
         f"<experimental_log>\n{experimental_log.strip()}\n</experimental_log>\n\n"
+        f"<guidelines>\n{guidelines.strip()}\n</guidelines>\n\n"
         "<collected_papers>\n"
         f"{json.dumps(list(papers), indent=1, ensure_ascii=False)}\n"
         "</collected_papers>\n\n"

@@ -63,8 +63,7 @@ class StubAgents:
         self.failures: dict[str, list[BaseException]] = {}
         self.seen: dict[str, Any] = {}
         self.states: dict[str, dict[str, Any]] = {}
-        #: Make the plotting stub replace figures/info.json with only its own figure.
-        self.plotting_overwrites_info = False
+        self.figure_id = "fig_arch"
         #: When set, literature and plotting must both be inside ``run`` to get past it.
         self.barrier: threading.Barrier | None = None
         self.plotting_delay = 0.0
@@ -140,20 +139,27 @@ class _Plotting(_Agent):
     def run(self, outline: dict[str, Any]) -> list[dict[str, Any]]:
         ctx = self.ctx
         self.stubs.seen.setdefault("plotting_outlines", []).append(outline)
+        self.stubs.seen.setdefault("plotting_figure_lists", []).append(
+            read_json(ctx.paths.figures_info)
+        )
         if self.stubs.barrier is not None:
             self.stubs.barrier.wait(timeout=5)
         time.sleep(self.stubs.plotting_delay)
         self.stubs.enter("plotting", ctx)
-        figure = ctx.paths.generated_figures_dir / "fig_arch.png"
-        figure.parent.mkdir(parents=True, exist_ok=True)
-        figure.write_bytes(PNG)
+        name = f"{self.stubs.figure_id}.png"
+        for directory in (ctx.paths.generated_figures_dir, ctx.paths.figures_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_bytes(PNG)
         results = [
-            {"figure_id": "fig_arch", "image_path": "figures/fig_arch.png", "caption": "Overview."}
+            {
+                "figure_id": self.stubs.figure_id,
+                "image_path": f"figures/{name}",
+                "caption": "Overview.",
+            }
         ]
         write_json(ctx.paths.plotting_results, results)
-        if self.stubs.plotting_overwrites_info:
-            (ctx.paths.figures_dir / "fig_arch.png").write_bytes(PNG)
-            write_json(ctx.paths.figures_info, [{"name": "fig_arch.png", "caption": "Overview."}])
+        listed = read_json(ctx.paths.figures_info)
+        write_json(ctx.paths.figures_info, [*listed, {"name": name, "caption": "Overview."}])
         return results
 
 
@@ -177,9 +183,9 @@ class _Refinement(_Agent):
     def run(self, tex_path: Path) -> Path:
         ctx = self.ctx
         self.stubs.enter("refinement", ctx)
-        work = ctx.paths.refinement_dir
-        self.stubs.seen["refinement_inputs"] = sorted(p.name for p in work.iterdir())
         assert tex_path == ctx.paths.raw_draft_tex
+        work = ctx.paths.refinement_dir
+        work.mkdir(exist_ok=True)
         (work / "final_refined_paper.tex").write_text(tex_path.read_text() + "% refined\n")
         (work / "final_refined_paper.pdf").write_bytes(b"%PDF-1.4 refined paper")
         return work / "final_refined_paper.pdf"
@@ -293,10 +299,6 @@ def test_run_without_plotting_honours_the_file_contract(cfg, stubs, caplog):
     assert stubs.seen["writer_template"] == FILLED_TEMPLATE
     assert stubs.seen["writer_outline"]["citations"] == ["Smith2020"]
     assert "Smith2020" in stubs.seen["writer_bib"] and "Sample" not in stubs.seen["writer_bib"]
-    # Refinement starts from a copy of the LaTeX workspace.
-    assert {"raw_draft_paper.tex", "template.tex", "venue.sty", "figures"} <= set(
-        stubs.seen["refinement_inputs"]
-    )
 
     # No figures and no plotting: an empty list, and the user is told.
     assert stubs.seen["figures"] == []
@@ -338,7 +340,6 @@ def test_run_with_plotting_runs_both_stages_concurrently_and_merges_figures(cfg,
         ],
     )
     cfg.use_plotting = True
-    stubs.plotting_overwrites_info = True
     # Both stubs block until the other one is running too: sequential stages would time out.
     stubs.barrier = threading.Barrier(2)
 
@@ -353,13 +354,14 @@ def test_run_with_plotting_runs_both_stages_concurrently_and_merges_figures(cfg,
     assert list(result.stages) == list(pipeline.STAGES)
     assert all(record["status"] == "completed" for record in result.stages.values())
 
-    # Provided and generated figures all reach the writer, although the plotting agent
-    # replaced the list with its own figure only.
-    assert stubs.seen["figures"] == [
-        {"name": "fig_arch.png", "caption": "Overview."},
+    # Provided figures are listed with their real file names; a file without a caption is
+    # still offered to the writer, and an entry without a file is dropped.
+    provided = [
         {"name": "teaser.png", "caption": "The teaser.", "width": 0.5},
         {"name": "extra.jpg", "caption": ""},
     ]
+    assert stubs.seen["plotting_figure_lists"] == [provided]
+    assert stubs.seen["figures"] == [*provided, {"name": "fig_arch.png", "caption": "Overview."}]
     for name in ("teaser.png", "extra.jpg", "fig_arch.png"):
         assert (paths.figures_dir / name).is_file()
     assert read_json(paths.plotting_results)[0]["figure_id"] == "fig_arch"
@@ -375,14 +377,32 @@ def test_run_with_plotting_runs_both_stages_concurrently_and_merges_figures(cfg,
     assert "The teaser." in page.body
 
 
-def test_generated_figures_are_registered_even_if_the_agent_only_reports_them(cfg, stubs):
+def test_a_repeated_plotting_stage_leaves_no_figures_of_the_earlier_one(cfg, stubs, monkeypatch):
+    figures = cfg.base_dir / "raw_materials" / "figures"
+    figures.mkdir()
+    (figures / "teaser.png").write_bytes(PNG)
     cfg.use_plotting = True
-    result, _, _ = run(cfg)
+    run(cfg)
     paths = RunPaths(cfg.base_dir)
+    assert (paths.figures_dir / "fig_arch.png").is_file()
+    paths.plotting_results.unlink()
+
+    again = StubAgents().install(monkeypatch)
+    again.figure_id = "fig_results"
+    result, _, _ = run(cfg)
 
     assert result.success
-    assert stubs.seen["figures"] == [{"name": "fig_arch.png", "caption": "Overview."}]
-    assert (paths.figures_dir / "fig_arch.png").read_bytes() == PNG
+    assert again.calls == ["plotting", "section_writing", "refinement"]
+    assert again.seen["figures"] == [
+        {"name": "teaser.png", "caption": ""},
+        {"name": "fig_results.png", "caption": "Overview."},
+    ]
+    assert sorted(p.name for p in paths.figures_dir.iterdir()) == [
+        "fig_results.png",
+        "info.json",
+        "teaser.png",
+    ]
+    assert [p.name for p in paths.generated_figures_dir.iterdir()] == ["fig_results.png"]
 
 
 def test_literature_stage_is_followed_by_a_synthesis_dream(cfg, stubs):
@@ -588,6 +608,9 @@ def test_literature_failure_is_fatal_and_plotting_is_still_awaited(cfg, stubs):
 
 
 def test_plotting_failure_is_tolerated(cfg, stubs, caplog):
+    figures = cfg.base_dir / "raw_materials" / "figures"
+    figures.mkdir()
+    (figures / "teaser.png").write_bytes(PNG)
     cfg.use_plotting = True
     stubs.failures["plotting"] = [RuntimeError("matplotlib boom"), RuntimeError("still boom")]
     with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
@@ -599,8 +622,8 @@ def test_plotting_failure_is_tolerated(cfg, stubs, caplog):
     assert record["status"] == "failed" and record["tolerated"] is True
     assert record["error"] == "RuntimeError: still boom"
     assert state_of(cfg)["status"] == "completed"
-    # The paper is written without generated figures.
-    assert stubs.seen["figures"] == []
+    # The paper is written with the provided figure only.
+    assert stubs.seen["figures"] == [{"name": "teaser.png", "caption": ""}]
     assert any("continuing without its output" in r.getMessage() for r in caplog.records)
     # Both failures were noted (a dream may already have archived them).
     wiki = harness.project
@@ -752,19 +775,58 @@ def test_invalid_settings_raise_value_error(cfg, stubs):
     cfg.idea_filename = "../idea_sparse.md"
     with pytest.raises(ValueError, match="idea_filename must be a file name"):
         run(cfg)
+    cfg.idea_filename = "idea_sparse.md"
+    cfg.research_cutoff = "last spring"
+    with pytest.raises(ValueError, match="research cutoff must look like YYYY-MM"):
+        run(cfg)
+    assert stubs.calls == []
 
 
-def test_an_unusable_model_raises_before_anything_runs(cfg, stubs):
+def test_an_unusable_model_fails_the_run_before_any_stage(cfg, stubs):
     def client_for(model: str) -> FakeLLM:
         if model == "gpt-missing-key":
             raise LLMConfigError("OPENAI_API_KEY is not set")
         return FakeLLM(responder)
 
     cfg.models.reflection = "gpt-missing-key"
-    harness = ContextHarness(client_for=client_for)
-    with pytest.raises(LLMConfigError, match="reflection model 'gpt-missing-key' cannot be used"):
-        run_paper(cfg, harness=harness, compute=FakeCompute())
-    assert stubs.calls == [] and not (cfg.base_dir / "state.json").exists()
+    result = run_paper(cfg, harness=ContextHarness(client_for=client_for), compute=FakeCompute())
+
+    assert not result.success
+    assert result.error == (
+        "the reflection model 'gpt-missing-key' cannot be used: OPENAI_API_KEY is not set"
+    )
+    assert stubs.calls == []
+    state = state_of(cfg)
+    assert state["status"] == "failed" and state["error"] == result.error
+    assert {record["status"] for record in state["stages"].values()} == {"pending"}
+
+
+def test_an_unusable_image_model_only_warns(cfg, stubs, caplog):
+    def client_for(model: str) -> FakeLLM:
+        if model == "imagen-missing-key":
+            raise LLMConfigError("GEMINI_API_KEY is not set")
+        return FakeLLM(responder)
+
+    cfg.use_plotting = True
+    cfg.models.image = "imagen-missing-key"
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result = run_paper(
+            cfg, harness=ContextHarness(client_for=client_for), compute=FakeCompute()
+        )
+
+    assert result.success
+    assert any("image model 'imagen-missing-key'" in r.getMessage() for r in caplog.records)
+
+
+def test_missing_tex_fails_the_run_before_any_stage(cfg, stubs, monkeypatch):
+    from paper_orchestra.compute.local import LocalBackend
+
+    monkeypatch.setattr(LocalBackend, "latex_available", staticmethod(lambda: False))
+    result = run_paper(cfg, harness=make_harness(cfg), compute=LocalBackend())
+
+    assert not result.success
+    assert "pdflatex/bibtex were not found" in result.error
+    assert stubs.calls == []
 
 
 def test_prepare_run_dir_copies_and_validates_raw_materials(tmp_path, template_dir):

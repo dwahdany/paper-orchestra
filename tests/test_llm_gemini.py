@@ -176,6 +176,21 @@ def test_missing_credentials_error_names_the_environment_variables(monkeypatch, 
     assert wire.client_kwargs == {}, "no SDK client may be built without credentials"
 
 
+@pytest.mark.parametrize("key", ["secret-key\nsecond-line", "secret-key\u201d"])
+def test_a_key_that_cannot_be_sent_is_refused_without_quoting_it(monkeypatch, wire, key):
+    # Sent as is, the HTTP library would quote the whole key in its error message.
+    monkeypatch.setenv("GEMINI_API_KEY", key)
+    with pytest.raises(LLMConfigError, match="GEMINI_API_KEY") as err:
+        GeminiClient()
+    assert "secret-key" not in str(err.value)
+    assert wire.client_kwargs == {}
+
+    # Vertex AI does not use the key, so its shape does not matter there.
+    assert build(monkeypatch, wire, vertex=True).client.describe()["credential_source"] == (
+        "vertex_ai"
+    )
+
+
 def test_missing_sdk_error_gives_the_install_command(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setitem(sys.modules, "google.genai", None)
@@ -439,6 +454,47 @@ def test_transient_failures_are_retried_with_backoff(api):
     assert response.usage.requests == 1
 
 
+def test_proxy_and_corrupted_body_failures_are_retried(api):
+    api.wire.queue(
+        HTTPX.ProxyError("502 Bad Gateway from the proxy"),
+        HTTPX.DecodingError("the gzip stream is cut short"),
+        ok("through"),
+    )
+    assert api.client.generate("q", model=MODEL).text == "through"
+    assert api.sleeps == [2.0, 4.0]
+
+
+@pytest.mark.parametrize("fault", ["LocalProtocolError", "UnsupportedProtocol", "TooManyRedirects"])
+def test_a_request_that_cannot_be_sent_fails_fast_as_an_llm_error(api, fault):
+    # A header or URL the HTTP library refuses is a local fault: it would fail the same way.
+    api.wire.queue(getattr(HTTPX, fault)("refused by the HTTP library"))
+    events: list[dict[str, Any]] = []
+    with pytest.raises(LLMError, match=f"could not be sent \\({fault}: refused") as err:
+        api.client.generate("q", model=MODEL, on_event=events.append)
+
+    assert type(err.value) is LLMError
+    assert len(api.wire.requests) == 1
+    assert api.sleeps == []
+    assert [event["type"] for event in events] == ["request", "error"]
+
+
+def test_a_success_status_with_a_body_that_is_not_json_is_asked_again(monkeypatch, wire):
+    api = build(monkeypatch, wire, retry=RetryPolicy(max_attempts=2))
+    gateway_page = "<html><body>upstream connect error</body></html>"
+
+    wire.queue(HTTPX.Response(200, text=gateway_page), ok("recovered"))
+    assert api.client.generate("q", model=MODEL).text == "recovered"
+    assert api.sleeps == [2.0]
+
+    wire.queue(HTTPX.Response(200, text=gateway_page), HTTPX.Response(200, text=gateway_page))
+    events: list[dict[str, Any]] = []
+    with pytest.raises(
+        LLMError, match="after 2 attempts: the API returned a body that is not JSON"
+    ):
+        api.client.generate("q", model=MODEL, on_event=events.append)
+    assert [event["type"] for event in events] == ["request", "error"]
+
+
 @pytest.mark.parametrize(
     ("code", "status", "error_type"),
     [
@@ -546,6 +602,24 @@ def test_credential_failures_are_config_errors_unless_retryable(monkeypatch, wir
     assert vertex.sleeps == [2.0]
 
 
+def test_an_unreachable_token_endpoint_is_retried_not_blamed_on_the_credentials(monkeypatch, wire):
+    vertex = build(monkeypatch, wire, vertex=True)
+    # google-auth does not flag either form as retryable.
+    unreachable = auth_exceptions.TransportError("oauth2.googleapis.com: connection reset")
+    wrapped = auth_exceptions.RefreshError("could not reach the metadata server")
+    wrapped.__cause__ = auth_exceptions.TransportError("metadata.google.internal: timed out")
+    assert not unreachable.retryable and not wrapped.retryable
+
+    wire.queue(unreachable, wrapped, ok("fine"))
+    assert vertex.client.generate("q", model=MODEL).text == "fine"
+    assert vertex.sleeps == [2.0, 4.0]
+
+    wire.queue(*[auth_exceptions.TransportError("still unreachable")] * 5)
+    with pytest.raises(LLMError, match="could not refresh Google credentials") as err:
+        vertex.client.generate("q", model=MODEL)
+    assert type(err.value) is LLMError, "a network failure is not a configuration error"
+
+
 # -- web search -----------------------------------------------------------------------
 
 
@@ -609,6 +683,24 @@ def test_generate_image_returns_the_raw_image_bytes(api):
         "responseModalities": ["IMAGE"],
         "imageConfig": {"aspectRatio": "4:3"},
     }
+
+
+def test_generate_image_skips_the_drafts_a_thinking_model_shows_as_thoughts(api):
+    draft = b"\x89PNG\r\n\x1a\n" + b"interim draft"
+
+    def blob(data: bytes) -> dict[str, str]:
+        return {"mimeType": "image/png", "data": base64.b64encode(data).decode()}
+
+    api.wire.queue(
+        ok(
+            parts=[
+                {"text": "Laying out the boxes first.", "thought": True},
+                {"inlineData": blob(draft), "thought": True},
+                {"inlineData": blob(PNG)},
+            ]
+        )
+    )
+    assert api.client.generate_image("A diagram", model="gemini-3-pro-image-preview") == PNG
 
 
 def test_generate_image_asks_again_when_the_model_answers_with_text(api):

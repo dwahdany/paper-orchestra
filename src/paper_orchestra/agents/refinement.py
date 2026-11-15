@@ -43,6 +43,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from paper_orchestra.agents.section_writing import (
+    NO_LATEX_PROBLEM,
     DraftCheck,
     check_latex,
     copy_workspace,
@@ -96,7 +97,6 @@ _PAGES_PER_SHEET = 4
 #: Longest side of a page sheet sent to the formatting reviewer.  Larger images are
 #: downscaled by the vision models anyway; this keeps a 2x2 sheet of pages legible.
 _SHEET_MAX_SIDE = 2576
-_NO_LATEX = "the reply contained no LaTeX document"
 
 
 class RefinementError(RuntimeError):
@@ -457,7 +457,7 @@ class ContentRefinementAgent:
                 break
             if round_no < cfg.max_reflections:
                 # Turn the outcomes so far into rules the next revision sees in its index.
-                harness.dream(stage=STAGE, focus=REFINEMENT_DREAM_FOCUS)
+                harness.dream(stage=STAGE, focus=REFINEMENT_DREAM_FOCUS, model=self.model)
         write_json(self.workdir / CONTENT_WORKLOG, self.worklogs)
         return current
 
@@ -499,13 +499,13 @@ class ContentRefinementAgent:
 
     @staticmethod
     def _build_problems(check: DraftCheck | None, current: _Version) -> list[str]:
-        """Why a revision cannot be reviewed (empty: it can).
+        """Why a new version cannot replace the current one (empty: it can).
 
-        Static problems the current version already has do not disqualify a revision:
-        it is no worse for keeping them, and the scores decide the rest.
+        Static problems the current version already has do not disqualify a new one:
+        it is no worse for keeping them.
         """
         if check is None:
-            return [_NO_LATEX]
+            return [NO_LATEX_PROBLEM]
         if not check.compiles:
             return check.problems
         return [p for p in check.static_problems if p not in current.static_problems]
@@ -543,7 +543,7 @@ class ContentRefinementAgent:
         if not self._build_problems(check, current):
             return plan, check
 
-        problems = check.problems if check is not None else [_NO_LATEX]
+        problems = check.problems if check is not None else [NO_LATEX_PROBLEM]
         log.warning("%s: %s needs a repair turn: %s", AGENT, name, "; ".join(problems)[:600])
         message = (
             revision_repair_prompt(check.feedback()) if check is not None else NO_LATEX_IN_REPLY
@@ -779,12 +779,14 @@ class ContentRefinementAgent:
             ]
         else:
             check = self._build(name, tex)
-            if check.compiles:
+            problems = self._build_problems(check, current)
+            if not problems:
                 entry["outcome"] = "ACCEPTED_COMPILE_SUCCESS"
                 accepted = self._version(name, check)
+            elif check.compiles:
+                entry["outcome"] = "REJECTED_STATIC_CHECK"
             else:
                 entry["outcome"] = "REJECTED_COMPILE_FAILURE"
-                problems = check.problems
 
         self.ctx.harness.record(
             "format", stage=STAGE, agent=AGENT, version=label, outcome=entry["outcome"]

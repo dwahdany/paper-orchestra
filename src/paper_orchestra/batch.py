@@ -45,6 +45,48 @@ PAPER_LOG_NAME = "paper_writing.log"
 ORIGINAL_PAPER_NAME = "original_paper.pdf"
 
 
+def _papers_in_folder(root: Path) -> list[dict[str, Any]]:
+    if not root.is_dir():
+        raise FileNotFoundError(f"Batch input folder not found: {root}")
+    papers: list[dict[str, Any]] = []
+    for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+        content = folder / "raw_materials"
+        if not content.is_dir():
+            log.warning("Skipping %s: it has no raw_materials directory.", folder)
+            continue
+        pdf = folder / f"{folder.name}.pdf"
+        papers.append(
+            {
+                "paper_id": folder.name,
+                "content_folder": str(content),
+                "pdf_path": str(pdf) if pdf.is_file() else None,
+            }
+        )
+    return papers
+
+
+def _papers_in_list(info: Path) -> list[dict[str, Any]]:
+    entries = read_json(info)
+    if not isinstance(entries, list):
+        raise ValueError(f"{info} must contain a JSON list of papers.")
+    papers: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get("paper_id"):
+            raise ValueError(f"{info}: entry {index} has no paper_id.")
+        if not entry.get("content_folder"):
+            raise ValueError(f"{info}: paper {entry['paper_id']} has no content_folder.")
+        pdf_path = entry.get("pdf_path")
+        papers.append(
+            {
+                "paper_id": str(entry["paper_id"]),
+                # Relative paths are relative to the list itself, wherever the batch is run.
+                "content_folder": str(info.parent / entry["content_folder"]),
+                "pdf_path": str(info.parent / pdf_path) if pdf_path else None,
+            }
+        )
+    return papers
+
+
 def load_papers(
     *,
     root_input_folder: str | Path | None = None,
@@ -55,53 +97,20 @@ def load_papers(
 
     ``root_input_folder`` holds one directory per paper with a
     ``raw_materials`` folder and, optionally, the original paper as
-    ``<paper_id>.pdf``.  ``paper_info_path`` is a JSON list of such entries;
-    relative paths in it are resolved against the JSON file's directory.
+    ``<paper_id>.pdf``.  ``paper_info_path`` is a JSON list of such entries.
+    ``n_papers`` keeps the first ``n`` (all of them when negative).
     """
-    if (root_input_folder is None) == (paper_info_path is None):
-        raise ValueError("Give exactly one of root_input_folder and paper_info_path.")
-
-    papers: list[dict[str, Any]] = []
-    if root_input_folder is not None:
-        root = Path(root_input_folder)
-        if not root.is_dir():
-            raise FileNotFoundError(f"Batch input folder not found: {root}")
-        for folder in sorted(p for p in root.iterdir() if p.is_dir()):
-            content = folder / "raw_materials"
-            if not content.is_dir():
-                log.warning("Skipping %s: it has no raw_materials directory.", folder)
-                continue
-            pdf = folder / f"{folder.name}.pdf"
-            papers.append(
-                {
-                    "paper_id": folder.name,
-                    "content_folder": str(content),
-                    "pdf_path": str(pdf) if pdf.is_file() else None,
-                }
-            )
+    if root_input_folder is not None and paper_info_path is None:
+        papers = _papers_in_folder(Path(root_input_folder))
+    elif paper_info_path is not None and root_input_folder is None:
+        papers = _papers_in_list(Path(paper_info_path))
     else:
-        info = Path(paper_info_path)  # type: ignore[arg-type]
-        entries = read_json(info)
-        if not isinstance(entries, list):
-            raise ValueError(f"{info} must contain a JSON list of papers.")
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, dict) or not entry.get("paper_id"):
-                raise ValueError(f"{info}: entry {index} has no paper_id.")
-            if not entry.get("content_folder"):
-                raise ValueError(f"{info}: paper {entry['paper_id']} has no content_folder.")
-            pdf_path = entry.get("pdf_path")
-            papers.append(
-                {
-                    "paper_id": str(entry["paper_id"]),
-                    "content_folder": str(info.parent / entry["content_folder"]),
-                    "pdf_path": str(info.parent / pdf_path) if pdf_path else None,
-                }
-            )
+        raise ValueError("Give exactly one of root_input_folder and paper_info_path.")
 
     seen: set[str] = set()
     for paper in papers:
         paper_id = paper["paper_id"]
-        if Path(paper_id).name != paper_id or paper_id in (".", ".."):
+        if Path(paper_id).name != paper_id or paper_id == "..":
             raise ValueError(f"paper_id {paper_id!r} cannot be used as a directory name.")
         if paper_id in seen:
             raise ValueError(f"paper_id {paper_id!r} appears more than once in the batch.")
@@ -124,7 +133,9 @@ def _load_log(path: Path) -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:
-        raise ValueError(f"{path} is not valid JSON ({exc}); fix or remove it to continue.") from exc
+        raise ValueError(
+            f"{path} is not valid JSON ({exc}); fix or remove it to continue."
+        ) from exc
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object keyed by paper id.")
     return data

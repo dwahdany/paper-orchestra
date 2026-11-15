@@ -47,7 +47,7 @@ from typing import Any
 
 from paper_orchestra.compute.base import CompileResult, ComputeBackend
 from paper_orchestra.context import RunContext
-from paper_orchestra.llm.base import Image, LLMParseError, Part, Text
+from paper_orchestra.llm.base import Image, LLMError, LLMParseError, Part, Text
 from paper_orchestra.llm.parsing import parse_latex
 from paper_orchestra.prompts.section_writing import (
     NO_LATEX_IN_REPLY,
@@ -76,9 +76,10 @@ _REFERENCE_WARNINGS = ("undefined citation", "undefined reference")
 _BLOCKING_WARNINGS = (*_REFERENCE_WARNINGS, "file not found")
 _BUILD_SUFFIXES = (".aux", ".bbl", ".blg", ".log", ".out", ".toc", ".pdf")
 _BUILD_PRODUCTS = shutil.ignore_patterns(
-    "*.aux", "*.bbl", "*.blg", "*.log", "*.out", "*.toc", "*.fls", "*.fdb_latexmk", "*.synctex.gz"
+    "*.aux", "*.blg", "*.log", "*.out", "*.toc", "*.fls", "*.fdb_latexmk", "*.synctex.gz"
 )
 _NO_PDF = "LaTeX did not produce a PDF"
+NO_LATEX_PROBLEM = "the reply contained no LaTeX document"
 
 
 class SectionWritingError(RuntimeError):
@@ -182,11 +183,9 @@ def copy_workspace(source: Path, destination: Path) -> None:
 
 def source_diff(before: str, after: str, *, max_lines: int = 60, max_width: int = 240) -> str:
     """The changed lines between two versions of a document, clipped for a note."""
-    changed = [
-        line[:max_width]
-        for line in difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0)
-        if not line.startswith(("---", "+++", "@@"))
-    ]
+    diff = difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0)
+    # The first two lines are the file header; "@@" lines only locate the hunks.
+    changed = [line[:max_width] for line in list(diff)[2:] if not line.startswith("@@")]
     if len(changed) > max_lines:
         changed = [*changed[:max_lines], f"... ({len(changed) - max_lines} more changed lines)"]
     return "\n".join(changed)
@@ -251,11 +250,7 @@ class _Attempt:
 
     @property
     def problems(self) -> list[str]:
-        return self.check.problems if self.check else ["the reply contained no LaTeX document"]
-
-    @property
-    def feedback(self) -> str:
-        return self.check.feedback() if self.check else NO_LATEX_IN_REPLY
+        return self.check.problems if self.check is not None else [NO_LATEX_PROBLEM]
 
 
 class SectionWritingAgent:
@@ -426,6 +421,18 @@ class SectionWritingAgent:
                 tex = conversation.send(message, parser=parse_latex).parsed
             except LLMParseError:
                 attempt = _Attempt(round_no, None)
+            except LLMError as exc:
+                if not any(a.check is not None and a.check.compiles for a in attempts):
+                    raise
+                # A draft that compiles is worth more than a repair that could not be asked for.
+                log.warning(
+                    "%s: repair round %d failed (%s: %s); keeping the best draft so far.",
+                    AGENT,
+                    round_no,
+                    type(exc).__name__,
+                    exc,
+                )
+                break
             else:
                 attempt = _Attempt(round_no, self._check(tex, round_no))
             if attempts:
@@ -440,7 +447,11 @@ class SectionWritingAgent:
                 len(attempt.problems),
                 "; ".join(attempt.problems)[:600],
             )
-            message = repair_prompt(attempt.feedback) if attempt.check else NO_LATEX_IN_REPLY
+            message = (
+                repair_prompt(attempt.check.feedback())
+                if attempt.check is not None
+                else NO_LATEX_IN_REPLY
+            )
 
         compiled = [a for a in attempts if a.check is not None and a.check.compiles]
         if not compiled:
@@ -478,7 +489,7 @@ class SectionWritingAgent:
             repair_lesson(
                 f"the section writing draft (repair round {after.round})",
                 before.problems,
-                before.check.tex if before.check else None,
+                before.check.tex if before.check is not None else None,
                 after.check,
             ),
             stage=STAGE,

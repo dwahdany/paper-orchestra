@@ -3,7 +3,7 @@
 From a checkout of this repository (the image is built from its ``uv.lock``)::
 
     uv run modal run -m paper_orchestra.modal_app \\
-        --raw-materials-dir ./raw_materials --template cvpr2025 --use-plotting
+        --raw-materials-dir ./raw_materials --template cvpr2025 --plotting
     uv run modal deploy -m paper_orchestra.modal_app
 
 ``modal run`` uploads the raw materials and the template, starts ``write_paper``,
@@ -46,13 +46,18 @@ Isolation.  The pipeline compiles LaTeX inside its own container, which holds
 the credentials, so TeX runs with paranoid file access.  Model-written figure
 code runs in a nested Sandbox with no network, no Secret and no identity token.
 
-Preemption.  Modal may restart a Function at any time.  Volumes are committed
-in the background every few seconds and once more before a summary is returned,
-and the pipeline resumes from ``runs/<run_id>/state.json``, so calling
-``write_paper`` again with the same job continues where the last attempt
-stopped.  A run id must not be in flight twice at the same time, and concurrent
-runs that share the lab wiki resolve conflicting edits of one page by
-last-writer-wins.
+Preemption.  Modal may restart a Function at any time.  The volume is committed
+in the background every few seconds, when a stage settles and once more before
+a summary is returned, and the pipeline resumes from
+``runs/<run_id>/state.json``, so calling ``write_paper`` again with the same job
+continues where the last attempt stopped.  A run id must not be in flight twice
+at the same time, and concurrent runs that share the lab wiki resolve
+conflicting edits of one page by last-writer-wins.
+
+Other settings, read when the app is run or deployed: ``PAPER_ORCHESTRA_MODAL_APP``
+(App name, default ``paper-orchestra``), ``PAPER_ORCHESTRA_MODAL_TIMEOUT``
+(seconds per attempt of ``write_paper``, default six hours) and
+``PAPER_ORCHESTRA_MODAL_MAX_CONTAINERS`` (papers written in parallel, default 4).
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -89,7 +95,7 @@ from paper_orchestra.config import (
     resolve_template_dir,
 )
 from paper_orchestra.context import RunPaths
-from paper_orchestra.llm.base import Effort
+from paper_orchestra.llm.base import Effort, LLMConfigError
 from paper_orchestra.log import setup_logging
 
 try:
@@ -484,6 +490,35 @@ def summarize(result: Any, spec: JobSpec, mount: Path, seconds: float) -> dict[s
     )
 
 
+class StageCheckpoint:
+    """``on_stage`` callback for the pipeline: commit the volume when a stage has settled.
+
+    An explicit commit may also reload the volume, which fails while files are
+    open and hides the volume from other threads for a moment.  So while stages
+    run side by side (``concurrent``) the checkpoint waits until all of them
+    have settled, and a checkpoint that fails is only logged: Modal's
+    background commits cover the gap.
+    """
+
+    def __init__(self, commit: Callable[[], None], concurrent: Iterable[str] = ()) -> None:
+        self._commit = commit
+        self._concurrent = frozenset(concurrent)
+        self._unsettled = set(self._concurrent)
+        self._lock = threading.Lock()
+
+    def __call__(self, name: str, record: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._unsettled.discard(name)
+            if name in self._concurrent and self._unsettled:
+                return
+            try:
+                self._commit()
+            except Exception as exc:
+                log.warning("Could not commit the volume after the %s stage: %s", name, exc)
+            else:
+                log.info("Committed the volume after the %s stage.", name)
+
+
 def commit_volume(commit: Callable[[], None]) -> None:
     """Make everything written so far durable and visible outside the container."""
     for attempt in range(1, _COMMIT_ATTEMPTS + 1):
@@ -507,14 +542,10 @@ def run_job(
 ) -> dict[str, Any]:
     """Run one paper inside the container and return its summary.
 
-    Problems that a retry cannot fix (a malformed job, missing inputs,
-    conflicting credentials) are returned as a failed summary.  Anything else
-    propagates so that Modal retries the call, which resumes the run.
-
-    The volume is committed only once the pipeline has finished: an explicit
-    commit also reloads the volume, which fails while files are open and hides
-    them from concurrent readers.  Until then Modal's background commits keep
-    partial progress safe.
+    Problems that a retry cannot fix (a malformed job, missing inputs, unusable
+    credentials) are returned as a failed summary.  Anything else propagates so
+    that Modal retries the call, which resumes the run.  The summary is returned
+    only after a final commit, so the files it lists can be downloaded at once.
     """
     started = time.monotonic()
     run_id = job.get("run_id") if isinstance(job, Mapping) else None
@@ -536,13 +567,10 @@ def run_job(
             log.info("Anthropic credential in use: %s.", credential)
         if not spec.config.template_dir.is_dir():
             raise JobError(f"LaTeX template not found in the container: {spec.config.template_dir}")
-        try:
-            # Fails here, before any model call, when the image lacks TeX Live.
-            backend = ModalBackend(latex="local")
-        except ComputeError as exc:
-            raise JobError(str(exc)) from exc
-        summary = _run_pipeline(spec, backend, mount, started)
-    except (FileNotFoundError, ValueError) as exc:
+        # Raises ComputeError here, before any model call, if the image lacks TeX Live.
+        backend = ModalBackend(latex="local")
+        summary = _run_pipeline(spec, backend, commit, mount, started)
+    except (FileNotFoundError, ValueError, LLMConfigError, ComputeError) as exc:
         log.error("Run %s cannot proceed: %s", run_id, exc)
         summary = failure_summary(run_id, str(exc), time.monotonic() - started)
     except Exception:
@@ -556,18 +584,23 @@ def run_job(
 
 
 def _run_pipeline(
-    spec: JobSpec, backend: ModalBackend, mount: Path, started: float
+    spec: JobSpec, backend: ModalBackend, commit: Callable[[], None], mount: Path, started: float
 ) -> dict[str, Any]:
     from paper_orchestra.pipeline import prepare_run_dir, run_paper
 
+    config = spec.config
+    # The pipeline runs these two stages in parallel when figures are generated.
+    checkpoint = StageCheckpoint(
+        commit, concurrent=("literature", "plotting") if config.use_plotting else ()
+    )
     os.environ[LAB_MEMORY_ENV] = str(mount / LAB_MEMORY_ROOT)
     # This container holds the credentials and compiles model-written LaTeX: paranoid input
     # keeps TeX from reading /proc/self/environ or the identity token file into the PDF.
     os.environ["openin_any"] = "p"  # noqa: SIM112 - kpathsea reads the lowercase name
     with backend:
-        prepare_run_dir(spec.config, spec.raw_materials_dir)
-        log.info("Writing paper %s in %s.", spec.run_id, spec.config.base_dir)
-        result = run_paper(spec.config, compute=backend)
+        prepare_run_dir(config, spec.raw_materials_dir)
+        log.info("Writing paper %s in %s.", spec.run_id, config.base_dir)
+        result = run_paper(config, compute=backend, on_stage=checkpoint)
     return summarize(result, spec, mount, time.monotonic() - started)
 
 
@@ -617,7 +650,7 @@ def upload_inputs(
     with volume.batch_upload(force=True) as batch:
         for source, target in targets:
             for path in _visible_files(source):
-                batch.put_file(path, f"{target}/{path.relative_to(source).as_posix()}")
+                batch.put_file(path, f"/{target}/{path.relative_to(source).as_posix()}")
     return targets[0][1], targets[1][1]
 
 
@@ -680,8 +713,9 @@ def launch(
         if not (raw / name).is_file():
             raise FileNotFoundError(f"required file not found: {raw / name}")
     template_dir = resolve_template_dir(template)
-    if not (template_dir / "template.tex").is_file():
-        raise FileNotFoundError(f"required file not found: {template_dir / 'template.tex'}")
+    for name in ("template.tex", "guidelines.md"):
+        if not (template_dir / name).is_file():
+            raise FileNotFoundError(f"the LaTeX template {template_dir} has no {name}")
 
     log.info("Uploading %s and template %s for run %s.", raw, template_dir, run)
     job["raw_materials_dir"], job["template_dir"] = upload_inputs(volume, run, raw, template_dir)
@@ -781,7 +815,7 @@ def main(
     template: str,
     output_dir: str | None = None,
     run_id: str | None = None,
-    use_plotting: bool = False,
+    plotting: bool = False,
     idea_filename: str = "idea_sparse.md",
     experimental_log_filename: str = "experimental_log.md",
     research_cutoff: str | None = None,
@@ -799,8 +833,9 @@ def main(
 ) -> None:
     """Write one paper on Modal from a local raw-materials directory.
 
-    ``template`` is a template name (``cvpr2025``) or a directory.  Pass the
-    ``--run-id`` of an interrupted run to resume it.
+    The options mirror ``paper-orchestra write``.  ``template`` is a template
+    name (``cvpr2025``) or a directory.  Pass the ``--run-id`` of an interrupted
+    run to resume it.
     """
     setup_logging()
     # Built here, where the build log is visible, rather than by the first figure of the run.
@@ -812,7 +847,7 @@ def main(
         template=template,
         output_dir=output_dir,
         run_id=run_id,
-        use_plotting=use_plotting,
+        use_plotting=plotting,
         idea_filename=idea_filename,
         experimental_log_filename=experimental_log_filename,
         research_cutoff=research_cutoff,

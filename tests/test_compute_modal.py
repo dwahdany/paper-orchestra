@@ -395,7 +395,7 @@ def test_run_python_round_trip_in_a_locked_down_sandbox(fake, monkeypatch):
 
     assert fake.named("App.lookup") == [(("paper-orchestra",), {"create_if_missing": True})]
     [(args, created)] = fake.named("Sandbox.create")
-    assert args == () and created["app"] == "app:paper-orchestra"
+    assert args == ("sleep", "infinity") and created["app"] == "app:paper-orchestra"
     assert created["block_network"] is True
     assert created["include_oidc_identity_token"] is False
     assert not created.get("secrets") and not created.get("env") and not created.get("volumes")

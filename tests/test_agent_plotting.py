@@ -352,9 +352,33 @@ def test_unusable_plotting_model_fails_the_stage(tmp_path):
     def no_client(model: str):
         raise LLMConfigError("no credentials for the plotting model")
 
-    ctx.harness._client_for = no_client
+    ctx.harness = ContextHarness(client_for=no_client)
     with pytest.raises(LLMConfigError, match="no credentials"):
         PlottingAgent(ctx).run({"plotting_plan": [figure()]})
+    assert not ctx.paths.plotting_results.exists()
+
+
+def test_works_with_a_provider_without_tools_or_structured_output(tmp_path):
+    critic_replies = iter([revise("Thicker lines.", "plan with thicker lines"), ACCEPT])
+    llm = scripted_llm(critic=lambda r: f"```json\n{next(critic_replies)}\n```")
+    llm.capabilities = Capabilities(tools=False, memory_tool=False, structured_output=False)
+    ctx = make_ctx(tmp_path, llm)
+    ctx.harness.write_page(
+        "wiki/lessons/figure-code.md",
+        "Importing seaborn fails in the figure sandbox; use matplotlib only.",
+        {"summary": "seaborn is not installed in the figure sandbox", "kind": "lesson"},
+    )
+
+    (result,) = PlottingAgent(ctx).run({"plotting_plan": [figure()]})
+
+    assert [entry["outcome"] for entry in result["critic_history"]] == ["revised", "accepted"]
+    assert result["description"] == "plan with thicker lines"
+    critic = requests_for(llm, "plotting.critic")[0]
+    # The schema travels in the prompt instead of a native response format.
+    assert critic.schema is None and "needs_revision" in critic.text
+    code = requests_for(llm, "plotting.code")[0]
+    assert code.memory is None and not code.tools
+    assert "seaborn is not installed in the figure sandbox" in code.system
 
 
 # -- diagrams ----------------------------------------------------------------------

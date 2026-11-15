@@ -427,9 +427,15 @@ def json_output_format(schema: Schema) -> dict[str, Any]:
             raise TypeError(
                 f"expected a pydantic model class or a JSON schema mapping, got {schema!r}"
             )
-    except (TypeError, ValueError) as exc:
+    except LLMConfigError:
+        raise
+    except Exception as exc:
+        # The SDK transform and pydantic's schema generation reject a schema with
+        # whatever they trip over (ValueError, AssertionError for a list-valued
+        # "type", PydanticUserError, AttributeError); each means the same thing here.
         raise LLMConfigError(
-            f"The output schema cannot be used for native structured output: {exc}"
+            "The output schema cannot be used for native structured output: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
     open_paths = _open_objects(transformed)
     if open_paths:
@@ -461,7 +467,15 @@ def _strict_tool_definition(definition: Mapping[str, Any]) -> dict[str, Any] | N
         return None
     try:
         strict_schema = _import_sdk().transform_schema(schema)
-    except (TypeError, ValueError):
+    except Exception as exc:
+        # The transform has no single error type for a schema it cannot express
+        # (it asserts on a list-valued "type", for one).  Strict mode is optional.
+        logger.debug(
+            "Tool '%s' is declared without strict mode: %s: %s",
+            definition["name"],
+            type(exc).__name__,
+            exc,
+        )
         return None
     if _open_objects(strict_schema):
         return None
@@ -647,17 +661,27 @@ def _text_of(content: Sequence[Mapping[str, Any]]) -> str:
 
     Adjacent text blocks are fragments of one passage (citations split prose
     into several blocks) and are joined directly; text separated by tool or
-    thinking blocks is joined with a blank line.
+    thinking blocks is joined with a blank line.  A ``fallback`` block that
+    follows text marks a mid-output handover: the fallback model continues the
+    declined model's partial text, possibly in the middle of a word, so the
+    two halves (and the fallback model's thinking between them) are joined
+    directly as well.
     """
     chunks: list[str] = []
     separated = False
+    continuing = False
     for block in content:
-        if block.get("type") == "text":
+        kind = block.get("type")
+        if kind == "text":
             text = block.get("text") or ""
             if chunks and separated and text:
                 chunks.append("\n\n")
             chunks.append(text)
-            separated = False
+            separated = continuing = False
+        elif kind == "fallback" and chunks and not separated:
+            continuing = True
+        elif continuing and kind in ("thinking", "redacted_thinking"):
+            continue
         elif chunks:
             separated = True
     return "".join(chunks)
@@ -1110,7 +1134,9 @@ class AnthropicConversation(Conversation):
             stop_reason=stop_reason,
             request_id=request_id,
             tool_calls=tool_calls,
-            raw=message.to_dict(warnings=False),
+            # JSON mode: the message can carry non-JSON values outside its content
+            # (the expiry time of a code-execution container is a datetime).
+            raw=message.to_dict(mode="json", warnings=False),
         )
 
     # -- one HTTP request ---------------------------------------------------

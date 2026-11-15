@@ -65,7 +65,7 @@ class Wire:
 
 
 def ok(
-    text: str | None = "hello",
+    text: Any = "hello",
     *,
     finish: str = "stop",
     refusal: str | None = None,
@@ -148,6 +148,16 @@ def test_missing_credentials_error_names_the_environment_variable(wire):
     with pytest.raises(LLMConfigError, match="OPENAI_API_KEY"):
         OpenAIClient()
     assert wire.client_kwargs == {}, "no SDK client may be built without credentials"
+
+
+@pytest.mark.parametrize("key", ["sk-secret\nsecond-line", "sk-secret\u201d"])
+def test_a_key_that_cannot_be_sent_is_refused_without_quoting_it(monkeypatch, wire, key):
+    # Sent as is, the HTTP library would quote the whole key in its error message.
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+    with pytest.raises(LLMConfigError, match="OPENAI_API_KEY") as err:
+        OpenAIClient()
+    assert "sk-secret" not in str(err.value)
+    assert wire.client_kwargs == {}
 
 
 def test_missing_sdk_error_gives_the_install_command(monkeypatch):
@@ -490,6 +500,54 @@ def test_retry_after_headers_only_lengthen_the_wait(api, headers, expected):
     api.wire.queue(api_error(429, "slow down", headers=headers), ok("fine"))
     api.client.generate("q", model=MODEL)
     assert api.sleeps == [expected]
+
+
+@pytest.mark.parametrize(
+    "not_a_completion",
+    [
+        lambda: HTTPX.Response(200, text="<html><body>upstream connect error</body></html>"),
+        lambda: HTTPX.Response(
+            200, content=b"<html>", headers={"content-type": "application/json"}
+        ),
+        lambda: HTTPX.Response(200, json=["not", "an", "object"]),
+    ],
+    ids=["html", "broken-json", "json-array"],
+)
+def test_a_success_status_without_a_completion_is_asked_again(monkeypatch, wire, not_a_completion):
+    api = build(monkeypatch, wire, retry=RetryPolicy(max_attempts=2))
+
+    wire.queue(not_a_completion(), ok("recovered"))
+    assert api.client.generate("q", model=MODEL).text == "recovered"
+    assert api.sleeps == [2.0]
+
+    wire.queue(not_a_completion(), not_a_completion())
+    events: list[dict[str, Any]] = []
+    with pytest.raises(LLMError, match="after 2 attempts: the API returned a body that is not"):
+        api.client.generate("q", model=MODEL, on_event=events.append)
+    assert [event["type"] for event in events] == ["request", "error"]
+
+
+def test_token_counts_missing_from_the_response_count_as_zero(api):
+    api.wire.queue(
+        ok("a", usage={"prompt_tokens": None, "completion_tokens": None}),
+        ok("b", usage={"total_tokens": 9}),
+    )
+    conversation = api.client.conversation(model=MODEL)
+
+    assert conversation.send("one").usage == Usage(requests=1)
+    assert conversation.send("two").usage == Usage(requests=1)
+    assert conversation.usage == Usage(requests=2)
+
+
+def test_an_answer_in_typed_parts_is_read_as_text(api):
+    # Not the OpenAI API's own shape, but what some compatible servers send.
+    parts = [{"type": "text", "text": "Hello "}, {"type": "text", "text": "there"}]
+    api.wire.queue(ok(parts), ok("again"))
+    conversation = api.client.conversation(model=MODEL)
+
+    assert conversation.send("q").text == "Hello there"
+    conversation.send("more")
+    assert api.wire.requests[1]["messages"][1] == {"role": "assistant", "content": "Hello there"}
 
 
 @pytest.mark.parametrize(

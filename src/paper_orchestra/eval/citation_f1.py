@@ -219,7 +219,8 @@ class SemanticScholarLookup:
                     S2_SEARCH_URL, headers=self._headers(), params=params, timeout=self.timeout
                 )
             except requests.RequestException as exc:
-                problem = f"{type(exc).__name__}: {exc}"
+                # The class name only: the message can embed the request URL and proxy details.
+                problem = type(exc).__name__
             else:
                 status = response.status_code
                 if status == 200:
@@ -335,9 +336,7 @@ class ReferenceF1V1Evaluator:
                 f"No numbered references could be extracted from the original paper {pdf_path}; "
                 "refusing to score against (and cache) an empty ground truth."
             )
-        # The first 20 pages cover the body of a conference paper and keep the prompt bounded.
-        paper_text = load_paper(pdf_path, num_pages=20)
-        return self.process_text_to_data(references_text, tag="gt", paper_text=paper_text)
+        return self.process_text_to_data(references_text, tag="gt", paper_text=load_paper(pdf_path))
 
     def _clean_text_to_list(self, raw_text: str) -> tuple[list[str], list[str]]:
         """Parse ``"[1] ... [2] ..."`` into citation strings and their extracted titles."""

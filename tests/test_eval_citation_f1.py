@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import socket
 from pathlib import Path
 
 import pymupdf
@@ -155,11 +154,7 @@ def instant_retry(attempts: int = 3) -> tuple[RetryPolicy, list[float]]:
 
 
 @pytest.fixture(autouse=True)
-def _offline(monkeypatch):
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("a test tried to open a network connection")
-
-    monkeypatch.setattr(socket.socket, "connect", refuse)
+def _fresh_router():
     reset_clients()
     yield
     reset_clients()

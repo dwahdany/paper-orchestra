@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import types
 import warnings
 from contextlib import contextmanager
@@ -15,10 +18,12 @@ from typing import Any
 
 import pytest
 
+from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.compute.modal_backend import ModalBackend
 from paper_orchestra.config import DEFAULT_MODEL, LAB_MEMORY_ENV, TEMPLATES_ENV
 from paper_orchestra.context import RunPaths
+from paper_orchestra.llm.base import LLMConfigError
 
 modal = pytest.importorskip("modal")
 
@@ -26,6 +31,7 @@ import paper_orchestra.modal_app as modal_app  # noqa: E402
 from paper_orchestra.modal_app import (  # noqa: E402
     JobError,
     Settings,
+    StageCheckpoint,
     batch_results,
     build_job,
     check_batch,
@@ -57,7 +63,8 @@ class FakeBatch:
         self._volume = volume
 
     def put_file(self, local_file: Path, remote_path: str, mode: int | None = None) -> None:
-        target = self._volume.root / remote_path
+        assert remote_path.startswith("/"), "uploads name their target from the volume root"
+        target = self._volume.root / remote_path.lstrip("/")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_file, target)
         self._volume.uploaded.append(remote_path)
@@ -149,6 +156,11 @@ class StubPipeline:
         self.runs: list[dict[str, Any]] = []
         self.success = True
         self.error: Exception | None = None
+        #: Called after each stage callback; its value is recorded in ``checkpoints``.
+        self.observe = lambda: None
+        self.checkpoints: list[tuple[str, Any]] = []
+        #: Overrides the stages reported through ``on_stage``.
+        self.only_stages: list[str] | None = None
 
     def prepare_run_dir(self, cfg, raw_materials_dir):
         self.prepared.append((cfg, raw_materials_dir))
@@ -159,7 +171,13 @@ class StubPipeline:
             raise FileNotFoundError(f"required file not found: {paths.idea}")
         return paths
 
-    def run_paper(self, cfg, *, harness=None, compute=None):
+    def stages(self, cfg) -> list[str]:
+        if self.only_stages is not None:
+            return self.only_stages
+        middle = ["literature", "plotting"] if cfg.use_plotting else ["literature"]
+        return ["ingest", "outline", *middle, "section_writing", "refinement", "finalize"]
+
+    def run_paper(self, cfg, *, harness=None, compute=None, on_stage=None):
         paths = RunPaths(cfg.base_dir, cfg.idea_filename, cfg.experimental_log_filename)
         self.runs.append(
             {
@@ -181,6 +199,9 @@ class StubPipeline:
             template = (cfg.template_dir / "template.tex").read_text()
             paths.final_tex.write_text(f"% built from: {template}")
             paths.usage.write_text(json.dumps({"total": {"requests": 3}}))
+        for name in self.stages(cfg):
+            on_stage(name, {"status": "completed"})
+            self.checkpoints.append((name, self.observe()))
         return types.SimpleNamespace(
             success=self.success,
             pdf_path=paths.final_pdf if self.success else None,
@@ -247,6 +268,7 @@ def local_inputs(tmp_path: Path) -> tuple[Path, Path]:
     template = tmp_path / "templates" / "mytemplate"
     template.mkdir(parents=True)
     (template / "template.tex").write_text("MY TEMPLATE")
+    (template / "guidelines.md").write_text("Eight pages.")
     (template / "style.sty").write_text("% style")
     return raw, template
 
@@ -532,6 +554,7 @@ def test_job_spec_rejects_non_mappings():
 def test_run_job_runs_the_pipeline_on_the_volume(pipeline, volume, monkeypatch, logs):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
     job = stage_inputs(volume)
+    pipeline.observe = lambda: volume.commits
     summary = run_job(job, commit=volume.commit, reload=volume.reload, mount=volume.root)
 
     assert summary == {
@@ -554,7 +577,16 @@ def test_run_job_runs_the_pipeline_on_the_volume(pipeline, volume, monkeypatch, 
     }
     assert json.loads(json.dumps(summary)) == summary and summary["seconds"] >= 0
     assert (volume.root / "runs/run-1/final_paper.pdf").read_bytes() == b"%PDF-1.5 the idea"
-    assert (volume.reloads, volume.commits) == (1, 1)
+    # One commit as each stage settles, and a last one before the summary is returned.
+    assert pipeline.checkpoints == [
+        ("ingest", 1),
+        ("outline", 2),
+        ("literature", 3),
+        ("section_writing", 4),
+        ("refinement", 5),
+        ("finalize", 6),
+    ]
+    assert (volume.reloads, volume.commits) == (1, 7)
 
     [(prepared_cfg, raw_materials_dir)] = pipeline.prepared
     assert raw_materials_dir == volume.root / "inputs/run-1/raw_materials"
@@ -579,7 +611,7 @@ def test_run_job_is_resumable(pipeline, volume):
     assert first["stages"]["outline"]["attempts"] == 1
     assert again["stages"]["outline"]["attempts"] == 2  # continued from state.json
     assert again["success"] and again["files"] == first["files"]
-    assert volume.commits == 2 and volume.reloads == 0
+    assert volume.commits == 2 * (6 + 1) and volume.reloads == 0
 
     fresh = run_job({**job, "resume": False}, commit=volume.commit, mount=volume.root)
     assert fresh["stages"]["outline"]["attempts"] == 1
@@ -590,7 +622,7 @@ def test_run_job_reports_a_failed_pipeline(pipeline, volume):
     summary = run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
     assert summary["success"] is False and summary["error"] == "stage refinement failed: boom"
     assert summary["files"] == {} and summary["run_dir"] == "runs/run-1"
-    assert volume.commits == 1  # partial progress is still made durable
+    assert volume.commits == 6 + 1  # partial progress is still made durable
 
 
 def test_run_job_keyless_with_modal_identity(pipeline, volume, monkeypatch, logs):
@@ -667,19 +699,80 @@ def test_run_job_lets_crashes_propagate_so_modal_retries(pipeline, volume):
         run_job(stage_inputs(volume, "run-2"), commit=volume.commit, mount=volume.root)
 
 
-def test_run_job_tolerates_a_failed_reload_but_not_a_failed_commit(pipeline, volume, logs):
+def test_checkpoints_wait_for_stages_that_run_side_by_side(pipeline, volume):
+    job = {**stage_inputs(volume), "use_plotting": True}
+    pipeline.observe = lambda: volume.commits
+    assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
+    # No commit while plotting may still be writing files; one once both have settled.
+    assert pipeline.checkpoints[:4] == [
+        ("ingest", 1),
+        ("outline", 2),
+        ("literature", 2),
+        ("plotting", 3),
+    ]
+    assert volume.commits == 6 + 1
+
+
+def test_stage_checkpoint_is_thread_safe_and_never_raises(logs):
+    commits: list[str] = []
+    checkpoint = StageCheckpoint(lambda: commits.append("commit"), ("literature", "plotting"))
+    barrier = threading.Barrier(2)
+
+    def settle(name: str) -> None:
+        barrier.wait()
+        checkpoint(name, {"status": "completed"})
+
+    threads = [threading.Thread(target=settle, args=(n,)) for n in ("plotting", "literature")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert commits == ["commit"]
+    checkpoint("section_writing", {"status": "failed"})
+    assert commits == ["commit", "commit"]
+
+    def busy() -> None:
+        raise RuntimeError("there are open files preventing the operation")
+
+    StageCheckpoint(busy)("outline", {"status": "completed"})
+    assert "Could not commit the volume after the outline stage" in logs.text
+
+
+def test_run_job_tolerates_failed_checkpoints_and_reloads(pipeline, volume, logs):
     volume.reload_error = RuntimeError("there are open files preventing the operation")
+    volume.commit_errors = [RuntimeError("volume busy")]
     job = stage_inputs(volume)
     assert run_job(job, commit=volume.commit, reload=volume.reload, mount=volume.root)["success"]
     assert "Could not reload the volume" in logs.text
+    assert "Could not commit the volume after the ingest stage: volume busy" in logs.text
+    assert volume.commits == 6 + 1
 
+
+def test_run_job_insists_on_the_final_commit(pipeline, volume):
+    pipeline.only_stages = []
+    job = stage_inputs(volume)
     volume.commit_errors = [RuntimeError("busy 1"), RuntimeError("busy 2")]
     assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
-    assert volume.commits == 1 + 3
+    assert volume.commits == 3
 
     volume.commit_errors = [RuntimeError(f"busy {n}") for n in range(3)]
     with pytest.raises(RuntimeError, match="busy 2"):
         run_job(job, commit=volume.commit, mount=volume.root)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMConfigError("the writer model 'claude-fable-5-2' cannot be used: no credentials"),
+        ComputeError("could not start a Modal sandbox"),
+        ValueError("The idea file is empty"),
+    ],
+)
+def test_run_job_does_not_retry_configuration_errors_from_the_pipeline(pipeline, volume, error):
+    pipeline.error = error
+    summary = run_job(stage_inputs(volume), commit=volume.commit, mount=volume.root)
+    assert summary["success"] is False and summary["error"] == str(error)
+    assert volume.commits == 1
 
 
 def test_commit_volume_retries_then_gives_up(monkeypatch, logs):
@@ -794,11 +887,12 @@ def test_upload_inputs_sends_visible_files_only(volume, tmp_path):
     targets = upload_inputs(volume, "r1", raw, template)
     assert targets == ("inputs/r1/raw_materials", "inputs/r1/template")
     assert sorted(volume.uploaded) == [
-        "inputs/r1/raw_materials/experimental_log.md",
-        "inputs/r1/raw_materials/figures/plot.png",
-        "inputs/r1/raw_materials/idea_sparse.md",
-        "inputs/r1/template/style.sty",
-        "inputs/r1/template/template.tex",
+        "/inputs/r1/raw_materials/experimental_log.md",
+        "/inputs/r1/raw_materials/figures/plot.png",
+        "/inputs/r1/raw_materials/idea_sparse.md",
+        "/inputs/r1/template/guidelines.md",
+        "/inputs/r1/template/style.sty",
+        "/inputs/r1/template/template.tex",
     ]
     assert volume.forced == [True]  # a resumed run uploads the same files again
 
@@ -921,7 +1015,10 @@ def test_launch_validates_everything_before_uploading(pipeline, volume, tmp_path
     with pytest.raises(FileNotFoundError, match="LaTeX template 'nope' not found"):
         launch(raw_materials_dir=raw, **{**common, "template": "nope"})
     (tmp_path / "not_a_template").mkdir()
-    with pytest.raises(FileNotFoundError, match=r"required file not found.*template\.tex"):
+    with pytest.raises(FileNotFoundError, match=r"not_a_template has no template\.tex"):
+        launch(raw_materials_dir=raw, **{**common, "template": tmp_path / "not_a_template"})
+    (tmp_path / "not_a_template" / "template.tex").write_text("x")
+    with pytest.raises(FileNotFoundError, match=r"not_a_template has no guidelines\.md"):
         launch(raw_materials_dir=raw, **{**common, "template": tmp_path / "not_a_template"})
     assert volume.uploaded == [] and function.jobs == []
 
@@ -951,7 +1048,76 @@ def test_modal_objects_are_defined_without_credentials():
     assert isinstance(modal_app.volume, modal.Volume)
     assert isinstance(modal_app.image, modal.Image)
     assert type(modal_app.main).__name__ == "LocalEntrypoint"
-    assert load_settings(os.environ) == modal_app.SETTINGS
+    assert isinstance(modal_app.SETTINGS, Settings)
+
+
+def test_fakes_match_the_modal_sdk_calls_the_app_makes():
+    from modal.volume import AbstractVolumeUploadContextManager
+
+    calls = [
+        (modal.Volume.batch_upload, (), {"force": True}),
+        (AbstractVolumeUploadContextManager.put_file, (Path("idea.md"), "/inputs/r/idea.md"), {}),
+        (modal.Volume.read_file, ("runs/r/final_paper.pdf",), {}),
+        (modal.Volume.commit, (), {}),
+        (modal.Volume.reload, (), {}),
+        (modal.Function.spawn, ({"run_id": "r"},), {}),
+        (modal.Function.map, ([{"run_id": "r"}],), {"return_exceptions": True}),
+        (modal.FunctionCall.get, (), {"timeout": 60.0}),
+        (modal.Image.build, (modal_app.app,), {}),
+    ]
+    for function, args, kwargs in calls:
+        inspect.signature(function).bind(None, *args, **kwargs)
+    assert hasattr(modal.FunctionCall, "object_id")
+
+
+def test_pipeline_entry_points_accept_what_run_job_passes():
+    """Guards the lazily imported pipeline contract against drift."""
+    pipeline = pytest.importorskip("paper_orchestra.pipeline")
+    config = job_spec({"run_id": "r1", "template": "cvpr2025"}).config
+    inspect.signature(pipeline.prepare_run_dir).bind(config, None)
+    inspect.signature(pipeline.run_paper).bind(
+        config, compute=object(), on_stage=StageCheckpoint(lambda: None)
+    )
+    result_fields = {field.name for field in dataclasses.fields(pipeline.PaperResult)}
+    assert {"success", "error", "stages", "usage"} <= result_fields
+
+
+def test_main_builds_the_sandbox_image_then_launches(monkeypatch):
+    monkeypatch.setattr(modal_app, "setup_logging", lambda **_: None)
+    built: list[Any] = []
+    monkeypatch.setattr(
+        modal_app, "python_image", lambda: types.SimpleNamespace(build=built.append)
+    )
+    seen: dict[str, Any] = {}
+
+    def fake_launch(**kwargs):
+        seen.update(kwargs)
+        return {"success": kwargs["run_id"] != "failing"}
+
+    monkeypatch.setattr(modal_app, "launch", fake_launch)
+    modal_app.main(
+        raw_materials_dir="raw",
+        template="cvpr2025",
+        output_dir="out",
+        run_id="r1",
+        plotting=True,
+        writer_model="claude-fable-5-2",
+        effort="low",
+        dream="end",
+        lab_memory=False,
+    )
+    assert built == [modal_app.app]
+    assert seen["volume"] is modal_app.volume and seen["function"] is modal_app.write_paper
+    launcher_options = ("volume", "function", "raw_materials_dir", "template", "output_dir")
+    assert [seen.pop(name) for name in launcher_options[2:]] == ["raw", "cvpr2025", "out"]
+    job = build_job(**{k: v for k, v in seen.items() if k not in launcher_options})
+    assert job["run_id"] == "r1" and job["use_plotting"] is True
+    assert job["models"] == {"writer": "claude-fable-5-2", "effort": "low"}
+    assert job["memory"] == {"enabled": True, "lab": False, "dream": "end"}
+
+    with pytest.raises(SystemExit) as raised:
+        modal_app.main(raw_materials_dir="raw", template="cvpr2025", run_id="failing")
+    assert raised.value.code == 1
 
 
 def test_local_entrypoint_flags_are_understood_by_the_modal_cli():
@@ -969,7 +1135,7 @@ def test_local_entrypoint_flags_are_understood_by_the_modal_cli():
         "--template TEXT",
         "--output-dir TEXT",
         "--run-id TEXT",
-        "--use-plotting / --no-use-plotting",
+        "--plotting / --no-plotting",
         "--idea-filename TEXT",
         "--experimental-log-filename TEXT",
         "--research-cutoff TEXT",
