@@ -37,7 +37,7 @@ import shutil
 import threading
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -86,6 +86,10 @@ LITERATURE_SYNTHESIS_FOCUS = (
 _USAGE_FIELDS = tuple(Usage().to_dict())
 #: A compile log in an exception message should not swamp ``state.json`` or a memory note.
 _MAX_ERROR_CHARS = 2_000
+
+
+#: Called as ``on_stage(name, record)`` when a stage has settled; see :func:`run_paper`.
+StageCallback = Callable[[str, Mapping[str, Any]], None]
 
 
 class StageError(RuntimeError):
@@ -303,8 +307,13 @@ def _relative(path: Path, base: Path) -> str:
         return str(path)
 
 
-def _now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _timestamp(epoch_seconds: float | None = None) -> str:
+    """UTC time as written to ``state.json`` (now, unless an epoch time is given)."""
+    if epoch_seconds is None:
+        moment = datetime.now(UTC)
+    else:
+        moment = datetime.fromtimestamp(epoch_seconds, UTC)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _describe(exc: BaseException) -> str:
@@ -428,11 +437,30 @@ def _carried_usage(path: Path) -> list[dict[str, Any]]:
         return []
 
 
-def _usage_report(tracker: UsageTracker, carried: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """The run's usage ledger with an estimated cost, including earlier invocations."""
+def _usage_report(
+    tracker: UsageTracker,
+    carried: Sequence[dict[str, Any]],
+    baseline: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    """The run's usage ledger with an estimated cost, including earlier invocations.
+
+    ``baseline`` is what ``tracker`` already held when this invocation started.  A harness
+    that served an earlier invocation still carries that usage, which ``carried`` (read
+    from ``usage.json``) accounts for, so only what was added since is counted.
+    """
+    before = {(row["label"], row["model"]): _usage_of(row) for row in baseline}
     merged = UsageTracker()
-    for row in (*carried, *tracker.to_dict()["by_label"]):
+    for row in carried:
         merged.record(row["label"], row["model"], _usage_of(row))
+    for row in tracker.to_dict()["by_label"]:
+        spent = _usage_of(row)
+        earlier = before.get((row["label"], row["model"]))
+        if earlier is not None:
+            spent = Usage(
+                **{name: getattr(spent, name) - getattr(earlier, name) for name in _USAGE_FIELDS}
+            )
+        if any(spent.to_dict().values()):
+            merged.record(row["label"], row["model"], spent)
     report = merged.to_dict()
     try:
         from paper_orchestra.llm.pricing import estimate_cost_usd
@@ -458,6 +486,8 @@ def _blank_record() -> dict[str, Any]:
     return {
         "status": "pending",
         "attempts": 0,
+        "started_at": None,
+        "finished_at": None,
         "seconds": 0.0,
         "error": None,
         "outputs": [],
@@ -479,7 +509,7 @@ class _State:
             self._save()
 
     def _save(self) -> None:
-        self._data["updated_at"] = _now()
+        self._data["updated_at"] = _timestamp()
         write_json(self._path, self._data)
 
     def update(self, stage: str, **fields: Any) -> None:
@@ -523,8 +553,9 @@ class _Stage:
 
 
 class _Runner:
-    def __init__(self, ctx: RunContext) -> None:
+    def __init__(self, ctx: RunContext, on_stage: StageCallback | None = None) -> None:
         self.ctx = ctx
+        self.on_stage = on_stage
         middle = [_Stage("literature", self._literature, after=self._synthesize_literature)]
         if ctx.cfg.use_plotting:
             middle.append(_Stage("plotting", self._plotting, optional=True))
@@ -540,9 +571,14 @@ class _Runner:
         self.memory_report = ctx.paths.base_dir / MEMORY_REPORT_NAME
         self.reuse: set[str] = set()
         self.carried_usage: list[dict[str, Any]] = []
+        #: What the harness's ledger already held when this invocation started.
+        self.usage_baseline: list[dict[str, Any]] = []
         self.carried_seconds = 0.0
         self.invocation_start = 0.0
         self.start_time = 0.0
+        #: Set when the run is interrupted while stages run side by side: a stage that is
+        #: still working finishes its current attempt and starts nothing new.
+        self._stop = threading.Event()
         self.state: _State
 
     # -- orchestration ---------------------------------------------------------
@@ -551,6 +587,7 @@ class _Runner:
         ctx = self.ctx
         cfg, paths, harness = ctx.cfg, ctx.paths, ctx.harness
         self.invocation_start = time.time()
+        self.usage_baseline = harness.usage.to_dict()["by_label"]
         fingerprint = _fingerprint(cfg, paths)
         previous = self._previous_state(fingerprint)
         self.reuse = self._plan_reuse(previous)
@@ -584,13 +621,14 @@ class _Runner:
             paths.state,
             {
                 "version": STATE_VERSION,
+                "started_at": _timestamp(self.start_time),
                 "start_time": self.start_time,
                 "inputs": fingerprint,
                 "config": cfg.to_dict(),
             },
             stages,
         )
-        harness.record(
+        self._record(
             "run_start",
             models=cfg.to_dict()["models"],
             use_plotting=cfg.use_plotting,
@@ -601,12 +639,16 @@ class _Runner:
             try:
                 failure = self._run_groups()
             except BaseException:
-                self.state.close("interrupted", "the run was interrupted")
+                self._guarded(
+                    lambda: self.state.close("interrupted", "the run was interrupted"),
+                    "update of state.json",
+                )
                 self._guarded(self._write_usage, "usage report")
                 raise
 
-        self.state.close("failed" if failure else "completed", failure)
-        harness.record("run_end", status="failed" if failure else "completed", error=failure)
+        status = "failed" if failure else "succeeded"
+        self.state.close(status, failure)
+        self._record("run_end", status=status, error=failure)
         usage = self._write_usage()
         if failure:
             log.error("The run failed: %s", failure)
@@ -683,19 +725,12 @@ class _Runner:
     def _run_groups(self) -> str | None:
         """Run every stage; return a description of the failure that stopped the run, if any."""
         for group in self.groups:
-            if len(group) == 1:
-                outcomes = {group[0].name: self._run_stage(group[0])}
-            else:
-                with ThreadPoolExecutor(len(group), thread_name_prefix="stage") as pool:
-                    futures = {s.name: pool.submit(self._run_stage, s) for s in group}
-                    # Every result is awaited, so a failing stage never leaves its
-                    # sibling running behind the pipeline's back.
-                    outcomes = {name: future.result() for name, future in futures.items()}
-            for stage in group:
-                if outcomes[stage.name]:
-                    continue
-                record = self.state.record(stage.name)
-                if stage.optional:
+            outcomes = self._run_group(group)
+            failed = [stage for stage in group if not outcomes[stage.name]]
+            fatal = next((stage for stage in failed if not stage.optional), None)
+            if fatal is None:
+                for stage in failed:
+                    record = self.state.record(stage.name)
                     self.state.update(stage.name, tolerated=True)
                     log.warning(
                         "Stage %s failed after %d attempt(s); continuing without its output. "
@@ -704,15 +739,51 @@ class _Runner:
                         record["attempts"],
                         record["error"],
                     )
-                    continue
+            # Reported once the whole group has settled, so a callback (a volume commit,
+            # say) never runs while a sibling stage is still writing files.
+            for stage in group:
+                self._notify(stage.name)
+            if fatal is not None:
+                record = self.state.record(fatal.name)
                 return (
-                    f"stage '{stage.name}' failed after {record['attempts']} attempt(s): "
+                    f"stage '{fatal.name}' failed after {record['attempts']} attempt(s): "
                     f"{record['error']}"
                 )
         return None
 
+    def _run_group(self, group: tuple[_Stage, ...]) -> dict[str, bool]:
+        """Run the stages of one group side by side; whether each one produced its output."""
+        if len(group) == 1:
+            return {group[0].name: self._run_stage(group[0])}
+        pool = ThreadPoolExecutor(len(group), thread_name_prefix="stage")
+        try:
+            futures = {stage.name: pool.submit(self._run_stage, stage) for stage in group}
+            # Every result is awaited, so a failing stage never leaves its sibling running
+            # behind the pipeline's back.
+            outcomes = {name: future.result() for name, future in futures.items()}
+        except BaseException:
+            # An interrupt cannot stop a stage in the middle of a model call, but waiting
+            # for it here would keep the run going, and spending, through every retry.
+            # The stages are told to wind down and the interrupt is passed on at once.
+            self._stop.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown()
+        return outcomes
+
+    def _notify(self, name: str) -> None:
+        callback = self.on_stage
+        if callback is None:
+            return
+        record = self.state.record(name)
+        self._guarded(lambda: callback(name, record), f"on_stage callback for the {name} stage")
+
+    def _record(self, type: str, **fields: Any) -> None:
+        """Add a milestone to the transcript, which is a record of the run, not a dependency."""
+        self._guarded(lambda: self.ctx.harness.record(type, **fields), f"transcript entry '{type}'")
+
     def _run_stage(self, stage: _Stage) -> bool:
-        name, harness = stage.name, self.ctx.harness
+        name = stage.name
         if name in self.reuse:
             log.info("Stage %s: reusing the result of the earlier run.", name)
             return True
@@ -720,9 +791,19 @@ class _Runner:
         attempts = self.ctx.cfg.max_stage_attempts
         base = self.ctx.paths.base_dir
         seconds = 0.0
+        started_at = _timestamp()
         for attempt in range(1, attempts + 1):
-            self.state.update(name, status="running", attempts=attempt, error=None)
-            harness.record("stage_start", stage=name, attempt=attempt)
+            if self._stop.is_set():
+                break
+            self.state.update(
+                name,
+                status="running",
+                attempts=attempt,
+                started_at=started_at,
+                finished_at=None,
+                error=None,
+            )
+            self._record("stage_start", stage=name, attempt=attempt)
             log.info("Stage %s started (attempt %d of %d).", name, attempt, attempts)
             started = time.monotonic()
             try:
@@ -737,7 +818,11 @@ class _Runner:
                 error = _describe(exc)
                 # A configuration problem (credentials, SDK, unsupported option) is the
                 # same on every attempt, so it is not retried.
-                retry = attempt < attempts and not isinstance(exc, LLMConfigError)
+                retry = (
+                    attempt < attempts
+                    and not isinstance(exc, LLMConfigError)
+                    and not self._stop.is_set()
+                )
                 log.error(
                     "Stage %s failed (attempt %d of %d): %s",
                     name,
@@ -746,8 +831,14 @@ class _Runner:
                     error,
                     exc_info=True,
                 )
-                self.state.update(name, status="failed", seconds=round(seconds, 3), error=error)
-                harness.record(
+                self.state.update(
+                    name,
+                    status="failed",
+                    finished_at=_timestamp(),
+                    seconds=round(seconds, 3),
+                    error=error,
+                )
+                self._record(
                     "stage_end",
                     stage=name,
                     status="failed",
@@ -764,11 +855,12 @@ class _Runner:
             self.state.update(
                 name,
                 status="completed",
+                finished_at=_timestamp(),
                 seconds=round(seconds, 3),
                 error=None,
                 outputs=[_relative(path, base) for path in outputs],
             )
-            harness.record(
+            self._record(
                 "stage_end",
                 stage=name,
                 status="completed",
@@ -776,7 +868,7 @@ class _Runner:
                 seconds=round(seconds, 3),
             )
             log.info("Stage %s completed in %.1f s.", name, seconds)
-            if stage.after is not None:
+            if stage.after is not None and not self._stop.is_set():
                 self._guarded(stage.after, f"consolidation after the {name} stage")
             self._settle(name)
             return True
@@ -827,7 +919,7 @@ class _Runner:
         self._guarded(self._write_usage, "usage report")
 
     def _write_usage(self) -> dict[str, Any]:
-        report = _usage_report(self.ctx.harness.usage, self.carried_usage)
+        report = _usage_report(self.ctx.harness.usage, self.carried_usage, self.usage_baseline)
         write_json(self.ctx.paths.usage, report)
         return report
 
@@ -1080,6 +1172,7 @@ def run_paper(
     *,
     harness: ContextHarness | None = None,
     compute: ComputeBackend | None = None,
+    on_stage: StageCallback | None = None,
 ) -> PaperResult:
     """Write one paper from ``<cfg.base_dir>/raw_materials``.
 
@@ -1091,6 +1184,12 @@ def run_paper(
 
     ``harness`` and ``compute`` default to what ``cfg`` asks for; a compute
     backend created here is closed before returning, one passed in is not.
+
+    ``on_stage(name, record)`` is called from this thread each time a stage has
+    settled (completed, failed for good, or reused from an earlier run), with
+    the stage's ``state.json`` record.  Stages that run side by side are
+    reported together once all of them have settled, so the callback is a safe
+    place to checkpoint the run directory.  What it raises is logged and ignored.
     """
     paths = prepare_run_dir(cfg, None)
     if harness is None:
@@ -1100,7 +1199,7 @@ def run_paper(
         compute = _build_compute(cfg)
     ctx = RunContext(cfg=cfg, paths=paths, harness=harness, compute=compute, usage=harness.usage)
     try:
-        return _Runner(ctx).run()
+        return _Runner(ctx, on_stage).run()
     finally:
         if owns_compute:
             try:

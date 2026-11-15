@@ -28,8 +28,10 @@ from paper_orchestra.eval import (
     JsonResultsFile,
     RetryPolicy,
     call_with_retries,
+    file_name_part,
     generate_structured,
     load_json_object,
+    raise_if_nothing_succeeded,
     resolve_client,
     run_batch,
 )
@@ -48,9 +50,23 @@ OVERALL_KEY = "overall_metrics"
 _LEGACY_AXES = ("clarity", "technical_depth", "connectivity", "presentation")
 
 
+def _on_rubric_scale(score: float) -> float:
+    """Reject scores outside the rubric's 0-100 scale.
+
+    Checked here rather than with ``ge``/``le``: numeric bounds are not part
+    of what a provider's structured output can enforce, and an out-of-range
+    score would silently skew every average computed from the ratings.
+    """
+    if not 0 <= score <= 100:
+        raise ValueError(f"score {score} is outside the rubric's 0-100 scale")
+    return score
+
+
 class AxisScore(BaseModel):
     score: float = Field(description="Score from 0 to 100 on the rubric.")
     justification: str = Field(description="Evidence-based justification, 2-5 sentences.")
+
+    _score_on_scale = field_validator("score")(_on_rubric_scale)
 
 
 class CitationStatistics(BaseModel):
@@ -95,6 +111,8 @@ class LitReviewRating(BaseModel):
     penalties: list[Penalty]
     summary: ReviewSummary
     overall_score: float = Field(description="Final score from 0 to 100 after penalties.")
+
+    _overall_on_scale = field_validator("overall_score")(_on_rubric_scale)
 
 
 def _paper_parts(client: LLMClient, pdf_path: Path) -> list[Part]:
@@ -155,8 +173,9 @@ def perform_batch_rating(
     """Rate ``{paper_id: pdf_path}`` in parallel, saving each rating as soon as it is ready.
 
     Papers already present in ``output_json_path`` are skipped.  A paper whose
-    rating fails is logged and left out, so a later run tries it again.
-    Returns the content of the results file.
+    rating fails is logged and left out, so a later run tries it again; when
+    every paper fails and the file holds no earlier rating, ``BatchFailedError``
+    is raised.  Returns the content of the results file.
     """
     results = JsonResultsFile(output_json_path)
     pending = {pid: path for pid, path in paper_path_dict.items() if pid not in results}
@@ -177,8 +196,14 @@ def perform_batch_rating(
         results.set(paper_id, rating)
 
     log.info("Rating %d paper(s) with %d worker(s).", len(pending), max_workers)
-    run_batch(pending, rate, max_workers=max_workers, what="literature-review rating")
-    return results.snapshot()
+    failures = run_batch(pending, rate, max_workers=max_workers, what="literature-review rating")
+    ratings = results.snapshot()
+    raise_if_nothing_succeeded(
+        failures,
+        results=sum(paper_id != OVERALL_KEY for paper_id in ratings),
+        what="literature-review rating",
+    )
+    return ratings
 
 
 def perform_batch_rating_folder(
@@ -200,7 +225,9 @@ def perform_batch_rating_folder(
     if not root.is_dir():
         raise FileNotFoundError(f"root folder not found: {root}")
     pdf_name = paper_rel_path.split("/")[-1].replace(".pdf", "")
-    output_json_path = root / f"lit_review_quality_ratings_{model_name}_{pdf_name}.json"
+    output_json_path = (
+        root / f"lit_review_quality_ratings_{file_name_part(model_name)}_{pdf_name}.json"
+    )
 
     paper_path_dict = {
         entry.name.strip(): str(entry / paper_rel_path)

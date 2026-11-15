@@ -47,12 +47,17 @@ the credentials, so TeX runs with paranoid file access.  Model-written figure
 code runs in a nested Sandbox with no network, no Secret and no identity token.
 
 Preemption.  Modal may restart a Function at any time.  The volume is committed
-in the background every few seconds, when a stage settles and once more before
-a summary is returned, and the pipeline resumes from
+in the background every few seconds, between stages and once more before a
+summary is returned, and the pipeline resumes from
 ``runs/<run_id>/state.json``, so calling ``write_paper`` again with the same job
 continues where the last attempt stopped.  A run id must not be in flight twice
-at the same time, and concurrent runs that share the lab wiki resolve
-conflicting edits of one page by last-writer-wins.
+at the same time.
+
+Lab memory.  Runs share the lab wiki on the volume, where a lock file cannot keep
+two containers apart and the last writer of a file wins.  So a run only adds its
+lessons to the wiki as notes, and ``consolidate_memory``, which never runs in
+more than one container at a time, folds the notes into pages.  ``write_paper``
+calls it after a successful run.
 
 Other settings, read when the app is run or deployed: ``PAPER_ORCHESTRA_MODAL_APP``
 (App name, default ``paper-orchestra``), ``PAPER_ORCHESTRA_MODAL_TIMEOUT``
@@ -68,6 +73,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -87,9 +93,12 @@ from paper_orchestra.compute.modal_backend import (
     python_image,
 )
 from paper_orchestra.config import (
+    DEFAULT_MODEL,
     LAB_MEMORY_ENV,
     TEMPLATES_ENV,
     DreamMode,
+    MemoryConfig,
+    ModelConfig,
     PipelineConfig,
     default_research_cutoff,
     resolve_template_dir,
@@ -97,6 +106,7 @@ from paper_orchestra.config import (
 from paper_orchestra.context import RunPaths
 from paper_orchestra.llm.base import Effort, LLMConfigError
 from paper_orchestra.log import setup_logging
+from paper_orchestra.memory.harness import ContextHarness
 
 try:
     import modal
@@ -160,6 +170,7 @@ _IDENTITY_TOKEN_VARS = (
 
 _DEFAULT_TIMEOUT = 6 * 60 * 60
 _MAX_TIMEOUT = 24 * 60 * 60
+_CONSOLIDATE_TIMEOUT = 60 * 60
 #: Volumes (v1) recommend at most five concurrent writers.
 _DEFAULT_MAX_CONTAINERS = 4
 _COMMIT_ATTEMPTS = 3
@@ -171,6 +182,7 @@ _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 _TEMPLATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _RESEARCH_CUTOFF = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 _CONTAINER_OWNED_FIELDS = frozenset({"base_dir", "template_dir", "compute"})
+_CONTAINER_OWNED_MEMORY = ("project_dir", "lab_dir", "lab_consolidate")
 
 
 class JobError(ValueError):
@@ -420,13 +432,15 @@ def job_spec(job: Mapping[str, Any], mount: Path = Path(VOLUME_MOUNT)) -> JobSpe
         if not isinstance(options.get(section, {}), Mapping):
             raise JobError(f"'{section}' must be a mapping, got {options[section]!r}")
     memory = dict(options.pop("memory", {}))
-    fixed = sorted(key for key in ("project_dir", "lab_dir") if memory.get(key))
+    fixed = sorted(key for key in _CONTAINER_OWNED_MEMORY if memory.get(key))
     if fixed:
         raise JobError(
             f"memory.{' and memory.'.join(fixed)} cannot be set: on Modal the wikis live on "
-            "the volume"
+            "the volume and consolidate_memory maintains the shared one"
         )
     memory["lab_dir"] = str(mount / LAB_MEMORY_ROOT)
+    # The run leaves its lessons as notes; consolidate_memory is the one writer of lab pages.
+    memory["lab_consolidate"] = False
     try:
         config = PipelineConfig.from_dict(
             {
@@ -491,32 +505,47 @@ def summarize(result: Any, spec: JobSpec, mount: Path, seconds: float) -> dict[s
 
 
 class StageCheckpoint:
-    """``on_stage`` callback for the pipeline: commit the volume when a stage has settled.
+    """Commit the volume between the stages of the pipeline.
 
-    An explicit commit may also reload the volume, which fails while files are
-    open and hides the volume from other threads for a moment.  So while stages
-    run side by side (``concurrent``) the checkpoint waits until all of them
-    have settled, and a checkpoint that fails is only logged: Modal's
-    background commits cover the gap.
+    Called whenever the pipeline refreshes its memory, which it does when a
+    stage has settled.  An explicit commit may also reload the volume, which
+    fails while files are open and hides the volume from other threads for a
+    moment.  So only the thread that drives the pipeline commits: stages that
+    run side by side settle on worker threads and are covered by the next
+    checkpoint.  A checkpoint that fails is only logged; Modal's background
+    commits cover the gap.
     """
 
-    def __init__(self, commit: Callable[[], None], concurrent: Iterable[str] = ()) -> None:
+    def __init__(self, commit: Callable[[], None]) -> None:
         self._commit = commit
-        self._concurrent = frozenset(concurrent)
-        self._unsettled = set(self._concurrent)
-        self._lock = threading.Lock()
+        self._driver = threading.current_thread()
 
-    def __call__(self, name: str, record: Mapping[str, Any]) -> None:
-        with self._lock:
-            self._unsettled.discard(name)
-            if name in self._concurrent and self._unsettled:
-                return
-            try:
-                self._commit()
-            except Exception as exc:
-                log.warning("Could not commit the volume after the %s stage: %s", name, exc)
-            else:
-                log.info("Committed the volume after the %s stage.", name)
+    def __call__(self) -> None:
+        if threading.current_thread() is not self._driver:
+            return
+        try:
+            self._commit()
+        except Exception as exc:
+            log.warning("Could not commit the volume between stages: %s", exc)
+        else:
+            log.info("Committed the volume between stages.")
+
+
+class _CheckpointingHarness(ContextHarness):
+    """The pipeline's harness, with a callback that runs after every memory refresh.
+
+    ``run_paper`` reports no progress to its caller, but it refreshes the
+    memory after every stage, so the refresh marks the stage boundaries.
+    """
+
+    after_refresh: Callable[[], None] | None = None
+
+    def refresh(self) -> None:
+        try:
+            super().refresh()
+        finally:
+            if self.after_refresh is not None:
+                self.after_refresh()
 
 
 def commit_volume(commit: Callable[[], None]) -> None:
@@ -533,11 +562,22 @@ def commit_volume(commit: Callable[[], None]) -> None:
             time.sleep(_COMMIT_RETRY_DELAY)
 
 
+def _reload_volume(reload: Callable[[], None] | None) -> None:
+    """Pick up what other containers committed since this one mounted the volume."""
+    if reload is None:
+        return
+    try:
+        reload()
+    except RuntimeError as exc:
+        log.warning("Could not reload the volume: %s", exc)
+
+
 def run_job(
     job: Mapping[str, Any],
     *,
     commit: Callable[[], None],
     reload: Callable[[], None] | None = None,
+    consolidate: Callable[[str], Any] | None = None,
     mount: Path = Path(VOLUME_MOUNT),
 ) -> dict[str, Any]:
     """Run one paper inside the container and return its summary.
@@ -546,15 +586,15 @@ def run_job(
     credentials) are returned as a failed summary.  Anything else propagates so
     that Modal retries the call, which resumes the run.  The summary is returned
     only after a final commit, so the files it lists can be downloaded at once.
+
+    ``consolidate(model)`` is ``consolidate_memory``: after a successful run it
+    folds the lessons the run left in the lab wiki into pages.
     """
     started = time.monotonic()
     run_id = job.get("run_id") if isinstance(job, Mapping) else None
-    if reload is not None:
-        try:
-            # Inputs may have been uploaded after this container mounted the volume.
-            reload()
-        except RuntimeError as exc:
-            log.warning("Could not reload the volume: %s", exc)
+    # Inputs may have been uploaded after this container mounted the volume.
+    _reload_volume(reload)
+    lessons_model: str | None = None
     try:
         spec = job_spec(job, mount)
         credential = check_credentials(os.environ)
@@ -570,6 +610,10 @@ def run_job(
         # Raises ComputeError here, before any model call, if the image lacks TeX Live.
         backend = ModalBackend(latex="local")
         summary = _run_pipeline(spec, backend, commit, mount, started)
+        memory = spec.config.memory
+        # Lessons reach the lab wiki in the last stage, and only a model can fold them in.
+        if summary["success"] and memory.resolved_lab_dir() is not None and memory.dream != "off":
+            lessons_model = spec.config.models.reflection
     except (FileNotFoundError, ValueError, LLMConfigError, ComputeError) as exc:
         log.error("Run %s cannot proceed: %s", run_id, exc)
         summary = failure_summary(run_id, str(exc), time.monotonic() - started)
@@ -580,6 +624,8 @@ def run_job(
             log.warning("Could not commit the volume after a failure: %s", exc)
         raise
     commit_volume(commit)
+    if consolidate is not None and lessons_model is not None:
+        _share_lessons(consolidate, lessons_model)
     return summary
 
 
@@ -589,19 +635,68 @@ def _run_pipeline(
     from paper_orchestra.pipeline import prepare_run_dir, run_paper
 
     config = spec.config
-    # The pipeline runs these two stages in parallel when figures are generated.
-    checkpoint = StageCheckpoint(
-        commit, concurrent=("literature", "plotting") if config.use_plotting else ()
-    )
     os.environ[LAB_MEMORY_ENV] = str(mount / LAB_MEMORY_ROOT)
     # This container holds the credentials and compiles model-written LaTeX: paranoid input
     # keeps TeX from reading /proc/self/environ or the identity token file into the PDF.
     os.environ["openin_any"] = "p"  # noqa: SIM112 - kpathsea reads the lowercase name
     with backend:
         prepare_run_dir(config, spec.raw_materials_dir)
+        harness = _CheckpointingHarness.create(config)
+        harness.after_refresh = StageCheckpoint(commit)
         log.info("Writing paper %s in %s.", spec.run_id, config.base_dir)
-        result = run_paper(config, compute=backend, on_stage=checkpoint)
+        result = run_paper(config, harness=harness, compute=backend)
     return summarize(result, spec, mount, time.monotonic() - started)
+
+
+def _share_lessons(consolidate: Callable[[str], Any], model: str) -> None:
+    """Have the lab wiki consolidated; a failure there is not a failure of the paper."""
+    try:
+        report = consolidate(model)
+    except Exception as exc:
+        log.warning(
+            "Could not consolidate the lab memory (%s: %s). The lessons of this run stay in "
+            "it as notes until the next consolidation.",
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if report.get("error"):
+        log.warning("The lab memory was not consolidated: %s", report["error"])
+    else:
+        log.info(
+            "Lab memory consolidated: %d note(s) folded in, %d page(s) changed.",
+            report.get("notes_archived", 0),
+            len(report.get("pages_changed", ())),
+        )
+
+
+def consolidate_lab(
+    model: str,
+    *,
+    commit: Callable[[], None],
+    reload: Callable[[], None] | None = None,
+    mount: Path = Path(VOLUME_MOUNT),
+) -> dict[str, Any]:
+    """Fold the notes that runs left in the lab wiki into its pages; return the report.
+
+    ``model`` holds the consolidation session, which sees the lab wiki and
+    nothing of any paper.  Only one of these may run at a time: it is the single
+    writer of the lab's pages.
+    """
+    _reload_volume(reload)
+    check_credentials(os.environ)
+    with tempfile.TemporaryDirectory(prefix="paper-orchestra-lab-") as scratch:
+        # A harness is built around a project wiki; no paper is involved here, so an empty
+        # one in a scratch directory stands in.
+        config = PipelineConfig(
+            base_dir=Path(scratch),
+            template_dir=Path(scratch),
+            models=ModelConfig(reflection=model),
+            memory=MemoryConfig(lab_dir=mount / LAB_MEMORY_ROOT, dream="end"),
+        )
+        report = ContextHarness.create(config).consolidate_lab_memory()
+    commit_volume(commit)
+    return _jsonable(report.to_dict()) if report is not None else {}
 
 
 def check_batch(jobs: Sequence[Mapping[str, Any]]) -> None:
@@ -798,7 +893,31 @@ def write_paper(job: dict[str, Any]) -> dict[str, Any]:
     source and the usage report), ``stages``, ``usage`` and ``seconds``.
     """
     setup_logging(rich=False)
-    return run_job(job, commit=volume.commit, reload=volume.reload)
+    return run_job(
+        job, commit=volume.commit, reload=volume.reload, consolidate=consolidate_memory.remote
+    )
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_MOUNT: volume},
+    secrets=[*_named_secrets, _env_secret],
+    timeout=_CONSOLIDATE_TIMEOUT,
+    # The single writer of the lab wiki's pages: calls queue up and run one at a time, each in
+    # a fresh container that sees what the runs before it committed.
+    max_containers=1,
+    single_use_containers=True,
+    memory=1024,
+)
+def consolidate_memory(model: str = DEFAULT_MODEL) -> dict[str, Any]:
+    """Fold the lessons that runs left as notes in the lab wiki into its pages.
+
+    ``write_paper`` calls this after a successful run.  Returns the
+    consolidation report (``notes_seen``, ``notes_archived``, ``pages_changed``,
+    ``error``, ...).
+    """
+    setup_logging(rich=False)
+    return consolidate_lab(model, commit=volume.commit, reload=volume.reload)
 
 
 @app.function(image=image, secrets=[_env_secret], timeout=_MAX_TIMEOUT, memory=1024)
@@ -842,8 +961,9 @@ def main(
     run to resume it.
     """
     setup_logging()
-    # Built here, where the build log is visible, rather than by the first figure of the run.
-    python_image().build(app)
+    if plotting:
+        # Built here, where the build log is visible, rather than by the first figure of the run.
+        python_image().build(app)
     summary = launch(
         volume=volume,
         function=write_paper,

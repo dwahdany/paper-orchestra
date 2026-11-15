@@ -16,6 +16,8 @@ from paper_orchestra.agents.section_writing import (
     SectionWritingError,
     check_latex,
     format_citation_library,
+    new_problems,
+    repair_lesson,
     source_diff,
 )
 from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError
@@ -31,6 +33,7 @@ from paper_orchestra.prompts.section_writing import (
     repair_prompt,
     section_writing_user_prompt,
 )
+from paper_orchestra.utils.latex import static_check
 
 LABEL = "section_writing.SectionWritingAgent"
 
@@ -471,6 +474,8 @@ def test_figures_are_listed_by_their_real_files_and_shown_to_the_writer(
     document.save(figures / "pipeline.pdf")
     document.close()
     (figures / "anim.gif").write_bytes(b"GIF89a")
+    elsewhere = tmp_path / "elsewhere.png"
+    elsewhere.write_bytes(png())
     ctx.paths.figures_info.write_text(
         json.dumps(
             [
@@ -479,6 +484,8 @@ def test_figures_are_listed_by_their_real_files_and_shown_to_the_writer(
                 {"name": "pipeline.pdf"},
                 {"name": "ghost.png", "caption": "Never rendered."},
                 {"name": "anim.gif", "caption": "Animation."},
+                {"name": str(elsewhere), "caption": "Not part of the workspace."},
+                {"name": "../../../elsewhere.png", "caption": "Not part of it either."},
             ]
         ),
         encoding="utf-8",
@@ -492,7 +499,7 @@ def test_figures_are_listed_by_their_real_files_and_shown_to_the_writer(
     assert "File: figures/accuracy.png" in listing  # the extension was resolved
     assert "File: figures/curve.JPG" in listing and "Caption: Loss curve." in listing
     assert "File: figures/pipeline.pdf" in listing and "Caption: No caption provided." in listing
-    assert "ghost" not in listing and "anim" not in listing
+    assert "ghost" not in listing and "anim" not in listing and "elsewhere" not in listing
     # A PDF figure is shown as a rendering of its first page.
     assert [image.media_type for image in request.images] == [
         "image/png",
@@ -502,6 +509,8 @@ def test_figures_are_listed_by_their_real_files_and_shown_to_the_writer(
     assert "Image of figures/pipeline.pdf:" in request.text
     assert "'ghost.png') is left out of the paper: no such file" in caplog.text
     assert "'anim.gif') is left out of the paper: pdflatex cannot include .gif files" in caplog.text
+    # Only the workspace is copied for a build, so a figure outside it could never be included.
+    assert caplog.text.count("is left out of the paper: it is outside the LaTeX workspace") == 2
 
 
 def test_figures_without_info_json_are_taken_from_the_directory(tmp_path, repo_root, caplog):
@@ -644,6 +653,60 @@ def test_static_problems_are_reported_next_to_build_errors(tmp_path, repo_root):
     assert "Warnings:\n- file not found: figures/missing.png" in feedback
 
 
+def test_a_defect_is_recognised_wherever_it_is_reported(tmp_path, repo_root):
+    error = "Undefined control sequence. [{line}We route each token. \\badmacro]"
+    before = [
+        "./initial_draft.tex:50: " + error.format(line="l.50 "),
+        "undefined reference 'fig:gone'",
+        "bibtex: I found no \\bibstyle command---while reading file initial_draft.aux",
+        "bibtex: Repeated entry---line 12 of file references.bib",
+    ]
+    after = [
+        # The same four defects in a later version: other file name, other lines.
+        "./refined_paper_v1.tex:57: " + error.format(line="l.57 "),
+        "undefined reference 'fig:gone'",
+        "bibtex: I found no \\bibstyle command---while reading file refined_paper_v1.aux",
+        "bibtex: Repeated entry---line 19 of file references.bib",
+        # Two new ones.
+        "./refined_paper_v1.tex:57: Undefined control sequence. [l.57 Another line. \\badmacro]",
+        "undefined reference 'fig:other'",
+    ]
+    assert new_problems(after, before) == after[4:]
+    assert new_problems(before, after) == [] and new_problems(after, []) == after
+
+    # The static checks put every unknown key (and every missing figure) on one line.
+    work = workdir_with(tmp_path, repo_root)
+
+    def static(extra: str) -> list[str]:
+        return static_check(finished_paper(repo_root, intro_extra=extra), workdir=work)
+
+    two = static(" \\cite{Ghost2099,Phantom2098} \\includegraphics{figures/a.png}")
+    one = static(" \\cite{Phantom2098} \\includegraphics{figures/a.png}")
+    other = static(" \\cite{Phantom2098,Wraith2097} \\includegraphics{figures/b.png}")
+    assert len(two) == len(one) == len(other) == 2 and two != one
+    assert new_problems(one, two) == []  # dropping one of two unknown keys adds no defect
+    assert new_problems(two, one) == [two[0]]
+    assert new_problems(other, two) == other
+
+
+def test_lesson_does_not_count_a_moved_error_as_fixed(tmp_path, repo_root):
+    work = workdir_with(tmp_path, repo_root)
+
+    def check_of(tex: str, line: int):
+        error = f"./paper.tex:{line}: Undefined control sequence. [l.{line} experts. \\badmacro]"
+        compute = ScriptedCompute(lambda _: CompileResult(ok=True, errors=[error, "Other."]))
+        return check_latex(compute, work, "paper", tex, timeout=10)
+
+    before = check_of(finished_paper(repo_root), 50)
+    after = check_of(finished_paper(repo_root, intro_extra="\n\nA new paragraph."), 52)
+    assert before.problems[0] != after.problems[0]
+
+    lesson = repair_lesson("the draft", before.problems, before.tex, after)
+
+    assert "0 of 2 reported problems were fixed." in lesson
+    assert "Still wrong after the fix:\n- ./paper.tex:52: Undefined control sequence." in lesson
+
+
 def test_source_diff_shows_changed_lines_and_is_clipped():
     assert source_diff("a\nb\nc\n", "a\nB\nc\n") == "-b\n+B"
     long = source_diff("\n".join(map(str, range(200))), "", max_lines=5)
@@ -662,6 +725,9 @@ def test_prompts_render_literal_latex():
     assert "`\\cite{Hu2021LoraLowrank}`" in SECTION_WRITING_SYSTEM_PROMPT
     assert "(\\toprule, \\midrule, \\bottomrule)" in SECTION_WRITING_SYSTEM_PROMPT
     assert "author names if missing" not in SECTION_WRITING_SYSTEM_PROMPT
+    # Not every template loads the packages the instructions rely on (iclr2025 has neither).
+    assert "\\includegraphics without `graphicx`" in SECTION_WRITING_SYSTEM_PROMPT
+    assert "\\toprule without `booktabs`" in SECTION_WRITING_SYSTEM_PROMPT
 
     latex = "\\title{{A} {B}}\n\\begin{document}{x}\\end{document}"
     prompt = section_writing_user_prompt(

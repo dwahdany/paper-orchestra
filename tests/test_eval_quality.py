@@ -13,10 +13,12 @@ from pydantic import BaseModel
 
 from paper_orchestra.config import DEFAULT_MODEL
 from paper_orchestra.eval import (
+    BatchFailedError,
     JsonResultsFile,
     RetryPolicy,
     aggregate_sxs_runs,
     call_with_retries,
+    file_name_part,
     generate_structured,
     load_json_object,
     normalize_winner,
@@ -39,6 +41,7 @@ from paper_orchestra.eval.prompts.sxs_quality_prompts import (
     sxs_paper_quality_system_prompt,
 )
 from paper_orchestra.eval.sxs_lit_review_quality import (
+    SxSLitReviewVerdict,
     perform_sxs_lit_review_batch,
     rate_sxs_lit_review,
 )
@@ -309,6 +312,16 @@ def test_run_batch_isolates_failures_but_stops_on_configuration_errors(caplog):
     assert len(started) < 50  # queued items were cancelled
 
 
+def test_file_name_parts_keep_safe_names_and_neutralise_the_rest():
+    for safe in ("claude-fable-5-2", "gemini-3.1-pro-preview", "ours_v2", "_baseline."):
+        assert file_name_part(safe) == safe
+    assert (
+        file_name_part("anthropic/claude-fable-5-2:latest") == "anthropic_claude-fable-5-2_latest"
+    )
+    assert file_name_part("../../etc") == ".._.._etc"
+    assert file_name_part("my exp (v2)") == "my_exp_v2_"
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -395,6 +408,58 @@ def test_rate_single_paper_raises_instead_of_returning_an_empty_string(tmp_path)
         rate_single_paper(str(pdf), MODEL, client=fake, retry=retry)
     assert len(fake.requests) == 3  # bounded
     assert len(sleeps) == 2 and sleeps[0] < sleeps[1]  # and it waits between attempts
+
+
+@pytest.mark.parametrize(
+    ("overall", "coverage"), [(162, 70), (-5, 70), (62, 700), (62, -1), (float("nan"), 70)]
+)
+def test_scores_outside_the_rubric_scale_are_rejected(tmp_path, overall, coverage):
+    """An accepted score of 700 would silently skew every average built on the ratings."""
+    pdf = make_pdf(tmp_path / "paper.pdf", "Our method")
+    payload = rating_payload(overall=overall, coverage=coverage)
+    for capabilities in (None, TEXT_ONLY):
+        fake = FakeLLM(
+            lambda request, payload=payload: json.dumps(payload), capabilities=capabilities
+        )
+        retry, _ = instant_retry(attempts=2)
+        with pytest.raises(LLMParseError):
+            rate_single_paper(str(pdf), MODEL, client=fake, retry=retry)
+        assert len(fake.requests) == 2
+
+    for edge in (0, 100):
+        fake = FakeLLM(lambda request, edge=edge: json.dumps(rating_payload(edge, edge)))
+        assert rate_single_paper(str(pdf), MODEL, client=fake)["overall_score"] == edge
+
+
+def test_batch_rating_in_which_every_paper_fails_is_an_error(tmp_path, caplog):
+    """It used to return {} after logging, which reads like 'nothing to rate'."""
+    root = tmp_path / "runs"
+    make_pdf(root / "p1" / "final_paper.pdf", "FIRST")
+    make_pdf(root / "p2" / "final_paper.pdf", "SECOND")
+    fake = FakeLLM(lambda request: "I would rather not.")
+    retry, _ = instant_retry(attempts=2)
+    with caplog.at_level(logging.ERROR), pytest.raises(BatchFailedError) as excinfo:
+        perform_batch_rating_folder(str(root), model_name=MODEL, client=fake, retry=retry)
+    assert "literature-review rating failed for all 2 item(s)" in str(excinfo.value)
+    assert "literature-review rating failed for p1" in caplog.text
+    assert not list(root.glob("*.json"))
+
+    # Earlier ratings in the file: the failures are reported and left for the next run.
+    output = root / f"lit_review_quality_ratings_{MODEL}_final_paper.json"
+    output.write_text(json.dumps({"p0": {"overall_score": 50}}))
+    ratings = perform_batch_rating_folder(str(root), model_name=MODEL, client=fake, retry=retry)
+    assert sorted(ratings) == ["overall_metrics", "p0"]
+
+
+def test_batch_rating_folder_keeps_model_ids_out_of_the_directory_structure(tmp_path):
+    root = tmp_path / "runs"
+    make_pdf(root / "p1" / "final_paper.pdf", "FIRST")
+    fake = FakeLLM(lambda request: json.dumps(rating_payload()))
+    perform_batch_rating_folder(str(root), model_name="vertex/claude-fable-5-2@1", client=fake)
+    assert (
+        root / "lit_review_quality_ratings_vertex_claude-fable-5-2_1_final_paper.json"
+    ).is_file()
+    assert sorted(path.name for path in root.iterdir() if path.is_dir()) == ["p1"]
 
 
 def test_batch_rating_saves_incrementally_skips_done_papers_and_reports_failures(tmp_path, caplog):
@@ -527,7 +592,39 @@ def test_stats_understand_the_older_rating_format(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "ambiguous",
+    [
+        "Paper 2 (clearly stronger than Paper 1)",
+        "paper_2, not paper_1",
+        "paper_1 or paper_2",
+        "A tie, although paper_1 reads better",
+        "paper_10",
+        "the first paper",
+        "",
+    ],
+)
+def test_a_winner_naming_no_or_several_labels_is_never_guessed(ambiguous):
+    """The first label found used to win: 'Paper 2 (stronger than Paper 1)' became paper_1."""
+    assert normalize_winner(ambiguous) == ambiguous
+    payload = json.loads(verdict(ambiguous))
+    with pytest.raises(ValueError, match="winner"):
+        SxSLitReviewVerdict.model_validate(payload)
+    with pytest.raises(ValueError, match="winner"):
+        aggregate_sxs_runs(
+            {"winner": "paper_1"},
+            {"winner": ambiguous},
+            paper1_path="a",
+            paper2_path="b",
+            exp1_name="x",
+            exp2_name="y",
+        )
+
+
 def test_winner_spellings_are_normalised():
+    assert normalize_winner("Paper1") == "paper_1"
+    assert normalize_winner("paper-2") == "paper_2"
+    assert normalize_winner("Winner: Paper 2.") == "paper_2"
     assert normalize_winner("Paper 1") == "paper_1"
     assert normalize_winner(" PAPER_2 ") == "paper_2"
     assert normalize_winner("Tie") == "tie"
@@ -730,6 +827,47 @@ def test_a_position_biased_judge_yields_ties_and_failures_are_left_for_a_rerun(t
     assert results["p1"]["total_score"] == 0 and results["p1"]["category_3pt"] == "tie"
     assert results["_summary_stats"]["five_point"]["ties"] == 1
     assert "SxS literature review failed for p2" in caplog.text
+
+
+def test_sxs_batch_in_which_every_pair_fails_is_an_error_and_writes_no_summary(tmp_path, caplog):
+    """A file holding only a summary over zero pairs used to pass for a finished evaluation."""
+    ours, base = make_sxs_projects(tmp_path)
+    fake = FakeLLM(lambda request: "no verdict")
+    retry, _ = instant_retry(attempts=2)
+    output = tmp_path / "out"
+    with caplog.at_level(logging.ERROR), pytest.raises(BatchFailedError) as excinfo:
+        perform_sxs_lit_review_batch(
+            str(ours), str(base), "final_paper.pdf", "paper.pdf", "ours", "base",
+            output_folder=str(output), model_name=MODEL, client=fake, retry=retry,
+        )  # fmt: skip
+    assert "SxS literature review failed for all 2 item(s)" in str(excinfo.value)
+    assert "SxS literature review failed for p1" in caplog.text
+    assert not list(output.glob("*.json"))
+
+
+def test_sxs_batch_without_any_common_paper_says_so(tmp_path, caplog):
+    ours, base = make_sxs_projects(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        results = perform_sxs_lit_review_batch(
+            str(ours), str(base), "missing.pdf", "paper.pdf", "ours", "base",
+            output_folder=str(tmp_path / "out"), model_name=MODEL, client=FakeLLM([]),
+        )  # fmt: skip
+    assert results["_summary_stats"]["total_valid_evals"] == 0
+    assert "nothing to compare" in caplog.text and "missing.pdf" in caplog.text
+
+
+def test_sxs_result_file_names_survive_unsafe_model_and_experiment_names(tmp_path):
+    ours, base = make_sxs_projects(tmp_path)
+    output = tmp_path / "out"
+    perform_sxs_lit_review_batch(
+        str(ours), str(base), "final_paper.pdf", "paper.pdf", "ours/v2", "base line",
+        output_folder=str(output), model_name="bedrock/claude:1", client=FakeLLM(prefers_strong),
+    )  # fmt: skip
+    (written,) = output.rglob("*.json")
+    assert written.parent == output
+    assert written.name == "sxs_lit_review_enhanced_bedrock_claude_1_ours_v2_vs_base_line_iclr.json"
+    # The names shown in the summary stay as given.
+    assert json.loads(written.read_text())["_summary_stats"]["exp1_name"] == "ours/v2"
 
 
 # ---------------------------------------------------------------------------

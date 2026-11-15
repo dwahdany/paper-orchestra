@@ -40,7 +40,9 @@ from paper_orchestra.eval import (
     JsonResultsFile,
     RetryPolicy,
     call_with_retries,
+    file_name_part,
     load_json_object,
+    raise_if_nothing_succeeded,
     resolve_client,
     run_batch,
 )
@@ -262,7 +264,9 @@ class SemanticScholarLookup:
 
 def _first_match(payload: Any) -> dict[str, str] | None:
     items = payload.get("data") if isinstance(payload, dict) else None
-    if not items or not isinstance(items[0], dict) or not items[0].get("paperId"):
+    if not isinstance(items, list) or not items:
+        return None
+    if not isinstance(items[0], dict) or not items[0].get("paperId"):
         return None
     return {
         "fetched_paper_id": items[0]["paperId"],
@@ -336,7 +340,16 @@ class ReferenceF1V1Evaluator:
                 f"No numbered references could be extracted from the original paper {pdf_path}; "
                 "refusing to score against (and cache) an empty ground truth."
             )
-        return self.process_text_to_data(references_text, tag="gt", paper_text=load_paper(pdf_path))
+        gt_data = self.process_text_to_data(
+            references_text, tag="gt", paper_text=load_paper(pdf_path)
+        )
+        if not gt_data["all_ids"]:
+            raise ValueError(
+                f"None of the {len(gt_data['citation_info'])} reference(s) of the original paper "
+                f"{pdf_path} was found on Semantic Scholar; refusing to score against (and cache) "
+                "a ground truth without paper ids."
+            )
+        return gt_data
 
     def _clean_text_to_list(self, raw_text: str) -> tuple[list[str], list[str]]:
         """Parse ``"[1] ... [2] ..."`` into citation strings and their extracted titles."""
@@ -516,6 +529,31 @@ def _ground_truth_ids(gt_data: Mapping[str, Any]) -> tuple[set[str], set[str], s
     return all_ids, p0_ids, p1_ids
 
 
+def _load_ground_truth(path: Path) -> dict[str, Any] | None:
+    """The ground-truth record stored at ``path``; ``None`` when it has to be (re)built.
+
+    A record without a single resolved reference is what a failed run of an
+    earlier version left behind (it cached extraction and lookup failures);
+    scoring against it would report 0 for every paper, forever.
+    """
+    if not path.is_file():
+        return None
+    try:
+        gt_data = load_json_object(path)
+        usable = bool(_ground_truth_ids(gt_data)[0])
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        log.warning("Ignoring the ground-truth cache %s: it cannot be read (%s).", path, exc)
+        return None
+    if not usable:
+        log.warning(
+            "Ignoring the ground-truth cache %s: it lists no resolved reference, which is what "
+            "a failed earlier run leaves behind.",
+            path,
+        )
+        return None
+    return gt_data
+
+
 def _priority_counts(gt_data: Mapping[str, Any]) -> tuple[int, int]:
     """Number of P0 and P1 citations of a ground-truth record, old cache formats included."""
     if "p0_ids_count" not in gt_data and "citation_info" in gt_data:
@@ -551,14 +589,10 @@ def get_citation_f1_metrics(
         log_folder=log_folder, model_name=model_name, client=client, scholar=scholar, retry=retry
     )
     cache = Path(
-        gt_cache_path or f"{os.path.splitext(original_pdf)[0]}_gt_citations_{model_name}.json"
+        gt_cache_path
+        or f"{os.path.splitext(original_pdf)[0]}_gt_citations_{file_name_part(model_name)}.json"
     )
-    gt_data: dict[str, Any] | None = None
-    if cache.is_file():
-        try:
-            gt_data = load_json_object(cache) or None
-        except ValueError as exc:
-            log.warning("Ignoring the ground-truth cache: %s", exc)
+    gt_data = _load_ground_truth(cache)
     if gt_data is None:
         log.info("Processing the original paper %s.", original_pdf)
         gt_data = evaluator.ground_truth_from_pdf(original_pdf)
@@ -569,6 +603,14 @@ def get_citation_f1_metrics(
             log.warning("Could not write the ground-truth cache %s: %s", cache, exc)
     else:
         log.info("Using cached ground-truth references from %s.", cache)
+    if not _ground_truth_ids(gt_data)[1]:
+        log.warning(
+            "The ground truth of %s has no must-have (P0) reference, so P0 recall is 0. If the "
+            "cache %s predates this version, delete it: a failed classification used to be "
+            "cached as 'everything is P1'.",
+            original_pdf,
+            cache,
+        )
 
     log.info("Processing the generated paper %s.", generated_pdf)
     gen_data = evaluator.process_text_to_data(
@@ -597,7 +639,8 @@ def generate_gt_citations_batch(
     directory, writes ``<sub_folder_name>/original_paper_gt_citations_<model>.json``
     (skipped when present), records P0/P1 counts in ``<base_folder>/info.json``
     when that file exists, and tracks finished papers in ``progress_json_path``.
-    Returns the progress record.
+    Returns the progress record.  A paper that fails is logged and left out;
+    ``BatchFailedError`` is raised when every paper failed.
     """
     base = Path(base_folder)
     if not base.is_dir():
@@ -627,10 +670,12 @@ def generate_gt_citations_batch(
 
     def process(paper: str, paper_path: Path) -> None:
         output_path = (
-            paper_path / sub_folder_name / f"original_paper_gt_citations_{model_name}.json"
+            paper_path
+            / sub_folder_name
+            / f"original_paper_gt_citations_{file_name_part(model_name)}.json"
         )
-        gt_data = load_json_object(output_path)
-        if gt_data:
+        gt_data = _load_ground_truth(output_path)
+        if gt_data is not None:
             log.info("[%s] %s already exists; skipping.", paper, output_path)
             mark_done(paper, output_path, gt_data)
             return
@@ -646,9 +691,11 @@ def generate_gt_citations_batch(
     log.info(
         "Found %d paper folder(s) with a '%s' subfolder in %s.", len(papers), sub_folder_name, base
     )
-    run_batch(papers, process, max_workers=max_workers, what="ground-truth citation extraction")
+    what = "ground-truth citation extraction"
+    failures = run_batch(papers, process, max_workers=max_workers, what=what)
 
     _update_info_json(base / "info.json", counts)
+    raise_if_nothing_succeeded(failures, results=len(counts), what=what)
     return progress
 
 
@@ -718,13 +765,18 @@ def review_citation_f1_batch(
     Results go to ``citation_f1_results_<model>.json`` in ``output_folder``
     (default: ``project_folder``); papers already in that file are skipped.
     Returns the content of the results file, including ``overall_metrics``.
+    A paper that fails is logged and left out, so a later run tries it again;
+    ``BatchFailedError`` is raised when every paper failed and the file holds
+    no earlier score.
     """
     project = Path(project_folder)
     if not project.is_dir():
         raise FileNotFoundError(f"project folder not found: {project}")
     resolve_client(model_name, client)  # fail before any work when the provider is unusable
     scholar = scholar or SemanticScholarLookup()
-    results_path = Path(output_folder or project) / f"citation_f1_results_{model_name}.json"
+    results_path = (
+        Path(output_folder or project) / f"citation_f1_results_{file_name_part(model_name)}.json"
+    )
     results = JsonResultsFile(results_path)
 
     papers = {
@@ -740,7 +792,11 @@ def review_citation_f1_batch(
         generated_pdf = paper_folder / gen_paper_rel_path
         log_folder = paper_folder / "citation_f1_metrics"
         log_folder.mkdir(parents=True, exist_ok=True)
-        gt_cache = paper_folder / "raw_materials" / f"original_paper_gt_citations_{model_name}.json"
+        gt_cache = (
+            paper_folder
+            / "raw_materials"
+            / f"original_paper_gt_citations_{file_name_part(model_name)}.json"
+        )
         metrics = get_citation_f1_metrics(
             original_pdf=str(original_pdf),
             generated_pdf=str(generated_pdf),
@@ -761,7 +817,9 @@ def review_citation_f1_batch(
             },
         )
 
-    run_batch(papers, process, max_workers=max_workers, what="citation F1")
+    failures = run_batch(papers, process, max_workers=max_workers, what="citation F1")
+    scored = sum(paper_id != OVERALL_KEY for paper_id in results.snapshot())
+    raise_if_nothing_succeeded(failures, results=scored, what="citation F1")
     analyze_citation_metrics(str(results_path))
     return load_json_object(results_path)
 

@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,7 @@ STAGE_STYLE = {
     "running": ("active", "⏳"),
     "failed": ("failed", "✗"),
     "interrupted": ("failed", "■"),
+    "skipped": ("", "–"),
     "pending": ("", "○"),
 }
 
@@ -177,9 +180,9 @@ def render_sidebar() -> dict[str, Any]:
         "Email", key="email_input", label_visibility="collapsed", disabled=locked
     )
     if st.sidebar.button("Confirm Email", disabled=locked):
-        st.session_state.email_confirmed = bool(st.session_state.get("email_input"))
+        st.session_state.email_confirmed = fu.valid_email_address(email.strip())
         if not st.session_state.email_confirmed:
-            st.sidebar.warning("⚠️ Please enter an email address first.")
+            st.sidebar.warning("⚠️ Please enter one valid email address first.")
     if st.session_state.get("email_confirmed"):
         st.sidebar.success("📧 Email confirmed successfully!")
 
@@ -207,6 +210,13 @@ def start_run(choices: dict[str, Any]) -> None:
     if not idea or not experimental_log:
         st.session_state.error_message = (
             "❌ Please fill in all required fields (Idea and Experimental Log)."
+        )
+        st.rerun()
+    if choices["email"] and not fu.valid_email_address(choices["email"]):
+        # Better now than after 40 minutes, when the notification would be refused.
+        st.session_state.error_message = (
+            "❌ The email address is not valid. Correct it, or clear the field to run "
+            "without a notification."
         )
         st.rerun()
 
@@ -465,6 +475,11 @@ def render_json_tab(path: Path | None, title: str, missing_message: str) -> None
         st.info(missing_message)
 
 
+def page_order(path: Path) -> list[int | str]:
+    """Sort key that puts ``grid_2.png`` before ``grid_10.png``."""
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)]
+
+
 def render_pdf_and_snapshots(pdf_path: Path, snapshots_directory: Path, download_key: str) -> None:
     if not pdf_path.is_file():
         return
@@ -477,7 +492,8 @@ def render_pdf_and_snapshots(pdf_path: Path, snapshots_directory: Path, download
     )
     if snapshots_directory.is_dir():
         image_files = sorted(
-            path for path in snapshots_directory.iterdir() if path.suffix in (".jpg", ".png")
+            (path for path in snapshots_directory.iterdir() if path.suffix in (".jpg", ".png")),
+            key=page_order,
         )
         if image_files:
             st.markdown("**Snapshots:**")
@@ -501,13 +517,14 @@ def stage_detail(stage: fu.StageProgress) -> str:
         )
     if stage.status == "interrupted":
         return "Interrupted."
+    if stage.status == "skipped":
+        return "Skipped."
     return ""
 
 
 def render_timeline_tab(run: fu.PipelineRun, progress: fu.RunProgress) -> None:
     st.subheader("Writing Progress")
-    done = sum(stage.status == "completed" for stage in progress.stages)
-    caption = f"{done} of {len(progress.stages)} stages completed"
+    caption = f"{progress.done} of {len(progress.stages)} stages completed"
     if progress.active:
         caption += f" · now: {', '.join(progress.active)}"
     st.progress(progress.fraction, text=caption)
@@ -691,7 +708,7 @@ def render_memory_tab() -> None:
     with index_column:
         st.markdown("### Injected index (`MEMORY.md`)")
         st.caption("Loaded into every agent session: standing notes and the page catalog.")
-        st.markdown(fu.memory_index_markdown(wiki))
+        st.markdown(fu.memory_index_markdown(wiki) or "*The index is being rewritten.*")
     with page_column:
         st.markdown("### Wiki pages")
         entries = fu.list_wiki_pages(wiki)
@@ -748,6 +765,22 @@ def render_run_status(run: fu.PipelineRun, progress: fu.RunProgress) -> None:
         reset_for_new_paper()
 
 
+def render_tab(render: Callable[..., None], *arguments: Any) -> None:
+    """Draw one tab and keep a failure inside it.
+
+    The page refreshes itself at the end of ``render_run``.  An exception
+    escaping from a tab (a half-written output file, a page the run just
+    moved) would end the script before that and leave a running pipeline with
+    a frozen page.  Streamlit's own rerun and stop signals are not
+    ``Exception`` subclasses, so they still pass through.
+    """
+    try:
+        render(*arguments)
+    except Exception as error:
+        fu.log.exception("A tab of the demo page could not be drawn.")
+        st.error(f"This tab could not be drawn: {type(error).__name__}: {error}")
+
+
 def render_run() -> None:
     run: fu.PipelineRun = st.session_state.run
     options: fu.RunOptions = st.session_state.run_options
@@ -780,19 +813,21 @@ def render_run() -> None:
         ]
     )
     with tab_timeline:
-        render_timeline_tab(run, progress)
+        render_tab(render_timeline_tab, run, progress)
     with tab_inputs:
-        render_inputs_tab()
+        render_tab(render_inputs_tab)
     with tab_gallery:
-        render_gallery_tab()
+        render_tab(render_gallery_tab)
     with tab_outline:
-        render_json_tab(paths.outline, "Paper Outline", "No outline generated yet.")
+        render_tab(render_json_tab, paths.outline, "Paper Outline", "No outline generated yet.")
     with tab_citation:
-        render_json_tab(paths.citation_map, "Citation Map", "No citation map generated yet.")
+        render_tab(
+            render_json_tab, paths.citation_map, "Citation Map", "No citation map generated yet."
+        )
     with tab_refinement:
-        render_refinement_tab()
+        render_tab(render_refinement_tab)
     with tab_memory:
-        render_memory_tab()
+        render_tab(render_memory_tab)
 
     if was_running:
         time.sleep(fu.POLL_SECONDS)

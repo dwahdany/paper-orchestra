@@ -33,7 +33,12 @@ from paper_orchestra.context import RunContext, RunPaths
 from paper_orchestra.llm.base import Capabilities, LLMError, WebSearch
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory import ContextHarness, TranscriptLog, Wiki
-from paper_orchestra.prompts.literature import DISCOVERY_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT
+from paper_orchestra.prompts.literature import (
+    DISCOVERY_SYSTEM_PROMPT,
+    WRITER_SYSTEM_PROMPT,
+    min_cited,
+    writer_user_prompt,
+)
 from paper_orchestra.utils.latex import bib_keys, cite_keys
 from paper_orchestra.utils.scholar import (
     SemanticScholar,
@@ -435,6 +440,23 @@ def test_discovery_answers_tolerate_sloppy_candidates(caplog):
     assert CandidatePaper(title="t", year=2020.0, reason="").year == 2020
 
 
+def test_discovery_answers_tolerate_a_null_list_and_titles_that_are_not_text(caplog):
+    # "No candidate" may come back as null, and one unusable title must not cost the others.
+    assert DiscoveryResult.model_validate({"candidates": None}).candidates == []
+    result = DiscoveryResult.model_validate(
+        {
+            "candidates": [
+                {"title": 1984, "year": 1949, "reason": "a number"},
+                {"title": ["A", "List"], "year": 2020},
+                {"title": {"text": "An Object"}},
+                {"title": "Kept", "year": 2020, "reason": "r"},
+            ]
+        }
+    )
+    assert [(c.title, c.year) for c in result.candidates] == [("Kept", 2020)]
+    assert "Ignored 3 candidate(s) without a title" in caplog.text
+
+
 # -- citation keys and BibTeX ------------------------------------------------
 
 
@@ -482,6 +504,22 @@ def test_escape_bibtex_handles_specials_accents_and_unknown_characters():
         for char in escaped:
             depth += (char == "{") - (char == "}")
             assert depth >= 0
+
+
+def test_escape_bibtex_only_uses_what_the_default_font_encoding_has():
+    # The ogonek (\k), d-with-stroke, eth and thorn exist only in T1, which the venue
+    # templates do not load: the letters keep their base form instead of raising an error.
+    assert escape_bibtex("Stanisław Jastrzębski, Kazlauskų, Įvairūs") == (
+        r"Stanis{\l}aw Jastrzebski, Kazlausku, Ivair{\={u}}s"
+    )
+    assert escape_bibtex("Đorđe Þór Guðmundsson") == r"Dorde Th{\'{o}}r Gudmundsson"
+    assert "\\k" not in escape_bibtex("ąęįųĄĘĮŲ")
+    # Hyphens, minus and multiplication signs of publisher metadata are kept, not deleted.
+    assert escape_bibtex("Parameter‐Efficient non‑local 3×3 − 5 µm OʼNeil") == (
+        r"Parameter-Efficient non-local 3{$\times$}3 - 5 {$\mu$}m O'Neil"
+    )
+    # In OT1 text a bare < > | prints as an inverted exclamation mark, question mark and dash.
+    assert escape_bibtex("a < b > c | d") == r"a \textless{} b \textgreater{} c \textbar{} d"
 
 
 def test_bibtex_entry_types_follow_the_source():
@@ -551,6 +589,35 @@ def test_generated_bibtex_compiles_with_hostile_metadata(tmp_path):
     assert "Warning--" not in bibtex_log and "error message" not in bibtex_log
     bbl = (tmp_path / "paper.bbl").read_text()
     assert bbl.count("\\bibitem") == 3 and "{\\L}ukasz" in bbl
+
+
+@pytest.mark.latex
+def test_generated_bibtex_needs_no_font_encoding_beyond_the_default(tmp_path):
+    papers = [
+        paper_data(
+            "Houlsby2019",
+            title="Parameter\u2010Efficient Transfer: a < b | c > d, 3×3 \u2212 5 µm",
+            authors=[
+                "Stanisław Jastrzębski",
+                "Đorđe Miladinović",
+                "Þór Guðmundsson",
+                "Jonas Kazlauskų",
+            ],
+        )
+    ]
+    (tmp_path / "references.bib").write_text(generate_bibtex(papers), encoding="utf-8")
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\n\\begin{document}\nText \\cite{Houlsby2019}.\n"
+        "\\bibliographystyle{plain}\n\\bibliography{references}\n\\end{document}\n",
+        encoding="utf-8",
+    )
+    result = LocalBackend().compile_latex(tmp_path, "paper")
+    assert result.ok and result.errors == [], result.feedback()
+    # An error raised while the .bbl is read is only visible in the log itself.
+    log_text = (tmp_path / "paper.log").read_text(errors="replace")
+    assert "LaTeX Error" not in log_text and "unavailable in encoding" not in log_text
+    bbl = (tmp_path / "paper.bbl").read_text()
+    assert "Jastrzebski" in bbl and "Dorde" in bbl and "Parameter-Efficient" in bbl
 
 
 # -- the whole stage ---------------------------------------------------------
@@ -1038,6 +1105,23 @@ def test_the_best_version_is_kept_when_repairs_run_out(tmp_path, caplog):
     assert "Ghost2020" in note
 
 
+def test_a_complete_draft_is_kept_over_a_truncated_one_with_as_many_problems(tmp_path, caplog):
+    def complete_with_two_problems(keys: list[str]) -> str:
+        document = filled([*keys, "Ghost2020"])
+        return fenced(document.replace("Prior work drifts.", "Related work here."))
+
+    def truncated(keys: list[str]) -> str:  # also two problems: no \end, 'document' unbalanced
+        return fenced(filled(keys).replace("\\end{document}\n", ""))
+
+    writer = scripted_writer(complete_with_two_problems, truncated)
+    result, _, client, _ = run_agent(tmp_path, Script(writer=writer), max_repair_rounds=1)
+
+    assert len(writer_requests(client)) == 2
+    # The later draft is cut off and cannot be used; the earlier one can, so the stage goes on.
+    assert "\\end{document}" in result.latex and "Ghost2020" in result.latex
+    assert "Keeping the best Introduction/Related Work draft" in caplog.text
+
+
 def test_a_document_that_stays_incomplete_fails_the_stage(tmp_path):
     def truncated(keys: list[str]) -> str:
         return fenced(filled(keys).replace("\\end{document}\n", ""))
@@ -1091,6 +1175,24 @@ def test_check_document_separates_blocking_from_advisory_problems():
 
     blocking, _ = check_document(TEMPLATE, template=TEMPLATE, citation_keys=[])
     assert len(blocking) == 2 and all("placeholder" in problem for problem in blocking)
+
+
+def test_a_single_collected_paper_is_asked_for_and_checked_as_one_not_zero():
+    assert [min_cited(count) for count in (0, 1, 2, 4, 10, 80)] == [0, 1, 1, 3, 9, 72]
+    prompt = writer_user_prompt(
+        template=TEMPLATE,
+        plan={},
+        idea="",
+        experimental_log="",
+        guidelines="",
+        papers=[{"citation_key": "A"}],
+        citation_keys=["A"],
+        cutoff="2024-10",
+    )
+    assert "abstracts of 1 collected paper. Cite at least 1 of them" in prompt
+    _, advisory = check_document(filled([]), template=TEMPLATE, citation_keys=["A"])
+    assert len(advisory) == 1 and "should cite at least 1. Not cited yet: A" in advisory[0]
+    assert check_document(filled(["A"]), template=TEMPLATE, citation_keys=["A"]) == ([], [])
 
 
 # -- nothing verified --------------------------------------------------------

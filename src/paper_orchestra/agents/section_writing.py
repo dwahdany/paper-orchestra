@@ -38,9 +38,11 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import logging
+import os
+import re
 import shutil
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,16 @@ _BUILD_PRODUCTS = shutil.ignore_patterns(
 )
 _NO_PDF = "LaTeX did not produce a PDF"
 NO_LATEX_PROBLEM = "the reply contained no LaTeX document"
+
+#: Where a build found a defect: the "./paper.tex:50: " in front of a LaTeX error, the
+#: "l.50 " in front of the source line it quotes, and BibTeX's "---line 3 of file paper.aux".
+_LOCATION = re.compile(
+    r"^(?:\./)?[^\s:]+:\d+: |(?<=\[)l\.\d+ |---(?:line \d+ of|while reading) file \S+"
+)
+#: Static problems that put every offending item on one line.
+_ITEMISED = re.compile(
+    r"^(?:\d+ )?(citation key\(s\) are not in the bibliography|figure file\(s\) not found): (.+)$"
+)
 
 
 class SectionWritingError(RuntimeError):
@@ -191,6 +203,29 @@ def source_diff(before: str, after: str, *, max_lines: int = 60, max_width: int 
     return "\n".join(changed)
 
 
+def problem_keys(problem: str) -> frozenset[str]:
+    """What identifies the defect(s) behind ``problem`` in any version of the document.
+
+    The wording of a problem changes although the defect stays: LaTeX names the file and
+    the line it stopped at, and the static checks list every unknown citation key (or
+    missing figure) in one line.  The keys leave the location out and count each listed
+    item on its own.
+    """
+    itemised = _ITEMISED.match(problem)
+    if itemised:
+        kind, items = itemised.groups()
+        return frozenset(f"{kind}: {item}" for item in items.removesuffix(" ...").split(", "))
+    return frozenset({_LOCATION.sub("", problem)})
+
+
+def new_problems(problems: Sequence[str], known: Iterable[str]) -> list[str]:
+    """The ``problems`` that describe a defect not already among the ``known`` ones."""
+    seen: set[str] = set()
+    for problem in known:
+        seen |= problem_keys(problem)
+    return [problem for problem in problems if not problem_keys(problem) <= seen]
+
+
 def repair_lesson(
     what: str, problems: Sequence[str], before_tex: str | None, after: DraftCheck | None
 ) -> str:
@@ -198,7 +233,8 @@ def repair_lesson(
     if after is None:
         verdict = "the model's reply contained no LaTeX document"
     else:
-        fixed = [problem for problem in problems if problem not in after.problems]
+        # A defect that only moved to another line is still there.
+        fixed = new_problems(problems, after.problems)
         verdict = f"{len(fixed)} of {len(problems)} reported problems were fixed" + (
             " and the document now builds cleanly" if after.clean else ""
         )
@@ -292,18 +328,21 @@ class SectionWritingAgent:
         """The listed figures that exist in a format pdflatex can include."""
         paths = self.ctx.paths
         figures: list[_Figure] = []
+        workspace = os.path.normpath(paths.latex_dir)
         for index, entry in enumerate(self._figure_entries(), start=1):
             name = str(entry.get("name") or "")
             found = resolve_graphic(paths.figures_dir, name) if name else None
-            if found is None or found.suffix.lower() not in GRAPHICS_EXTENSIONS:
-                log.warning(
-                    "Figure %d (%r) is left out of the paper: %s.",
-                    index,
-                    name,
-                    f"no such file in {paths.figures_dir}"
-                    if found is None
-                    else f"pdflatex cannot include {found.suffix} files",
-                )
+            if found is None:
+                reason = f"no such file in {paths.figures_dir}"
+            elif found.suffix.lower() not in GRAPHICS_EXTENSIONS:
+                reason = f"pdflatex cannot include {found.suffix} files"
+            elif not Path(os.path.normpath(found)).is_relative_to(workspace):
+                # Only the workspace is copied (or uploaded) for a build.
+                reason = f"it is outside the LaTeX workspace {paths.latex_dir}"
+            else:
+                reason = ""
+            if found is None or reason:
+                log.warning("Figure %d (%r) is left out of the paper: %s.", index, name, reason)
                 continue
             figures.append(
                 _Figure(

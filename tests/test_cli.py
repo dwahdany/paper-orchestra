@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import subprocess
@@ -371,6 +372,8 @@ def test_batch_passes_its_options_on_and_reports_failures(tmp_path, template, mo
         return log
 
     monkeypatch.setattr(cli, "run_batch", fake_run_batch)
+    for paper_id in ("a", "b", "c"):
+        (tmp_path / "papers" / paper_id / "raw_materials").mkdir(parents=True)
     args = [
         "batch",
         "--root-input-folder", str(tmp_path / "papers"),
@@ -401,6 +404,34 @@ def test_batch_passes_its_options_on_and_reports_failures(tmp_path, template, mo
     result = runner.invoke(cli.app, args)
     assert result.exit_code == 1
     assert "1 written, 1 failed, 1 in error" in result.output
+
+
+def test_batch_summary_and_exit_status_cover_this_batch_only(tmp_path, template, monkeypatch):
+    # The log of the output directory still holds a paper of an earlier, larger batch
+    # that failed.  It is not part of this batch, so it is neither counted nor an error.
+    def fake_run_batch(cfg: PipelineConfig, **kwargs: Any) -> Path:
+        log = Path(kwargs["output_dir"]) / "paper_writing_log.json"
+        write_json(
+            log,
+            {
+                "a": {"status": "success", "paper_path": "a.pdf"},
+                "b": {"status": "success", "paper_path": "b.pdf"},
+                "z": {"status": "failed", "paper_path": "", "error": "an earlier batch"},
+            },
+        )
+        return log
+
+    monkeypatch.setattr(cli, "run_batch", fake_run_batch)
+    for paper_id in ("a", "b", "z"):
+        (tmp_path / "papers" / paper_id / "raw_materials").mkdir(parents=True)
+    result = runner.invoke(
+        cli.app,
+        ["batch", "--root-input-folder", str(tmp_path / "papers"), "--n-papers", "2",
+         "--output-dir", str(tmp_path / "out"), "--template", "demo2026"],
+    )  # fmt: skip
+
+    assert result.exit_code == 0, result.output
+    assert "2 written, 0 failed, 0 in error" in result.output
 
 
 def test_batch_validation_errors_exit_with_2(tmp_path, template):
@@ -615,6 +646,22 @@ def test_memory_commands_need_exactly_one_existing_location(run_dir, tmp_path):
     assert not missing.exists()
 
 
+def test_memory_viewers_leave_the_memory_directory_as_it_is(tmp_path):
+    memory = tmp_path / "copied" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "MEMORY.md").write_text("# Memory index: project\n\nNothing yet.\n")
+
+    for command in (["show"], ["search", "anything"], ["lint"]):
+        result = runner.invoke(cli.app, ["memory", *command, "--memory-dir", str(memory)])
+        assert result.exit_code == 0, result.output
+    assert (
+        "Nothing yet."
+        in runner.invoke(cli.app, ["memory", "show", "--memory-dir", str(memory)]).output
+    )
+    # Opening a wiki normally creates its folders; looking at one must not.
+    assert sorted(p.name for p in memory.iterdir()) == ["MEMORY.md"]
+
+
 def test_memory_search(run_dir):
     result = runner.invoke(
         cli.app, ["memory", "search", "sparse attention", "--run-dir", str(run_dir)]
@@ -744,6 +791,20 @@ def test_modal_deploy_and_print_command(monkeypatch):
     )
 
 
+def test_the_modal_run_help_names_options_the_modal_entrypoint_has():
+    pytest.importorskip("modal")
+    from paper_orchestra import modal_app
+
+    result = runner.invoke(cli.app, ["modal", "run", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    example = result.output.split("e.g.", 1)[1].split("╭", 1)[0]
+    flags = [word.rstrip(".") for word in example.split() if word.startswith("--")]
+    assert flags == ["--raw-materials-dir", "--template", "--plotting"]
+    parameters = inspect.signature(modal_app.main.info.raw_f).parameters
+    for flag in flags:
+        assert flag.removeprefix("--").replace("-", "_") in parameters
+
+
 def test_modal_commands_need_the_modal_sdk(monkeypatch):
     real = cli.importlib.util.find_spec
     monkeypatch.setattr(
@@ -771,6 +832,29 @@ def test_main_loads_the_environment_and_logging_before_dispatch(monkeypatch, cap
     monkeypatch.setattr(cli, "app", dispatch)
     cli.main(["doctor"])
     assert order == ["load_env", "setup_logging", "dispatch ['doctor']"]
+
+
+def test_logs_go_to_stderr_so_that_stdout_stays_machine_readable(monkeypatch, capsys):
+    class ChattyClient(DescribedClient):
+        def describe(self) -> dict[str, Any]:
+            logging.getLogger("paper_orchestra.llm").info("Client ready (credential source: x).")
+            return super().describe()
+
+    register_client("anthropic", ChattyClient({"credential_source": "api_key"}))
+    monkeypatch.setattr(cli, "load_env", lambda: None)
+    logger = logging.getLogger("paper_orchestra")
+    handlers, propagate = list(logger.handlers), logger.propagate
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cli.main(["doctor", "--json"])
+    finally:
+        logger.handlers[:] = handlers
+        logger.propagate = propagate
+
+    captured = capsys.readouterr()
+    assert exit_info.value.code == 0
+    assert json.loads(captured.out)["provider"]["credential_source"] == "api_key"
+    assert "Client ready (credential source: x)." in captured.err
 
 
 def test_main_exits_with_the_command_status(monkeypatch, capsys):

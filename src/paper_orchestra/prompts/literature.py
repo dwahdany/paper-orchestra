@@ -126,6 +126,15 @@ Output: return the complete updated template.tex in a single ```latex fenced blo
 MIN_CITED_FRACTION = 0.9
 
 
+def min_cited(count: int) -> int:
+    """How many of ``count`` collected papers the two sections have to cite.
+
+    Never zero when there is something to cite: 90% of a single paper would round down to
+    "cite at least 0 of them".
+    """
+    return max(1, int(count * MIN_CITED_FRACTION)) if count > 0 else 0
+
+
 def writer_user_prompt(
     *,
     template: str,
@@ -141,8 +150,8 @@ def writer_user_prompt(
     if citation_keys:
         count = len(citation_keys)
         requirement = (
-            f"You have the abstracts of {count} collected papers. Cite at least "
-            f"{int(count * MIN_CITED_FRACTION)} of them across the two sections."
+            f"You have the abstracts of {count} collected {'paper' if count == 1 else 'papers'}. "
+            f"Cite at least {min_cited(count)} of them across the two sections."
         )
         checklist = "\n".join(citation_keys)
     else:

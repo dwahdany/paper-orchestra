@@ -8,7 +8,7 @@ import pymupdf
 import pytest
 import requests
 
-from paper_orchestra.eval import RetryPolicy
+from paper_orchestra.eval import BatchFailedError, RetryPolicy
 from paper_orchestra.eval.citation_f1 import (
     S2_SEARCH_URL,
     ReferenceF1V1Evaluator,
@@ -292,6 +292,15 @@ def test_auth_errors_fail_immediately_and_other_client_errors_count_as_not_found
     assert "HTTP 400" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "payload", [{"data": {"paperId": "x"}}, {"data": "oops"}, {"data": [None]}, [], None]
+)
+def test_an_unexpected_search_payload_counts_as_no_match(payload):
+    session = FakeScholarSession([FakeResponse(200, payload)])
+    assert make_lookup(session).find("Adam") is None
+    assert len(session.calls) == 1
+
+
 def test_requests_are_spaced_by_the_minimum_interval():
     session = FakeScholarSession()
     clock = Clock()
@@ -314,6 +323,21 @@ def test_reference_extraction_returns_text_or_empty_for_a_paper_without_referenc
     request = fake.requests[0]
     assert "<paper_text>\nORIGINAL body\n</paper_text>" in request.text
     assert "References" in request.system
+
+
+def test_an_answer_that_is_not_a_reference_list_is_a_failed_extraction():
+    """Without this, an apology from the model scored the paper 0 as if it cited nothing."""
+    fake = fake_judge(**{"eval.reference_extraction": "Sorry, I can only see part of the paper."})
+    retry, sleeps = instant_retry(attempts=3)
+    with pytest.raises(LLMParseError):
+        extract_reference_from_pdf_text("GENERATED body", MODEL, client=fake, retry=retry)
+    assert fake.labels() == ["eval.reference_extraction"] * 3 and len(sleeps) == 2
+
+    # The sentinel next to an actual list does not discard the list.
+    listed = fake_judge(**{"eval.reference_extraction": f"{NO_REFERENCES}\n[1] A | Adam | X\n"})
+    assert extract_reference_from_pdf_text("body", MODEL, client=listed) == (
+        f"{NO_REFERENCES}\n[1] A | Adam | X"
+    )
 
 
 def test_reference_extraction_raises_after_bounded_retries_on_blank_output(tmp_path):
@@ -595,6 +619,130 @@ def test_original_without_references_is_an_error_but_a_generated_one_scores_zero
         )
 
 
+def test_failed_extraction_of_the_generated_paper_is_an_error_not_a_zero_score(tmp_path):
+    def references(request: FakeRequest) -> str:
+        return ORIGINAL_REFS if "ORIGINAL" in request.text else "I could not find the paper text."
+
+    fake = fake_judge(**{"eval.reference_extraction": references})
+    retry, _ = instant_retry(attempts=2)
+    original = make_pdf(tmp_path / "original.pdf", "ORIGINAL")
+    generated = make_pdf(tmp_path / "generated.pdf", "GENERATED")
+    with pytest.raises(LLMParseError):
+        get_citation_f1_metrics(
+            str(original),
+            str(generated),
+            log_folder=str(tmp_path / "logs"),
+            model_name=MODEL,
+            client=fake,
+            scholar=make_lookup(FakeScholarSession()),
+            retry=retry,
+        )
+    assert not (tmp_path / "logs" / "metrics.json").exists()
+
+
+def test_a_ground_truth_without_any_resolved_reference_is_refused(tmp_path):
+    """Scoring against it would give recall 0 for every paper, and it would be cached."""
+    nothing_indexed = FakeScholarSession(
+        [FakeResponse(200, {"total": 0, "data": []}) for _ in range(5)]
+    )
+    original = make_pdf(tmp_path / "original.pdf", "ORIGINAL")
+    generated = make_pdf(tmp_path / "generated.pdf", "GENERATED")
+    with pytest.raises(ValueError, match="None of the 5 reference"):
+        get_citation_f1_metrics(
+            str(original),
+            str(generated),
+            log_folder=str(tmp_path / "logs"),
+            model_name=MODEL,
+            client=fake_judge(),
+            scholar=make_lookup(nothing_indexed),
+        )
+    assert not list(tmp_path.glob("*_gt_citations_*.json"))
+
+
+@pytest.mark.parametrize(
+    "poisoned",
+    [
+        # What the old code cached when reference extraction failed ...
+        {"citation_info": [], "all_ids": [], "all_ids_count": 0, "p0_ids": [], "p1_ids": []},
+        # ... and when every Semantic Scholar lookup failed.
+        {
+            "citation_info": [{"fetched_paper_id": "gt_NA", "priority": "P1"}],
+            "all_ids": [],
+            "p0_ids": [],
+            "p1_ids": [],
+        },
+        {"citation_info": "not a list"},
+        {},
+    ],
+)
+def test_a_ground_truth_cache_left_by_a_failed_run_is_rebuilt(tmp_path, caplog, poisoned):
+    original = make_pdf(tmp_path / "original.pdf", "ORIGINAL")
+    generated = make_pdf(tmp_path / "generated.pdf", "GENERATED")
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps(poisoned))
+    with caplog.at_level(logging.WARNING):
+        metrics = get_citation_f1_metrics(
+            str(original),
+            str(generated),
+            log_folder=str(tmp_path / "logs"),
+            gt_cache_path=str(cache),
+            model_name=MODEL,
+            client=fake_judge(),
+            scholar=make_lookup(FakeScholarSession()),
+        )
+    assert "Ignoring the ground-truth cache" in caplog.text
+    assert metrics["counts"]["ground_truth_ids_all"] == 4
+    assert metrics["overall_recall"] == pytest.approx(0.5)
+    assert json.loads(cache.read_text())["all_ids_count"] == 4
+
+
+def test_a_ground_truth_without_must_have_references_is_flagged(tmp_path, caplog):
+    """A failed classification used to be cached as 'everything is P1': P0 recall 0 for good."""
+    original = make_pdf(tmp_path / "original.pdf", "ORIGINAL")
+    generated = make_pdf(tmp_path / "generated.pdf", "GENERATED")
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"all_ids": ["id-resnet"], "p0_ids": [], "p1_ids": ["id-resnet"]}))
+    with caplog.at_level(logging.WARNING):
+        metrics = get_citation_f1_metrics(
+            str(original),
+            str(generated),
+            log_folder=str(tmp_path / "logs"),
+            gt_cache_path=str(cache),
+            model_name=MODEL,
+            client=fake_judge(),
+            scholar=make_lookup(FakeScholarSession()),
+        )
+    assert metrics["p0_recall"] == 0.0 and metrics["p1_recall"] == 1.0
+    assert "no must-have (P0) reference" in caplog.text
+
+
+def test_model_ids_with_path_characters_do_not_end_up_in_file_paths(tmp_path):
+    """'anthropic/claude-...' used to turn the cache and results names into sub-directories."""
+    model = "anthropic/claude-fable-5-2:latest"
+    project = make_project(tmp_path / "runs", ["p1"])
+    original = project / "p1" / "raw_materials" / "original_paper.pdf"
+    fake = fake_judge()
+    scholar = make_lookup(FakeScholarSession())
+
+    results = review_citation_f1_batch(str(project), model_name=model, client=fake, scholar=scholar)
+    safe = "anthropic_claude-fable-5-2_latest"
+    assert (project / f"citation_f1_results_{safe}.json").is_file()
+    assert (original.parent / f"original_paper_gt_citations_{safe}.json").is_file()
+    assert results["p1"]["metrics"]["overall_precision"] == pytest.approx(2 / 3)
+
+    get_citation_f1_metrics(
+        str(original),
+        str(project / "p1" / "final_paper.pdf"),
+        log_folder=str(tmp_path / "logs"),
+        model_name=model,
+        client=fake,
+        scholar=scholar,
+    )
+    assert (original.parent / f"original_paper_gt_citations_{safe}.json").is_file()
+    assert (original.parent / f"original_paper_gt_citations_{safe}.json").parent == original.parent
+    assert not [path for path in project.rglob("*") if path.is_dir() and "anthropic" in path.name]
+
+
 def test_a_damaged_ground_truth_cache_is_rebuilt(tmp_path, caplog):
     fake = fake_judge()
     original = make_pdf(tmp_path / "original.pdf", "ORIGINAL")
@@ -665,6 +813,26 @@ def test_review_batch_writes_per_paper_and_overall_metrics_and_resumes(tmp_path,
     )
     assert again["p1"] == results["p1"]
     assert len(fake.requests) == requests_before  # p1 and p2 are skipped; p3 fails before any call
+
+
+def test_review_batch_in_which_every_paper_fails_is_an_error(tmp_path, caplog):
+    """It used to return (and save) an empty result that looked like a finished evaluation."""
+    project = make_project(tmp_path / "runs", ["p1", "p2"])
+    fake = fake_judge(**{"eval.reference_extraction": "   "})
+    retry, _ = instant_retry(attempts=2)
+    with caplog.at_level(logging.ERROR), pytest.raises(BatchFailedError) as excinfo:
+        review_citation_f1_batch(
+            str(project),
+            max_workers=2,
+            model_name=MODEL,
+            client=fake,
+            scholar=make_lookup(FakeScholarSession()),
+            retry=retry,
+        )
+    assert "failed for all 2 item(s)" in str(excinfo.value)
+    assert "LLMParseError" in str(excinfo.value)
+    assert "citation F1 failed for p1" in caplog.text
+    assert not (project / f"citation_f1_results_{MODEL}.json").exists()
 
 
 def test_review_batch_falls_back_to_the_dataset_copy_of_the_original(tmp_path):
@@ -745,6 +913,41 @@ def test_generate_gt_citations_batch_writes_caches_progress_and_info(tmp_path, c
     )
     assert again["processed_count"] == 2
     assert len(fake.requests) == requests_before
+
+
+def test_generate_gt_citations_batch_rebuilds_poisoned_files_and_fails_when_nothing_works(
+    tmp_path, caplog
+):
+    base = tmp_path / "cvpr2025"
+    make_pdf(base / "0001" / "0001.pdf", "ORIGINAL")
+    target = base / "0001" / "raw_materials" / f"original_paper_gt_citations_{MODEL}.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"citation_info": [], "all_ids": [], "p0_ids_count": 0}))
+
+    with caplog.at_level(logging.WARNING):
+        progress = generate_gt_citations_batch(
+            str(base),
+            "raw_materials",
+            model_name=MODEL,
+            client=fake_judge(),
+            scholar=make_lookup(FakeScholarSession()),
+        )
+    assert "Ignoring the ground-truth cache" in caplog.text
+    assert json.loads(target.read_text())["all_ids_count"] == 4
+    assert progress["successful_papers"] == {"0001": str(target)}
+
+    target.unlink()
+    retry, _ = instant_retry(attempts=2)
+    with pytest.raises(BatchFailedError, match="ground-truth citation extraction failed for all 1"):
+        generate_gt_citations_batch(
+            str(base),
+            "raw_materials",
+            model_name=MODEL,
+            client=fake_judge(priorities="no labels, sorry"),
+            scholar=make_lookup(FakeScholarSession()),
+            retry=retry,
+        )
+    assert not target.exists()
 
 
 def test_generate_gt_citations_batch_leaves_an_unreadable_info_json_alone(tmp_path, caplog):

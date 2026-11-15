@@ -41,7 +41,7 @@ Instructions:
 1. Preserving existing content
    - Do not modify the text, style, or content of sections that are already filled in the template.
    - Write a good title if the template has none or still carries its placeholder title. If the author block is missing or still a placeholder, make it anonymous (see the anonymity requirement at the end).
-   - Keep the preamble (packages) exactly as it is.
+   - Keep the preamble (packages) as it is. The one exception: when compiling shows that a command the paper needs is undefined because the template does not load its package (for example \includegraphics without `graphicx`, or \toprule without `booktabs`), add that package.
 
 2. Data and tables
    - You are responsible for creating the LaTeX tables.

@@ -27,8 +27,10 @@ import ctypes
 import io
 import json
 import logging
+import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import smtplib
@@ -50,7 +52,7 @@ from typing import Any
 
 from paper_orchestra.config import DEFAULT_MODEL
 from paper_orchestra.context import RunPaths
-from paper_orchestra.memory import Wiki, WikiError
+from paper_orchestra.memory import Wiki
 from paper_orchestra.memory.wiki import INDEX_FILE, NOTES_DIR, WIKI_DIR
 
 log = logging.getLogger("paper_orchestra.frontend")
@@ -167,10 +169,40 @@ def build_write_command(
 
 
 def new_run_directory(now: datetime | None = None) -> Path:
-    """``<demo dir>/paper_orchestra_run_<timestamp>`` (not created yet)."""
+    """``<demo dir>/paper_orchestra_run_<timestamp>_<random id>`` (not created yet).
+
+    The random part keeps two browser sessions that start in the same second
+    from writing their inputs into, and running two pipelines in, one folder.
+    """
     base = os.environ.get(DEMO_DIR_ENV)
     root = Path(base).expanduser() if base else REPO_ROOT.parent / "demo_logs"
-    return root / f"paper_orchestra_run_{(now or datetime.now()):%Y%m%d_%H%M%S}"
+    stamp = f"{(now or datetime.now()):%Y%m%d_%H%M%S}"
+    return root / f"paper_orchestra_run_{stamp}_{secrets.token_hex(3)}"
+
+
+_UNSAFE_FILE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def safe_figure_name(name: str, taken: Sequence[str] = ()) -> str:
+    """A browser-supplied figure name as a plain file name that is not in ``taken``.
+
+    Directories are dropped, characters that are awkward in a LaTeX
+    ``\\includegraphics`` path (spaces, ``%``, ``#`` ...) become ``_``, and a
+    name already used by another figure gets a number, so no upload replaces
+    another one.
+    """
+    base = Path(str(name).replace("\\", "/")).name
+    cleaned = _UNSAFE_FILE_NAME_CHARS.sub("_", base).lstrip(".")
+    stem, suffix = os.path.splitext(cleaned)
+    if not any(character.isalnum() for character in stem) or cleaned.lower() == "info.json":
+        raise ValueError(f"unusable figure file name: {name!r}")
+    # Compared without case: the run directory may be on a case-insensitive file system.
+    used = {other.lower() for other in taken}
+    candidate, number = cleaned, 1
+    while candidate.lower() in used:
+        number += 1
+        candidate = f"{stem}_{number}{suffix}"
+    return candidate
 
 
 def write_raw_materials(
@@ -179,9 +211,10 @@ def write_raw_materials(
     """Write the inputs of a run where the pipeline expects them.
 
     ``figures`` entries carry ``name``, ``caption`` and ``file`` (a path, or
-    an upload exposing ``getvalue()``).  Their captions go to
-    ``figures/info.json``; without it the writer would never learn about them.
-    Returns the raw-materials directory.
+    an upload exposing ``getvalue()``).  Each is stored under
+    :func:`safe_figure_name`, and their captions go to ``figures/info.json``;
+    without it the writer would never learn about them.  Returns the
+    raw-materials directory.
     """
     paths = RunPaths(Path(run_dir), IDEA_FILENAME, EXPERIMENTAL_LOG_FILENAME)
     paths.provided_figures_dir.mkdir(parents=True, exist_ok=True)
@@ -190,10 +223,7 @@ def write_raw_materials(
 
     captions: dict[str, str] = {}
     for figure in figures:
-        # Upload names come from the browser: keep the file inside the figures folder.
-        name = Path(str(figure["name"]).replace("\\", "/")).name
-        if not name or name == "info.json":
-            raise ValueError(f"unusable figure file name: {figure['name']!r}")
+        name = safe_figure_name(figure["name"], taken=list(captions))
         target = paths.provided_figures_dir / name
         source = figure["file"]
         if isinstance(source, (str, Path)):
@@ -232,6 +262,38 @@ def load_example(name: str = "cvpr_example.json") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # The pipeline process
 # ---------------------------------------------------------------------------
+
+_SECRET_NAME_PARTS = ("API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD")
+_NOT_SECRET_SUFFIXES = ("_FILE", "_PATH", "_DIR", "_URL")
+_MIN_SECRET_LENGTH = 8
+SECRET_MASK = "***"
+
+
+def secret_values(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """Values of the environment variables that hold credentials, longest first.
+
+    Judged by name (``*_API_KEY``, ``*TOKEN*``, ``*PASSWORD*`` ...).  Short
+    values are left out: masking them would blank ordinary words in the log.
+    """
+    values = set()
+    for name, value in environ.items():
+        upper = name.upper()
+        named_secret = upper.endswith("_KEY") or any(part in upper for part in _SECRET_NAME_PARTS)
+        if (
+            named_secret
+            and not upper.endswith(_NOT_SECRET_SUFFIXES)
+            and len(value) >= _MIN_SECRET_LENGTH
+        ):
+            values.add(value)
+    return tuple(sorted(values, key=lambda value: (-len(value), value)))
+
+
+def mask_secrets(text: str, secrets_to_hide: Sequence[str]) -> str:
+    """``text`` with every given secret replaced by ``***``."""
+    for secret in secrets_to_hide:
+        text = text.replace(secret, SECRET_MASK)
+    return text
+
 
 _PR_SET_PDEATHSIG = 1
 _active_runs: weakref.WeakSet[PipelineRun] = weakref.WeakSet()
@@ -342,6 +404,7 @@ class PipelineRun:
 
     def _run(self) -> None:
         try:
+            environment = dict(os.environ)
             try:
                 self._process = subprocess.Popen(
                     self.command,
@@ -352,7 +415,7 @@ class PipelineRun:
                     errors="replace",
                     cwd=self.cwd,
                     # Unbuffered output, so the log tail follows the pipeline in real time.
-                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                    env={**environment, "PYTHONUNBUFFERED": "1"},
                     **_isolation_options(),
                 )
             except (OSError, ValueError) as exc:
@@ -360,7 +423,7 @@ class PipelineRun:
                 return
             finally:
                 self._launched.set()
-            self._pump_output(self._process)
+            self._pump_output(self._process, secret_values(environment))
             self._process.wait()
         finally:
             if self._on_finish is not None:
@@ -371,11 +434,13 @@ class PipelineRun:
             self._finished.set()
             _active_runs.discard(self)
 
-    def _pump_output(self, process: subprocess.Popen[str]) -> None:
+    def _pump_output(self, process: subprocess.Popen[str], hidden: Sequence[str] = ()) -> None:
         """Read the child's output to its end, keeping the tail in memory and all of it on disk.
 
         Reading never stops early: a full pipe would block the pipeline.  A log
-        file that cannot be written is given up on instead.
+        file that cannot be written is given up on instead.  The values in
+        ``hidden`` (the credentials the child inherited) are masked first: the
+        tail is shown in the browser, and a library may echo a key in an error.
         """
         assert process.stdout is not None
         log_file = None
@@ -387,6 +452,7 @@ class PipelineRun:
             log.warning("The pipeline log %s cannot be written: %s", self.log_path, exc)
         try:
             for line in process.stdout:
+                line = mask_secrets(line, hidden)
                 with self._lock:
                     self._lines.append(line)
                 if log_file is None:
@@ -457,7 +523,14 @@ STAGE_LABELS: dict[str, str] = {
     "refinement": "Content Refinement",
     "finalize": "Finalizing",
 }
-_STAGE_STATUSES = ("pending", "running", "completed", "failed", "interrupted")
+_STAGE_STATUSES = ("pending", "running", "completed", "failed", "interrupted", "skipped")
+#: How a finished run is recorded: the pipeline writes ``completed``, its spec says ``succeeded``.
+_RUN_STATUSES = {
+    "completed": "completed",
+    "succeeded": "completed",
+    "failed": "failed",
+    "interrupted": "interrupted",
+}
 
 
 @dataclass(frozen=True)
@@ -482,11 +555,14 @@ class RunProgress:
     error: str | None = None
 
     @property
+    def done(self) -> int:
+        """Number of stages that need no more work (completed or skipped)."""
+        return sum(stage.status in ("completed", "skipped") for stage in self.stages)
+
+    @property
     def fraction(self) -> float:
         """Share of the stages that are done, for a progress bar."""
-        if not self.stages:
-            return 0.0
-        return sum(stage.status == "completed" for stage in self.stages) / len(self.stages)
+        return self.done / len(self.stages) if self.stages else 0.0
 
     @property
     def active(self) -> tuple[str, ...]:
@@ -505,6 +581,20 @@ def read_run_state(run_dir: Path) -> dict[str, Any] | None:
         log.warning("Could not read %s: %s", path, exc)
         return None
     return state if isinstance(state, dict) and isinstance(state.get("stages"), dict) else None
+
+
+def _number(value: Any) -> float:
+    """A count or duration from ``state.json``; 0 for anything that is not a number."""
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
+def _text(value: Any) -> str | None:
+    """An error message from ``state.json`` as text; ``None`` when there is none."""
+    return str(value) if value else None
 
 
 def read_progress(
@@ -538,17 +628,18 @@ def read_progress(
                 name=name,
                 label=STAGE_LABELS.get(name, name.replace("_", " ").title()),
                 status=settled(record.get("status")),
-                attempts=int(record.get("attempts") or 0),
-                seconds=float(record.get("seconds") or 0.0),
-                error=record.get("error") or None,
+                attempts=int(_number(record.get("attempts"))),
+                seconds=_number(record.get("seconds")),
+                error=_text(record.get("error")),
                 reused=bool(record.get("reused")),
                 tolerated=bool(record.get("tolerated")),
             )
         )
-    status = state.get("status")
-    if status not in ("completed", "failed", "interrupted"):
+    recorded = state.get("status")
+    status = _RUN_STATUSES.get(recorded) if isinstance(recorded, str) else None
+    if status is None:
         status = "running" if process_running else "interrupted"
-    return RunProgress(status, tuple(stages), state.get("error") or None)
+    return RunProgress(status, tuple(stages), _text(state.get("error")))
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +647,8 @@ def read_progress(
 # ---------------------------------------------------------------------------
 
 _HTML_COMMENT_LINE = re.compile(r"^\s*<!--.*-->\s*$")
+#: The "!" that turns a Markdown link (inline or reference style) into an embedded image.
+_IMAGE_EMBED_MARK = re.compile(r"!(?=\[[^\]\n]*\][(\[])")
 
 
 @dataclass(frozen=True)
@@ -575,41 +668,81 @@ class WikiEntry:
 def open_run_wiki(run_dir: Path) -> Wiki | None:
     """The project wiki of a run, or ``None`` when the run has no memory (yet).
 
-    Only an existing memory directory is opened, so looking never creates one.
+    The wiki is opened as a viewer: looking at a run never creates or changes
+    anything in its memory directory.
     """
     memory_dir = RunPaths(Path(run_dir)).memory_dir
     if not (memory_dir / INDEX_FILE).is_file():
         return None
-    return Wiki(memory_dir)
+    return Wiki(memory_dir, create=False)
+
+
+def without_embedded_images(markdown: str) -> str:
+    """Turn ``![alt](url)`` image embeds into plain ``[alt](url)`` links.
+
+    Memory pages are written by models, partly from web search results.
+    Rendering an embed makes the viewer's browser fetch its URL at once; a
+    link is only followed when the viewer chooses to.
+    """
+    return _IMAGE_EMBED_MARK.sub("", markdown)
 
 
 def memory_index_markdown(wiki: Wiki) -> str:
-    """``MEMORY.md`` as the model sees it, minus the marker comments."""
-    text = wiki.read_text(INDEX_FILE)
-    return "\n".join(line for line in text.splitlines() if not _HTML_COMMENT_LINE.match(line))
+    """``MEMORY.md`` as the model sees it, minus the marker comments.
+
+    Empty when the index cannot be read right now (the run may be rewriting it).
+    """
+    try:
+        text = wiki.read_text(INDEX_FILE)
+    except (ValueError, OSError) as exc:
+        log.warning("Could not read %s of %s: %s", INDEX_FILE, wiki.root, exc)
+        return ""
+    lines = (line for line in text.splitlines() if not _HTML_COMMENT_LINE.match(line))
+    return without_embedded_images("\n".join(lines))
 
 
 def list_wiki_pages(wiki: Wiki, *, include_notes: bool = True) -> list[WikiEntry]:
-    """Every wiki page, then (optionally) the notes, each labelled with its section."""
+    """Every wiki page, then (optionally) the notes, each labelled with its section.
+
+    The run rewrites, moves and archives pages while the viewer is looking,
+    so each page is read on its own and one that vanished, cannot be decoded
+    or is not addressable (:meth:`Wiki.normalize` decides, which also keeps
+    links pointing out of the memory directory away) is left out.
+    """
     entries = []
     for prefix in (WIKI_DIR, NOTES_DIR) if include_notes else (WIKI_DIR,):
-        for info in wiki.list(prefix):
-            parts = info.path.split("/")
+        try:
+            files = sorted((wiki.root / prefix).rglob("*.md"))
+        except OSError as exc:
+            log.warning("Could not list %s: %s", wiki.root / prefix, exc)
+            continue
+        for file in files:
+            path = file.relative_to(wiki.root).as_posix()
+            try:
+                page = wiki.read(path)
+            except (ValueError, OSError):
+                continue
+            parts = path.split("/")
             if prefix == NOTES_DIR:
                 section = "notes" if len(parts) == 2 else "/".join(parts[:-1])
             else:
                 section = parts[1] if len(parts) > 2 else "wiki"
-            entries.append(WikiEntry(info.path, info.title, info.summary, info.kind, section))
+            entries.append(WikiEntry(path, page.title, page.summary, page.kind, section))
     return entries
 
 
 def read_wiki_page(wiki: Wiki, path: str) -> tuple[dict[str, Any], str] | None:
-    """``(front matter, body)`` of a page; ``None`` when it does not exist (any more)."""
+    """``(front matter, body)`` of a page; ``None`` when it cannot be shown (any more).
+
+    The path is validated by :meth:`Wiki.normalize`, so nothing outside the
+    memory directory can be opened.
+    """
     try:
         page = wiki.read(path)
-    except (WikiError, OSError):
+    except (ValueError, OSError):
+        # WikiError (no such page, not addressable) and undecodable bytes are ValueErrors.
         return None
-    return page.meta, page.body
+    return page.meta, without_embedded_images(page.body)
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +824,14 @@ def result_attachments(run_dir: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
+_EMAIL_ADDRESS = re.compile(r"[^@\s,;<>\"']+@[^@\s,;<>\"']+\.[^@\s,;<>\"']+")
+
+
+def valid_email_address(address: str) -> bool:
+    """Whether ``address`` is one plain e-mail address: no list, display name or line break."""
+    return bool(_EMAIL_ADDRESS.fullmatch(address))
+
+
 def send_notification_email(
     recipient_email: str,
     paper_name: str,
@@ -706,6 +847,9 @@ def send_notification_email(
     sender_password = os.environ.get("SMTP_PASSWORD")
     if not sender_email or not sender_password:
         return False, "E-mail is not configured: set SMTP_EMAIL and SMTP_PASSWORD."
+    # The address is typed into a public page: it must not be able to add recipients or headers.
+    if not valid_email_address(recipient_email):
+        return False, "No e-mail was sent: the address given is not a valid e-mail address."
     host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     try:
         port = int(os.environ.get("SMTP_PORT", "465"))

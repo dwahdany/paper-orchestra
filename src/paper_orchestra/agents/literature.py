@@ -50,9 +50,9 @@ from paper_orchestra.memory.harness import MemoryPolicy
 from paper_orchestra.memory.wiki import WikiError
 from paper_orchestra.prompts.literature import (
     DISCOVERY_SYSTEM_PROMPT,
-    MIN_CITED_FRACTION,
     WRITER_SYSTEM_PROMPT,
     exploration_discovery_prompt,
+    min_cited,
     targeted_discovery_prompt,
     writer_repair_prompt,
     writer_user_prompt,
@@ -153,6 +153,8 @@ class DiscoveryResult(BaseModel):
         Only the title is indispensable (it is what gets verified), so a
         missing year or reason is filled in rather than treated as an error.
         """
+        if value is None:  # "no candidate" spelled as null
+            return []
         if not isinstance(value, list):
             return value
         usable: list[Any] = []
@@ -161,7 +163,11 @@ class DiscoveryResult(BaseModel):
                 item = {"title": item}
             if isinstance(item, CandidatePaper):
                 usable.append(item)
-            elif isinstance(item, Mapping) and str(item.get("title") or "").strip():
+            elif (
+                isinstance(item, Mapping)
+                and isinstance(item.get("title"), str)
+                and item["title"].strip()
+            ):
                 reason = item.get("reason")
                 usable.append(
                     {
@@ -266,8 +272,13 @@ class _Draft:
     blocking: list[str]
     advisory: list[str]
 
-    def rank(self) -> tuple[int, int]:
-        return len(self.blocking), len(self.advisory)
+    def rank(self) -> tuple[bool, int, int]:
+        """Sort key, lower is better.
+
+        A complete document always beats a truncated one: only a complete one can be kept
+        when the repair turns run out, however many other problems it has.
+        """
+        return not _is_complete_document(self.latex), len(self.blocking), len(self.advisory)
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +385,18 @@ def inject_citations(outline: dict[str, Any], papers: Sequence[PaperData]) -> di
 # ---------------------------------------------------------------------------
 
 
+# Letters that Unicode does not decompose into a base letter plus a mark.
+_UNDECOMPOSED_LETTERS = str.maketrans(
+    {
+        "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D",
+        "þ": "th", "Þ": "Th", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss", "ı": "i",
+    }
+)  # fmt: skip
+
+
 def _ascii(text: str) -> str:
+    """Closest ASCII rendering of ``text``; characters without one are dropped."""
+    text = text.translate(_UNDECOMPOSED_LETTERS)
     return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
 
@@ -426,7 +448,16 @@ _BIBTEX_SPECIALS = {
     "_": r"\_",
     "~": r"\textasciitilde{}",
     "^": r"\textasciicircum{}",
+    # In the default (OT1) text fonts these three print as other glyphs: ¡, ¿ and a dash.
+    "<": r"\textless{}",
+    ">": r"\textgreater{}",
+    "|": r"\textbar{}",
 }
+# The two tables below hold only spellings that the default OT1 font encoding has, because
+# the venue templates do not load T1.  The ogonek (``\k``), eth, thorn and d-with-stroke
+# raise "Command unavailable in encoding OT1" there, so those letters are reduced to their
+# closest plain ones instead.
+
 #: Unicode combining mark -> the LaTeX accent command that draws it.
 _COMBINING_ACCENTS = {
     "\u0300": "`",  # grave
@@ -441,7 +472,6 @@ _COMBINING_ACCENTS = {
     "\u030b": "H",  # double acute
     "\u030c": "v",  # caron
     "\u0327": "c",  # cedilla
-    "\u0328": "k",  # ogonek
 }
 _LATEX_SPELLINGS = {
     "ß": r"{\ss}",
@@ -454,10 +484,17 @@ _LATEX_SPELLINGS = {
     "ł": r"{\l}",
     "Ł": r"{\L}",
     "ı": r"{\i}",
+    "\u2010": "-",  # hyphen
+    "\u2011": "-",  # non-breaking hyphen
+    "\u2012": "--",  # figure dash
     "–": "--",
     "—": "---",
+    "\u2212": "-",  # minus sign
+    "×": r"{$\times$}",
+    "µ": r"{$\mu$}",  # micro sign
     "‘": "`",
     "’": "'",
+    "\u02bc": "'",  # modifier letter apostrophe
     "“": "``",
     "”": "''",
     "…": r"\ldots{}",
@@ -475,7 +512,7 @@ def _latex_for(char: str) -> str:
     base, *marks = unicodedata.normalize("NFD", char)
     if base.isascii() and base.isalpha() and len(marks) == 1 and marks[0] in _COMBINING_ACCENTS:
         accent = _COMBINING_ACCENTS[marks[0]]
-        if base in "ij" and accent not in "ck":
+        if base in "ij" and accent != "c":
             base = f"\\{base}"  # an accent above replaces the dot
         return f"{{\\{accent}{{{base}}}}}"
     name = unicodedata.name(char, "")
@@ -736,7 +773,7 @@ def check_document(
             )
 
     advisory: list[str] = []
-    required = int(len(citation_keys) * MIN_CITED_FRACTION)
+    required = min_cited(len(citation_keys))
     cited = cite_keys(latex) & allowed
     if len(cited) < required:
         missing = [key for key in citation_keys if key not in cited]

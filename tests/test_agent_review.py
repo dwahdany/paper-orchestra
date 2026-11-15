@@ -278,6 +278,8 @@ def test_instructions_ask_for_no_written_out_reasoning():
 def test_review_schema_fits_structured_output_limits():
     schema = Review.model_json_schema()
     assert set(schema["required"]) == set(Review.model_fields)
+    # The schema description is part of what the reviewer reads: no notes for developers.
+    assert schema["description"] == "A peer review of a research paper."
     for name, spec in schema["properties"].items():
         assert " " not in name
         # No dict-shaped fields and no numeric or length constraints.

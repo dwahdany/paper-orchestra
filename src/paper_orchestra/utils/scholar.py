@@ -222,6 +222,16 @@ class HttpSession(Protocol):
     ) -> Any: ...
 
 
+# Network faults worth another attempt.  The last two are a response that was cut off or
+# garbled on the way: requests reads the body inside ``get`` and reports those separately.
+_TRANSIENT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
+
+
 def _retry_after(response: Any) -> float | None:
     """Seconds the server asked us to wait, when it said so in a usable form."""
     value = (getattr(response, "headers", None) or {}).get("Retry-After")
@@ -298,7 +308,7 @@ class SemanticScholar:
                     params=params,
                     timeout=self.timeout,
                 )
-            except (requests.ConnectionError, requests.Timeout) as exc:
+            except _TRANSIENT_ERRORS as exc:
                 failure = type(exc).__name__
             except requests.RequestException as exc:
                 # Not retryable.  The original message can quote request headers (an API key

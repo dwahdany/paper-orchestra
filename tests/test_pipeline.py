@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import threading
 import time
 from collections import Counter
@@ -432,19 +433,38 @@ def test_state_json_follows_every_transition(cfg, stubs):
     assert during_outline["stages"]["outline"] == {
         "status": "running",
         "attempts": 1,
+        "started_at": during_outline["stages"]["outline"]["started_at"],
+        "finished_at": None,
         "seconds": 0.0,
         "error": None,
         "outputs": [],
         "reused": False,
     }
-    assert during_outline["stages"]["literature"]["status"] == "pending"
+    assert during_outline["stages"]["literature"] == {
+        "status": "pending",
+        "attempts": 0,
+        "started_at": None,
+        "finished_at": None,
+        "seconds": 0.0,
+        "error": None,
+        "outputs": [],
+        "reused": False,
+    }
     during_refinement = stubs.states["refinement"]["stages"]
     assert during_refinement["section_writing"]["outputs"] == ["latex_writeup/raw_draft_paper.tex"]
     assert during_refinement["finalize"]["status"] == "pending"
 
     state = state_of(cfg)
     order = ["ingest", "outline", "literature", "section_writing", "refinement", "finalize"]
-    assert state["status"] == "completed" and state["error"] is None
+    assert state["status"] == "succeeded" and state["error"] is None
+    assert state["version"] == 1
+    # Timestamps are UTC, to the second, and ordered.
+    stamp = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+    assert stamp.fullmatch(state["started_at"]) and stamp.fullmatch(state["updated_at"])
+    assert state["started_at"] <= state["updated_at"]
+    for record in state["stages"].values():
+        assert stamp.fullmatch(record["started_at"]) and stamp.fullmatch(record["finished_at"])
+        assert state["started_at"] <= record["started_at"] <= record["finished_at"]
     assert list(state["stages"]) == order
     assert state["stages"] == result.stages
     assert state["stages"]["refinement"]["outputs"] == [
@@ -484,6 +504,106 @@ def test_time_breakdown_usage_and_memory_report(cfg, stubs):
     assert report["enabled"] is True and report["lab"] is None
     assert report["project"]["pages"] >= 5
     assert [(r["scope"], r["stage"]) for r in report["reports"]] == [("project", "finalize")]
+
+
+def test_on_stage_reports_each_stage_once_it_has_settled(cfg, stubs, monkeypatch, caplog):
+    cfg.use_plotting = True
+    stubs.plotting_delay = 0.1
+    stubs.failures["plotting"] = [RuntimeError("boom"), RuntimeError("still boom")]
+    seen: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+
+    def on_stage(name: str, record: dict[str, Any]) -> None:
+        on_disk = {n: r["status"] for n, r in state_of(cfg)["stages"].items()}
+        seen.append((name, dict(record), on_disk))
+        if name == "outline":
+            raise RuntimeError("callback bug")
+
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result = run_paper(cfg, harness=make_harness(cfg), compute=FakeCompute(), on_stage=on_stage)
+
+    # A callback that raises is logged and does not fail the run.
+    assert result.success, result.error
+    assert "on_stage callback for the outline stage failed: callback bug" in caplog.text
+    assert [(name, record["status"]) for name, record, _ in seen] == [
+        ("ingest", "completed"),
+        ("outline", "completed"),
+        ("literature", "completed"),
+        ("plotting", "failed"),
+        ("section_writing", "completed"),
+        ("refinement", "completed"),
+        ("finalize", "completed"),
+    ]
+    # Literature finished long before plotting gave up, yet it was only reported once
+    # nothing was running any more: the callback may checkpoint the run directory.
+    _, literature, on_disk = seen[2]
+    assert on_disk["plotting"] == "failed" and on_disk["section_writing"] == "pending"
+    assert literature == state_of(cfg)["stages"]["literature"]
+    assert seen[3][1]["tolerated"] is True and seen[3][1]["attempts"] == 2
+
+    # Stages reused from the earlier run are reported as well.
+    StubAgents().install(monkeypatch)
+    reused: list[tuple[str, bool]] = []
+    resumed = run_paper(
+        cfg,
+        harness=make_harness(cfg),
+        compute=FakeCompute(),
+        on_stage=lambda name, record: reused.append((name, record["reused"])),
+    )
+    assert resumed.success
+    assert reused == [(name, True) for name in pipeline.STAGES]
+
+
+def test_on_stage_reports_the_stage_that_failed_the_run(cfg, stubs):
+    stubs.failures["outline"] = [RuntimeError("first"), RuntimeError("second")]
+    seen: list[tuple[str, str, int]] = []
+    result = run_paper(
+        cfg,
+        harness=make_harness(cfg),
+        compute=FakeCompute(),
+        on_stage=lambda name, record: seen.append((name, record["status"], record["attempts"])),
+    )
+
+    assert not result.success
+    # Once per stage, not once per attempt, and nothing for stages that never started.
+    assert seen == [("ingest", "completed", 1), ("outline", "failed", 2)]
+
+
+def test_usage_is_not_counted_twice_when_one_harness_serves_a_resumed_run(cfg, stubs, monkeypatch):
+    stubs.failures["refinement"] = [RuntimeError("reviewer down"), RuntimeError("reviewer down")]
+    harness = make_harness(cfg)
+    # Spent before the run started: not this run's usage.
+    harness.generate("warm up", agent="Probe", stage="setup", model="claude-fable-5-2")
+    first, _, _ = run(cfg, harness=harness)
+    assert not first.success
+
+    StubAgents().install(monkeypatch)
+    second, _, _ = run(cfg, harness=harness)
+
+    assert second.success
+    rows = {row["label"]: row for row in second.usage["by_label"]}
+    assert "setup.Probe" not in rows
+    # The outline call was made once, in the first invocation.
+    assert rows["outline.OutlineAgent"]["requests"] == 1
+    assert second.usage["total"]["requests"] == harness.usage.total().requests - 1
+    assert read_json(RunPaths(cfg.base_dir).usage) == second.usage
+
+
+def test_a_transcript_that_cannot_be_written_does_not_fail_the_run(cfg, stubs, caplog):
+    harness = make_harness(cfg)
+    real_record = harness.transcripts.record
+
+    def record(event: dict[str, Any]) -> dict[str, Any]:
+        if event.get("type") in ("run_start", "stage_start", "stage_end", "run_end"):
+            raise OSError("No space left on device")
+        return real_record(event)
+
+    harness.transcripts.record = record
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result, _, _ = run(cfg, harness=harness)
+
+    assert result.success, result.error
+    assert state_of(cfg)["status"] == "succeeded"
+    assert "transcript entry 'stage_end' failed: No space left on device" in caplog.text
 
 
 def test_run_with_memory_disabled(cfg, stubs):
@@ -596,11 +716,14 @@ def test_a_stage_that_keeps_failing_fails_the_run_without_raising(cfg, stubs):
     assert state["stages"]["section_writing"] == {
         "status": "failed",
         "attempts": 2,
+        "started_at": state["stages"]["section_writing"]["started_at"],
+        "finished_at": state["stages"]["section_writing"]["finished_at"],
         "seconds": state["stages"]["section_writing"]["seconds"],
         "error": "RuntimeError: second",
         "outputs": [],
         "reused": False,
     }
+    assert state["stages"]["section_writing"]["finished_at"] is not None
     assert state["stages"]["refinement"]["status"] == "pending"
     assert read_json(paths.usage)["total"]["requests"] > 0
     assert events(harness, "run_end")[0]["status"] == "failed"
@@ -650,7 +773,7 @@ def test_plotting_failure_is_tolerated(cfg, stubs, caplog, monkeypatch):
     record = state_of(cfg)["stages"]["plotting"]
     assert record["status"] == "failed" and record["tolerated"] is True
     assert record["error"] == "RuntimeError: still boom"
-    assert state_of(cfg)["status"] == "completed"
+    assert state_of(cfg)["status"] == "succeeded"
     # The paper is written with the provided figure only.
     assert stubs.seen["figures"] == [{"name": "teaser.png", "caption": ""}]
     assert any("continuing without its output" in r.getMessage() for r in caplog.records)
@@ -697,6 +820,50 @@ def test_an_interrupt_is_recorded_and_propagates(cfg, stubs):
     assert state["status"] == "interrupted"
     assert state["stages"]["section_writing"]["status"] == "interrupted"
     assert state["stages"]["literature"]["status"] == "completed"
+
+
+def test_an_interrupt_does_not_wait_for_stages_running_side_by_side(cfg, stubs, monkeypatch):
+    cfg.use_plotting = True
+    plotting_started = threading.Event()
+    release = threading.Event()
+    plotting_attempts: list[str] = []
+
+    class Interrupted(_Literature):
+        def run(self, outline: dict[str, Any]) -> None:
+            assert plotting_started.wait(timeout=5)
+            raise KeyboardInterrupt
+
+    class Stuck(_Plotting):
+        def run(self, outline: dict[str, Any]) -> list[dict[str, Any]]:
+            plotting_attempts.append("attempt")
+            plotting_started.set()
+            assert release.wait(timeout=10)
+            raise RuntimeError("the sandbox went away")
+
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Interrupted(stubs, ctx))
+    monkeypatch.setattr(pipeline, "_plotting_agent", lambda ctx: Stuck(stubs, ctx))
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run(cfg)
+        # The interrupt came through while plotting was still in its first attempt.
+        assert not release.is_set()
+        state = state_of(cfg)
+        assert state["status"] == "interrupted"
+        assert state["stages"]["literature"]["status"] == "interrupted"
+        assert state["stages"]["plotting"]["status"] == "interrupted"
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("stage"):
+                thread.join(timeout=10)
+
+    # Plotting finished the attempt it was in and did not start the retry it had left.
+    assert plotting_attempts == ["attempt"]
+    state = state_of(cfg)
+    assert state["status"] == "interrupted"
+    assert state["stages"]["plotting"]["status"] == "failed"
+    assert state["stages"]["plotting"]["attempts"] == 1
+    assert "section_writing" not in stubs.calls
 
 
 # -- resume ----------------------------------------------------------------------
@@ -944,4 +1111,4 @@ def test_state_file_is_valid_json_at_every_write(cfg, stubs, monkeypatch):
 
     monkeypatch.setattr(pipeline, "write_json", spy)
     run(cfg)
-    assert seen[0] == "running" and seen[-1] == "completed" and len(seen) > 12
+    assert seen[0] == "running" and seen[-1] == "succeeded" and len(seen) > 12

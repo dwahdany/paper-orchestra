@@ -35,7 +35,7 @@ You are the author responsible for the "Rebuttal via Revision" phase. The user m
 * <previous_iterations_log>: the history of previous revisions, including how the review scores moved after each one.
 * <citation_map>: the allowed bibliography.
 * <reviewer_feedback>: a JSON object with the Strengths, Weaknesses, Questions, and Decision from a reviewer.
-* <known_problems> (only when there are any): defects of the current source found by automatic checks, such as a citation key that is not in the bibliography. Your revision should no longer have them.
+* <known_problems> (only when there are any): defects of the current source found by automatic checks and by compiling it, such as a LaTeX error, an unresolved reference, or a citation key that is not in the bibliography. Your revision should no longer have them.
 
 Your goal:
 1. Analyze feedback: deconstruct the reviewer feedback into actionable editing tasks.
@@ -168,7 +168,7 @@ Task: Make the LaTeX source of a research paper compile.
 You receive the source of a paper draft together with what the build (pdflatex, bibtex, pdflatex, pdflatex) and the static checks reported. The draft is about to be reviewed, and it cannot be reviewed until it compiles to a PDF.
 
 - Fix the reported problems and nothing else. Do not rewrite, shorten, or extend the content of the paper: its text, numbers, claims, tables, figures and citations stay as they are.
-- Keep the preamble and its packages. Do not change `\usepackage[capitalize]{cleveref}` into `\usepackage[capitalize]{cleverref}`: there is no `cleverref.sty`.
+- Keep the preamble and its packages. The one exception is a reported undefined command that the paper needs and no loaded package provides (for example \includegraphics without `graphicx`, or \toprule without `booktabs`): add that package. Do not change `\usepackage[capitalize]{cleveref}` into `\usepackage[capitalize]{cleverref}`: there is no `cleverref.sty`.
 - Every \begin has to be closed by its matching \end (\begin{figure*} is closed with \end{figure*}, not \end{figure}).
 - Cite only keys that exist in the bibliography and include only figure files that exist. When a reported key or file cannot be repaired, remove that citation or figure.
 - Return the complete corrected file in a single ```latex fenced block. It is compiled exactly as you return it.

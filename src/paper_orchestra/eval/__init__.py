@@ -242,6 +242,37 @@ class JsonResultsFile:
             return dict(self._data)
 
 
+_UNSAFE_FILE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def file_name_part(text: str) -> str:
+    """``text`` (a model id, an experiment name) made safe to embed in a file name.
+
+    Names that are already safe are kept as they are, so existing result files
+    are still found; anything else (``/``, ``:``, spaces ...) becomes ``_``.
+    """
+    return _UNSAFE_FILE_NAME_CHARS.sub("_", text)
+
+
+class BatchFailedError(RuntimeError):
+    """A batch produced no result at all: every item it tried failed."""
+
+
+def raise_if_nothing_succeeded(failures: Mapping[str, str], *, results: int, what: str) -> None:
+    """Fail a batch whose items all failed and that has no earlier result to show.
+
+    A results file holding nothing (or a summary over zero items) looks like
+    a finished evaluation, so this case is an error.  Some items failing is
+    not: they are logged by :func:`run_batch` and retried by the next run.
+    """
+    if failures and not results:
+        name, error = next(iter(failures.items()))
+        raise BatchFailedError(
+            f"{what} failed for all {len(failures)} item(s) and there is no earlier result; "
+            f"first failure ({name}): {error}"
+        )
+
+
 def run_batch(
     items: Mapping[str, T], worker: Callable[[str, T], None], *, max_workers: int, what: str
 ) -> dict[str, str]:
@@ -283,22 +314,24 @@ def run_batch(
 # ---------------------------------------------------------------------------
 
 _WINNERS = ("paper_1", "paper_2", "tie")
-_TIE_WORD = re.compile(r"(?<![a-z])tie(?![a-z])")
+#: A label as a whole word: ``paper 1`` / ``paper_1`` / ``paper1`` (not ``paper 10``) or ``tie``.
+_WINNER_MENTION = re.compile(r"(?<![a-z0-9])(?:paper[\s_-]*([12])(?![0-9])|(tie)(?![a-z]))")
 
 
 def normalize_winner(value: Any) -> Any:
     """Map spellings such as ``"Paper 1"`` onto ``paper_1`` / ``paper_2`` / ``tie``.
 
-    Anything else is returned unchanged, so validation rejects it instead of
-    a verdict being guessed.
+    Only a string that names exactly one of the three is mapped.  Anything
+    else, such as ``"Paper 2 (stronger than Paper 1)"``, is returned
+    unchanged, so validation rejects it instead of a verdict being guessed.
     """
     if not isinstance(value, str):
         return value
-    text = "_".join(value.strip().lower().split())
-    for winner in ("paper_1", "paper_2"):
-        if winner in text:
-            return winner
-    return "tie" if _TIE_WORD.search(text) else value
+    named = {
+        f"paper_{match.group(1)}" if match.group(1) else "tie"
+        for match in _WINNER_MENTION.finditer(value.lower())
+    }
+    return named.pop() if len(named) == 1 else value
 
 
 Winner = Annotated[Literal["paper_1", "paper_2", "tie"], BeforeValidator(normalize_winner)]
@@ -426,7 +459,9 @@ def run_sxs_batch(
     ``rate_both_orders(paper1_path, paper2_path)`` returns the ratings for the
     two presentation orders.  Pairs already in the results file are skipped,
     each finished pair is saved immediately, and the summary is stored under
-    ``_summary_stats``.  Returns the content of the results file.
+    ``_summary_stats``.  Returns the content of the results file.  Raises
+    :class:`BatchFailedError` when every pair failed and no pair was rated
+    before: a summary over zero pairs must not pass for a result.
     """
     results = JsonResultsFile(output_json_path)
     second = set(_subfolders(project_folder_2))
@@ -441,6 +476,15 @@ def run_sxs_batch(
             continue
         pairs[paper_id] = (str(paper1), str(paper2))
     log.info("%s: comparing [%s] with [%s] on %d paper(s).", what, exp1_name, exp2_name, len(pairs))
+    if not pairs and not any(key != SUMMARY_KEY for key in results.snapshot()):
+        log.warning(
+            "%s: no paper folder has both %s under %s and %s under %s; nothing to compare.",
+            what,
+            rel_path_1,
+            project_folder_1,
+            rel_path_2,
+            project_folder_2,
+        )
 
     def worker(paper_id: str, paths: tuple[str, str]) -> None:
         rating1, rating2 = rate_both_orders(*paths)
@@ -461,9 +505,10 @@ def run_sxs_batch(
             entry["category_3pt"],
         )
 
-    run_batch(pairs, worker, max_workers=max_workers, what=what)
+    failures = run_batch(pairs, worker, max_workers=max_workers, what=what)
 
     stats = summarize_sxs_results(results.snapshot(), exp1_name=exp1_name, exp2_name=exp2_name)
+    raise_if_nothing_succeeded(failures, results=stats["total_valid_evals"], what=what)
     results.set(SUMMARY_KEY, stats)
     five, three = stats["five_point"], stats["three_point"]
     log.info(

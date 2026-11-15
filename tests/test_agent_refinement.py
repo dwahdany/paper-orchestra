@@ -182,13 +182,29 @@ def write_pdf(path: Path, tex: str) -> None:
     document.close()
 
 
+def latex_error(tex_name: str, tex: str, marker: str) -> str:
+    """The error pdflatex reports for an undefined ``marker``, with file name and line."""
+    number, line = next((n, ln) for n, ln in enumerate(tex.splitlines(), 1) if marker in ln)
+    quoted = line[: line.index(marker) + len(marker)][-40:]
+    return f"./{tex_name}.tex:{number}: Undefined control sequence. [l.{number} {quoted}]"
+
+
 class ScriptedCompute(ComputeBackend):
-    """Builds nothing: a document "compiles" unless it contains one of the failing markers."""
+    """Builds nothing: a document "compiles" unless it contains one of the failing markers.
+
+    A flawed marker stands for the usual LaTeX error: pdflatex reports it and writes a PDF
+    all the same.
+    """
 
     name = "scripted"
 
-    def __init__(self, failing: Sequence[str] = ("\\badmacro",)) -> None:
+    def __init__(
+        self,
+        failing: Sequence[str] = ("\\badmacro",),
+        flawed: Sequence[str] = ("\\flawedmacro", "\\otherflaw"),
+    ) -> None:
         self.failing = tuple(failing)
+        self.flawed = tuple(flawed)
         self.builds: list[tuple[str, str]] = []
 
     def run_python(self, code, *, inputs=None, outputs=(), timeout=120.0):
@@ -205,7 +221,8 @@ class ScriptedCompute(ComputeBackend):
                 )
         pdf = Path(output_pdf) if output_pdf else work / f"{tex_name}.pdf"
         write_pdf(pdf, tex)
-        return CompileResult(ok=True, pdf_path=pdf)
+        errors = [latex_error(tex_name, tex, marker) for marker in self.flawed if marker in tex]
+        return CompileResult(ok=True, pdf_path=pdf, errors=errors)
 
 
 def make_ctx(
@@ -596,6 +613,8 @@ def test_revision_that_does_not_build_gets_one_repair_turn(tmp_path, repo_root):
             "REJECTED_STATIC_CHECK",
             "1 citation key(s) are not in the bibliography: Ghost2099",
         ),
+        # pdflatex wrote a PDF, but with an error the current version does not have.
+        (" \\flawedmacro", "REJECTED_LATEX_ERRORS", "Undefined control sequence."),
     ],
 )
 def test_unrepairable_revision_is_rejected_and_the_loop_goes_on(
@@ -611,7 +630,8 @@ def test_unrepairable_revision_is_rejected_and_the_loop_goes_on(
 
     work = ctx.paths.refinement_dir
     log = worklog(ctx)
-    assert log["v1"]["outcome"] == outcome and problem in log["v1"]["problems"]
+    assert log["v1"]["outcome"] == outcome
+    assert any(problem in found for found in log["v1"]["problems"])
     assert "scores_after" not in log["v1"]
     assert log["v2"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
     # The broken revision was never reviewed, and v2 was judged against v0.
@@ -670,6 +690,62 @@ def test_known_problems_of_the_current_version_do_not_disqualify_a_revision(tmp_
         "</known_problems>" in request.text
     )
     assert worklog(ctx)["v1"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
+    assert text_of(ctx, "final_refined_paper.tex") == v1
+
+
+def test_revision_with_latex_errors_is_repaired_although_a_pdf_was_written(tmp_path, repo_root):
+    v0 = paper(repo_root, "overall=5")
+    flawed = paper(repo_root, "overall=9", extra=" \\flawedmacro")
+    fixed = paper(repo_root, "overall=6", extra=" Fixed macro.")
+    client = FakeLLM(script(**{REVISE: Reviser([revision(flawed), fence(fixed)])}))
+    compute = ScriptedCompute()
+    ctx = make_ctx(tmp_path, repo_root, client, v0, compute, max_reflections=1)
+
+    run(ctx)
+
+    _, repair = requests(client, REVISE)
+    assert "Undefined control sequence." in repair.text and "\\flawedmacro]" in repair.text
+    assert "LaTeX did not produce a PDF" not in repair.text
+    # The flawed build was never reviewed: only v0 and the repaired v1 were.
+    assert len(requests(client, REVIEW)) == 6
+    assert [(e["ok"], e["clean"]) for e in events(ctx, "compile")] == [
+        (True, True),
+        (True, False),
+        (True, True),
+    ]
+    assert worklog(ctx)["v1"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
+    assert text_of(ctx, "final_refined_paper.tex") == fixed
+
+
+def test_problems_inherited_from_the_current_version_survive_an_edit(tmp_path, repo_root):
+    # The draft arrives with a LaTeX error and two unknown citation keys.  The revision
+    # moves the error to another line (and another file name) and drops one of the keys:
+    # it is better than the draft, so neither a repair turn nor a rejection is due.
+    flaw = "\nWe write \\flawedmacro for the routing matrix."
+    v0 = paper(repo_root, "overall=5", extra=" See~\\cite{Ghost2099, Phantom2098}." + flaw)
+    v1 = paper(
+        repo_root, "overall=6", extra="\n\nA new paragraph.\n\nSee~\\cite{Ghost2099}." + flaw
+    )
+    worse = v1.replace("Sparse routing works.", "Sparse routing works. \\otherflaw")
+    client = FakeLLM(
+        script(**{REVISE: Reviser(revision(v1)), FORMAT_REVIEW: ISSUES, FORMAT_FIX: fence(worse)})
+    )
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=1)
+
+    run(ctx)
+
+    [request] = requests(client, REVISE)
+    known = request.text.split("<known_problems>")[1].split("</known_problems>")[0]
+    assert "- 2 citation key(s) are not in the bibliography: Ghost2099, Phantom2098" in known
+    assert "- ./initial_draft.tex:" in known and "Undefined control sequence." in known
+    first, second = (e["errors"] for e in events(ctx, "compile")[:2])
+    assert first != second  # the same defect, reported at another place
+    assert worklog(ctx)["v1"]["outcome"] == "ACCEPTED_SCORE_INCREASE"
+    # A formatting candidate that adds an error of its own is still turned down.
+    entry = worklog(ctx, "format_refinement_worklog.json")["v1"]
+    assert entry["outcome"] == "REJECTED_LATEX_ERRORS"
+    [problem] = entry["problems"]
+    assert "\\otherflaw]" in problem
     assert text_of(ctx, "final_refined_paper.tex") == v1
 
 
@@ -827,6 +903,12 @@ def test_formatting_fix_is_applied_when_it_compiles_and_keeps_the_citations(tmp_
             "figure file(s) not found: figures/gone.png",
             True,
         ),
+        (
+            lambda tex: tex.replace("Routing has", "\\flawedmacro Routing has"),
+            "REJECTED_LATEX_ERRORS",
+            "Undefined control sequence.",
+            True,
+        ),
     ],
 )
 def test_unsafe_formatting_candidate_is_rejected(
@@ -842,12 +924,13 @@ def test_unsafe_formatting_candidate_is_rejected(
 
     work = ctx.paths.refinement_dir
     entry = worklog(ctx, "format_refinement_worklog.json")["v1"]
-    assert entry["outcome"] == outcome and problem in entry["problems"]
+    assert entry["outcome"] == outcome
+    assert any(problem in found for found in entry["problems"])
     assert entry["formatting_feedback"] == json.loads(ISSUES)
     assert ("formatted_candidate_v1" in [name for name, _ in compute.builds]) is built
     # The candidate is kept for inspection, but the paper is the version before it.
     assert text_of(ctx, "formatted_candidate_v1.tex") == candidate
-    compiled = outcome == "REJECTED_STATIC_CHECK"
+    compiled = outcome in ("REJECTED_STATIC_CHECK", "REJECTED_LATEX_ERRORS")
     assert (work / "formatted_candidate_v1.pdf").exists() is compiled
     assert text_of(ctx, "final_refined_paper.tex") == v0
     assert final_pdf.read_bytes() == (work / "initial_draft.pdf").read_bytes()
@@ -1037,8 +1120,10 @@ def test_prompts_carry_literal_json_and_latex():
 @pytest.mark.latex
 def test_real_compile_review_and_revision(tmp_path, repo_root):
     v0 = paper(repo_root, "overall=5")
+    # pdflatex writes a PDF for this one too, with an error and a "??" in it.
+    flawed = paper(repo_root, "overall=9", extra=" See \\undefinedmacro and \\cref{fig:gone}.")
     v1 = paper(repo_root, "overall=6", extra=" We also report an ablation.")
-    client = FakeLLM(script(**{REVISE: Reviser(revision(v1))}))
+    client = FakeLLM(script(**{REVISE: Reviser([revision(flawed), revision(v1)])}))
     ctx = make_ctx(
         tmp_path, repo_root, client, v0, LocalBackend(), max_reflections=1, review_ensemble=1
     )
@@ -1053,11 +1138,18 @@ def test_real_compile_review_and_revision(tmp_path, repo_root):
     text = " ".join(load_paper(final_pdf).split()).replace("- ", "")
     assert "Sparse Routing for Tiny Models" in text and "We also report an ablation." in text
     assert "??" not in text  # the citation and the cross-reference resolved
-    compiles = events(ctx, "compile")
-    assert [e["document"] for e in compiles] == ["initial_draft.tex", "refined_paper_v1.tex"]
-    assert all(e["ok"] and e["clean"] for e in compiles)
-    # No repair turn was needed, and the single reviewer wrote each review without a meta pass.
-    assert len(requests(client, REVISE)) == 1 and not requests(client, META)
+    initial, rejected, repaired = events(ctx, "compile")
+    assert initial["document"] == "initial_draft.tex" and initial["ok"] and initial["clean"]
+    assert rejected["document"] == repaired["document"] == "refined_paper_v1.tex"
+    assert rejected["ok"] and not rejected["clean"]
+    assert "Undefined control sequence." in rejected["errors"][0]
+    assert "undefined reference 'fig:gone'" in rejected["warnings"]
+    assert repaired["ok"] and repaired["clean"]
+    # One repair turn for the build problems; the flawed build was never reviewed, and the
+    # single reviewer wrote each review without a meta pass.
+    _, repair = requests(client, REVISE)
+    assert "\\undefinedmacro]" in repair.text and "undefined reference 'fig:gone'" in repair.text
+    assert len(requests(client, REVIEW)) == 2 and not requests(client, META)
     assert (work / "pdf_screenshots" / "content_refinement" / "v1" / "grid_1.png").is_file()
     [sheet] = requests(client, FORMAT_REVIEW)[0].images
     assert max(PILImage.open(io.BytesIO(sheet.data)).size) <= 2576

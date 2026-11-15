@@ -5,7 +5,8 @@ This directory contains the Streamlit frontend for Paper Orchestra.
 ## How to Launch the Demo Locally
 
 1. From the project root, install the project with the UI extra (add `--extra gemini`,
-   `--extra openai` or `--extra modal` if you want those providers or the Modal compute backend):
+   `--extra openai` or `--extra modal` if you want those providers or the Modal compute backend).
+   The page needs Streamlit 1.49 or newer:
    ```bash
    cd paper-orchestra
    uv sync --extra ui
@@ -29,12 +30,19 @@ This directory contains the Streamlit frontend for Paper Orchestra.
 - **Wiki Memory** and **Memory Consolidation (Dreaming)**: whether the run keeps a wiki of what
   it learns, and when notes are consolidated into wiki pages. The **Memory** tab shows the
   run's `MEMORY.md` and lets you open any wiki page.
-- **Your Email**: optional. A finished run is e-mailed when `SMTP_EMAIL` and `SMTP_PASSWORD`
-  (and optionally `SMTP_HOST` / `SMTP_PORT`, default Gmail over SSL) are set.
+- **Your Email**: optional, one address. A finished run is e-mailed when `SMTP_EMAIL` and
+  `SMTP_PASSWORD` (and optionally `SMTP_HOST` / `SMTP_PORT`, default Gmail over SSL) are set.
 
-Each run is written to `../demo_logs/paper_orchestra_run_<timestamp>/` next to the repository
-(set `PAPER_ORCHESTRA_DEMO_DIR` to use another folder). The complete pipeline output is kept in
-`pipeline.log` inside the run folder.
+Each run is written to `../demo_logs/paper_orchestra_run_<timestamp>_<id>/` next to the
+repository (set `PAPER_ORCHESTRA_DEMO_DIR` to use another folder). The complete pipeline output
+is kept in `pipeline.log` inside the run folder; the values of credential environment variables
+(`*_API_KEY`, `*TOKEN*`, `*PASSWORD*`, ...) are masked in it and in the log shown on the page.
+
+Uploaded figures are stored under plain file names (other characters become `_`, and a second
+figure with the same name gets a number), which is how the paper refers to them.
+
+The page follows a run only in the browser session that started it: reloading the tab starts a
+new session, and the earlier run keeps going in the background (see below for stopping it).
 
 ## How to Kill Unfinished Writing Processes
 

@@ -337,6 +337,20 @@ def test_rate_limit_and_server_errors_are_retried_with_backoff():
     assert fake_time.sleeps == [1.0, 2.0, 4.0, 8.0]
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        requests.exceptions.ChunkedEncodingError("connection broken: IncompleteRead"),
+        requests.exceptions.ContentDecodingError("incorrect header check"),
+    ],
+)
+def test_a_response_cut_off_or_garbled_in_transit_is_retried(fault):
+    session = FakeSession(fault, results(paper("Found At Last")))
+    client, fake_time = make_client(session, min_interval=0.0)
+    assert [p["title"] for p in client.search("found at last")] == ["Found At Last"]
+    assert len(session.calls) == 2 and fake_time.sleeps == [1.0]
+
+
 def test_retry_after_is_honoured_and_capped():
     session = FakeSession(
         FakeResponse(429, headers={"Retry-After": "7"}),

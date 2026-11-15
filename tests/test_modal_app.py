@@ -11,6 +11,7 @@ import sys
 import threading
 import types
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,10 @@ from paper_orchestra.compute.modal_backend import ModalBackend
 from paper_orchestra.config import DEFAULT_MODEL, LAB_MEMORY_ENV, TEMPLATES_ENV
 from paper_orchestra.context import RunPaths
 from paper_orchestra.llm.base import LLMConfigError
+from paper_orchestra.llm.fake import FakeLLM, FakeRequest
+from paper_orchestra.llm.router import register_client, reset_clients
+from paper_orchestra.memory.harness import ContextHarness
+from paper_orchestra.memory.wiki import Wiki
 
 modal = pytest.importorskip("modal")
 
@@ -37,6 +42,7 @@ from paper_orchestra.modal_app import (  # noqa: E402
     check_batch,
     check_credentials,
     commit_volume,
+    consolidate_lab,
     container_path,
     download_outputs,
     failure_summary,
@@ -149,18 +155,23 @@ class FakeFunction:
 
 
 class StubPipeline:
-    """Stands in for `paper_orchestra.pipeline`: copies inputs, resumes from state.json."""
+    """Stands in for `paper_orchestra.pipeline`: copies inputs, resumes from state.json.
+
+    Like the real pipeline it refreshes the harness when a stage has settled,
+    on a worker thread for the stages that run side by side.
+    """
 
     def __init__(self) -> None:
         self.prepared: list[tuple[Any, Path | None]] = []
         self.runs: list[dict[str, Any]] = []
         self.success = True
         self.error: Exception | None = None
-        #: Called after each stage callback; its value is recorded in ``checkpoints``.
+        #: Called after each stage has settled; its value is recorded in ``checkpoints``.
         self.observe = lambda: None
         self.checkpoints: list[tuple[str, Any]] = []
-        #: Overrides the stages reported through ``on_stage``.
+        #: Overrides the stages that settle.
         self.only_stages: list[str] | None = None
+        self.refresh_errors: list[Exception] = []
 
     def prepare_run_dir(self, cfg, raw_materials_dir):
         self.prepared.append((cfg, raw_materials_dir))
@@ -177,11 +188,26 @@ class StubPipeline:
         middle = ["literature", "plotting"] if cfg.use_plotting else ["literature"]
         return ["ingest", "outline", *middle, "section_writing", "refinement", "finalize"]
 
-    def run_paper(self, cfg, *, harness=None, compute=None, on_stage=None):
+    def settle(self, name: str, cfg, harness) -> None:
+        def refresh() -> None:
+            try:
+                harness.refresh()
+            except Exception as exc:  # the real pipeline guards its memory upkeep too
+                self.refresh_errors.append(exc)
+
+        if cfg.use_plotting and name in ("literature", "plotting"):
+            with ThreadPoolExecutor(1, thread_name_prefix="stage") as pool:
+                pool.submit(refresh).result()
+        else:
+            refresh()
+        self.checkpoints.append((name, self.observe()))
+
+    def run_paper(self, cfg, *, harness=None, compute=None):
         paths = RunPaths(cfg.base_dir, cfg.idea_filename, cfg.experimental_log_filename)
         self.runs.append(
             {
                 "cfg": cfg,
+                "harness": harness,
                 "compute": compute,
                 "env": {
                     name: os.environ.get(name)
@@ -200,8 +226,7 @@ class StubPipeline:
             paths.final_tex.write_text(f"% built from: {template}")
             paths.usage.write_text(json.dumps({"total": {"requests": 3}}))
         for name in self.stages(cfg):
-            on_stage(name, {"status": "completed"})
-            self.checkpoints.append((name, self.observe()))
+            self.settle(name, cfg, harness)
         return types.SimpleNamespace(
             success=self.success,
             pdf_path=paths.final_pdf if self.success else None,
@@ -703,39 +728,62 @@ def test_checkpoints_wait_for_stages_that_run_side_by_side(pipeline, volume):
     job = {**stage_inputs(volume), "use_plotting": True}
     pipeline.observe = lambda: volume.commits
     assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
-    # No commit while plotting may still be writing files; one once both have settled.
-    assert pipeline.checkpoints[:4] == [
+    # No commit while a sibling stage may still be writing files; the next boundary has it.
+    assert pipeline.checkpoints == [
         ("ingest", 1),
         ("outline", 2),
         ("literature", 2),
-        ("plotting", 3),
+        ("plotting", 2),
+        ("section_writing", 3),
+        ("refinement", 4),
+        ("finalize", 5),
     ]
-    assert volume.commits == 6 + 1
+    assert volume.commits == 5 + 1
 
 
-def test_stage_checkpoint_is_thread_safe_and_never_raises(logs):
+def test_stage_checkpoint_commits_on_the_driving_thread_only_and_never_raises(logs):
     commits: list[str] = []
-    checkpoint = StageCheckpoint(lambda: commits.append("commit"), ("literature", "plotting"))
-    barrier = threading.Barrier(2)
-
-    def settle(name: str) -> None:
-        barrier.wait()
-        checkpoint(name, {"status": "completed"})
-
-    threads = [threading.Thread(target=settle, args=(n,)) for n in ("plotting", "literature")]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert commits == ["commit"]
-    checkpoint("section_writing", {"status": "failed"})
-    assert commits == ["commit", "commit"]
+    checkpoint = StageCheckpoint(lambda: commits.append("commit"))
+    worker = threading.Thread(target=checkpoint)
+    worker.start()
+    worker.join()
+    assert commits == []
+    checkpoint()
+    assert commits == ["commit"] and "Committed the volume between stages." in logs.text
 
     def busy() -> None:
         raise RuntimeError("there are open files preventing the operation")
 
-    StageCheckpoint(busy)("outline", {"status": "completed"})
-    assert "Could not commit the volume after the outline stage" in logs.text
+    StageCheckpoint(busy)()
+    assert "Could not commit the volume between stages: there are open files" in logs.text
+
+
+def test_the_pipeline_gets_a_harness_that_checkpoints_after_every_refresh(
+    pipeline, volume, monkeypatch
+):
+    job = stage_inputs(volume)
+    assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
+    harness = pipeline.runs[0]["harness"]
+    assert isinstance(harness, ContextHarness)
+    # The harness the pipeline would have built itself: both wikis live on the volume.
+    assert harness.project.root == volume.root / "runs/run-1/memory"
+    assert harness.lab.root == volume.root / "memory"
+    assert harness.consolidate_lab is False  # consolidate_memory is the one writer of lab pages
+    assert (harness.project.root / "MEMORY.md").is_file()  # the real refresh ran as well
+
+    def broken(self) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ContextHarness, "refresh", broken)
+    before = volume.commits
+    assert run_job(job, commit=volume.commit, mount=volume.root)["success"]
+    assert [type(error) for error in pipeline.refresh_errors] == [OSError] * 6
+    assert volume.commits == before + 6 + 1  # a failed refresh does not cost the checkpoint
+
+    assert run_job(
+        {**job, "memory": {"enabled": False}}, commit=volume.commit, mount=volume.root
+    )["success"]
+    assert pipeline.runs[-1]["harness"].enabled is False
 
 
 def test_run_job_tolerates_failed_checkpoints_and_reloads(pipeline, volume, logs):
@@ -744,7 +792,7 @@ def test_run_job_tolerates_failed_checkpoints_and_reloads(pipeline, volume, logs
     job = stage_inputs(volume)
     assert run_job(job, commit=volume.commit, reload=volume.reload, mount=volume.root)["success"]
     assert "Could not reload the volume" in logs.text
-    assert "Could not commit the volume after the ingest stage: volume busy" in logs.text
+    assert "Could not commit the volume between stages: volume busy" in logs.text
     assert volume.commits == 6 + 1
 
 
@@ -865,18 +913,31 @@ def test_write_paper_commits_and_reloads_the_mounted_volume(monkeypatch, tmp_pat
     monkeypatch.setattr(modal_app, "volume", fake_volume)
     seen: dict[str, Any] = {}
 
-    def fake_run_job(job, *, commit, reload):
+    def fake_run_job(job, *, commit, reload, consolidate):
         commit()
         reload()
         seen["job"] = job
+        seen["report"] = consolidate("some-model")
         return {"success": True}
 
+    def fake_consolidate_lab(model, *, commit, reload):
+        commit()
+        reload()
+        return {"model": model}
+
     monkeypatch.setattr(modal_app, "run_job", fake_run_job)
+    monkeypatch.setattr(modal_app, "consolidate_lab", fake_consolidate_lab)
+    # Inside a container `.remote` reaches the consolidation Function; here it runs in-process.
+    monkeypatch.setattr(
+        modal_app,
+        "consolidate_memory",
+        types.SimpleNamespace(remote=modal_app.consolidate_memory.local),
+    )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # .local() warns that the Volume is not mounted
         assert modal_app.write_paper.local({"run_id": "r"}) == {"success": True}
-    assert seen["job"] == {"run_id": "r"}
-    assert (fake_volume.commits, fake_volume.reloads) == (1, 1)
+    assert seen == {"job": {"run_id": "r"}, "report": {"model": "some-model"}}
+    assert (fake_volume.commits, fake_volume.reloads) == (2, 2)
 
 
 # -- launching ------------------------------------------------------------------------
@@ -1075,11 +1136,11 @@ def test_pipeline_entry_points_accept_what_run_job_passes():
     pipeline = pytest.importorskip("paper_orchestra.pipeline")
     config = job_spec({"run_id": "r1", "template": "cvpr2025"}).config
     inspect.signature(pipeline.prepare_run_dir).bind(config, None)
-    inspect.signature(pipeline.run_paper).bind(
-        config, compute=object(), on_stage=StageCheckpoint(lambda: None)
-    )
+    inspect.signature(pipeline.run_paper).bind(config, harness=object(), compute=object())
     result_fields = {field.name for field in dataclasses.fields(pipeline.PaperResult)}
     assert {"success", "error", "stages", "usage"} <= result_fields
+    # The volume is committed between stages from the memory refresh that follows each one.
+    assert "harness.refresh" in inspect.getsource(pipeline)
 
 
 def test_main_builds_the_sandbox_image_then_launches(monkeypatch):

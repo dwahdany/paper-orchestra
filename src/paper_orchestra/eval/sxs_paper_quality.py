@@ -31,6 +31,7 @@ from paper_orchestra.eval import (
     Winner,
     call_with_retries,
     conference_tag,
+    file_name_part,
     generate_structured,
     resolve_client,
     run_sxs_batch,
@@ -134,7 +135,8 @@ def perform_sxs_paper_quality_batch(
     Results (one entry per paper plus ``_summary_stats``) are written to
     ``<output_folder>/sxs_paper_quality_enhanced_<model>_<exp1>_vs_<exp2>_<venue>.json``
     and returned.  Pairs already in that file are skipped; a pair that fails is
-    logged and left out, so a later run tries it again.
+    logged and left out, so a later run tries it again.  When every pair fails
+    and the file holds no earlier result, ``BatchFailedError`` is raised.
     """
     llm = resolve_client(model_name, client)
 
@@ -145,8 +147,8 @@ def perform_sxs_paper_quality_batch(
         )
 
     output_json_path = Path(output_folder) / (
-        f"sxs_paper_quality_enhanced_{model_name}_{exp1_name}_vs_{exp2_name}"
-        f"_{conference_tag(project_folder_1)}.json"
+        f"sxs_paper_quality_enhanced_{file_name_part(model_name)}_{file_name_part(exp1_name)}"
+        f"_vs_{file_name_part(exp2_name)}_{conference_tag(project_folder_1)}.json"
     )
     return run_sxs_batch(
         rate_both_orders,

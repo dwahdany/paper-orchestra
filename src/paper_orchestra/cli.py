@@ -36,7 +36,7 @@ import typer
 from typer.core import TyperCommand
 
 from paper_orchestra import __version__
-from paper_orchestra.batch import run_batch, summarize
+from paper_orchestra.batch import load_papers, run_batch, summarize
 from paper_orchestra.compute.base import ComputeError
 from paper_orchestra.config import (
     DEFAULT_MODEL,
@@ -492,6 +492,9 @@ def batch(
         resume=resume,
     )
     try:
+        papers = load_papers(
+            root_input_folder=root_input_folder, paper_info_path=paper_info, n_papers=n_papers
+        )
         log_path = run_batch(
             cfg,
             root_input_folder=root_input_folder,
@@ -502,7 +505,12 @@ def batch(
         )
     except (FileNotFoundError, ValueError) as exc:
         _fail(str(exc))
-    counts = summarize(read_json(log_path))
+    # The log also holds papers of earlier batches in this directory; the summary and the
+    # exit status are about the papers of this one.
+    write_log = read_json(log_path)
+    counts = summarize(
+        {paper["paper_id"]: write_log.get(paper["paper_id"], {}) for paper in papers}
+    )
     typer.echo(
         f"{counts['success']} written, {counts['failed']} failed, {counts['error']} in error "
         f"(details: {log_path})"
@@ -561,7 +569,8 @@ def _open_wiki(memory_dir: Path | None, run_dir: Path | None) -> Wiki:
     from paper_orchestra.memory.harness import CODE_OWNED_SECTIONS
     from paper_orchestra.memory.wiki import Wiki
 
-    return Wiki(_memory_root(memory_dir, run_dir), read_only=CODE_OWNED_SECTIONS)
+    # create=False: looking at a memory must not add directories to it.
+    return Wiki(_memory_root(memory_dir, run_dir), read_only=CODE_OWNED_SECTIONS, create=False)
 
 
 def _open_harness(root: Path, model: str) -> ContextHarness:
@@ -717,7 +726,7 @@ def modal_run(
     ctx: typer.Context, detach: DetachOption = False, print_command: PrintCommandOption = False
 ) -> None:
     """Write one paper on Modal. Remaining arguments go to the Modal entrypoint, e.g.
-    --raw-materials-dir DIR --template cvpr2025 --use-plotting.
+    --raw-materials-dir DIR --template cvpr2025 --plotting.
     """
     _modal("run", f"{MODAL_MODULE}::main", ctx.args, detach=detach, show=print_command)
 
@@ -728,8 +737,23 @@ def modal_deploy(ctx: typer.Context, print_command: PrintCommandOption = False) 
     _modal("deploy", MODAL_MODULE, ctx.args, detach=False, show=print_command)
 
 
+def _send_logs_to_stderr() -> None:
+    """Keep stdout for results (``doctor --json``, ``memory show``, the paper's path).
+
+    ``setup_logging`` builds a Rich handler that prints to stdout, where a log
+    line would end up in the middle of machine-readable output.
+    """
+    from rich.console import Console
+    from rich.logging import RichHandler
+
+    for handler in logging.getLogger(LOGGER_NAME).handlers:
+        if isinstance(handler, RichHandler):
+            handler.console = Console(stderr=True)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Console entry point: load ``.env``, set up logging, then dispatch."""
     load_env()
     setup_logging()
+    _send_logs_to_stderr()
     app(args=None if argv is None else list(argv))

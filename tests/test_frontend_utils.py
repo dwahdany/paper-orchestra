@@ -181,11 +181,14 @@ def test_every_command_is_accepted_by_the_real_cli(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_directory_is_timestamped_and_relocatable(tmp_path, monkeypatch):
+def test_run_directory_is_timestamped_unique_and_relocatable(tmp_path, monkeypatch):
     moment = datetime(2026, 3, 4, 5, 6, 7)
     monkeypatch.delenv(fu.DEMO_DIR_ENV, raising=False)
     default = fu.new_run_directory(moment)
-    assert default == fu.REPO_ROOT.parent / "demo_logs" / "paper_orchestra_run_20260304_050607"
+    assert default.parent == fu.REPO_ROOT.parent / "demo_logs"
+    assert default.name.startswith("paper_orchestra_run_20260304_050607_")
+    # Two sessions starting in the same second used to share (and overwrite) one directory.
+    assert len({fu.new_run_directory(moment) for _ in range(20)}) == 20
     monkeypatch.setenv(fu.DEMO_DIR_ENV, str(tmp_path / "demo"))
     assert fu.new_run_directory(moment).parent == tmp_path / "demo"
     assert not (tmp_path / "demo").exists()  # nothing is created until a run starts
@@ -219,14 +222,35 @@ def test_raw_materials_are_written_where_the_pipeline_reads_them(tmp_path):
     assert paths.experimental_log.read_text() == "the log"
     figure_dir = paths.provided_figures_dir
     assert (figure_dir / "overview.png").read_bytes() == b"\x89PNG path figure"
-    # The browser-supplied name cannot leave the figures folder; a re-upload replaces the file.
-    assert (figure_dir / "plot.jpg").read_bytes() == b"newer jpeg"
+    # The browser-supplied name cannot leave the figures folder ...
+    assert (figure_dir / "plot.jpg").read_bytes() == b"jpeg bytes"
     assert not (tmp_path / "plot.jpg").exists()
+    # ... and a second figure with the same name is kept next to the first, not over it.
+    assert (figure_dir / "plot_2.jpg").read_bytes() == b"newer jpeg"
     # Captions reach the writer through info.json (the old frontend never wrote it).
     assert json.loads((figure_dir / "info.json").read_text()) == [
         {"name": "overview.png", "caption": "System overview."},
-        {"name": "plot.jpg", "caption": "Results, v2"},
+        {"name": "plot.jpg", "caption": "Results"},
+        {"name": "plot_2.jpg", "caption": "Results, v2"},
     ]
+    assert sorted(path.name for path in figure_dir.iterdir()) == [
+        "info.json",
+        "overview.png",
+        "plot.jpg",
+        "plot_2.jpg",
+    ]
+
+
+def test_figure_names_are_made_safe_for_the_file_system_and_latex():
+    assert fu.safe_figure_name("overview.png") == "overview.png"
+    assert fu.safe_figure_name("C:\\Users\\me\\my plot #1 (50%).png") == "my_plot_1_50_.png"
+    assert fu.safe_figure_name("../../etc/passwd.png") == "passwd.png"
+    assert fu.safe_figure_name(".hidden.png") == "hidden.png"
+    # Numbered until free, without regard to case (the run may sit on such a file system).
+    assert fu.safe_figure_name("Fig.PNG", taken=["fig.png", "Fig_2.PNG"]) == "Fig_3.PNG"
+    for unusable in ("", ".", "..", "a/..", "/", "info.json", "INFO.JSON", "%%%", "__.png"):
+        with pytest.raises(ValueError, match="figure file name"):
+            fu.safe_figure_name(unusable)
 
 
 def test_raw_materials_without_figures_have_no_info_json_and_bad_names_fail(tmp_path):
@@ -384,6 +408,43 @@ def test_unknown_stages_and_statuses_are_shown_rather_than_dropped(tmp_path):
     ]
 
 
+def test_the_status_words_of_the_pipeline_spec_are_understood(tmp_path):
+    """The spec calls a finished run 'succeeded' and lists a 'skipped' stage status."""
+    write_state(
+        tmp_path,
+        "succeeded",
+        {
+            "ingest": stage_record("completed", attempts=1),
+            "plotting": stage_record("skipped"),
+            "finalize": stage_record("completed", attempts=1),
+        },
+    )
+    progress = fu.read_progress(tmp_path, process_running=False)
+    assert progress.status == "completed"
+    assert [stage.status for stage in progress.stages] == ["completed", "skipped", "completed"]
+    assert progress.done == 3 and progress.fraction == 1.0
+
+
+def test_odd_values_in_the_state_file_do_not_break_the_page(tmp_path):
+    write_state(
+        tmp_path,
+        ["running"],
+        {
+            "ingest": stage_record("completed", attempts="two", seconds="soon"),
+            "outline": stage_record("failed", attempts=None, seconds=float("nan"), error=["boom"]),
+            "literature": stage_record(["running"], attempts=[1], seconds={"s": 1}),
+        },
+        error={"stage": "outline"},
+    )
+    progress = fu.read_progress(tmp_path, process_running=False)
+    assert progress.status == "interrupted"
+    assert progress.error == "{'stage': 'outline'}"
+    ingest, outline, literature = progress.stages
+    assert (ingest.attempts, ingest.seconds) == (0, 0.0)
+    assert (outline.attempts, outline.seconds, outline.error) == (0, 0.0, "['boom']")
+    assert (literature.status, literature.attempts, literature.seconds) == ("pending", 0, 0.0)
+
+
 def test_unreadable_state_counts_as_no_state(tmp_path, caplog):
     (tmp_path / "state.json").write_text('{"stages": {"outline"')
     with caplog.at_level(logging.WARNING):
@@ -423,6 +484,66 @@ def run_with_memory(tmp_path):
 def test_opening_the_wiki_of_a_run_without_memory_creates_nothing(tmp_path):
     assert fu.open_run_wiki(tmp_path / "run") is None
     assert not (tmp_path / "run").exists()
+
+    # A memory directory that only has its index so far is viewed as it is.
+    memory_dir = tmp_path / "early" / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "MEMORY.md").write_text("# Memory\n")
+    wiki = fu.open_run_wiki(tmp_path / "early")
+    assert fu.list_wiki_pages(wiki) == []
+    assert fu.memory_index_markdown(wiki) == "# Memory"
+    assert sorted(path.name for path in memory_dir.iterdir()) == ["MEMORY.md"]
+
+
+def test_wiki_listing_survives_pages_that_vanish_are_unreadable_or_point_outside(
+    run_with_memory, tmp_path, monkeypatch
+):
+    """The run moves and archives pages while the page is polling: one bad page is not fatal."""
+    wiki = fu.open_run_wiki(run_with_memory)
+    wiki_dir = run_with_memory / "memory" / "wiki"
+    (wiki_dir / "broken.md").write_bytes(b"\xff\xfe not utf-8")
+    secret = tmp_path / "secret.md"
+    secret.write_text("# Outside\n\nNot part of the memory.")
+    (wiki_dir / "escape.md").symlink_to(secret)
+    (wiki_dir / ".hidden.md").write_text("hidden")
+
+    # A page that is listed by the directory scan but gone when it is read.
+    real_read = wiki.read
+
+    def read(rel: str):
+        if rel == "wiki/overview.md":
+            raise FileNotFoundError(rel)
+        return real_read(rel)
+
+    monkeypatch.setattr(wiki, "read", read)
+    paths = [entry.path for entry in fu.list_wiki_pages(wiki, include_notes=False)]
+    assert paths == ["wiki/literature/He2016.md", "wiki/sources/idea.md"]
+
+    monkeypatch.undo()
+    assert fu.read_wiki_page(wiki, "wiki/broken.md") is None
+    assert fu.read_wiki_page(wiki, "wiki/escape.md") is None
+    assert fu.read_wiki_page(wiki, "wiki/.hidden.md") is None
+    assert fu.read_wiki_page(wiki, "transcripts/session.jsonl") is None
+    assert fu.read_wiki_page(wiki, "/etc/passwd") is None
+
+    (run_with_memory / "memory" / "MEMORY.md").unlink()
+    assert fu.memory_index_markdown(wiki) == ""
+
+
+def test_memory_pages_do_not_make_the_browser_fetch_images(run_with_memory):
+    wiki = Wiki(run_with_memory / "memory")
+    wiki.write(
+        "wiki/synthesis/themes.md",
+        "Intro ![chart](https://tracker.example/pixel.png?run=1) and ![ref-style][logo].\n\n"
+        "A [normal link](https://example.org) and an exclamation! [kept](https://example.org).",
+        {"summary": "Themes."},
+    )
+    _, body = fu.read_wiki_page(fu.open_run_wiki(run_with_memory), "wiki/synthesis/themes.md")
+    assert "![" not in body
+    assert "[chart](https://tracker.example/pixel.png?run=1)" in body
+    assert "[ref-style][logo]" in body
+    assert "A [normal link](https://example.org) and an exclamation! [kept]" in body
+    assert fu.without_embedded_images("![a](b) ![c](d)") == "[a](b) [c](d)"
 
 
 def test_wiki_pages_are_listed_by_section_with_notes_last(run_with_memory):
@@ -635,6 +756,28 @@ def test_email_reads_settings_at_call_time_and_attaches_the_results(
     assert (smtp.instances[1].host, smtp.instances[1].port) == ("mail.example.org", 2465)
 
 
+@pytest.mark.parametrize(
+    "address",
+    [
+        "reader@example.org\nBcc: victim@example.org",
+        "reader@example.org, other@example.org",
+        "Reader <reader@example.org>",
+        "not an address",
+        "reader@localhost",
+        "",
+    ],
+)
+def test_email_is_only_sent_to_one_plain_address(smtp, monkeypatch, address):
+    """The address is typed into a public page: it must not add recipients or headers."""
+    monkeypatch.setenv("SMTP_EMAIL", "bot@example.org")
+    monkeypatch.setenv("SMTP_PASSWORD", "pw")
+    assert not fu.valid_email_address(address)
+    sent, message = fu.send_notification_email(address, "Generated Paper")
+    assert not sent and "not a valid e-mail address" in message
+    assert smtp.instances == []
+    assert fu.valid_email_address("first.last+tag@mail.example.org")
+
+
 def test_email_failures_are_reported_without_the_password(smtp, monkeypatch):
     monkeypatch.setenv("SMTP_EMAIL", "bot@example.org")
     monkeypatch.setenv("SMTP_PASSWORD", "hunter2-secret")
@@ -708,6 +851,50 @@ def test_pipeline_run_captures_output_and_reports_completion(tmp_path):
     assert "to stderr" in output
     assert run.log_tail(lines=2).count("\n") == 2
     assert (tmp_path / "logs" / "pipeline.log").read_text() == output
+
+
+def test_credentials_echoed_by_the_pipeline_are_masked_in_the_tail_and_on_disk(
+    tmp_path, monkeypatch
+):
+    """The log tail is shown in the browser; a library may print a key in an error message."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret-0123456789")
+    monkeypatch.setenv("SMTP_PASSWORD", "hunter2-secret")
+    monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "s2-secret-key")
+    command = python_command(
+        """
+        import os
+        print("request failed: key=" + os.environ["ANTHROPIC_API_KEY"] + " rejected")
+        print("smtp", os.environ["SMTP_PASSWORD"], "s2", os.environ["SEMANTIC_SCHOLAR_API_KEY"])
+        print("an ordinary line")
+        """
+    )
+    run = fu.PipelineRun(command, cwd=tmp_path, log_path=tmp_path / "pipeline.log")
+    run.start()
+    assert run.wait(timeout=30) and run.returncode == 0
+    for output in (run.log_tail(), (tmp_path / "pipeline.log").read_text()):
+        assert "request failed: key=*** rejected" in output
+        assert "smtp *** s2 ***" in output and "an ordinary line" in output
+        assert "secret" not in output
+
+
+def test_secret_values_are_chosen_by_variable_name():
+    environ = {
+        "ANTHROPIC_API_KEY": "sk-ant-0123456789",
+        "ANTHROPIC_AUTH_TOKEN": "token-0123456789-long",
+        "MODAL_TOKEN_SECRET": "as-0123456789",
+        "SMTP_PASSWORD": "correct horse!",
+        "ANTHROPIC_IDENTITY_TOKEN_FILE": "/var/run/secrets/token",
+        "OPENAI_API_KEY": "short",
+        "PATH": "/usr/local/bin:/usr/bin",
+        "KEYBOARD_LAYOUT": "us-international",
+    }
+    assert fu.secret_values(environ) == (
+        "token-0123456789-long",
+        "sk-ant-0123456789",
+        "correct horse!",
+        "as-0123456789",
+    )
+    assert fu.mask_secrets("a correct horse b", ["correct horse"]) == "a *** b"
 
 
 def test_pipeline_run_keeps_only_the_tail_in_memory_but_everything_on_disk(tmp_path):
@@ -962,3 +1149,36 @@ def test_page_runs_the_pipeline_and_shows_progress_results_and_memory(app):
     assert "Escape percent signs." in page
     assert app.selectbox(key="memory_page").value == "wiki/lessons/escape-percent.md"
     assert {button.label for button in app.button} >= {"Start a New Paper"}
+
+
+def test_a_tab_that_fails_does_not_stop_the_page_from_following_the_run(app, monkeypatch):
+    """An exception in one tab used to end the script before its refresh: a frozen page."""
+
+    def exploding_wiki(run_dir):
+        raise RuntimeError("wiki exploded")
+
+    monkeypatch.setattr(fu, "open_run_wiki", exploding_wiki)
+    app.run()
+    app.text_area(key="idea_text_main").set_value("A new idea.")
+    app.text_area(key="log_text_main").set_value("Accuracy 91.2%.")
+    app.run()
+    next(button for button in app.button if "Begin Writing" in button.label).click().run()
+
+    assert not app.exception
+    assert any("RuntimeError: wiki exploded" in error.value for error in app.error)
+    # The page kept polling to the end of the run and shows its outcome and the other tabs.
+    assert not app.session_state.run.running
+    assert any("Paper writing complete" in box.value for box in app.success)
+    assert json.loads(app.json[0].value) == {"idea_seen": "A new idea."}
+
+
+def test_page_refuses_to_start_with_an_invalid_notification_address(app):
+    app.run()
+    app.text_area(key="idea_text_main").set_value("A new idea.")
+    app.text_area(key="log_text_main").set_value("Accuracy 91.2%.")
+    app.sidebar.text_input(key="email_input").set_value("reader@example.org, other@example.org")
+    app.run()
+    next(button for button in app.button if "Begin Writing" in button.label).click().run()
+    assert not app.exception
+    assert any("email address is not valid" in error.value for error in app.error)
+    assert app.commands == [] and not app.run_dir.exists()

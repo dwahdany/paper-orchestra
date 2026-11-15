@@ -83,6 +83,18 @@ def _non_blank(text: str) -> str | None:
     return stripped or None
 
 
+def _reference_list(text: str) -> str | None:
+    """The answer of the extraction prompt: a ``[n]``-numbered list, or ``""`` for none.
+
+    Anything else (an apology, an unnumbered list) is not an answer: treating
+    it as "no references" would score a paper 0 on a failed extraction.
+    """
+    stripped = text.strip()
+    if _REFERENCE_MARKER.search(stripped):
+        return stripped
+    return "" if NO_REFERENCES in stripped else None
+
+
 def extract_paper_title_from_citation(
     citation_text: str,
     model_name: str = DEFAULT_MODEL,
@@ -119,6 +131,8 @@ def extract_reference_from_pdf_text(
     """Return the reference list of a paper as ``"[1] ... [2] ..."``.
 
     Returns ``""`` when the model reports that the text has no reference list.
+    An answer that is neither a numbered list nor that report counts as a
+    failed call: it is retried and finally raised as ``LLMParseError``.
     """
     llm = resolve_client(model_name, client)
     prompt = f"<paper_text>\n{paper_text}\n</paper_text>\n\nExtract the reference list."
@@ -127,17 +141,14 @@ def extract_reference_from_pdf_text(
             prompt,
             model=model_name,
             system=REFERENCE_EXTRACTION_SYSTEM_PROMPT,
-            parser=_non_blank,
+            parser=_reference_list,
             label="eval.reference_extraction",
             parse_retries=0,
         ),
         what="reference extraction",
         retry=retry,
     )
-    references: str = response.parsed
-    if NO_REFERENCES in references and not _REFERENCE_MARKER.search(references):
-        return ""
-    return references
+    return response.parsed
 
 
 def get_paper_references_from_pdf(

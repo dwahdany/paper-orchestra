@@ -47,6 +47,7 @@ from paper_orchestra.agents.section_writing import (
     DraftCheck,
     check_latex,
     copy_workspace,
+    new_problems,
     repair_lesson,
 )
 from paper_orchestra.context import RunContext
@@ -210,7 +211,9 @@ class _Version:
     name: str
     tex: str
     pdf: Path
-    static_problems: frozenset[str]
+    #: What the checks and the build still report about it.  A later version is asked to
+    #: fix these and is not turned down for sharing them.
+    problems: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -308,7 +311,7 @@ class ContentRefinementAgent:
     def _version(name: str, check: DraftCheck) -> _Version:
         if check.pdf is None or not check.pdf.is_file():
             raise RefinementError(f"the build of {name}.tex reported success but left no PDF")
-        return _Version(name, check.tex, check.pdf, frozenset(check.static_problems))
+        return _Version(name, check.tex, check.pdf, tuple(check.problems))
 
     def _screenshots(self, pdf: Path, out_dir: Path, *, max_side: int | None = None) -> list[Path]:
         """Page sheets of ``pdf`` for the frontend (and the formatting reviewer)."""
@@ -362,11 +365,11 @@ class ContentRefinementAgent:
         check = self._build(name, tex)
         if not check.compiles:
             check = self._repair_initial(name, check)
-        if check.static_problems:
+        if check.problems:
             log.warning(
                 "%s: the initial draft compiles but has open problems: %s",
                 AGENT,
-                "; ".join(check.static_problems),
+                "; ".join(check.problems)[:600],
             )
         return self._version(name, check)
 
@@ -390,6 +393,11 @@ class ContentRefinementAgent:
             try:
                 tex = conversation.send(message, parser=parse_latex).parsed
             except LLMParseError:
+                log.warning(
+                    "%s: repair round %d of the initial draft returned no LaTeX document.",
+                    AGENT,
+                    round_no,
+                )
                 message = NO_LATEX_IN_REPLY
                 continue
             repaired = self._build(name, tex)
@@ -471,12 +479,7 @@ class ContentRefinementAgent:
 
         problems = self._build_problems(check, current)
         if check is None or problems:
-            outcome = (
-                "REJECTED_STATIC_CHECK"
-                if check is not None and check.compiles
-                else "REJECTED_COMPILE_FAILURE"
-            )
-            entry.update(outcome=outcome, problems=problems)
+            entry.update(outcome=self._rejection(check, problems), problems=problems)
             self._remember_unbuildable(label, base, entry)
             return _Reflection(entry)
 
@@ -501,14 +504,25 @@ class ContentRefinementAgent:
     def _build_problems(check: DraftCheck | None, current: _Version) -> list[str]:
         """Why a new version cannot replace the current one (empty: it can).
 
-        Static problems the current version already has do not disqualify a new one:
-        it is no worse for keeping them.
+        pdflatex writes a PDF despite most errors, so a PDF alone does not qualify a new
+        version: its LaTeX errors, unresolved references and static problems count too.
+        The ones the current version already has do not disqualify it: it is no worse
+        for keeping them.
         """
         if check is None:
             return [NO_LATEX_PROBLEM]
         if not check.compiles:
             return check.problems
-        return [p for p in check.static_problems if p not in current.static_problems]
+        return new_problems(check.problems, current.problems)
+
+    @staticmethod
+    def _rejection(check: DraftCheck | None, problems: Sequence[str]) -> str:
+        """The worklog outcome of a version turned down for ``problems``."""
+        if check is None or not check.compiles:
+            return "REJECTED_COMPILE_FAILURE"
+        if any(problem in check.static_problems for problem in problems):
+            return "REJECTED_STATIC_CHECK"
+        return "REJECTED_LATEX_ERRORS"
 
     def _revise(
         self, round_no: int, name: str, current: _Version, review: dict[str, Any]
@@ -527,7 +541,7 @@ class ContentRefinementAgent:
             experimental_log=self._experimental_log,
             citation_map=self._citation_map,
             tex=current.tex,
-            known_problems=sorted(current.static_problems),
+            known_problems=current.problems,
         )
         parts: list[Part] = [Text(prompt)]
         if self.ctx.client(self.model).capabilities.pdf_input:
@@ -783,10 +797,8 @@ class ContentRefinementAgent:
             if not problems:
                 entry["outcome"] = "ACCEPTED_COMPILE_SUCCESS"
                 accepted = self._version(name, check)
-            elif check.compiles:
-                entry["outcome"] = "REJECTED_STATIC_CHECK"
             else:
-                entry["outcome"] = "REJECTED_COMPILE_FAILURE"
+                entry["outcome"] = self._rejection(check, problems)
 
         self.ctx.harness.record(
             "format", stage=STAGE, agent=AGENT, version=label, outcome=entry["outcome"]

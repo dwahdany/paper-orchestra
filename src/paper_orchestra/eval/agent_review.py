@@ -113,13 +113,13 @@ def generate_from_client(
 
 
 class Review(BaseModel):
-    """One peer review.
+    """A peer review of a research paper."""
 
-    The ratings carry no numeric bounds in the schema (structured output does
-    not support them); out-of-range values are handled when reviews are
-    aggregated.  Dump with ``by_alias=True`` to get the keys of the review
-    files (``"Ethical Concerns"``).
-    """
+    # The docstring above is sent to the model as the schema description, so notes for
+    # developers go here.  The ratings carry no numeric bounds in the schema (structured
+    # output does not support them); out-of-range values are handled when reviews are
+    # aggregated.  Dump with ``by_alias=True`` to get the keys of the review files
+    # (``"Ethical Concerns"``).
 
     Summary: str = Field(description="A summary of the paper content and its contributions.")
     Strengths: list[str] = Field(description="A list of strengths of the paper.")
