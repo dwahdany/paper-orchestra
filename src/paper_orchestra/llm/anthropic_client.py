@@ -66,9 +66,29 @@ DEFAULT_MAX_TOKENS = 64_000
 MAX_OUTPUT_TOKENS = 128_000
 DEFAULT_EFFORT: Effort = "high"
 
-#: Opts every request into server-side fallbacks: a request the model declines
-#: for policy reasons is re-run on the model Anthropic recommends for that case.
+#: Opts a request into server-side fallbacks: a request the model declines for
+#: policy reasons is re-run on the model Anthropic recommends for that case.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+#: Model families documented to accept the fallback parameter.  It is left out
+#: for anything else, where it could turn every request into a 400.
+FALLBACK_MODEL_PREFIXES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+)
+#: Older families that reject ``output_config.effort``.
+NO_EFFORT_MODEL_PREFIXES = ("claude-3", "claude-haiku-4", "claude-sonnet-4-5")
+
+
+def supports_fallbacks(model: str) -> bool:
+    return model.startswith(FALLBACK_MODEL_PREFIXES)
+
+
+def supports_effort(model: str) -> bool:
+    return not model.startswith(NO_EFFORT_MODEL_PREFIXES)
+
 
 MEMORY_TOOL_TYPE = "memory_20250818"
 MEMORY_TOOL_NAME = "memory"
@@ -1155,7 +1175,9 @@ class AnthropicConversation(Conversation):
     ) -> tuple[Any, str | None]:
         """Send one request and map SDK failures onto :class:`LLMError`."""
         anthropic = _import_sdk()
-        output_config: dict[str, Any] = {"effort": self._effort}
+        output_config: dict[str, Any] = {}
+        if supports_effort(self.model):
+            output_config["effort"] = self._effort
         if output_format is not None:
             output_config["format"] = output_format
         # No `thinking` (adaptive is the default and the only mode Fable 5.2
@@ -1165,13 +1187,15 @@ class AnthropicConversation(Conversation):
             "model": self.model,
             "max_tokens": max_tokens,
             "messages": messages,
-            "output_config": output_config,
             # Moves a cache breakpoint along the growing conversation; the
             # system block carries its own, so tools and system stay cached.
             "cache_control": {"type": "ephemeral"},
-            "betas": [FALLBACK_BETA],
-            "fallbacks": "default",
         }
+        if output_config:
+            request["output_config"] = output_config
+        if supports_fallbacks(self.model):
+            request["betas"] = [FALLBACK_BETA]
+            request["fallbacks"] = "default"
         if self._system is not None:
             request["system"] = self._system
         if self._tools:

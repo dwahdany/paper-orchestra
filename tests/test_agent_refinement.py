@@ -528,14 +528,15 @@ def test_score_decrease_is_rejected_and_the_previous_version_restored(tmp_path, 
     v0 = paper(repo_root, "overall=5")
     v1 = paper(repo_root, "overall=4 clarity=4", extra=" A bolder claim.")
     client = FakeLLM(script(**{REVISE: Reviser(revision(v1))}))
-    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=3)
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=3, retry_after_rejection=False)
 
     final_pdf = run(ctx)
 
     work = ctx.paths.refinement_dir
     assert worklog(ctx)["v1"]["outcome"] == "REJECTED_SCORE_DECREASE"
     assert list(worklog(ctx)) == ["v1"]
-    # The loop stops at the first rejection and falls back to the version before it.
+    # Without retry_after_rejection the loop stops at the first rejection and falls back
+    # to the version before it.
     assert len(requests(client, REVISE)) == 1 and not requests(client, DREAM)
     assert text_of(ctx, "final_refined_paper.tex") == v0
     assert text_of(ctx, "format_candidate_v0.tex") == v0
@@ -554,6 +555,33 @@ def test_score_decrease_is_rejected_and_the_previous_version_restored(tmp_path, 
         for note in all_notes(ctx)
     )
     assert "a copy of `initial_draft`" in wiki.read("wiki/drafts/final_refined_paper.md").body
+
+
+def test_after_a_rejection_the_loop_retries_from_the_last_accepted_version(tmp_path, repo_root):
+    """The default: a rejected revision is discarded, its lesson is consolidated, and the
+    remaining iterations revise the last accepted version again."""
+    v0 = paper(repo_root, "overall=5")
+    v1 = paper(repo_root, "overall=4 clarity=4", extra=" A bolder claim.")
+    v2 = paper(repo_root, "overall=6", extra=" A better supported claim.")
+    client = FakeLLM(script(**{REVISE: Reviser(revision(v1), revision(v2))}))
+    ctx = make_ctx(tmp_path, repo_root, client, v0, max_reflections=2)
+    assert ctx.cfg.retry_after_rejection
+
+    run(ctx)
+
+    log = worklog(ctx)
+    assert [log[v]["outcome"] for v in ("v1", "v2")] == [
+        "REJECTED_SCORE_DECREASE",
+        "ACCEPTED_SCORE_INCREASE",
+    ]
+    # The second revision started from v0, not from the rejected v1 ...
+    second = requests(client, REVISE)[1].text
+    assert "A bolder claim." not in second.split("<paper>")[-1]
+    # ... was judged against v0's review ...
+    assert log["v2"]["scores_before"]["Overall"] == 5
+    # ... and the rejection was consolidated before it began.
+    assert len(requests(client, DREAM)) == 1
+    assert text_of(ctx, "final_refined_paper.tex") == v2
 
 
 @pytest.mark.parametrize(

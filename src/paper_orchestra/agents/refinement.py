@@ -20,6 +20,10 @@ The agent works in ``RunPaths.refinement_dir``, a copy of the LaTeX workspace:
    and have it peer-reviewed.
 2. Up to ``max_reflections`` times: revise the paper against the current review,
    build and review the revision, and keep it only if the scores did not get worse.
+   A revision whose scores got worse is discarded.  With ``retry_after_rejection``
+   (the default) the remaining iterations start again from the last accepted version,
+   with the rejection recorded in memory as a lesson; without it the loop stops at
+   the first rejection.
 3. Up to ``max_formatting_rounds`` times: review the rendered pages for layout
    problems and apply a formatting-only fix.
 4. Save the surviving version as ``final_refined_paper.tex`` / ``.pdf``.
@@ -226,7 +230,8 @@ class _Reflection:
     #: The revision and its review when it was accepted.
     version: _Version | None = None
     review: dict[str, Any] | None = None
-    #: The scores went down: stop revising.
+    #: The scores went down: the revision is discarded (and, unless
+    #: ``retry_after_rejection`` is set, revising stops).
     stop: bool = False
 
 
@@ -465,7 +470,7 @@ class ContentRefinementAgent:
             log.info("%s: revision %s: %s.", AGENT, label, result.entry["outcome"])
             if result.version is not None and result.review is not None:
                 current, review, base = result.version, result.review, label
-            if result.stop:
+            if result.stop and not cfg.retry_after_rejection:
                 break
             if round_no < cfg.max_reflections:
                 # Turn the outcomes so far into rules the next revision sees in its index.

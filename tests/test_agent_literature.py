@@ -650,7 +650,7 @@ def test_generated_bibtex_needs_no_font_encoding_beyond_the_default(tmp_path):
     )
     result = LocalBackend().compile_latex(tmp_path, "paper")
     assert result.ok and result.errors == [], result.feedback()
-    # An error raised while the .bbl is read is only visible in the log itself.
+    # The log of the last pass, read directly: nothing went wrong inside the .bbl either.
     log_text = (tmp_path / "paper.log").read_text(errors="replace")
     assert "LaTeX Error" not in log_text and "Undefined control sequence" not in log_text
     bbl = (tmp_path / "paper.bbl").read_text()
@@ -692,9 +692,10 @@ def test_generated_bibtex_compiles_with_author_year_citations_and_odd_names(tmp_
     )
     result = LocalBackend().compile_latex(tmp_path, "paper")
     assert result.ok and result.errors == [], result.feedback()
-    # Errors raised while the .aux and .bbl are read are only visible in the log itself.
+    # The log of the last pass, read directly: the .aux and the .bbl were read cleanly.
     log_text = (tmp_path / "paper.log").read_text(errors="replace")
-    assert "Error" not in log_text and "Missing \\endcsname" not in log_text
+    for symptom in ("LaTeX Error", "natbib Error", "Missing \\endcsname"):
+        assert symptom not in log_text
     assert "error message" not in (tmp_path / "paper.blg").read_text(errors="replace")
 
 

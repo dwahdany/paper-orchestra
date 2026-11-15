@@ -322,6 +322,34 @@ def test_effort_and_max_tokens_options(api, client):
         conversation.send(["", "  "])
 
 
+@pytest.mark.parametrize(
+    ("model", "fallbacks", "effort"),
+    [
+        ("claude-fable-5-2", True, True),
+        ("claude-opus-5-5", True, True),
+        ("claude-sonnet-5-5", True, True),
+        ("claude-haiku-5-5", True, True),
+        # Families not documented to take the fallback parameter must not be sent it,
+        # or every request on them could fail with a 400.
+        ("claude-sonnet-5", False, True),
+        ("claude-opus-4-8", False, True),
+        ("claude-haiku-4-5", False, False),
+    ],
+)
+def test_fallbacks_and_effort_are_only_sent_to_models_that_accept_them(
+    api, client, model, fallbacks, effort
+):
+    api.script.append(msg([text("ok")]))
+    client.conversation(model=model).send("hi")
+    body = api.requests[0]
+    assert ("fallbacks" in body) is fallbacks
+    assert ("server-side-fallback-2026-07-01" in api.headers[0].get("anthropic-beta", "")) is (
+        fallbacks
+    )
+    assert (body.get("output_config") == {"effort": "high"}) is effort
+    assert ("output_config" in body) is effort
+
+
 def test_second_turn_extends_the_journal_and_usage_accumulates(api, client):
     first = [thinking("S1"), text("First answer.")]
     api.script += [

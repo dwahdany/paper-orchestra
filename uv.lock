@@ -2329,12 +2329,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=2.8,<3" },
-    { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=1.0" },
+    { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=3.0,<4" },
     { name = "json-repair", specifier = ">=0.30" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.6,<2" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=3.0,<4" },
     { name = "paper-orchestra", extras = ["modal", "gemini", "openai", "ui"], marker = "extra == 'all'" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -2344,7 +2344,7 @@ requires-dist = [
     { name = "rapidfuzz", specifier = ">=3.6" },
     { name = "requests", specifier = ">=2.31" },
     { name = "rich", specifier = ">=13.0" },
-    { name = "streamlit", marker = "extra == 'ui'", specifier = ">=1.36" },
+    { name = "streamlit", marker = "extra == 'ui'", specifier = ">=1.50" },
     { name = "typer", specifier = ">=0.12" },
 ]
 provides-extras = ["modal", "gemini", "openai", "ui", "all"]

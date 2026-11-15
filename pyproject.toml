@@ -30,9 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 modal = ["modal>=1.6,<2"]
-gemini = ["google-genai>=1.0"]
-openai = ["openai>=1.40"]
-ui = ["streamlit>=1.36"]
+gemini = ["google-genai>=3.0,<4"]
+openai = ["openai>=3.0,<4"]
+ui = ["streamlit>=1.50"]
 all = ["paper-orchestra[modal,gemini,openai,ui]"]
 
 [project.scripts]

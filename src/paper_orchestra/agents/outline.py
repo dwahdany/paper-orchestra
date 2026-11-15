@@ -131,14 +131,16 @@ class SectionPlan(_Part):
             return data
         bullets = data.get("content_bullets") or []
         hints = data.get("citation_hints") or []
-        if not bullets and not hints:
+        subsections = data.get("subsections") or []
+        # Anything but a list of subsections is left for validation to reject.
+        if (not bullets and not hints) or not isinstance(subsections, list):
             return data
         own = {
             "subsection_title": data.get("section_title", ""),
             "content_bullets": bullets,
             "citation_hints": hints,
         }
-        return {**data, "subsections": [own, *(data.get("subsections") or [])]}
+        return {**data, "subsections": [own, *subsections]}
 
 
 class Outline(_Part):

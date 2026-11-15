@@ -359,6 +359,17 @@ def test_an_unparseable_answer_is_asked_for_again(tmp_path):
     assert outline["section_plan"][1]["section_title"] == "3. Method"
 
 
+def test_an_outline_of_the_wrong_shape_is_asked_for_again_not_crashed_on(tmp_path):
+    # Section-level bullets next to a "subsections" that is not a list used to raise a
+    # TypeError from inside validation, which no retry catches.
+    malformed = model_outline()
+    malformed["section_plan"][0]["subsections"] = 5
+    client = FakeLLM([json.dumps(malformed), json.dumps(model_outline())])
+    outline = OutlineAgent(make_ctx(tmp_path, client)).run()
+    assert len(client.requests) == 2
+    assert outline["section_plan"][0]["subsections"][0]["subsection_title"] == "Abstract"
+
+
 def test_run_fails_when_the_model_never_returns_an_outline(tmp_path):
     client = FakeLLM(["nope"] * 3)
     ctx = make_ctx(tmp_path, client)
