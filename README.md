@@ -67,8 +67,9 @@ Useful options:
 | Option | Default | Meaning |
 |---|---|---|
 | `--plotting / --no-plotting` | off | Generate figures from the outline's plotting plan. |
-| `--writer-model`, `--reflection-model`, `--plotting-model` | `claude-fable-5-2` | Model per role. |
-| `--fast-model` | `claude-fable-5-2` | Model for high-volume calls such as literature discovery (run at low effort). |
+| `--model` | `claude-fable-5-2` | Model for every role without a flag of its own. |
+| `--writer-model`, `--reflection-model`, `--plotting-model` | `--model` | Model per role. |
+| `--fast-model` | `--model` | Model for high-volume calls such as literature discovery (run at low effort). |
 | `--image-model` | unset | Image-generation model for diagrams (for example a Gemini image model). When unset, diagrams are drawn from model-written plotting code. |
 | `--effort` | `high` | Reasoning effort for the main calls. |
 | `--research-cutoff` | current month | `YYYY-MM`; papers published later are not cited as prior work. |
@@ -96,7 +97,7 @@ ANTHROPIC_WORKSPACE_ID=wrkspc_...          # only if the rule spans several work
 ANTHROPIC_IDENTITY_TOKEN_FILE=/path/to/oidc-token
 ```
 
-The token is exchanged for a short-lived access token and refreshed automatically. An `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the environment takes precedence over federation, so unset them when you want federation; `doctor` warns when this happens.
+The token is exchanged for a short-lived access token and refreshed automatically. An `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the environment takes precedence over federation, so unset them when you want federation; `doctor` warns when this happens. Identity tokens are usually single-use, so each process needs its own: for local batch runs with several worker processes use an API key, or fan out on Modal, where every container gets its own token.
 
 Claude Fable 5.2 requires an organization with data retention enabled. Requests the model declines are retried on a fallback model by the API (server-side fallbacks are enabled).
 
@@ -123,24 +124,28 @@ Two kinds of work leave the orchestrating process: running model-written Python 
 
 ```bash
 uv sync --extra modal
-uv run modal token new
+uv run modal setup
 uv run paper-orchestra write ... --compute modal
 ```
 
 ### Running the whole pipeline on Modal
 
 ```bash
-uv run modal run -m paper_orchestra.modal_app \
+uv run paper-orchestra modal run \
   --raw-materials-dir path/to/raw_materials \
   --template cvpr2025 \
   --output-dir paper_output \
   --plotting
 ```
 
-Outputs and the cross-run memory live on a Modal Volume (`paper-orchestra` by default), so an interrupted run resumes where it stopped. Credentials come from a Modal Secret named `paper-orchestra`, which holds either:
+This is `modal run -m paper_orchestra.modal_app` underneath and must be run from a checkout of this repository (the image is built from `uv.lock`). It uploads the raw materials, runs the pipeline in a container with TeX Live, and downloads `final_paper.pdf`, `final_paper.tex` and `usage.json`. `paper-orchestra modal deploy` deploys the app, and `paper-orchestra modal batch` writes many papers with it, one container per paper.
 
-- `ANTHROPIC_API_KEY` (and optionally `SEMANTIC_SCHOLAR_API_KEY`), or
-- only the federation identifiers (`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`). The container's Modal OIDC identity token is then exchanged for an Anthropic access token, with no long-lived key stored anywhere. Configure the federation rule to trust issuer `https://oidc.modal.com`, and do not put an API key in the same secret.
+Outputs and the lab memory live on a Modal Volume (`paper-orchestra` by default), so a preempted or interrupted run resumes where it stopped. Model-written figure code runs in a nested sandbox with no network, no secret and no identity token.
+
+Credentials come from a Modal Secret (named `paper-orchestra` by default, `PAPER_ORCHESTRA_MODAL_SECRET` to change). Two setups are supported:
+
+- **API key**: `modal secret create paper-orchestra ANTHROPIC_API_KEY=sk-ant-...` (add `SEMANTIC_SCHOLAR_API_KEY` if you have one).
+- **Keyless**: Modal gives every function an OIDC identity token (issuer `https://oidc.modal.com`, audience `oidc.modal.com`), which is exchanged for short-lived Anthropic access tokens, so no Anthropic secret is stored anywhere. The container only needs the non-secret identifiers `ANTHROPIC_FEDERATION_RULE_ID` and `ANTHROPIC_ORGANIZATION_ID` (plus `ANTHROPIC_SERVICE_ACCOUNT_ID` / `ANTHROPIC_WORKSPACE_ID` if your rule needs them). Put them in the Secret, or export them in the shell that launches the run and set `PAPER_ORCHESTRA_MODAL_SECRET=none`. Do not also provide an API key: it would take precedence, and the run refuses to start when both are present.
 
 ## Memory
 
@@ -153,7 +158,7 @@ Agents do not get everything stuffed into their prompt, and they do not start fr
 | Wiki pages | `memory/wiki/<section>/<page>.md` | pipeline code (records) and consolidation sessions (lessons, synthesis) | One page per thing, linked with `[[section/page]]`. |
 | Index | `memory/MEMORY.md` | regenerated automatically; a few curated standing notes | Loaded into every session (capped at 200 lines / 25 KB). |
 
-Between stages a separate consolidation session ("dreaming") verifies notes against the transcripts and sources, folds what holds up into pages, repairs links and keeps the index within budget. The refinement loop uses this as a learning loop: each accepted or rejected revision is recorded with its score changes and turned into a rule the next iteration can see.
+Between stages a separate consolidation session ("dreaming") verifies notes against the transcripts and sources, folds what holds up into pages, repairs links and keeps the index within budget. The refinement loop uses this as a learning loop: each accepted or rejected revision is recorded with its score changes and turned into a rule the next iteration can see. A rejected revision is discarded and the remaining iterations start again from the last accepted version, now with that lesson (`retry_after_rejection`; the original behaviour of stopping at the first rejection is available by turning it off in `PipelineConfig`).
 
 There are two memories:
 
@@ -186,6 +191,7 @@ Everything is written under `--output-dir`:
 | `memory/` | The project memory described above. |
 | `state.json` | Per-stage status; drives resume and the demo's progress display. |
 | `usage.json`, `time_breakdown.json` | Token usage with an estimated cost, and time per stage. |
+| `memory_report.json` | What the end-of-run consolidation did. |
 
 A failed stage is retried on its own; re-running the same command resumes from the last completed stage.
 
