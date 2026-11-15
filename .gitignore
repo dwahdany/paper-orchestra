@@ -4,4 +4,12 @@
 *.log
 datasets/*
 paper_output*
+batch_output*
 *.zip
+# Python / uv
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/

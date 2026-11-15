@@ -1,0 +1,79 @@
+[project]
+name = "paper-orchestra"
+version = "0.2.0"
+description = "PaperOrchestra: a multi-agent framework for automated AI research paper writing"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "Yiwen Song" },
+    { name = "Yale Song" },
+    { name = "Tomas Pfister" },
+    { name = "Jinsung Yoon" },
+]
+dependencies = [
+    "anthropic>=2.8,<3",
+    "json-repair>=0.30",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "pydantic>=2.7",
+    "pymupdf>=1.24",
+    "pypdf>=4.0",
+    "python-dotenv>=1.0",
+    "rapidfuzz>=3.6",
+    "requests>=2.31",
+    "rich>=13.0",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+modal = ["modal>=1.6,<2"]
+gemini = ["google-genai>=3.0,<4"]
+openai = ["openai>=3.0,<4"]
+ui = ["streamlit>=1.50"]
+all = ["paper-orchestra[modal,gemini,openai,ui]"]
+
+[project.scripts]
+paper-orchestra = "paper_orchestra.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "latex: needs a local TeX Live install (pdflatex + bibtex)",
+    "live: talks to a real external service; never run by default",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["src/paper_orchestra/templates"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",   # prompts are long by nature
+    "RUF001", # prompts contain typographic characters on purpose
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/paper_orchestra/prompts/*" = ["E", "W"]
+"src/paper_orchestra/eval/prompts/*" = ["E", "W"]

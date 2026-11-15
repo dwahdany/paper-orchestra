@@ -12,35 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import streamlit as st
-import os
+"""Streamlit demo of PaperOrchestra.
+
+Collects an idea, an experimental log and optional figures, runs
+``paper-orchestra write`` as a child process and shows what the run produces:
+stage progress, the outline, the citation map, figures, refinement rounds and
+the wiki memory.  Launch it with ``uv run streamlit run frontend/app.py``.
+"""
+
+from __future__ import annotations
+
+import html
 import json
-import sys
+import re
 import time
-import threading
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
-from dotenv import load_dotenv
-import subprocess
-import shutil
-import tempfile
-import datetime
-import io
-import zipfile
-from streamlit.runtime.scriptrunner import add_script_run_ctx
-import signal
-import ctypes
-from frontend_utils import send_notification_email
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
-load_dotenv()
+import frontend_utils as fu
+import streamlit as st
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from methods.paper_writer import write_single_paper
-from utils.pdf_utils import pdf_to_grid_images
+from paper_orchestra.config import load_env
+from paper_orchestra.context import RunPaths
 
 st.set_page_config(
     page_title="Paper Orchestra - AI Paper Writer",
@@ -49,8 +43,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Credentials and SMTP settings may live in the repository's .env; the pipeline process inherits them.
+load_env(fu.REPO_ROOT / ".env")
 
-def apply_custom_css():
+NO_IMAGE_MODEL = "None (draw diagrams with code)"
+DREAM_LABELS = {
+    "stages": "After each stage",
+    "end": "At the end of the run",
+    "off": "Off",
+}
+#: Timeline CSS class and icon per stage status.
+STAGE_STYLE = {
+    "completed": ("finished", "✓"),
+    "running": ("active", "⏳"),
+    "failed": ("failed", "✗"),
+    "interrupted": ("failed", "■"),
+    "skipped": ("", "–"),
+    "pending": ("", "○"),
+}
+
+
+def apply_custom_css() -> None:
     st.markdown(
         """
     <style>
@@ -61,9 +74,12 @@ def apply_custom_css():
         .timeline-item { border-left: 2px solid #e2e8f0; padding-left: 1.5rem; position: relative; margin-bottom: 1.5rem; }
         .timeline-item.active { border-left-color: #2563eb; }
         .timeline-item.finished { border-left-color: #10b981; }
+        .timeline-item.failed { border-left-color: #dc2626; }
         .timeline-icon { position: absolute; left: -11px; top: 0; width: 20px; height: 20px; border-radius: 50%; background: white; border: 2px solid #cbd5e1; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; color: #64748b; }
         .timeline-item.active .timeline-icon { border-color: #b45309; background: #fffbeb; color: #b45309; }
         .timeline-item.finished .timeline-icon { border-color: #10b981; background: #10b981; color: white; }
+        .timeline-item.failed .timeline-icon { border-color: #dc2626; background: #dc2626; color: white; }
+        .timeline-detail { color: #64748b; font-size: 0.85rem; margin: 0; }
         .gallery-item { background: white; border-radius: 8px; padding: 1rem; text-align: center; border: 1px solid #e2e8f0; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); }
         .stButton > button { background-color: #ecfdf5 !important; color: #065f46 !important; border: 1px solid #a7f3d0 !important; padding: 0.75rem 1.5rem; border-radius: 6px; font-weight: 600; width: 100%; transition: all 0.2s; }
         .stButton > button:hover { transform: translateY(-1px); background-color: #d1fae5 !important; box-shadow: 0 4px 6px -1px rgba(5, 150, 105, 0.2); }
@@ -74,475 +90,756 @@ def apply_custom_css():
     )
 
 
-apply_custom_css()
-
-
-# Session State Initialization
-def initialize_session_state():
-    default_states = {
+def initialize_session_state() -> None:
+    defaults: dict[str, Any] = {
         "locked": False,
-        "running": False,
-        "progress": 0,
         "hide_inputs": False,
-        "logs": {
-            "Outline Generation": "",
-            "Literature Review": "",
-            "Figure Plotting": "",
-            "Section Writing": "",
-            "Content Refinement": "",
-        },
-        "current_step": 0,
         "figures": [],
         "figure_counter": 0,
-        "generated_figures": [],
+        "run": None,
+        "run_options": None,
         "run_directory": None,
+        "wiki": None,
         "email_confirmed": False,
         "error_message": "",
     }
-    for state_key, default_value in default_states.items():
-        if state_key not in st.session_state:
-            st.session_state[state_key] = default_value
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-initialize_session_state()
+def is_running() -> bool:
+    run = st.session_state.run
+    return run is not None and run.running
 
 
-def render_sidebar():
+def run_paths() -> RunPaths | None:
+    directory = st.session_state.run_directory
+    return RunPaths(Path(directory)) if directory else None
+
+
+# ------------------------------------------------------------------------
+# SIDEBAR
+# ------------------------------------------------------------------------
+
+
+def render_sidebar() -> dict[str, Any]:
+    locked = st.session_state.locked
     st.sidebar.title("🎻 Configuration")
 
-    if st.sidebar.button("Load CVPR Example", disabled=st.session_state.locked):
-        examples_directory = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "examples"
-        )
-        javascript_object_notation_path = os.path.join(
-            examples_directory, "cvpr_example.json"
-        )
+    if st.sidebar.button("Load CVPR Example", disabled=locked):
         try:
-            with open(javascript_object_notation_path, "r") as file_object:
-                example_data = json.load(file_object)
-            st.session_state.idea_text_main = example_data.get("idea", "")
-            st.session_state.log_text_main = example_data.get("log", "")
-
-            figure_path = example_data.get("figure_path")
-            figure_caption = example_data.get("figure_caption", "")
-            if figure_path:
-                full_figure_path = os.path.join(examples_directory, figure_path)
-                if os.path.exists(full_figure_path):
-                    st.session_state.figures = [
-                        {
-                            "file": full_figure_path,
-                            "name": figure_path,
-                            "caption": figure_caption,
-                        }
-                    ]
-
+            example = fu.load_example()
+        except (OSError, ValueError) as error:
+            st.sidebar.error(f"Error loading example: {error}")
+        else:
+            st.session_state.idea_text_main = example["idea"]
+            st.session_state.log_text_main = example["log"]
+            if example["figures"]:
+                st.session_state.figures = example["figures"]
             st.sidebar.success("🎉 Example loaded successfully!")
             time.sleep(1)
             st.rerun()
-        except Exception as exception_object:
-            st.sidebar.error(f"Error loading example: {exception_object}")
 
-    models = ["gemini-3.1-pro-preview", "gemini-3-flash-preview"]
-    selected_model = st.sidebar.selectbox(
-        "Select Model", models, disabled=st.session_state.locked
+    model = st.sidebar.selectbox("Select Model", fu.MODEL_CHOICES, disabled=locked)
+    template = st.sidebar.selectbox("Select Template", fu.TEMPLATE_CHOICES, disabled=locked)
+    plotting = st.sidebar.selectbox(
+        "Enable Figure Generation", ["Yes", "No"], index=0, disabled=locked
+    )
+    image_model = st.sidebar.selectbox(
+        "Diagram Image Model",
+        [NO_IMAGE_MODEL, *fu.IMAGE_MODEL_CHOICES],
+        disabled=locked or plotting == "No",
+        help="Diagrams are drawn by model-written plotting code unless an image model is chosen. "
+        "A Gemini image model needs Gemini credentials.",
+    )
+    compute = st.sidebar.selectbox(
+        "Compute Backend",
+        fu.COMPUTE_CHOICES,
+        disabled=locked,
+        help="Where model-written figure code runs and LaTeX compiles: on this machine, "
+        "or in network-isolated Modal sandboxes.",
+    )
+    memory = st.sidebar.checkbox(
+        "Wiki Memory",
+        value=True,
+        disabled=locked,
+        help="Keep a wiki of what the run learns (sources, literature, reviews, lessons) "
+        "that every agent can consult.",
+    )
+    dream = st.sidebar.selectbox(
+        "Memory Consolidation (Dreaming)",
+        fu.DREAM_CHOICES,
+        format_func=DREAM_LABELS.get,
+        disabled=locked or not memory,
+        help="When a separate session folds notes into wiki pages and tested rules.",
     )
 
-    templates = ["cvpr2025", "iclr2025"]
-    selected_template = st.sidebar.selectbox(
-        "Select Template", templates, disabled=st.session_state.locked
+    st.sidebar.markdown("Your Email (for the completion notification, optional)")
+    email = st.sidebar.text_input(
+        "Email", key="email_input", label_visibility="collapsed", disabled=locked
     )
-
-    plotting_options = ["Yes", "No"]
-    enable_plotting = st.sidebar.selectbox(
-        "Enable Figure Generation",
-        plotting_options,
-        index=0,
-        disabled=st.session_state.locked,
-    )
-
-    st.sidebar.markdown(
-        "Your Email (for notification) <span style='color:red'>*</span>",
-        unsafe_allow_html=True,
-    )
-    email_input = st.sidebar.text_input(
-        "Email",
-        key="email_input",
-        label_visibility="collapsed",
-        disabled=st.session_state.locked,
-    )
-
-    if st.sidebar.button("Confirm Email", disabled=st.session_state.locked):
-        if st.session_state.get("email_input"):
-            st.session_state.email_confirmed = True
-        else:
-            st.session_state.email_confirmed = False
-            st.sidebar.warning("⚠️ Please enter an email address first.")
-
+    if st.sidebar.button("Confirm Email", disabled=locked):
+        st.session_state.email_confirmed = fu.valid_email_address(email.strip())
+        if not st.session_state.email_confirmed:
+            st.sidebar.warning("⚠️ Please enter one valid email address first.")
     if st.session_state.get("email_confirmed"):
         st.sidebar.success("📧 Email confirmed successfully!")
 
-    return selected_model, selected_template, enable_plotting, email_input
+    return {
+        "model": model,
+        "template": template,
+        "use_plotting": plotting == "Yes",
+        "image_model": None if image_model == NO_IMAGE_MODEL else image_model,
+        "compute": compute,
+        "memory": memory,
+        "dream": dream,
+        "email": email.strip() or None,
+    }
 
 
-selected_model, selected_template, enable_plotting, email_input = render_sidebar()
+# ------------------------------------------------------------------------
+# RUN CONTROL
+# ------------------------------------------------------------------------
+
+
+def start_run(choices: dict[str, Any]) -> None:
+    """Validate the inputs, prepare the run directory and launch the pipeline."""
+    idea = (st.session_state.get("idea_text_main") or "").strip()
+    experimental_log = (st.session_state.get("log_text_main") or "").strip()
+    if not idea or not experimental_log:
+        st.session_state.error_message = (
+            "❌ Please fill in all required fields (Idea and Experimental Log)."
+        )
+        st.rerun()
+    if choices["email"] and not fu.valid_email_address(choices["email"]):
+        # Better now than after 40 minutes, when the notification would be refused.
+        st.session_state.error_message = (
+            "❌ The email address is not valid. Correct it, or clear the field to run "
+            "without a notification."
+        )
+        st.rerun()
+
+    options = fu.RunOptions(
+        run_dir=fu.new_run_directory(),
+        template=choices["template"],
+        model=choices["model"],
+        use_plotting=choices["use_plotting"],
+        image_model=choices["image_model"],
+        compute=choices["compute"],
+        memory=choices["memory"],
+        dream=choices["dream"],
+    )
+    try:
+        fu.write_raw_materials(options.run_dir, idea, experimental_log, st.session_state.figures)
+    except (OSError, ValueError) as error:
+        st.session_state.error_message = f"❌ Could not prepare the run directory: {error}"
+        st.rerun()
+
+    recipient = choices["email"]
+    run = fu.PipelineRun(
+        fu.build_write_command(options),
+        cwd=fu.REPO_ROOT,
+        log_path=options.run_dir / fu.PIPELINE_LOG_NAME,
+        on_finish=lambda finished: fu.notify_completion(finished, options.run_dir, recipient),
+    )
+    run.start()
+
+    st.session_state.run = run
+    st.session_state.run_options = options
+    st.session_state.run_directory = str(options.run_dir)
+    st.session_state.wiki = None
+    st.session_state.saved_idea = idea
+    st.session_state.saved_log = experimental_log
+    st.session_state.locked = True
+    st.session_state.hide_inputs = True
+    st.rerun()
+
+
+def reset_for_new_paper() -> None:
+    st.session_state.run = None
+    st.session_state.run_options = None
+    st.session_state.run_directory = None
+    st.session_state.wiki = None
+    st.session_state.locked = False
+    st.session_state.hide_inputs = False
+    st.rerun()
+
 
 # ------------------------------------------------------------------------
 # UI COMPONENT FUNCTIONS
 # ------------------------------------------------------------------------
 
 
-def render_gallery_tab():
-    st.subheader("Uploaded Figures")
-    if not st.session_state.figures:
-        if not st.session_state.running:
+def render_inputs(choices: dict[str, Any]) -> None:
+    locked = st.session_state.locked
+    if st.session_state.get("error_message"):
+        st.error(st.session_state.error_message)
+        st.session_state.error_message = ""
+
+    st.header("📝 Input Materials")
+    column_1, column_2 = st.columns(2)
+
+    with column_1:
+        st.subheader("💡 Research Idea")
+        idea_input_type = st.radio(
+            "Idea Input Type", ["Text", "Upload"], disabled=locked, key="idea_input_type_main"
+        )
+        if idea_input_type == "Text":
             st.markdown(
-                "<p style='color: gray; font-style: italic;'>No figures uploaded yet. Add figures from the input materials section.</p>",
+                "Enter your idea here <span style='color:red'>*</span>", unsafe_allow_html=True
+            )
+            st.text_area(
+                "Idea",
+                key="idea_text_main",
+                label_visibility="collapsed",
+                disabled=locked,
+                height=300,
+            )
+        else:
+            st.markdown(
+                "Upload Idea file (.md/.txt) <span style='color:red'>*</span>",
+                unsafe_allow_html=True,
+            )
+            uploaded_idea = st.file_uploader(
+                "Upload Idea",
+                type=["md", "txt"],
+                label_visibility="collapsed",
+                disabled=locked,
+                key="idea_uploader_main",
+            )
+            if uploaded_idea:
+                st.session_state.idea_text_main = uploaded_idea.getvalue().decode(
+                    "utf-8", errors="replace"
+                )
+
+    with column_2:
+        st.subheader("📊 Experimental Log")
+        log_input_type = st.radio(
+            "Exp Log Input Type", ["Text", "Upload"], disabled=locked, key="log_input_type_main"
+        )
+        if log_input_type == "Text":
+            st.markdown(
+                "Enter experimental log here <span style='color:red'>*</span>",
+                unsafe_allow_html=True,
+            )
+            st.text_area(
+                "Exp Log",
+                key="log_text_main",
+                label_visibility="collapsed",
+                disabled=locked,
+                height=300,
+            )
+        else:
+            st.markdown(
+                "Upload Exp Log file (.md/.txt) <span style='color:red'>*</span>",
+                unsafe_allow_html=True,
+            )
+            uploaded_log = st.file_uploader(
+                "Upload Exp Log",
+                type=["md", "txt"],
+                label_visibility="collapsed",
+                disabled=locked,
+                key="log_uploader_main",
+            )
+            if uploaded_log:
+                st.session_state.log_text_main = uploaded_log.getvalue().decode(
+                    "utf-8", errors="replace"
+                )
+
+    st.subheader("🖼️ Upload Figures")
+    figure_column_1, figure_column_2 = st.columns([1, 2])
+    with figure_column_1:
+        figure_file = st.file_uploader(
+            "Upload figure",
+            type=["png", "jpg", "jpeg", "pdf"],
+            disabled=locked,
+            key="figure_uploader_main",
+        )
+    with figure_column_2:
+        figure_caption = st.text_input("Figure Caption", disabled=locked, key="figure_caption_main")
+        button_column, _ = st.columns([1, 2])
+        with button_column:
+            st.markdown(
+                """
+            <style>
+                .stButton > button { background-color: #e0e7ff !important; color: #3730a3 !important; border: 1px solid #c7d2fe !important; }
+            </style>
+            """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Add Figure", disabled=locked or not figure_file or not figure_caption):
+                st.session_state.figure_counter += 1
+                st.session_state.figures.append(
+                    {
+                        "id": st.session_state.figure_counter,
+                        "file": figure_file,
+                        "name": figure_file.name,
+                        "caption": figure_caption,
+                    }
+                )
+                st.success("🎉 Figure added successfully!")
+                time.sleep(1)
+                st.rerun()
+
+    render_uploaded_figures()
+
+    st.markdown(
+        """
+    <style>
+        .stButton > button[kind="primary"] { background-color: #2563eb !important; color: white !important; font-size: 1.25rem !important; padding: 1rem 2rem !important; border: none !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important; }
+        .stButton > button[kind="primary"]:hover { background-color: #1d4ed8 !important; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05) !important; }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+    if st.button("🚀 Begin Writing", type="primary", disabled=locked):
+        start_run(choices)
+
+
+def render_uploaded_figures() -> None:
+    """The figures added so far, with editable captions until the run starts."""
+    locked = st.session_state.locked
+    if not st.session_state.figures:
+        if not locked:
+            st.markdown(
+                "<p style='color: gray; font-style: italic;'>No figures uploaded yet.</p>",
                 unsafe_allow_html=True,
             )
         else:
             st.info("ℹ️ No user figures provided for this run.")
-    else:
-        for index, figure in enumerate(st.session_state.figures):
-            st.markdown(
-                f'<div class="gallery-item" style="margin-bottom: 1rem;"><p style="font-weight: bold;">{figure["name"]}</p></div>',
-                unsafe_allow_html=True,
-            )
-            st.image(figure["file"], width="stretch")
-            new_caption = st.text_input(
-                "Edit Caption",
-                value=figure["caption"],
-                key=f"edit_caption_{index}",
-                disabled=st.session_state.locked,
-            )
-            if new_caption != figure["caption"]:
-                st.session_state.figures[index]["caption"] = new_caption
-            if st.button(
-                "🗑️ Delete Image",
-                key=f"delete_figure_{index}",
-                disabled=st.session_state.locked,
-            ):
-                st.session_state.figures.pop(index)
-                st.rerun()
-            st.markdown("<hr>", unsafe_allow_html=True)
+        return
+    for index, figure in enumerate(st.session_state.figures):
+        # Keyed by the figure, not its position, so deleting one leaves the others' widgets alone.
+        widget_id = figure.get("id", "example")
+        st.markdown(
+            f'<div class="gallery-item" style="margin-bottom: 1rem;"><p style="font-weight: bold;">{html.escape(figure["name"])}</p></div>',
+            unsafe_allow_html=True,
+        )
+        if figure["name"].lower().endswith(".pdf"):
+            st.caption("PDF figure (no preview).")
+        else:
+            try:
+                st.image(figure["file"], width="stretch")
+            except Exception as error:
+                # A file that is not really an image must stay on the page with its delete
+                # button: an exception here would end the script above the rest of the form.
+                st.warning(f"This file cannot be shown as an image ({type(error).__name__}).")
+        new_caption = st.text_input(
+            "Edit Caption",
+            value=figure["caption"],
+            key=f"edit_caption_{widget_id}",
+            disabled=locked,
+        )
+        if new_caption != figure["caption"]:
+            st.session_state.figures[index]["caption"] = new_caption
+        if st.button("🗑️ Delete Image", key=f"delete_figure_{widget_id}", disabled=locked):
+            st.session_state.figures.pop(index)
+            st.rerun()
+        st.markdown("<hr>", unsafe_allow_html=True)
+
+
+def read_json_file(path: Path) -> Any:
+    """Parsed JSON, or ``None`` when the file is absent or still being written."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        st.error(f"Error loading {path.name}: {error}")
+        return None
+
+
+def render_gallery_tab() -> None:
+    st.subheader("Uploaded Figures")
+    render_uploaded_figures()
 
     st.subheader("Generated Figures")
-    if st.session_state.get("run_directory"):
-        results_path = os.path.join(
-            st.session_state.run_directory, "plotting_results.json"
-        )
-        if os.path.exists(results_path):
-            try:
-                with open(results_path, "r") as file_object:
-                    st.session_state.generated_figures = json.load(file_object)
-            except Exception:
-                pass
-
-    if st.session_state.get("generated_figures"):
-        for figure in st.session_state.generated_figures:
-            image_path = os.path.join(
-                st.session_state.run_directory, figure.get("image_path", "")
-            )
-            if os.path.exists(image_path):
-                st.markdown(f"**{figure.get('title', 'Figure')}**")
-                st.image(image_path, caption=figure.get("caption", ""))
-                st.markdown("<hr>", unsafe_allow_html=True)
+    paths = run_paths()
+    generated = read_json_file(paths.plotting_results) if paths else None
+    if not isinstance(generated, list) or not generated:
+        if not is_running():
+            st.info("No generated figures.")
+        return
+    for figure in generated:
+        if not isinstance(figure, dict):
+            continue
+        image_path = paths.base_dir / str(figure.get("image_path", ""))
+        if image_path.is_file():
+            st.markdown(f"**{figure.get('title', 'Figure')}**")
+            st.image(str(image_path), caption=figure.get("caption", ""))
+            st.markdown("<hr>", unsafe_allow_html=True)
 
 
-def render_json_file(file_name, title, failure_message):
+def render_json_tab(path: Path | None, title: str, missing_message: str) -> None:
     st.subheader(title)
-    if st.session_state.get("run_directory"):
-        file_path = os.path.join(st.session_state.run_directory, file_name)
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, "r") as file_object:
-                    st.json(json.load(file_object))
-            except Exception as exception_object:
-                st.error(f"Error loading {title.lower()}: {exception_object}")
-        elif not st.session_state.running:
-            st.info(failure_message)
-    else:
-        st.info(failure_message)
+    content = read_json_file(path) if path else None
+    if content is not None:
+        st.json(content)
+    elif not is_running():
+        st.info(missing_message)
 
 
-def render_pdf_and_snapshots(pdf_path, snapshots_directory, download_key):
-    if os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as file_object:
+def page_order(path: Path) -> list[int | str]:
+    """Sort key that puts ``grid_2.png`` before ``grid_10.png``."""
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)]
+
+
+def render_pdf_and_snapshots(pdf_path: Path, snapshots_directory: Path, download_key: str) -> None:
+    if not pdf_path.is_file():
+        return
+    st.download_button(
+        label="📥 Download PDF",
+        data=pdf_path.read_bytes(),
+        file_name=pdf_path.name,
+        mime="application/pdf",
+        key=download_key,
+    )
+    if snapshots_directory.is_dir():
+        image_files = sorted(
+            (path for path in snapshots_directory.iterdir() if path.suffix in (".jpg", ".png")),
+            key=page_order,
+        )
+        if image_files:
+            st.markdown("**Snapshots:**")
+            for column, image_file in zip(st.columns(3), image_files[:3], strict=False):
+                with column:
+                    st.image(str(image_file), width="stretch")
+
+
+def stage_detail(stage: fu.StageProgress) -> str:
+    """One line under a timeline entry: how the stage is doing."""
+    minutes, seconds = divmod(int(stage.seconds), 60)
+    took = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+    if stage.status == "completed":
+        return "Reused from the earlier run." if stage.reused else f"Completed in {took}."
+    if stage.status == "running":
+        return f"Running (attempt {stage.attempts})." if stage.attempts > 1 else "Running."
+    if stage.status == "failed":
+        outcome = " The run continued without it." if stage.tolerated else ""
+        return (
+            f"Failed after {stage.attempts} attempt(s): {stage.error or 'unknown error'}.{outcome}"
+        )
+    if stage.status == "interrupted":
+        return "Interrupted."
+    if stage.status == "skipped":
+        return "Skipped."
+    return ""
+
+
+def render_timeline_tab(run: fu.PipelineRun, progress: fu.RunProgress) -> None:
+    st.subheader("Writing Progress")
+    caption = f"{progress.done} of {len(progress.stages)} stages completed"
+    if progress.active:
+        caption += f" · now: {', '.join(progress.active)}"
+    st.progress(progress.fraction, text=caption)
+
+    for stage in progress.stages:
+        state_class, icon = STAGE_STYLE.get(stage.status, STAGE_STYLE["pending"])
+        st.markdown(
+            f'<div class="timeline-item {state_class}"><div class="timeline-icon">{icon}</div>'
+            f'<p style="font-weight: bold; margin-bottom: 0.25rem;">{html.escape(stage.label)}</p>'
+            f'<p class="timeline-detail">{html.escape(stage_detail(stage))}</p></div>',
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("View Pipeline Log", expanded=run.running):
+        log_tail = run.log_tail()
+        if log_tail:
+            st.code(log_tail, language=None)
+        else:
+            st.text("No logs yet.")
+
+    paths = run_paths()
+    if run.running or paths is None:
+        return
+    archive = fu.latex_source_zip(paths.base_dir)
+    if not paths.final_pdf.is_file() and archive is None:
+        return
+    st.markdown("### 📥 Download Results")
+    column_download_1, column_download_2 = st.columns(2)
+    if paths.final_pdf.is_file():
+        with column_download_1:
+            st.download_button(
+                label="📄 Download Final PDF",
+                data=paths.final_pdf.read_bytes(),
+                file_name="final_paper.pdf",
+                mime="application/pdf",
+                key="download_final_pdf_tab",
+            )
+    if archive is not None:
+        with column_download_2:
+            st.download_button(
+                label="📦 Download LaTeX Source",
+                data=archive,
+                file_name="latex_source.zip",
+                mime="application/zip",
+                key="download_final_latex_tab",
+            )
+
+
+def render_inputs_tab() -> None:
+    st.header("📥 User Inputs")
+    st.markdown(
+        "<h3 style='background-color: #ffe6e6; padding: 5px; border-radius: 3px;'>Idea</h3>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(st.session_state.get("saved_idea", "*(No input provided or process not started)*"))
+    st.markdown(
+        "<h3 style='background-color: #ffffcc; padding: 5px; border-radius: 3px;'>Experimental Log</h3>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(st.session_state.get("saved_log", "*(No input provided or process not started)*"))
+
+
+def render_refinement_tab() -> None:
+    st.header("Content & Format Refinement Progress")
+    paths = run_paths()
+    if paths is None:
+        st.info("No refinement progress available yet.")
+        return
+    work_dir = paths.refinement_dir
+    screenshots = work_dir / "pdf_screenshots"
+    initial_pdf_path = work_dir / "initial_draft.pdf"
+    worklog = read_json_file(work_dir / "content_refinement_worklog.json")
+
+    st.markdown("### Content Refinement")
+    columns = st.columns(2)
+    if initial_pdf_path.is_file():
+        with columns[0], st.expander("Content Refinement V0 (Initial)"):
+            st.write("Initial draft compiled.")
+            render_pdf_and_snapshots(
+                initial_pdf_path, screenshots / "content_refinement" / "v0", "download_content_0"
+            )
+    if not isinstance(worklog, dict):
+        if not is_running() and not initial_pdf_path.is_file():
+            st.info("No refinement progress available yet.")
+        return
+
+    rounds = {key: entry for key, entry in worklog.items() if isinstance(entry, dict)}
+    for index, (version_key, entry) in enumerate(rounds.items()):
+        with columns[(index + 1) % 2], st.expander(f"Content Refinement {version_key.upper()}"):
+            st.write(f"**Outcome:** {entry.get('outcome')}")
+            st.write(f"**Total Gain:** {entry.get('total_gain')}")
+            st.write(f"**Total Drop:** {entry.get('total_drop')}")
+            if "scores_before" in entry and "scores_after" in entry:
+                st.markdown("**Scores:**")
+                for axis in ["Overall", "Originality", "Quality", "Clarity"]:
+                    st.write(
+                        f"- {axis}: {entry['scores_before'].get(axis, 0)} -> {entry['scores_after'].get(axis, 0)}"
+                    )
+            render_pdf_and_snapshots(
+                work_dir / f"refined_paper_{version_key}.pdf",
+                screenshots / "content_refinement" / version_key,
+                f"download_content_{version_key}",
+            )
+
+    format_worklog = read_json_file(work_dir / "format_refinement_worklog.json")
+    if not isinstance(format_worklog, dict):
+        return
+    selected_content = fu.last_accepted_version(worklog)
+    selected_label = selected_content.upper() if selected_content else "V0 (Initial)"
+    st.info(
+        f"💡 `Content Refinement {selected_label}` is selected at the output of the content "
+        "refinement phase, now move on to formatting refinement..."
+    )
+
+    st.markdown("### Format Refinement")
+    format_columns = st.columns(2)
+    with format_columns[0], st.expander("Format Refinement V0 (Initial)"):
+        st.write("Input from content refinement phase.")
+        source_pdf = work_dir / (
+            f"refined_paper_{selected_content}.pdf" if selected_content else "initial_draft.pdf"
+        )
+        if source_pdf.is_file():
             st.download_button(
                 label="📥 Download PDF",
-                data=file_object.read(),
-                file_name=os.path.basename(pdf_path),
+                data=source_pdf.read_bytes(),
+                file_name=source_pdf.name,
                 mime="application/pdf",
-                key=download_key,
+                key="download_format_0",
+            )
+    format_rounds = {k: entry for k, entry in format_worklog.items() if isinstance(entry, dict)}
+    for index, (version_key, entry) in enumerate(format_rounds.items()):
+        iteration = fu.version_number(version_key)
+        with format_columns[(index + 1) % 2], st.expander(f"Format Refinement V{iteration}"):
+            if entry.get("outcome"):
+                st.write(f"**Outcome:** {entry['outcome']}")
+            feedback = entry.get("formatting_feedback") or {}
+            if "figure_and_tables" in feedback:
+                st.markdown("**Figure & Table Issues:**")
+                st.json(feedback["figure_and_tables"])
+            render_pdf_and_snapshots(
+                work_dir / f"formatted_candidate_{version_key}.pdf",
+                screenshots / "format_refinement" / version_key,
+                f"download_format_{iteration}",
             )
 
-        if os.path.exists(snapshots_directory):
-            st.markdown("**Snapshots:**")
-            image_files = sorted(
-                [
-                    file
-                    for file in os.listdir(snapshots_directory)
-                    if file.endswith(".jpg") or file.endswith(".png")
-                ]
+    if (work_dir / "final_refined_paper.pdf").is_file():
+        selected_format = fu.last_accepted_version(format_worklog)
+        if selected_format:
+            st.info(
+                f"💡 `Format Refinement V{fu.version_number(selected_format)}` is selected as "
+                "the final output of this pipeline."
             )
-            if image_files:
-                grid_columns = st.columns(3)
-                for index, image_file in enumerate(image_files[:3]):
-                    with grid_columns[index]:
-                        st.image(
-                            os.path.join(snapshots_directory, image_file),
-                            width="stretch",
-                        )
-
-
-# ------------------------------------------------------------------------
-# BACKGROUND EXECUTION POLLING
-# ------------------------------------------------------------------------
-
-
-def handle_live_execution(
-    steps, email_input, selected_template, selected_model, enable_plotting
-):
-    if st.session_state.running:
-
-        if not st.session_state.get("thread_started"):
-            if (
-                not st.session_state.get("saved_idea")
-                or not st.session_state.get("saved_log")
-                or not st.session_state.get("email_input")
-            ):
-                st.session_state.error_message = (
-                    "❌ Please fill in all required fields (Idea, Log, and Email)."
-                )
-                st.session_state.running = False
-                st.session_state.locked = False
-                st.session_state.hide_inputs = (
-                    False  # Fixed: ensures inputs pop back up if validation fails
-                )
-                st.rerun()
-            st.session_state.thread_started = True
-
-            base_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            parent_directory = os.path.dirname(base_directory)
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_directory = os.path.join(
-                parent_directory, "demo_logs", f"paper_orchestra_run_{timestamp}"
+        else:
+            st.info(
+                f"💡 No formatting change was accepted: `Content Refinement {selected_label}` "
+                "is the final output of this pipeline."
             )
-            st.session_state.run_directory = run_directory
-            raw_materials_directory = os.path.join(run_directory, "raw_materials")
-            figures_directory = os.path.join(raw_materials_directory, "figures")
+    elif not is_running():
+        st.info("💡 Refinement pipeline ended without producing a final separated PDF.")
 
-            os.makedirs(run_directory, exist_ok=True)
-            os.makedirs(raw_materials_directory, exist_ok=True)
-            os.makedirs(figures_directory, exist_ok=True)
 
-            command = [
-                sys.executable,
-                "-u",
-                os.path.join(base_directory, "paper_writing_cli.py"),
-                "--raw_materials_dir",
-                raw_materials_directory,
-                "--output_dir",
-                run_directory,
-                "--latex_template_dir",
-                os.path.join(base_directory, "templates", selected_template),
-                "--writer_model_name",
-                selected_model,
-                "--reflection_model_name",
-                selected_model,
-                "--idea_filename",
-                "idea_sparse.md",
-                "--experimental_log_filename",
-                "experimental_log.md",
-            ]
-            if enable_plotting == "Yes":
-                command.extend(
-                    [
-                        "--use_plotting",
-                        "True",
-                        "--plotting_model_name",
-                        selected_model,
-                        "--image_model_name",
-                        "gemini-3-pro-image-preview",
-                    ]
-                )
+def render_memory_tab() -> None:
+    st.header("Wiki Memory")
+    paths = run_paths()
+    if paths is None:
+        st.info("No run yet.")
+        return
+    if st.session_state.wiki is None:
+        st.session_state.wiki = fu.open_run_wiki(paths.base_dir)
+    wiki = st.session_state.wiki
+    if wiki is None:
+        options = st.session_state.run_options
+        if options is not None and not options.memory:
+            st.info("Memory is switched off for this run.")
+        else:
+            st.info("The run has not written any memory yet.")
+        return
 
-            def run_pipeline(
-                execution_command,
-                working_directory,
-                steps_list,
-                recipient_email,
-                idea_content,
-                log_content,
-                figures_list,
-            ):
-                try:
-                    libc = ctypes.CDLL(None)
-                    process_set_parent_death_signal = 1
+    st.caption(f"Memory directory: `{paths.memory_dir}`")
+    index_column, page_column = st.columns(2)
+    with index_column:
+        st.markdown("### Injected index (`MEMORY.md`)")
+        st.caption("Loaded into every agent session: standing notes and the page catalog.")
+        st.markdown(fu.memory_index_markdown(wiki) or "*The index is being rewritten.*")
+    with page_column:
+        st.markdown("### Wiki pages")
+        entries = fu.list_wiki_pages(wiki)
+        if not entries:
+            st.info("No wiki pages yet.")
+            return
+        by_path = {entry.path: entry for entry in entries}
+        # A dream may have moved or removed the page that was open.
+        if st.session_state.get("memory_page") not in by_path:
+            st.session_state.pop("memory_page", None)
+        selected = st.selectbox(
+            "Open a page",
+            list(by_path),
+            format_func=lambda path: by_path[path].label,
+            key="memory_page",
+        )
+        entry = by_path[selected]
+        page = fu.read_wiki_page(wiki, selected)
+        if page is None:
+            st.warning("This page no longer exists.")
+            return
+        meta, body = page
+        st.caption(f"`{entry.path}`" + (f" · {entry.summary}" if entry.summary else ""))
+        if meta:
+            with st.expander("Front matter"):
+                st.json(meta)
+        st.markdown(body)
 
-                    def set_death_signal():
-                        libc.prctl(process_set_parent_death_signal, signal.SIGKILL)
 
-                    os.makedirs(run_directory, exist_ok=True)
-                    raw_materials_directory = os.path.join(
-                        run_directory, "raw_materials"
-                    )
-                    figures_directory = os.path.join(raw_materials_directory, "figures")
-
-                    os.makedirs(raw_materials_directory, exist_ok=True)
-                    os.makedirs(figures_directory, exist_ok=True)
-
-                    with open(
-                        os.path.join(raw_materials_directory, "idea_sparse.md"), "w"
-                    ) as file_object:
-                        file_object.write(idea_content)
-
-                    with open(
-                        os.path.join(raw_materials_directory, "experimental_log.md"),
-                        "w",
-                    ) as file_object:
-                        file_object.write(log_content)
-
-                    for figure in figures_list:
-                        figure_path = os.path.join(figures_directory, figure["name"])
-                        if isinstance(figure["file"], str):
-                            shutil.copy(figure["file"], figure_path)
-                        else:
-                            with open(figure_path, "wb") as file_object:
-                                file_object.write(figure["file"].getvalue())
-
-                    process = subprocess.Popen(
-                        execution_command,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        cwd=working_directory,
-                        preexec_fn=set_death_signal,
-                    )
-
-                    current_step_name = steps_list[0]
-                    st.session_state.current_step = 0
-
-                    while True:
-                        line = process.stdout.readline()
-                        if not line and process.poll() is not None:
-                            break
-                        if line:
-                            if (
-                                "Processing figure:" in line
-                                or (
-                                    line.strip().startswith("[")
-                                    and not line.strip().startswith("[DEBUG]")
-                                )
-                                or "Figure processing complete" in line
-                                or "Saved figures/" in line
-                                or "[DEBUG] Starting run_plotting_agent" in line
-                            ):
-                                st.session_state.logs["Figure Plotting"] += line
-                            else:
-                                if "Starting Fast Hybrid Literature Agent" in line:
-                                    st.session_state.current_step = 1
-                                    current_step_name = steps_list[1]
-                                elif "Agent SectionWritingAgent starting" in line:
-                                    st.session_state.current_step = 2
-                                    current_step_name = steps_list[2]
-                                elif (
-                                    "=== Initial Baseline Review ===" in line
-                                    or "Starting dedicated formatting loop" in line
-                                ):
-                                    st.session_state.current_step = 3
-                                    current_step_name = steps_list[3]
-
-                                st.session_state.logs[current_step_name] += line
-
-                    if process.poll() == 0:
-                        st.session_state.current_step = len(steps_list)
-                        if recipient_email:
-                            attachments = []
-                            run_dir = st.session_state.run_directory
-
-                            # 1. Final PDF
-                            final_pdf = os.path.join(run_dir, "final_paper.pdf")
-                            if os.path.exists(final_pdf):
-                                attachments.append(final_pdf)
-
-                            # 2. LaTeX Zip
-                            latex_writeup = os.path.join(run_dir, "latex_writeup")
-                            final_tex = os.path.join(
-                                run_dir,
-                                "content_refinement_workdir",
-                                "final_refined_paper.tex",
-                            )
-
-                            if os.path.exists(latex_writeup) and os.path.exists(
-                                final_tex
-                            ):
-                                try:
-                                    with tempfile.TemporaryDirectory() as tmp_dir:
-                                        zip_source_dir = os.path.join(
-                                            tmp_dir, "latex_source"
-                                        )
-                                        shutil.copytree(latex_writeup, zip_source_dir)
-
-                                        for f_name in [
-                                            "template.tex",
-                                            "raw_draft_paper.tex",
-                                        ]:
-                                            f_path = os.path.join(
-                                                zip_source_dir, f_name
-                                            )
-                                            if os.path.exists(f_path):
-                                                os.remove(f_path)
-
-                                        shutil.copy(
-                                            final_tex,
-                                            os.path.join(zip_source_dir, "main.tex"),
-                                        )
-
-                                        zip_output_base = os.path.join(
-                                            run_dir, "latex_source"
-                                        )
-                                        shutil.make_archive(
-                                            zip_output_base, "zip", zip_source_dir
-                                        )
-
-                                        if os.path.exists(zip_output_base + ".zip"):
-                                            attachments.append(zip_output_base + ".zip")
-                                except Exception as e:
-                                    print(f" >> Error preparing latex zip: {e}")
-                                    st.session_state.logs[
-                                        "Content Refinement"
-                                    ] += f"\n❌ Error preparing latex zip: {e}"
-
-                            send_notification_email(
-                                recipient_email,
-                                "Generated Paper",
-                                attachments=attachments,
-                            )
-                except Exception as exception_object:
-                    st.session_state.logs[
-                        "Content Refinement"
-                    ] += f"\n❌ Error in thread: {exception_object}"
-                finally:
-                    st.session_state.running = False
-                    st.session_state.thread_started = False
-
-            worker_thread = threading.Thread(
-                target=run_pipeline,
-                args=(
-                    command,
-                    base_directory,
-                    steps,
-                    email_input,
-                    st.session_state.saved_idea,
-                    st.session_state.saved_log,
-                    list(st.session_state.figures),
-                ),
-            )
-            add_script_run_ctx(worker_thread)
-            worker_thread.start()
+def render_run_status(run: fu.PipelineRun, progress: fu.RunProgress) -> None:
+    paths = run_paths()
+    if run.running:
+        st.info(
+            "🚀 Paper generation in progress! This may take 35-45 minutes. "
+            "Please do not close this tab."
+        )
+        if st.button("⏹ Stop Run", key="stop_run"):
+            with st.spinner("Stopping the pipeline..."):
+                run.stop()
             st.rerun()
+        return
+    if run.launch_error:
+        st.error(f"❌ {run.launch_error}")
+    elif paths is not None and fu.run_succeeded(run, paths.base_dir):
+        st.success("🎉 Paper writing complete!")
+    elif run.stopped:
+        st.warning("Paper writing was stopped.")
+    else:
+        reason = f" {progress.error}" if progress.error else ""
+        st.error(f"❌ Paper writing failed or stopped unexpectedly. Check logs.{reason}")
+    if run.notification:
+        st.caption(run.notification)
+    if st.button("Start a New Paper", key="new_paper"):
+        reset_for_new_paper()
 
-        time.sleep(2)
+
+def render_tab(render: Callable[..., None], *arguments: Any) -> None:
+    """Draw one tab and keep a failure inside it.
+
+    The page refreshes itself at the end of ``render_run``.  An exception
+    escaping from a tab (a half-written output file, a page the run just
+    moved) would end the script before that and leave a running pipeline with
+    a frozen page.  Streamlit's own rerun and stop signals are not
+    ``Exception`` subclasses, so they still pass through.
+    """
+    try:
+        render(*arguments)
+    except Exception as error:
+        problem = f"{type(error).__name__}: {error}"
+        # Logged once per problem, not on every refresh of the page.
+        if st.session_state.get(f"tab_problem_{render.__name__}") != problem:
+            st.session_state[f"tab_problem_{render.__name__}"] = problem
+            fu.log.exception("The %s part of the demo page could not be drawn.", render.__name__)
+        st.error(f"This tab could not be drawn: {problem}")
+
+
+def render_run() -> None:
+    run: fu.PipelineRun = st.session_state.run
+    options: fu.RunOptions = st.session_state.run_options
+    # Sampled once: if the run ends while this page is being drawn, the refresh at the
+    # bottom still happens and the next pass shows the final state.
+    was_running = run.running
+    progress = fu.read_progress(
+        options.run_dir, use_plotting=options.use_plotting, process_running=was_running
+    )
+    render_run_status(run, progress)
+
+    paths = options.paths
+    (
+        tab_timeline,
+        tab_inputs,
+        tab_gallery,
+        tab_outline,
+        tab_citation,
+        tab_refinement,
+        tab_memory,
+    ) = st.tabs(
+        [
+            "📊 Progress Timeline",
+            "📥 Inputs",
+            "🖼️ Figures Gallery",
+            "📝 Outline",
+            "🔗 Citation Map",
+            "📈 Refinement Progress",
+            "🧠 Memory",
+        ]
+    )
+    with tab_timeline:
+        render_tab(render_timeline_tab, run, progress)
+    with tab_inputs:
+        render_tab(render_inputs_tab)
+    with tab_gallery:
+        render_tab(render_gallery_tab)
+    with tab_outline:
+        render_tab(render_json_tab, paths.outline, "Paper Outline", "No outline generated yet.")
+    with tab_citation:
+        render_tab(
+            render_json_tab, paths.citation_map, "Citation Map", "No citation map generated yet."
+        )
+    with tab_refinement:
+        render_tab(render_refinement_tab)
+    with tab_memory:
+        render_tab(render_memory_tab)
+
+    if was_running:
+        time.sleep(fu.POLL_SECONDS)
         st.rerun()
 
 
@@ -550,533 +847,17 @@ def handle_live_execution(
 # MAIN PAGE ROUTING
 # ------------------------------------------------------------------------
 
+apply_custom_css()
+initialize_session_state()
+sidebar_choices = render_sidebar()
+
 st.title("🎻 Paper Orchestra Demo")
 st.markdown(
-    "Demonstrating the automated paper writing process as detailed in [PaperOrchestra](https://arxiv.org/abs/2604.05018)."
+    "Demonstrating the automated paper writing process as detailed in "
+    "[PaperOrchestra](https://arxiv.org/abs/2604.05018)."
 )
 
-steps = [
-    "Outline Generation",
-    "Literature Review",
-    "Section Writing",
-    "Content Refinement",
-]
-
-# ========================================================================
-# PHASE 1: INPUT MATERIALS (Only visible when NOT running)
-# ========================================================================
-if not st.session_state.get("hide_inputs"):
-    input_container = st.container()
-    with input_container:
-
-        if st.session_state.get("error_message"):
-            st.error(st.session_state.error_message)
-            st.session_state.error_message = ""
-
-        st.header("📝 Input Materials")
-        column_1, column_2 = st.columns(2)
-
-        with column_1:
-            st.subheader("💡 Research Idea")
-            idea_input_type = st.radio(
-                "Idea Input Type",
-                ["Text", "Upload"],
-                disabled=st.session_state.locked,
-                key="idea_input_type_main",
-            )
-            if idea_input_type == "Text":
-                st.markdown(
-                    "Enter your idea here <span style='color:red'>*</span>",
-                    unsafe_allow_html=True,
-                )
-                st.text_area(
-                    "Idea",
-                    key="idea_text_main",
-                    label_visibility="collapsed",
-                    disabled=st.session_state.locked,
-                    height=300,
-                )
-            else:
-                st.markdown(
-                    "Upload Idea file (.md/.txt) <span style='color:red'>*</span>",
-                    unsafe_allow_html=True,
-                )
-                uploaded_idea = st.file_uploader(
-                    "Upload Idea",
-                    type=["md", "txt"],
-                    label_visibility="collapsed",
-                    disabled=st.session_state.locked,
-                    key="idea_uploader_main",
-                )
-                if uploaded_idea:
-                    st.session_state.idea_text_main = uploaded_idea.read().decode(
-                        "utf-8"
-                    )
-
-        with column_2:
-            st.subheader("📊 Experimental Log")
-            log_input_type = st.radio(
-                "Exp Log Input Type",
-                ["Text", "Upload"],
-                disabled=st.session_state.locked,
-                key="log_input_type_main",
-            )
-            if log_input_type == "Text":
-                st.markdown(
-                    "Enter experimental log here <span style='color:red'>*</span>",
-                    unsafe_allow_html=True,
-                )
-                st.text_area(
-                    "Exp Log",
-                    key="log_text_main",
-                    label_visibility="collapsed",
-                    disabled=st.session_state.locked,
-                    height=300,
-                )
-            else:
-                st.markdown(
-                    "Upload Exp Log file (.md/.txt) <span style='color:red'>*</span>",
-                    unsafe_allow_html=True,
-                )
-                uploaded_log = st.file_uploader(
-                    "Upload Exp Log",
-                    type=["md", "txt"],
-                    label_visibility="collapsed",
-                    disabled=st.session_state.locked,
-                    key="log_uploader_main",
-                )
-                if uploaded_log:
-                    st.session_state.log_text_main = uploaded_log.read().decode("utf-8")
-
-        st.subheader("🖼️ Upload Figures")
-        figure_column_1, figure_column_2 = st.columns([1, 2])
-        with figure_column_1:
-            figure_file = st.file_uploader(
-                "Upload figure",
-                type=["png", "jpg", "jpeg", "pdf"],
-                disabled=st.session_state.locked,
-                key=f"figure_uploader_main",
-            )
-        with figure_column_2:
-            figure_caption = st.text_input(
-                "Figure Caption",
-                disabled=st.session_state.locked,
-                key=f"figure_caption_main",
-            )
-
-            button_column, _ = st.columns([1, 2])
-            with button_column:
-                st.markdown(
-                    """
-                <style>
-                    .stButton > button { background-color: #e0e7ff !important; color: #3730a3 !important; border: 1px solid #c7d2fe !important; }
-                </style>
-                """,
-                    unsafe_allow_html=True,
-                )
-                if st.button(
-                    "Add Figure",
-                    disabled=st.session_state.locked
-                    or not figure_file
-                    or not figure_caption,
-                ):
-                    st.session_state.figures.append(
-                        {
-                            "file": figure_file,
-                            "name": figure_file.name,
-                            "caption": figure_caption,
-                        }
-                    )
-                    st.session_state.figure_counter += 1
-                    st.success("🎉 Figure added successfully! Check the Gallery tab.")
-                    time.sleep(3)
-                    st.rerun()
-
-        st.markdown(
-            """
-        <style>
-            .stButton > button[kind="primary"] { background-color: #2563eb !important; color: white !important; font-size: 1.25rem !important; padding: 1rem 2rem !important; border: none !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important; }
-            .stButton > button[kind="primary"]:hover { background-color: #1d4ed8 !important; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05) !important; }
-        </style>
-        """,
-            unsafe_allow_html=True,
-        )
-
-        if st.button(
-            "🚀 Begin Writing", type="primary", disabled=st.session_state.locked
-        ):
-            st.session_state.saved_idea = st.session_state.get("idea_text_main")
-            st.session_state.saved_log = st.session_state.get("log_text_main")
-            st.session_state.locked = True
-            st.session_state.running = True
-            st.session_state.hide_inputs = True
-            st.rerun()
-
-# ========================================================================
-# PHASE 2: PROCESSING & TABS (Only visible after clicking start)
-# ========================================================================
+if st.session_state.hide_inputs and st.session_state.run is not None:
+    render_run()
 else:
-    if st.session_state.get("running") or st.session_state.get("thread_started"):
-        st.info(
-            "🚀 Paper generation in progress! This may take 35-45 minutes. Please do not close this tab."
-        )
-    elif (
-        not st.session_state.get("running")
-        and st.session_state.get("thread_started", False) is False
-    ):
-        if st.session_state.get("current_step") == len(steps):
-            st.success("🎉 Paper writing complete!")
-        elif st.session_state.get("current_step", 0) < len(steps) and any(
-            st.session_state.logs.values()
-        ):
-            st.error("❌ Paper writing failed or stopped unexpectedly. Check logs.")
-
-    tabs_list = [
-        "📊 Progress Timeline",
-        "📥 Inputs",
-        "🖼️ Figures Gallery",
-        "📝 Outline",
-        "🔗 Citation Map",
-        "📈 Refinement Progress",
-    ]
-    tab_timeline, tab_inputs, tab_gallery, tab_outline, tab_citation, tab_refinement = (
-        st.tabs(tabs_list)
-    )
-
-    # 1. Timeline Tab
-    with tab_timeline:
-        st.subheader("Writing Progress")
-        for index, step in enumerate(steps):
-            state_class, icon = (
-                ("finished", "✓")
-                if index < st.session_state.current_step
-                else (
-                    ("active", "⏳")
-                    if index == st.session_state.current_step
-                    and st.session_state.running
-                    else ("", "○")
-                )
-            )
-
-            if step == "Literature Review" and enable_plotting == "Yes":
-                st.markdown(
-                    f'<div class="timeline-item {state_class}"><div class="timeline-icon">{icon}</div><p style="font-weight: bold; margin-bottom: 0.25rem;">Literature Review</p></div>',
-                    unsafe_allow_html=True,
-                )
-                with st.expander(
-                    "View Literature Logs",
-                    expanded=(index == st.session_state.current_step),
-                ):
-                    if st.session_state.logs["Literature Review"]:
-                        st.code(st.session_state.logs["Literature Review"])
-                    else:
-                        st.text("No logs yet.")
-
-                st.markdown(
-                    f'<div class="timeline-item {state_class}"><div class="timeline-icon">{icon}</div><p style="font-weight: bold; margin-bottom: 0.25rem;">Figure Generation</p></div>',
-                    unsafe_allow_html=True,
-                )
-                with st.expander(
-                    "View Figure Logs",
-                    expanded=(index == st.session_state.current_step),
-                ):
-                    if st.session_state.logs["Figure Plotting"]:
-                        st.code(st.session_state.logs["Figure Plotting"])
-                    else:
-                        st.text("No logs yet.")
-            else:
-                st.markdown(
-                    f'<div class="timeline-item {state_class}"><div class="timeline-icon">{icon}</div><p style="font-weight: bold; margin-bottom: 0.25rem;">{step}</p></div>',
-                    unsafe_allow_html=True,
-                )
-                with st.expander(
-                    f"View Logs for {step}",
-                    expanded=(index == st.session_state.current_step),
-                ):
-                    if st.session_state.logs[step]:
-                        st.code(st.session_state.logs[step])
-                    else:
-                        st.text("No logs yet.")
-
-        if not st.session_state.running and st.session_state.get("run_directory"):
-            pdf_path = os.path.join(st.session_state.run_directory, "final_paper.pdf")
-            latex_directory = os.path.join(
-                st.session_state.run_directory, "latex_writeup"
-            )
-
-            if os.path.exists(pdf_path) or os.path.exists(latex_directory):
-                st.markdown("### 📥 Download Results")
-                column_download_1, column_download_2 = st.columns(2)
-
-                if os.path.exists(pdf_path):
-                    with open(pdf_path, "rb") as file_object:
-                        with column_download_1:
-                            st.download_button(
-                                label="📄 Download Final PDF",
-                                data=file_object.read(),
-                                file_name="final_paper.pdf",
-                                mime="application/pdf",
-                                key="download_final_pdf_tab",
-                            )
-
-                if os.path.exists(latex_directory):
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(
-                        zip_buffer, "a", zipfile.ZIP_DEFLATED, False
-                    ) as zip_file:
-                        for root, directories, files in os.walk(latex_directory):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                archive_name = os.path.relpath(
-                                    file_path, latex_directory
-                                )
-                                zip_file.write(file_path, archive_name)
-
-                    with column_download_2:
-                        st.download_button(
-                            label="📦 Download LaTeX Source",
-                            data=zip_buffer.getvalue(),
-                            file_name="latex_source.zip",
-                            mime="application/zip",
-                            key="download_final_latex_tab",
-                        )
-
-    # 2. Inputs Tab
-    with tab_inputs:
-        st.header("📥 User Inputs")
-        st.markdown(
-            "<h3 style='background-color: #ffe6e6; padding: 5px; border-radius: 3px;'>Idea</h3>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            st.session_state.get(
-                "saved_idea", "*(No input provided or process not started)*"
-            )
-        )
-        st.markdown(
-            "<h3 style='background-color: #ffffcc; padding: 5px; border-radius: 3px;'>Experimental Log</h3>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            st.session_state.get(
-                "saved_log", "*(No input provided or process not started)*"
-            )
-        )
-
-    # 3. Gallery Tab
-    with tab_gallery:
-        render_gallery_tab()
-
-    # 4. Outline Tab
-    with tab_outline:
-        render_json_file("outline.json", "Paper Outline", "No outline generated yet.")
-
-    # 5. Citation Map Tab
-    with tab_citation:
-        render_json_file(
-            os.path.join("literature_agent_output", "citation_map.json"),
-            "Citation Map",
-            "No citation map generated yet.",
-        )
-
-    # 6. Refinement Tab
-    with tab_refinement:
-        st.header("Content & Format Refinement Progress")
-        if not st.session_state.get("run_directory"):
-            st.info("No refinement progress available yet.")
-        else:
-            worklog_path = os.path.join(
-                st.session_state.run_directory,
-                "content_refinement_workdir",
-                "content_refinement_worklog.json",
-            )
-
-            st.markdown("### Content Refinement")
-            columns = st.columns(2)
-
-            initial_pdf_path = os.path.join(
-                st.session_state.run_directory,
-                "content_refinement_workdir",
-                "initial_draft.pdf",
-            )
-            if os.path.exists(initial_pdf_path):
-                with columns[0]:
-                    with st.expander("Content Refinement V0 (Initial)"):
-                        st.write("Initial draft compiled.")
-                        render_pdf_and_snapshots(
-                            initial_pdf_path,
-                            os.path.join(
-                                st.session_state.run_directory,
-                                "content_refinement_workdir",
-                                "pdf_screenshots",
-                                "content_refinement",
-                                "v0",
-                            ),
-                            "download_content_0",
-                        )
-
-            if os.path.exists(worklog_path):
-                try:
-                    with open(worklog_path, "r") as file_object:
-                        worklog_data = json.load(file_object)
-
-                    content_versions = list(worklog_data.keys())
-
-                    for index, version_key in enumerate(content_versions):
-                        entry = worklog_data[version_key]
-                        with columns[(index + 1) % 2]:
-                            with st.expander(
-                                f"Content Refinement {version_key.upper()}"
-                            ):
-                                st.write(f"**Outcome:** {entry.get('outcome')}")
-                                st.write(f"**Total Gain:** {entry.get('total_gain')}")
-                                st.write(f"**Total Drop:** {entry.get('total_drop')}")
-
-                                if "scores_before" in entry and "scores_after" in entry:
-                                    st.markdown("**Scores:**")
-                                    for axis in [
-                                        "Overall",
-                                        "Originality",
-                                        "Quality",
-                                        "Clarity",
-                                    ]:
-                                        st.write(
-                                            f"- {axis}: {entry['scores_before'].get(axis, 0)} -> {entry['scores_after'].get(axis, 0)}"
-                                        )
-
-                                render_pdf_and_snapshots(
-                                    os.path.join(
-                                        st.session_state.run_directory,
-                                        "content_refinement_workdir",
-                                        f"refined_paper_{version_key}.pdf",
-                                    ),
-                                    os.path.join(
-                                        st.session_state.run_directory,
-                                        "content_refinement_workdir",
-                                        "pdf_screenshots",
-                                        "content_refinement",
-                                        version_key,
-                                    ),
-                                    f"download_content_{version_key}",
-                                )
-
-                    final_selected_version = next(
-                        (
-                            f"V{entry['round']}"
-                            for entry in worklog_data.values()
-                            if entry.get("outcome")
-                            in [
-                                "ACCEPTED_SCORE_INCREASE",
-                                "ACCEPTED_NEUTRAL_IMPROVEMENT",
-                            ]
-                        ),
-                        "V0 (Initial)",
-                    )
-
-                    format_worklog_path = os.path.join(
-                        st.session_state.run_directory,
-                        "content_refinement_workdir",
-                        "format_refinement_worklog.json",
-                    )
-                    if os.path.exists(format_worklog_path):
-                        st.info(
-                            f"💡 `Content Refinement {final_selected_version}` is selected at the output of the content refinement phase, now move on to formatting refinement..."
-                        )
-
-                        st.markdown("### Format Refinement")
-
-                        format_iterations = []
-                        with open(format_worklog_path, "r") as file_object:
-                            for version_key, entry in json.load(file_object).items():
-                                format_iterations.append(
-                                    {
-                                        "iteration": int(version_key[1:]),
-                                        "feedback": entry.get(
-                                            "formatting_feedback", {}
-                                        ),
-                                        "pdf_path": os.path.join(
-                                            st.session_state.run_directory,
-                                            "content_refinement_workdir",
-                                            f"formatted_candidate_{version_key}.pdf",
-                                        ),
-                                        "screenshots_directory": os.path.join(
-                                            st.session_state.run_directory,
-                                            "content_refinement_workdir",
-                                            "pdf_screenshots",
-                                            "format_refinement",
-                                            version_key,
-                                        ),
-                                    }
-                                )
-
-                        format_columns = st.columns(2)
-
-                        with format_columns[0]:
-                            with st.expander("Format Refinement V0 (Initial)"):
-                                st.write("Input from content refinement phase.")
-                                source_pdf_name = (
-                                    "initial_draft.pdf"
-                                    if final_selected_version == "V0 (Initial)"
-                                    else f"refined_paper_v{final_selected_version[1:]}.pdf"
-                                )
-                                pdf_path = os.path.join(
-                                    st.session_state.run_directory,
-                                    "content_refinement_workdir",
-                                    source_pdf_name,
-                                )
-
-                                if os.path.exists(pdf_path):
-                                    with open(pdf_path, "rb") as file_object:
-                                        st.download_button(
-                                            label="📥 Download PDF",
-                                            data=file_object.read(),
-                                            file_name=source_pdf_name,
-                                            mime="application/pdf",
-                                            key="download_format_0",
-                                        )
-
-                        for index, entry in enumerate(format_iterations):
-                            with format_columns[(index + 1) % 2]:
-                                with st.expander(
-                                    f"Format Refinement V{entry['iteration']}"
-                                ):
-                                    if "figure_and_tables" in entry["feedback"]:
-                                        st.markdown("**Figure & Table Issues:**")
-                                        st.json(entry["feedback"]["figure_and_tables"])
-                                    render_pdf_and_snapshots(
-                                        entry["pdf_path"],
-                                        entry["screenshots_directory"],
-                                        f"download_format_{entry['iteration']}",
-                                    )
-
-                        if os.path.exists(
-                            os.path.join(
-                                st.session_state.run_directory,
-                                "content_refinement_workdir",
-                                "final_refined_paper.pdf",
-                            )
-                        ):
-                            if format_iterations:
-                                max_iter = max(
-                                    entry["iteration"] for entry in format_iterations
-                                )
-                                st.info(
-                                    f"💡 `Format Refinement V{max_iter}` is selected as the final output of this pipeline."
-                                )
-                            else:
-                                st.info(
-                                    "💡 `final_refined_paper.pdf` is selected as the final output of this pipeline."
-                                )
-                        else:
-                            st.info(
-                                "💡 Refinement pipeline ended without producing a final separated PDF."
-                            )
-
-                except Exception as exception_object:
-                    st.error(f"Error processing refinement data: {exception_object}")
-            elif not st.session_state.running and not os.path.exists(initial_pdf_path):
-                st.info("No refinement progress available yet.")
-
-    handle_live_execution(
-        steps, email_input, selected_template, selected_model, enable_plotting
-    )
+    render_inputs(sidebar_choices)

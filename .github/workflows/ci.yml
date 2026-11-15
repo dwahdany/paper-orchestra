@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      # Every uv command below uses the interpreter of this matrix job. Without it, `uv run`
+      # takes the version in .python-version and rebuilds the environment on that one.
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --all-extras
+      # The later steps use the environment installed above as it is (--no-sync): when a
+      # plain `uv run` rebuilds the environment, it does so without the extras. This step
+      # fails if the environment is not the matrix interpreter with every extra.
+      - name: Check the environment
+        run: >-
+          uv run --no-sync python -c
+          "import sys, modal, openai, streamlit, google.genai;
+          assert '%d.%d' % sys.version_info[:2] == '${{ matrix.python-version }}', sys.version"
+      - name: Lint
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+      # The tests that compile real documents (the end-to-end run of the whole pipeline is
+      # one of them) are skipped without TeX Live, so CI would pass without exercising it.
+      - name: Install TeX Live
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-base texlive-latex-recommended texlive-latex-extra \
+            texlive-fonts-recommended texlive-fonts-extra texlive-science \
+            texlive-bibtex-extra texlive-publishers texlive-plain-generic lmodern cm-super
+      # Tests are offline. With this variable set, a missing TeX install fails the run
+      # instead of skipping those tests.
+      - name: Test
+        env:
+          PAPER_ORCHESTRA_REQUIRE_TEX: "1"
+        run: uv run --no-sync pytest
