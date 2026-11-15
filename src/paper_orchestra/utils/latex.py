@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 GRAPHICS_EXTENSIONS = (".pdf", ".png", ".jpg", ".jpeg")
@@ -28,7 +29,9 @@ _UNDEFINED_CITE = re.compile(r"Citation [`']([^']+)' (?:on page \d+ )?undefined"
 _UNDEFINED_REF = re.compile(r"Reference [`']([^']+)' on page \d+ undefined")
 _MISSING_FILE = re.compile(r"File [`']([^']+)' not found")
 _OVERFULL = re.compile(r"Overfull \\hbox \(([\d.]+)pt too wide\)")
-_FILE_LINE_ERROR = re.compile(r"^(?:\./)?[^\s:]+\.(?:tex|sty|cls|bib|bst):\d+: ")
+_FILE_LINE_ERROR = re.compile(r"^(?:\./)?[^\s:]+\.(?:tex|sty|cls|bib|bst|bbl):\d+: ")
+#: pdflatex hard-wraps its log at this many characters.
+_LOG_WRAP = 79
 
 #: Placeholder bodies shipped in the bundled templates.  If one survives into a
 #: draft, the corresponding section was never written.
@@ -150,6 +153,39 @@ def static_check(
     return problems
 
 
+def _unwrap(log_text: str) -> list[str]:
+    """Split a pdflatex log into logical lines, undoing its hard wrap at 79 columns."""
+    lines: list[str] = []
+    carry = ""
+    for raw in log_text.splitlines():
+        line = carry + raw
+        # A line of exactly the wrap width continues on the next one.
+        if len(raw) == _LOG_WRAP and not raw.startswith("$ "):
+            carry = line
+            continue
+        carry = ""
+        lines.append(line)
+    if carry:
+        lines.append(carry)
+    return lines
+
+
+def summarize_build(outputs: Sequence[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """``(errors, warnings)`` for a whole build, given ``(program, output)`` per step.
+
+    Errors are collected from every step.  Warnings come from the last pdflatex
+    pass only: citations and references are always "undefined" on the first
+    pass, and only what is still unresolved at the end is a real problem.
+    """
+    errors: list[str] = []
+    for _, text in outputs:
+        for error in parse_latex_log(text)[0]:
+            if error not in errors:
+                errors.append(error)
+    final = next((text for program, text in reversed(outputs) if program == "pdflatex"), "")
+    return errors, parse_latex_log(final)[1]
+
+
 def parse_latex_log(
     log_text: str, *, overfull_threshold_pt: float = 25.0
 ) -> tuple[list[str], list[str]]:
@@ -176,9 +212,8 @@ def parse_latex_log(
             seen_warnings.add(message)
             warnings.append(message)
 
-    # pdflatex wraps log lines at 79 columns; re-join for pattern matching.
-    joined = re.sub(r"(?<=.{79})\n(?=\S)", "", log_text)
-    lines = joined.splitlines()
+    lines = _unwrap(log_text)
+    joined = "\n".join(lines)
     for index, line in enumerate(lines):
         is_bang = line.startswith("! ")
         if is_bang or _FILE_LINE_ERROR.match(line):
@@ -189,11 +224,12 @@ def parse_latex_log(
                     context = follow
                     break
             add_error(f"{message} [{context}]" if context else message)
-        elif (
-            line.startswith("I couldn't open")
-            or "I found no" in line
-            or ("---line " in line and " of file " in line)
-        ):
+        elif line.startswith("I found no "):
+            # BibTeX saying the document has no citations, bibliography or style.  A paper
+            # that cites nothing is legitimate, and when citations were expected the
+            # undefined-citation warnings of the final pass report it.
+            continue
+        elif line.startswith("I couldn't open") or ("---line " in line and " of file " in line):
             add_error(f"bibtex: {line}")
 
     for key in _UNDEFINED_CITE.findall(joined):

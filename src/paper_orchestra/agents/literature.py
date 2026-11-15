@@ -552,7 +552,8 @@ def escape_bibtex(text: str) -> str:
         if char in _BIBTEX_SPECIALS:
             out.append(_BIBTEX_SPECIALS[char])
         elif char.isascii():
-            out.append(char)
+            if char.isprintable() or char.isspace():  # TeX rejects control characters
+                out.append(char)
         else:
             out.append(_latex_for(char))
     return " ".join("".join(out).split())
@@ -627,8 +628,19 @@ def generate_citation_map(papers: Sequence[PaperData]) -> dict[str, dict[str, An
 # ---------------------------------------------------------------------------
 
 
+def _strip_controls(text: str) -> str:
+    """``text`` without control, format and unpaired surrogate characters (white space stays).
+
+    Scraped metadata carries them now and then (a NUL, a soft hyphen inside a word, half
+    of an emoji).  TeX rejects the first as an invalid character and the last cannot be
+    written to a UTF-8 file at all.
+    """
+    return "".join(c for c in text if c.isspace() or unicodedata.category(c)[0] != "C")
+
+
 def _clean(value: Any) -> str | None:
-    text = " ".join(str(value).split()) if value is not None else ""
+    """``value`` as one line of text, or ``None`` when nothing is left of it."""
+    text = " ".join(_strip_controls(str(value)).split()) if value is not None else ""
     return text or None
 
 
@@ -640,20 +652,29 @@ def _clip_abstract(abstract: str) -> str:
 
 
 def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    """The bibliographic fields of a Semantic Scholar result that the pipeline uses."""
+    """The bibliographic fields of a Semantic Scholar result that the pipeline uses.
+
+    Total on purpose: the input is a service's answer or a cache page, and a field of an
+    unexpected type becomes "unknown" instead of an exception that would fail the stage.
+    """
     journal = record.get("journal") if isinstance(record.get("journal"), Mapping) else {}
-    year = record.get("year")
+    authors = record.get("authors") if isinstance(record.get("authors"), list) else []
+    year, abstract, citations = (record.get(k) for k in ("year", "abstract", "citationCount"))
     return {
         "title": _clean(record.get("title")) or "",
         "authors": [
             {"name": name}
-            for author in record.get("authors") or []
+            for author in authors
             if isinstance(author, Mapping) and (name := _clean(author.get("name")))
         ],
         "venue": _clean(record.get("venue")),
         "year": year if isinstance(year, int) and not isinstance(year, bool) else None,
-        "abstract": _clip_abstract((record.get("abstract") or "").strip()),
-        "citationCount": record.get("citationCount") or 0,
+        "abstract": (
+            _clip_abstract(_strip_controls(abstract).strip()) if isinstance(abstract, str) else ""
+        ),
+        "citationCount": (
+            citations if isinstance(citations, int) and not isinstance(citations, bool) else 0
+        ),
         "journal": {
             "name": _clean(journal.get("name")),
             "volume": _clean(journal.get("volume")),

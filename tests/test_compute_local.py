@@ -12,6 +12,7 @@ from paper_orchestra.utils.latex import (
     latex_commands,
     parse_latex_log,
     static_check,
+    summarize_build,
 )
 
 
@@ -97,9 +98,61 @@ def test_compile_reports_errors_with_line_context(backend, tmp_path):
     result = backend.compile_latex(tmp_path, "bad")
     assert result.ok  # nonstopmode still yields a PDF
     assert any("Undefined control sequence" in e and "l.3" in e for e in result.errors)
+    assert len(result.errors) == 1  # the same error from three passes is reported once
     assert "undefined citation 'Missing2024'" in result.warnings
     assert "undefined reference 'sec:none'" in result.warnings
     assert "Undefined control sequence" in result.feedback()
+
+
+@pytest.mark.latex
+def test_resolved_citations_and_references_are_not_reported(backend, tmp_path):
+    """First-pass 'undefined' warnings disappear once bibtex and the later passes resolve them."""
+    (tmp_path / "references.bib").write_text(
+        "@article{Known2020,\n title={A title},\n author={Doe, Jane},\n journal={J},\n year={2020}\n}\n"
+    )
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\n\\begin{document}\n\\section{Intro}\\label{sec:intro}\n"
+        "See \\cite{Known2020} and Section~\\ref{sec:intro}.\n"
+        "\\bibliographystyle{plain}\n\\bibliography{references}\n\\end{document}\n"
+    )
+    result = backend.compile_latex(tmp_path, "paper")
+    assert result.ok and result.errors == [] and result.warnings == []
+
+
+@pytest.mark.latex
+def test_paper_without_citations_builds_clean(backend, tmp_path):
+    (tmp_path / "references.bib").write_text("")
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\n\\begin{document}\nNo citations here.\n"
+        "\\bibliographystyle{plain}\n\\bibliography{references}\n\\end{document}\n"
+    )
+    result = backend.compile_latex(tmp_path, "paper")
+    assert result.ok and result.errors == []
+
+
+@pytest.mark.latex
+def test_tex_cannot_read_outside_its_directory_or_see_credentials(backend, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-value")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "paper.tex").write_text(
+        "\\documentclass{article}\n\\begin{document}\n"
+        f"\\input{{{secret}}}\n\\input{{../secret.txt}}\n\\input{{/proc/self/environ}}\n"
+        "\\end{document}\n"
+    )
+    result = backend.compile_latex(work, "paper")
+    log = (work / "paper.log").read_text(errors="replace")
+    assert "TOPSECRET" not in log and "sk-secret-value" not in log
+    if result.pdf_path:
+        from paper_orchestra.utils.pdf import PdfError, load_paper
+
+        try:
+            text = load_paper(result.pdf_path, min_size=0)
+        except PdfError:
+            text = ""
+        assert "TOPSECRET" not in text and "sk-secret-value" not in text
 
 
 @pytest.mark.latex
@@ -144,6 +197,69 @@ def test_static_check_catches_common_model_mistakes(tmp_path):
 def test_static_check_clean_document():
     tex = "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
     assert static_check(tex) == []
+
+
+def test_run_python_keeps_only_the_tail_of_huge_output(backend):
+    result = backend.run_python("import sys\nfor i in range(400000):\n    print('line', i)\n")
+    assert result.ok and len(result.stdout) <= 200_000
+    assert result.stdout.rstrip().endswith("line 399999")
+
+
+def test_interrupt_kills_the_child_process_group(tmp_path, monkeypatch):
+    import subprocess
+
+    from paper_orchestra.compute import local
+
+    killed: list[int] = []
+    real_wait = subprocess.Popen.wait
+    state = {"first": True}
+
+    def interrupted_wait(self, timeout=None):
+        if state["first"]:
+            state["first"] = False
+            raise KeyboardInterrupt
+        return real_wait(self, timeout)
+
+    real_kill = local._kill_group
+    monkeypatch.setattr(subprocess.Popen, "wait", interrupted_wait)
+    monkeypatch.setattr(local, "_kill_group", lambda p: (killed.append(p.pid), real_kill(p)))
+    with pytest.raises(KeyboardInterrupt):
+        local._run(
+            [local.sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=tmp_path,
+            env=local.scrubbed_env(tmp_path),
+            timeout=120,
+        )
+    assert len(killed) == 1
+
+
+def test_bibtex_notice_and_bbl_errors():
+    errors, _ = parse_latex_log("I found no \\citation commands---while reading file paper.aux\n")
+    assert errors == []
+    errors, _ = parse_latex_log(
+        "./paper.bbl:12: Misplaced alignment tab character &.\nl.12 Smith & Jones\n"
+    )
+    assert errors == ["./paper.bbl:12: Misplaced alignment tab character &. [l.12 Smith & Jones]"]
+
+
+def test_summarize_build_takes_warnings_from_the_last_pass_only():
+    first = "LaTeX Warning: Citation `A' on page 1 undefined on input line 3.\n! Undefined control sequence.\nl.4 \\foo\n"
+    last = "LaTeX Warning: Reference `sec:x' on page 1 undefined on input line 9.\n! Undefined control sequence.\nl.4 \\foo\n"
+    errors, warnings = summarize_build(
+        [("pdflatex", first), ("bibtex", "I couldn't open file name `x.aux'\n"), ("pdflatex", last)]
+    )
+    assert errors == [
+        "Undefined control sequence. [l.4 \\foo]",
+        "bibtex: I couldn't open file name `x.aux'",
+    ]
+    assert warnings == ["undefined reference 'sec:x'"]
+
+
+def test_long_command_header_is_not_glued_to_the_log():
+    header = "$ pdflatex -interaction=nonstopmode -no-shell-escape -file-line-error paper.tex"
+    assert len(header) == 79
+    errors, _ = parse_latex_log(header + "\n! Undefined control sequence.\nl.1 \\x\n")
+    assert errors == ["Undefined control sequence. [l.1 \\x]"]
 
 
 def test_parse_latex_log_dedupes_and_flags_overfull():

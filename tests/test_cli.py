@@ -848,6 +848,12 @@ def test_modal_batch_submits_the_batch_to_the_deployed_app(tmp_path, template, m
     assert "App 'paper-orchestra' not found." in result.stderr
     assert "paper-orchestra modal deploy" in " ".join(result.stderr.split())
 
+    # Any other Modal failure is one line, not a traceback.
+    outcome = modal.exception.FunctionTimeoutError("write_batch ran out of time")
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == 1
+    assert "Modal reported FunctionTimeoutError: write_batch ran out of time" in result.stderr
+
 
 def test_the_modal_run_help_names_options_the_modal_entrypoint_has():
     pytest.importorskip("modal")

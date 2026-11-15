@@ -408,10 +408,12 @@ def test_unusable_bodies_are_errors_and_odd_shapes_are_tolerated():
         FakeResponse(payload={"total": 0}),
         FakeResponse(payload={"data": None}),
         FakeResponse(payload=["unexpected"]),
+        FakeResponse(payload={"data": 5}),
+        FakeResponse(payload={"data": {"title": "not a list"}}),
         FakeResponse(payload={"data": ["junk", paper("Kept")]}),
     )
     client, _ = make_client(odd, min_interval=0.0)
-    assert [client.search("x") for _ in range(3)] == [[], [], []]
+    assert [client.search("x") for _ in range(5)] == [[], [], [], [], []]
     assert [p["title"] for p in client.search("x")] == ["Kept"]
 
 

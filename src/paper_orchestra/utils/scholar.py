@@ -362,7 +362,7 @@ class SemanticScholar:
         except ValueError as exc:
             raise SemanticScholarError("Semantic Scholar returned a body that is not JSON") from exc
         data = payload.get("data") if isinstance(payload, dict) else None
-        return [item for item in data or [] if isinstance(item, dict)]
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
     def find_paper(
         self,

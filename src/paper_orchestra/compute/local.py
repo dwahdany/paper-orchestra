@@ -1,10 +1,12 @@
 """Run jobs as subprocesses on this machine.
 
-This backend needs TeX Live on ``PATH`` for LaTeX and gives model-written
-Python a scrubbed environment, a throw-away working directory, resource limits
-and a timeout.  That keeps credentials out of the child's environment and
-contains accidents, but it is **not** a security sandbox: the code still runs
-as your user with network access.  Use the Modal backend for isolation.
+This backend needs TeX Live on ``PATH`` for LaTeX.  Both kinds of job get a
+minimal environment without credentials, their own process group, a timeout,
+and bounded output capture; model-written Python additionally runs in a
+throw-away working directory under resource limits, and TeX may only read and
+write inside its working directory.  That contains accidents, but it is
+**not** a security sandbox: the code still runs as your user with network
+access.  Use the Modal backend for isolation.
 """
 
 from __future__ import annotations
@@ -16,16 +18,19 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
-from paper_orchestra.utils.latex import latex_commands, parse_latex_log
+from paper_orchestra.utils.latex import latex_commands, summarize_build
 
 _PASSTHROUGH_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TZ")
-_TEX_ENV_TO_DROP = ("TEXINPUTS", "TEXMFHOME", "TEXMF", "TEXMFVAR", "TEXMFCONFIG", "BIBINPUTS")
+#: Characters of stdout/stderr kept per stream.  Only the tail is kept, so a job
+#: that prints in a loop cannot exhaust the orchestrator's memory.
 _MAX_CAPTURE = 200_000
 
 
@@ -41,6 +46,17 @@ def scrubbed_env(home: Path) -> dict[str, str]:
         PYTHONDONTWRITEBYTECODE="1",
         PYTHONIOENCODING="utf-8",
     )
+    return env
+
+
+def latex_env() -> dict[str, str]:
+    """Environment for TeX: no credentials, no inherited TeX search paths, and
+    file access restricted to the working directory tree (``openin_any`` /
+    ``openout_any`` = paranoid), so a document cannot ``\\input`` files such as
+    ``/proc/self/environ`` or anything given by absolute or parent path."""
+    env = {key: os.environ[key] for key in (*_PASSTHROUGH_ENV, "HOME") if key in os.environ}
+    env.setdefault("PATH", os.defpath)
+    env.update(openout_any="p", openin_any="p")
     return env
 
 
@@ -66,6 +82,36 @@ def _limit_resources(cpu_seconds: int, memory_bytes: int | None):  # pragma: no 
     return apply
 
 
+class _Tail:
+    """Keeps the last ``limit`` bytes written to it."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._chunks: deque[bytes] = deque()
+        self._size = 0
+
+    def pump(self, stream: IO[bytes]) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            for chunk in iter(lambda: stream.read(65536), b""):
+                self._chunks.append(chunk)
+                self._size += len(chunk)
+                while self._size - len(self._chunks[0]) >= self._limit:
+                    self._size -= len(self._chunks.popleft())
+
+    def text(self) -> str:
+        data = b"".join(self._chunks)[-self._limit :]
+        return data.decode("utf-8", errors="replace")
+
+
+def _kill_group(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "posix":
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+    else:  # pragma: no cover - non-posix
+        with contextlib.suppress(OSError):
+            process.kill()
+
+
 def _run(
     command: Sequence[str],
     *,
@@ -74,7 +120,11 @@ def _run(
     timeout: float,
     preexec: Any = None,
 ) -> tuple[int, str, str, bool]:
-    """Run ``command`` in its own process group; kill the group on timeout."""
+    """Run ``command`` in its own process group and return its bounded output.
+
+    The whole group is killed on timeout and also when this call is interrupted
+    (for example by Ctrl-C), so no compile or script outlives the pipeline.
+    """
     posix = os.name == "posix"
     process = subprocess.Popen(
         list(command),
@@ -86,23 +136,29 @@ def _run(
         start_new_session=posix,
         preexec_fn=preexec if posix else None,
     )
+    out, err = _Tail(_MAX_CAPTURE), _Tail(_MAX_CAPTURE)
+    readers = [
+        threading.Thread(target=out.pump, args=(process.stdout,), daemon=True),
+        threading.Thread(target=err.pump, args=(process.stderr,), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
     timed_out = False
     try:
-        out, err = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        if posix:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(process.pid, signal.SIGKILL)
-        else:  # pragma: no cover - non-posix
-            process.kill()
-        out, err = process.communicate()
-
-    def decode(data: bytes) -> str:
-        text = data.decode("utf-8", errors="replace")
-        return text if len(text) <= _MAX_CAPTURE else text[-_MAX_CAPTURE:]
-
-    return process.returncode, decode(out), decode(err), timed_out
+        _kill_group(process)
+        process.wait()
+    except BaseException:
+        _kill_group(process)
+        process.wait()
+        raise
+    finally:
+        # A grandchild that escaped the group could keep a pipe open; do not wait forever.
+        for reader in readers:
+            reader.join(timeout=5)
+    return process.returncode, out.text(), err.text(), timed_out
 
 
 class LocalBackend(ComputeBackend):
@@ -122,20 +178,22 @@ class LocalBackend(ComputeBackend):
         outputs: Sequence[str] = (),
         timeout: float = 120.0,
     ) -> ExecResult:
-        with tempfile.TemporaryDirectory(prefix="paper-orchestra-exec-") as tmp:
-            workdir = Path(tmp)
-            for name, data in (inputs or {}).items():
-                target = workdir / safe_relative(name)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-            script = workdir / "_script.py"
-            script.write_text(code, encoding="utf-8")
+        input_paths = {name: safe_relative(name) for name in (inputs or {})}
+        output_paths = {name: safe_relative(name) for name in outputs}
+        try:
+            with tempfile.TemporaryDirectory(prefix="paper-orchestra-exec-") as tmp:
+                workdir = Path(tmp)
+                for name, relative in input_paths.items():
+                    target = workdir / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes((inputs or {})[name])
+                script = workdir / "_script.py"
+                script.write_text(code, encoding="utf-8")
 
-            preexec = None
-            if os.name == "posix":
-                memory = self.memory_limit_mb * 1024 * 1024 if self.memory_limit_mb else None
-                preexec = _limit_resources(int(timeout) + 5, memory)
-            try:
+                preexec = None
+                if os.name == "posix":
+                    memory = self.memory_limit_mb * 1024 * 1024 if self.memory_limit_mb else None
+                    preexec = _limit_resources(int(timeout) + 5, memory)
                 # -I: isolated mode, so PYTHON* variables and the user site are ignored.
                 returncode, out, err, timed_out = _run(
                     [self.python, "-I", "-B", script.name],
@@ -144,17 +202,16 @@ class LocalBackend(ComputeBackend):
                     timeout=timeout,
                     preexec=preexec,
                 )
-            except OSError as exc:
-                raise ComputeError(f"could not start python: {exc}") from exc
-
-            files: dict[str, bytes] = {}
-            for name in outputs:
-                produced = workdir / safe_relative(name)
-                if produced.is_file():
-                    files[name] = produced.read_bytes()
-            return ExecResult(
-                returncode=returncode, stdout=out, stderr=err, timed_out=timed_out, files=files
-            )
+                files = {
+                    name: (workdir / relative).read_bytes()
+                    for name, relative in output_paths.items()
+                    if (workdir / relative).is_file()
+                }
+        except OSError as exc:
+            raise ComputeError(f"could not run the script locally: {exc}") from exc
+        return ExecResult(
+            returncode=returncode, stdout=out, stderr=err, timed_out=timed_out, files=files
+        )
 
     # -- latex -----------------------------------------------------------------
 
@@ -181,12 +238,11 @@ class LocalBackend(ComputeBackend):
 
         produced = work / f"{tex_name}.pdf"
         produced.unlink(missing_ok=True)
-        env = {k: v for k, v in os.environ.items() if k not in _TEX_ENV_TO_DROP}
-        # Paranoid output: TeX may only write inside the working directory.
-        env["openout_any"] = "p"
+        env = latex_env()
 
         deadline = time.monotonic() + timeout
-        chunks: list[str] = []
+        steps: list[tuple[str, str]] = []
+        transcript: list[str] = []
         timed_out = False
         for command in latex_commands(tex_name):
             remaining = deadline - time.monotonic()
@@ -197,13 +253,13 @@ class LocalBackend(ComputeBackend):
                 _, out, err, step_timed_out = _run(command, cwd=work, env=env, timeout=remaining)
             except OSError as exc:
                 raise ComputeError(f"could not run {command[0]}: {exc}") from exc
-            chunks.append(f"$ {' '.join(command)}\n{out}{err}")
+            steps.append((command[0], out + err))
+            transcript.append(f"$ {' '.join(command)}\n\n{out}{err}")
             if step_timed_out:
                 timed_out = True
                 break
 
-        output = "\n".join(chunks)
-        errors, warnings = parse_latex_log(output)
+        errors, warnings = summarize_build(steps)
         ok = produced.is_file() and not timed_out
         pdf_path: Path | None = None
         if ok:
@@ -216,7 +272,7 @@ class LocalBackend(ComputeBackend):
             pdf_path=pdf_path,
             errors=errors,
             warnings=warnings,
-            log_tail=output[-6000:],
+            log_tail="\n".join(transcript)[-6000:],
             timed_out=timed_out,
         )
 
@@ -226,5 +282,5 @@ class LocalBackend(ComputeBackend):
             "python": self.python,
             "pdflatex": shutil.which("pdflatex"),
             "bibtex": shutil.which("bibtex"),
-            "isolation": "none (subprocess with scrubbed environment)",
+            "isolation": "none (subprocess with a minimal environment)",
         }

@@ -546,7 +546,9 @@ def test_escape_bibtex_escapes_specials_hidden_in_compatibility_characters():
     assert escape_bibtex("Ａ＆Ｂ ５０％ ｛ｘ｝ ＿ ＃") == (
         r"A\&B 50\% \textbraceleft{}x\textbraceright{} \_ \#"
     )
-    blocks = (range(0x20, 0x3100), range(0xFB00, 0xFB50), range(0xFE50, 0xFF70))
+    # TeX stops at a control character ("Text line contains an invalid character").
+    assert escape_bibtex("a\x00b\x01 c\x7f d\x1fe") == "ab c d e"
+    blocks = (range(0x00, 0x3100), range(0xFB00, 0xFB50), range(0xFE50, 0xFF70))
     for code in (code for block in blocks for code in block):
         escaped = escape_bibtex(chr(code))
         # What is left once the macros are taken out has to be inert text (a bare ~ is a
@@ -962,6 +964,66 @@ def test_a_missing_input_fails_before_any_call(tmp_path, missing):
     with pytest.raises(FileNotFoundError, match=getattr(ctx.paths, missing).name):
         LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
     assert client.requests == []
+
+
+def test_control_characters_and_broken_unicode_in_metadata_are_dropped(tmp_path):
+    library = [
+        s2_paper(
+            "Trans\u00adformers \x00Are\x01 Great\ud83d",  # soft hyphen, NUL, half an emoji
+            ["Ann\u200b Author\x07"],
+            2020,
+            "2020-01-01",
+            abstract="Line\x00 one\ud83d.\nLine two.",
+        )
+    ]
+    script = Script(
+        {
+            "widget surveys": [{"title": "Transformers Are Great", "year": 2020, "reason": ""}],
+            "widget drift failure": [],
+            ADAM_HINT: [],
+        }
+    )
+    result, ctx, _, _ = run_agent(tmp_path, script, session=FakeS2Session(library))
+
+    ((key, entry),) = result.citation_map.items()
+    assert key == "Author2020TransformersGreat"
+    assert entry["title"] == "Transformers Are Great"
+    assert entry["authors"] == ["Ann Author"]
+    assert entry["abstract"] == "Line one.\nLine two."
+    assert "title={{Transformers Are Great}}" in result.bibtex
+    assert "author={Ann Author}" in result.bibtex
+    # An unpaired surrogate cannot be encoded: every output file and page was still written.
+    assert json.loads(ctx.paths.citation_map.read_text(encoding="utf-8")) == result.citation_map
+    page = ctx.harness.project.read(f"wiki/literature/{key}.md")
+    assert "> Line one.\n> Line two.\n" in page.body
+
+
+def test_semantic_scholar_fields_of_an_unexpected_type_count_as_unknown(tmp_path):
+    odd = s2_paper("Odd Shape Paper", ["A B"], 2020, "2020-01-01") | {
+        "authors": 7,
+        "citationCount": "many",
+        "venue": None,
+        "journal": "J",
+    }
+    textless = s2_paper("Second Odd Paper", ["A B"], 2020, "2020-01-01") | {"abstract": ["x"]}
+    script = Script(
+        {
+            "widget surveys": [
+                {"title": "Odd Shape Paper", "year": 2020, "reason": ""},
+                {"title": "Second Odd Paper", "year": 2020, "reason": ""},
+            ],
+            "widget drift failure": [],
+            ADAM_HINT: [],
+        }
+    )
+    result, ctx, _, _ = run_agent(tmp_path, script, session=FakeS2Session([odd, textless]))
+
+    ((key, entry),) = result.citation_map.items()
+    assert (entry["title"], entry["authors"], entry["venue"]) == ("Odd Shape Paper", [], "arXiv")
+    assert "author={Unknown}" in result.bibtex
+    assert ctx.harness.project.read(f"wiki/literature/{key}.md").meta["citation_count"] == 0
+    (event,) = [e for e in ctx.harness.transcripts.events() if e["type"] == "literature"]
+    assert (event["verified"], event["no_abstract"]) == (1, 1)
 
 
 # -- citation key collisions -------------------------------------------------

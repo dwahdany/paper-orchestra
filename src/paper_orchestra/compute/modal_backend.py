@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from paper_orchestra.compute.base import CompileResult, ComputeBackend, ComputeError, ExecResult
 from paper_orchestra.compute.local import LocalBackend, safe_relative
-from paper_orchestra.utils.latex import latex_commands, parse_latex_log
+from paper_orchestra.utils.latex import latex_commands, summarize_build
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -385,6 +385,7 @@ class ModalBackend(ComputeBackend):
                 self._upload_tree(sandbox, work, job_dir)
                 deadline = time.monotonic() + limit
                 chunks: list[str] = []
+                steps: list[tuple[str, str]] = []
                 timed_out = False
                 for command in latex_commands(tex_name):
                     remaining = deadline - time.monotonic()
@@ -403,7 +404,8 @@ class ModalBackend(ComputeBackend):
                             f"could not run {command[0]} in the Modal sandbox: "
                             f"{done.stderr.strip() or 'command not found'}"
                         )
-                    chunks.append(f"$ {' '.join(command)}\n{done.stdout}{done.stderr}")
+                    steps.append((command[0], done.stdout + done.stderr))
+                    chunks.append(f"$ {' '.join(command)}\n\n{done.stdout}{done.stderr}")
                     if done.timed_out:
                         timed_out = True
                         break
@@ -419,7 +421,9 @@ class ModalBackend(ComputeBackend):
             finally:
                 self._remove(sandbox, job_dir)
             output = "\n".join(chunks)
-            errors, warnings = parse_latex_log(output)
+            # Same rule as the local backend: errors from every step, warnings from the
+            # final pdflatex pass only.
+            errors, warnings = summarize_build(steps)
             return CompileResult(
                 ok=pdf_path is not None,
                 pdf_path=pdf_path,

@@ -823,6 +823,8 @@ def modal_batch(
         _fail(f"{exc} Deploy the app first with `paper-orchestra modal deploy`.")
     except modal.exception.AuthError as exc:
         _fail(f"Modal is not set up on this machine ({exc}). Run `modal setup` first.")
+    except modal.exception.Error as exc:
+        _fail(f"Modal reported {type(exc).__name__}: {exc}", code=1)
     _report_batch(papers, log_path)
 
 

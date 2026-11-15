@@ -235,3 +235,17 @@ def test_open_existing_memory_without_creating_anything(tmp_path):
     real = Wiki(tmp_path / "real")
     real.write("wiki/a/x.md", "body", {"summary": "s"})
     assert [i.path for i in Wiki(tmp_path / "real", create=False).list()] == ["wiki/a/x.md"]
+
+
+def test_unreadable_and_symlinked_pages_are_skipped_not_fatal(tmp_path):
+    wiki = Wiki(tmp_path / "memory")
+    wiki.write("wiki/a/good.md", "fine", {"summary": "good"})
+    (wiki.root / "wiki" / "a" / "binary.md").write_bytes(b"\xff\xfe\x00 not utf-8 \x80")
+    outside = tmp_path / "outside.md"
+    outside.write_text("---\nsummary: SECRET SUMMARY\n---\nsecret body")
+    (wiki.root / "wiki" / "a" / "link.md").symlink_to(outside)
+
+    assert [info.path for info in wiki.list()] == ["wiki/a/good.md"]
+    assert "SECRET" not in wiki.rebuild_index()
+    assert wiki.search("secret") == [] and wiki.grep("secret") == []
+    assert wiki.lint().ok

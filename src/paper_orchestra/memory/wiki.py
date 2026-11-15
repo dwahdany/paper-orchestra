@@ -25,6 +25,7 @@ Pages are Markdown with a small ``key: value`` front matter block and
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -36,6 +37,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 INDEX_FILE = "MEMORY.md"
 WIKI_DIR = "wiki"
@@ -429,6 +432,7 @@ class Wiki:
 
     def _iter_paths(self, prefix: str = "") -> Iterable[str]:
         prefix = prefix.strip("/")
+        root = self.root.resolve()
         tops = (WIKI_DIR, NOTES_DIR) if not prefix else (prefix.split("/")[0],)
         for top in tops:
             base = self.root / top
@@ -440,8 +444,17 @@ class Wiki:
                     continue
                 if prefix and not (rel == prefix or rel.startswith(prefix + "/")):
                     continue
-                if path.is_file():
-                    yield rel
+                # A symlink could point outside the memory root; never read through one.
+                if path.is_symlink() or not path.resolve().is_relative_to(root):
+                    continue
+                try:
+                    self._load(rel)
+                except (OSError, UnicodeDecodeError) as exc:
+                    # Deleted since the scan, or not text: skip it rather than fail every
+                    # listing, search and index rebuild.
+                    log.warning("skipping unreadable memory page %s: %s", rel, exc)
+                    continue
+                yield rel
 
     def list(self, prefix: str = WIKI_DIR) -> list[PageInfo]:
         """Pages under ``prefix`` (default: the wiki layer), sorted by path."""

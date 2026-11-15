@@ -722,7 +722,7 @@ def test_compile_latex_uploads_the_workspace_and_fetches_the_outputs(
     assert result.errors == ["./main.tex:3: Undefined control sequence. [l.3 \\foo]"]
     assert result.warnings == ["undefined citation 'Missing2024'"]
     assert result.log_tail.startswith("$ pdflatex -interaction=nonstopmode -no-shell-escape")
-    assert "$ bibtex main\nThis is BibTeX" in result.log_tail and "caf\ufffd" in result.log_tail
+    assert "$ bibtex main\n\nThis is BibTeX" in result.log_tail and "caf\ufffd" in result.log_tail
 
     assert [command for command, _, _ in seen] == latex_commands("main")
     assert {policy for _, _, policy in seen} == {("p", "p")}  # paranoid TeX file access
