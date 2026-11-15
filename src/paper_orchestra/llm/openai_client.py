@@ -23,8 +23,9 @@ The client has no client-side tools, no memory tool and no web search, so the
 context harness drives it in push mode.  PDFs are sent as their extracted
 text.  ``effort`` and ``max_turns`` have no equivalent here and are ignored
 because dropping them cannot make a result wrong.  ``temperature`` is left out
-for o-series reasoning models, and for any other model once the API has
-rejected it by name.
+for o-series reasoning models and for any other model that turns out not to
+support it; a ``temperature`` or token limit the API rejects by name is
+dropped with a warning and the request is sent again.
 
 A ``send`` that raises anything other than :class:`LLMParseError` leaves the
 conversation exactly as it was, so the caller may send the same turn again.
@@ -88,13 +89,16 @@ _TRANSIENT_STATUS = frozenset({408, 429})
 _O_SERIES = re.compile(r"o\d")
 
 # Optional request parameters a model may reject with a 400 that names them
-# (API parameter name -> our keyword).  The API still reports an oversized
-# token limit under the legacy name ``max_tokens``.
+# (API parameter name -> our keyword; the token limit also goes by its legacy name).
 _REJECTABLE = {
     "temperature": "temperature",
     "max_completion_tokens": "max_completion_tokens",
     "max_tokens": "max_completion_tokens",
 }
+
+# Error codes that say the model does not take the parameter at all, as
+# opposed to this one value being out of range.
+_UNSUPPORTED_CODES = frozenset({"unsupported_parameter", "unsupported_value"})
 
 _STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}
 
@@ -181,10 +185,10 @@ def _usage_of(completion: ChatCompletion) -> Usage:
     reported = completion.usage
     if reported is None:
         return usage
-    details = reported.prompt_tokens_details
-    cached = (details.cached_tokens or 0) if details is not None else 0
-    # Older SDK releases do not have the cache-write field.
-    written = (getattr(details, "cache_write_tokens", None) or 0) if details is not None else 0
+    # The detail fields are newer than the oldest SDK release this package accepts.
+    details = getattr(reported, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", None) or 0
+    written = getattr(details, "cache_write_tokens", None) or 0
     usage.input_tokens = max(0, reported.prompt_tokens - cached - written)
     usage.cache_read_input_tokens = cached
     usage.cache_creation_input_tokens = written
@@ -335,7 +339,7 @@ class _OpenAIConversation(Conversation):
             self._usage.add(turn)
             if turn.requests:
                 self._emit({"type": "usage", **turn.to_dict()})
-            self._emit({"type": "error", "error": str(exc)})
+            self._emit({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
             raise
 
         self._messages += [user, {"role": "assistant", "content": reply.text}]
@@ -346,6 +350,7 @@ class _OpenAIConversation(Conversation):
                 "text": reply.text,
                 "stop_reason": reply.stop_reason,
                 "model": reply.model,
+                "request_id": reply.request_id,
             }
         )
         self._emit({"type": "usage", **turn.to_dict()})
@@ -356,7 +361,7 @@ class _OpenAIConversation(Conversation):
                 f"The response of OpenAI model {self.model} could not be parsed.",
                 raw_text=reply.text,
             )
-            self._emit({"type": "error", "error": str(error)})
+            self._emit({"type": "error", "error": f"LLMParseError: {error}"})
             raise error
         return LLMResponse(
             text=reply.text,
@@ -401,7 +406,11 @@ class OpenAIClient(LLMClient):
         self._no_temperature: set[str] = set()
 
     def describe(self) -> dict[str, Any]:
-        return {"provider": self.provider, "credential_source": "api_key"}
+        return {
+            "provider": self.provider,
+            "credential_source": "api_key",
+            "sdk_version": self._openai.__version__,
+        }
 
     def conversation(
         self,
@@ -497,7 +506,7 @@ class OpenAIClient(LLMClient):
                     rejected,
                     value,
                 )
-                if rejected == "temperature":
+                if rejected == "temperature" and exc.code in _UNSUPPORTED_CODES:
                     with self._lock:
                         self._no_temperature.add(model)
             except openai.APIConnectionError as exc:

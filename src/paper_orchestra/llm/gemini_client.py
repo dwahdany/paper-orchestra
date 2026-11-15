@@ -371,7 +371,7 @@ class _GeminiConversation(Conversation):
             self._usage.add(turn)
             if turn.requests:
                 self._emit({"type": "usage", **turn.to_dict()})
-            self._emit({"type": "error", "error": str(exc)})
+            self._emit({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
             raise
 
         # The model turn goes back verbatim: it carries the thought signatures
@@ -384,6 +384,7 @@ class _GeminiConversation(Conversation):
                 "text": reply.text,
                 "stop_reason": reply.stop_reason,
                 "model": reply.model,
+                "request_id": reply.request_id,
             }
         )
         self._emit({"type": "usage", **turn.to_dict()})
@@ -394,7 +395,7 @@ class _GeminiConversation(Conversation):
                 f"The response of Gemini model {self.model} could not be parsed.",
                 raw_text=reply.text,
             )
-            self._emit({"type": "error", "error": str(error)})
+            self._emit({"type": "error", "error": f"LLMParseError: {error}"})
             raise error
         return LLMResponse(
             text=reply.text,
@@ -458,6 +459,7 @@ class GeminiClient(LLMClient):
                 "VERTEX_AI_LOCATION (Vertex AI), or set GEMINI_API_KEY (Gemini API)."
             )
 
+        self._sdk_version: str = sdk.genai.__version__
         self._types = sdk.types
         self._errors = sdk.errors
         self._auth_error: type[Exception] = sdk.auth.GoogleAuthError
@@ -469,9 +471,11 @@ class GeminiClient(LLMClient):
         self._warned: set[str] = set()
 
     def describe(self) -> dict[str, Any]:
+        info: dict[str, Any] = {"provider": self.provider, "credential_source": "api_key"}
         if self._vertex is not None:
-            return {"provider": self.provider, "credential_source": "vertex_ai", **self._vertex}
-        return {"provider": self.provider, "credential_source": "api_key"}
+            info |= {"credential_source": "vertex_ai", **self._vertex}
+        info["sdk_version"] = self._sdk_version
+        return info
 
     def conversation(
         self,

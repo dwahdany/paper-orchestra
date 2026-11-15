@@ -1,7 +1,8 @@
 """Model id -> provider client.
 
 Clients are built on first use and cached per provider, so a missing optional
-SDK or credential for one provider never affects another.
+SDK or credential for one provider never affects another.  Provider modules are
+imported inside the builders: importing this module imports no SDK.
 """
 
 from __future__ import annotations
@@ -38,24 +39,6 @@ def provider_for_model(model: str) -> str:
     )
 
 
-def _missing_sdk(provider: str, extra: str | None, exc: ImportError) -> LLMConfigError:
-    command = f"uv sync --extra {extra}" if extra else "uv sync"
-    return LLMConfigError(
-        f"The {provider} provider needs a Python package that is not installed ({exc}). "
-        f"Install it with `{command}`."
-    )
-
-
-def _import_guard(provider: str, extra: str | None, build: Callable[[], LLMClient]) -> LLMClient:
-    try:
-        return build()
-    except ImportError as exc:
-        # A missing module of this package is a packaging bug, not a missing extra.
-        if (exc.name or "").startswith("paper_orchestra"):
-            raise
-        raise _missing_sdk(provider, extra, exc) from exc
-
-
 def _build_anthropic() -> LLMClient:
     from paper_orchestra.llm.anthropic_client import AnthropicClient
 
@@ -74,17 +57,32 @@ def _build_openai() -> LLMClient:
     return OpenAIClient()
 
 
+#: provider -> (optional-dependency extra that ships its SDK, builder).
+_BUILDERS: dict[str, tuple[str | None, Callable[[], LLMClient]]] = {
+    "anthropic": (None, _build_anthropic),
+    "gemini": ("gemini", _build_gemini),
+    "openai": ("openai", _build_openai),
+}
+
+
 def _build(provider: str) -> LLMClient:
-    if provider == "anthropic":
-        return _import_guard(provider, None, _build_anthropic)
-    if provider == "gemini":
-        return _import_guard(provider, "gemini", _build_gemini)
-    if provider == "openai":
-        return _import_guard(provider, "openai", _build_openai)
-    raise LLMConfigError(
-        "No fake client is registered. Call "
-        "paper_orchestra.llm.register_client('fake', FakeLLM(...)) before using a 'fake' model."
-    )
+    if provider not in _BUILDERS:
+        raise LLMConfigError(
+            f"No {provider} client is registered. Call paper_orchestra.llm.register_client("
+            f"'{provider}', FakeLLM(...)) before using a '{provider}' model."
+        )
+    extra, build = _BUILDERS[provider]
+    try:
+        return build()
+    except ImportError as exc:
+        # A missing module of this package is a packaging bug, not a missing extra.
+        if (exc.name or "").startswith("paper_orchestra"):
+            raise
+        command = f"uv sync --extra {extra}" if extra else "uv sync"
+        raise LLMConfigError(
+            f"The {provider} provider needs a Python package that is not installed ({exc}). "
+            f"Install it with `{command}`."
+        ) from exc
 
 
 def get_client(model: str) -> LLMClient:
