@@ -1827,11 +1827,21 @@ CHECKS.paper = async ({ page, pid }) => {
      paper, on file) is what the view says, in the server's sentence, also after a reload. */
   await idle(pid, 120000);
   await page.click('.paper-form button[type=submit]');
-  let writing = null;
+  let writing = null, over = null;
   /* (How long the worker takes to start is the machine's business: a loaded or small one needs
      many seconds to import the pipeline. The wait is for that; the write-up itself then runs
-     for a second or two, and a look every few dozen milliseconds does not miss it.) */
-  for (const deadline = Date.now() + 90000; Date.now() < deadline && !writing;) { const paper = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (paper.running && paper.last && paper.last.outcome === 'running' && paper.worker.pid > 0 && paper.worker.kind === 'write') writing = paper.worker; else await sleep(60); }
+     for a second or two, and a look every few dozen milliseconds does not miss it. Where a
+     write-up cannot run at all, on a machine without TeX, it ends at its first look at the
+     machine: that is told apart by the new start it announced, and noted, not failed.) */
+  const earlier = last && last.started_at;
+  for (const deadline = Date.now() + 90000; Date.now() < deadline && !writing && !over;) {
+    const paper = (await api('GET', '/api/projects/' + pid + '/paper')).data;
+    if (paper.running && paper.last && paper.last.outcome === 'running' && paper.worker.pid > 0 && paper.worker.kind === 'write') writing = paper.worker;
+    else if (!paper.running && paper.last && paper.last.started_at && paper.last.started_at !== earlier && paper.last.outcome !== 'running') over = paper.last;
+    else await sleep(60);
+  }
+  if (over) notes.push('paper: the write-up ended by itself before its worker could be ended (' + String(over.summary || over.outcome).replace(/\s+/g, ' ').slice(0, 160) + '); how a killed write-up is shown was not looked at. On a machine without pdflatex and bibtex that is expected');
+  else
   if (ok(!!writing, 'the write-up is under way again, and has said that it started')) {
     let killed = true;
     try { process.kill(writing.pid, 'SIGKILL'); } catch (e) { killed = false; notes.push('paper: the worker of the write-up had ended before it could be killed (' + e.message + '); how a killed write-up is shown was not looked at'); }
