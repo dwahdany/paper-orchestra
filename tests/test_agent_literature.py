@@ -1696,3 +1696,630 @@ def test_a_stopped_run_ends_the_search_without_counting_failed_tasks(tmp_path, c
         LiteratureAgent(ctx, scholar=make_scholar(FakeS2Session())).run(make_outline())
     assert len(client.requests) == 1  # no further call was started
     assert "Search task" not in caplog.text  # a stop is not a failed search
+
+
+# -- the papers the materials already know (a paper written from a research project) ---------
+
+#: The file ``research/writeup.py`` exports next to the idea and the experimental log.
+KNOWN_PAPERS = "known_papers.json"
+WARMUP = "Aaa2020Warmup"
+#: The key the wiki gave the survey; not the one this stage would make for it.
+WIKI_SURVEY = "Lovelace2021SurveyWidgetsb"
+
+
+def known_entry(key: str = WARMUP, title: str = "Warmup, Measured", **overrides) -> dict:
+    """An accepted source as the research project's write-up exports it."""
+    entry = {
+        "citation_key": key,
+        "title": title,
+        "authors": ["A. Aaa", "B. Bbb"],
+        "venue": "ICML",
+        "year": 2020,
+        "abstract": "We measure warmup at small batch sizes.",
+        "citation_count": 12,
+        "found_in_section": "",
+        "sections": [],
+        "reason": "A source the researcher accepted in the project's research wiki.",
+        "journal": None,
+        "volume": None,
+        "pages": None,
+        "publication_date": None,
+        "link": "https://example.org/aaa2020",
+        "record": f"wiki/sources/{key}.md",
+    }
+    return entry | overrides
+
+
+def known_survey(**overrides) -> dict:
+    """The survey of the fake Semantic Scholar, as a source the wiki holds under its own key."""
+    fields = {
+        "authors": ["Ada Lovelace", "Bob Stone"],
+        "venue": "NeurIPS",
+        "year": 2021,
+        "abstract": "The wiki's copy of the abstract.",
+        "citation_count": 300,
+    }
+    return known_entry(WIKI_SURVEY, "A Survey of Widgets", **(fields | overrides))
+
+
+def rejected(
+    title: str, key: str = "Rejected2020Paper", reason: str = "Not about widgets."
+) -> dict:
+    return {"citation_key": key, "title": title, "reason": reason}
+
+
+def give_known(ctx: RunContext, papers=(), excluded=(), *, text: str | bytes | None = None) -> Path:
+    """Write ``known_papers.json`` into the run's materials (``text``: as it is, broken or not)."""
+    path = ctx.paths.materials_dir / KNOWN_PAPERS
+    if text is None:
+        text = json.dumps({"version": 1, "papers": list(papers), "excluded": list(excluded)})
+    path.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
+    return path
+
+
+def run_with_known(
+    tmp_path: Path,
+    papers=(),
+    excluded=(),
+    *,
+    text: str | bytes | None = None,
+    script: Script | None = None,
+    session: FakeS2Session | None = None,
+    outline: dict | None = None,
+    **ctx_kwargs,
+) -> tuple[LiteratureResult, RunContext, FakeLLM, FakeS2Session]:
+    client = FakeLLM(script or Script())
+    session = session or FakeS2Session()
+    ctx = make_ctx(tmp_path, client, **ctx_kwargs)
+    give_known(ctx, papers, excluded, text=text)
+    result = LiteratureAgent(ctx, scholar=make_scholar(session)).run(outline or make_outline())
+    return result, ctx, client, session
+
+
+def outline_without_searches() -> dict:
+    outline = make_outline()
+    outline["intro_related_work_plan"]["introduction_strategy"]["search_directions"] = []
+    outline["intro_related_work_plan"]["related_work_strategy"]["subsections"] = []
+    outline["section_plan"][0]["subsections"][0]["citation_hints"] = []
+    return outline
+
+
+def checkpoint_of(ctx: RunContext) -> dict:
+    return json.loads((ctx.paths.literature_dir / CHECKPOINT_NAME).read_text(encoding="utf-8"))
+
+
+def test_the_bibliography_starts_from_the_known_papers_without_looking_them_up(tmp_path):
+    result, ctx, client, session = run_with_known(tmp_path, [known_entry(), known_survey()])
+
+    # The known papers come first, under the keys the wiki has for them; the search adds more.
+    keys = [WARMUP, WIKI_SURVEY, FOUNDATIONS, DRIFT, ADAM]
+    assert list(result.citation_map) == keys and result.papers == 5
+    assert bib_keys(result.bibtex) == set(keys)
+    assert "@inproceedings{Aaa2020Warmup," in result.bibtex and "booktitle={ICML}" in result.bibtex
+    # One entry for the survey, not a second one under the key this stage would make.
+    assert result.bibtex.count("A Survey of Widgets") == 1
+    assert (result.known, result.excluded, result.warnings) == (2, 0, [])
+
+    # They were verified when they were recorded: no title of theirs is looked up again,
+    # also when a search proposes the paper (the survey, twice), and the wiki's data stands.
+    assert sorted(session.queries) == sorted(
+        [
+            "Widget Foundations",
+            "Totally Invented Paper Title About Nothing",
+            "Future Widgets",
+            "Abstractless Widgets",
+            "Widget Drift in Practice",
+            "Adam: A Method for Stochastic Optimization",
+        ]
+    )
+    assert result.citation_map[WIKI_SURVEY]["abstract"] == "The wiki's copy of the abstract."
+    assert result.citation_map[WARMUP] == {
+        "citation_key": WARMUP,
+        "title": "Warmup, Measured",
+        "authors": ["A. Aaa", "B. Bbb"],
+        "venue": "ICML",
+        "year": 2020,
+        "abstract": "We measure warmup at small batch sizes.",
+    }
+
+    # A known paper that a search returns is listed where the search wanted it; one that
+    # no search returned is in the bibliography all the same.
+    plan = result.outline["intro_related_work_plan"]
+    assert plan["introduction_strategy"]["citation_candidates"] == [WIKI_SURVEY, FOUNDATIONS]
+    assert plan["related_work_strategy"]["subsections"][0]["citation_candidates"] == [
+        WIKI_SURVEY,
+        DRIFT,
+    ]
+    assert WARMUP not in all_candidate_keys(result.outline)
+    saved = {paper["citation_key"]: paper for paper in checkpoint_of(ctx)["papers"]}
+    assert list(saved) == keys
+    assert saved[WIKI_SURVEY]["found_in_section"] == "Introduction"
+    assert saved[WIKI_SURVEY]["sections"] == ["Introduction", "Related Work: 2.1 Widget Models"]
+    assert (saved[WARMUP]["found_in_section"], saved[WARMUP]["sections"]) == ("", [])
+
+    # The writer may cite them like any other paper, and is told why they are there.
+    (request,) = writer_requests(client)
+    assert checklist(request) == keys
+    assert "A source the researcher accepted in the project's research wiki." in request.text
+    assert cite_keys(result.latex) == set(keys)
+    wiki = ctx.harness.project
+    assert {Path(info.path).stem for info in wiki.list("wiki/literature")} == set(keys)
+    page = wiki.read(f"wiki/literature/{WARMUP}.md")
+    assert "No search of the outline returned it" in page.body
+    assert wiki.lint().broken_links == []
+
+    event = literature_event(ctx)
+    assert (event["papers"], event["known"], event["verified"]) == (5, 2, 3)
+    assert (event["candidates"], event["duplicates"], event["lookups"]) == (8, 2, 6)
+    assert notes(ctx) == []
+
+
+def test_the_known_papers_are_the_bibliography_when_the_outline_asks_for_no_search(tmp_path):
+    result, _, client, session = run_with_known(
+        tmp_path, [known_entry()], outline=outline_without_searches()
+    )
+    assert list(result.citation_map) == [WARMUP] and result.known == 1
+    assert session.queries == [] and discovery_requests(client) == []
+    assert "\\cite{Aaa2020Warmup}" in result.latex
+    assert "No verified papers could be collected" not in writer_requests(client)[0].text
+
+
+def test_a_paper_the_researcher_rejected_is_never_cited(tmp_path, caplog):
+    # Another wording of the title, which Semantic Scholar resolves to the rejected paper.
+    reworded = {"title": "Widgets Drift in Practice", "year": 2022, "reason": "Documents drift."}
+    discovery = DISCOVERY | {
+        "widget drift failure": [
+            reworded,
+            {"title": "a survey of  widgets", "year": 2021, "reason": "Also covers drift."},
+        ],
+        ADAM_HINT: [*DISCOVERY[ADAM_HINT], reworded],
+    }
+    excluded = [
+        rejected("Widget Drift in Practice", DRIFT),
+        rejected("A survey of widgets!", SURVEY, "rejected by the researcher"),
+    ]
+    with caplog.at_level(logging.INFO, logger="paper_orchestra.agents.literature"):
+        result, ctx, client, session = run_with_known(
+            tmp_path, excluded=excluded, script=Script(discovery)
+        )
+
+    assert list(result.citation_map) == [FOUNDATIONS, ADAM]
+    assert bib_keys(result.bibtex) == {FOUNDATIONS, ADAM}
+    assert cite_keys(result.latex) == {FOUNDATIONS, ADAM}
+    for text in (result.bibtex, json.dumps(result.outline), writer_requests(client)[0].text):
+        assert "Widget Drift in Practice" not in text and "Survey of Widgets" not in text
+    stems = {Path(info.path).stem for info in ctx.harness.project.list("wiki/literature")}
+    assert stems == {FOUNDATIONS, ADAM}
+    # Under the same title it is not even looked up; under another one the lookup tells,
+    # once.
+    assert "A Survey of Widgets" not in session.queries
+    assert session.queries.count("Widgets Drift in Practice") == 1
+
+    # The stage says how many candidates it left out for that reason: the survey and the
+    # paper on drift, each proposed by two searches.
+    assert result.excluded == 4 and result.known == 0 and result.warnings == []
+    event = literature_event(ctx)
+    assert (event["excluded"], event["verified"], event["candidates"]) == (4, 2, 9)
+    assert event["duplicates"] == 0
+    assert (
+        "4 candidate(s) left out because the researcher rejected the paper as a source"
+        in caplog.text
+    )
+    assert "Left out 'Widget Drift in Practice'" in caplog.text
+
+
+def test_a_new_paper_never_takes_the_key_of_a_known_or_a_rejected_one(tmp_path):
+    result, _, _, _ = run_with_known(
+        tmp_path,
+        # Another paper of the same author and year, on record under the key the search's
+        # paper would get; and a rejected one whose key the paper on drift would get.
+        [known_entry(FOUNDATIONS, "Widget Foundations: The Lectures", authors=["Carl Gauss"])],
+        [rejected("Widget Drift, the Earlier Version", DRIFT)],
+    )
+    assert list(result.citation_map) == [
+        FOUNDATIONS,
+        SURVEY,
+        FOUNDATIONS + "a",
+        DRIFT + "a",
+        ADAM,
+    ]
+    assert result.citation_map[FOUNDATIONS]["title"] == "Widget Foundations: The Lectures"
+    assert result.citation_map[FOUNDATIONS + "a"]["title"] == "Widget Foundations"
+    assert result.citation_map[DRIFT + "a"]["title"] == "Widget Drift in Practice"
+    assert DRIFT not in bib_keys(result.bibtex)
+
+
+def test_the_research_cutoff_applies_to_known_papers_too(tmp_path, caplog):
+    papers = [
+        known_entry("Early2023Paper", "Early Enough", year=2023),
+        known_entry("Dated2024Paper", "Dated Before", year=2024, publication_date="2024-03-01"),
+        known_entry("Year2024Paper", "Known Only By The Cutoff Year", year=2024),
+        known_entry("Late2025Paper", "Too Late", year=2025, publication_date="2025-01-10"),
+        known_entry("Undated", "Without Any Date", year=None),
+    ]
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.agents.literature"):
+        result, ctx, _, _ = run_with_known(
+            tmp_path, papers, outline=outline_without_searches(), cutoff="2024-10"
+        )
+
+    assert list(result.citation_map) == ["Early2023Paper", "Dated2024Paper"]
+    assert result.known == 2 and len(result.warnings) == 3
+    # The person accepted these sources, so they are told why the paper does not cite them.
+    late = next(warning for warning in result.warnings if "Too Late" in warning)
+    assert "Late2025Paper" in late and "2025-01-10" in late and "2024-10" in late
+    assert any("Known Only By The Cutoff Year" in warning for warning in result.warnings)
+    assert any("Without Any Date" in warning for warning in result.warnings)
+    for warning in result.warnings:
+        assert warning in caplog.text
+    ((kind, note),) = notes(ctx)
+    assert kind == "observation" and "Too Late" in note
+
+    # Without a cutoff every one of them stands.
+    everything, _, _, _ = run_with_known(
+        tmp_path, papers, outline=outline_without_searches(), cutoff="", name="no-cutoff"
+    )
+    assert len(everything.citation_map) == 5 and everything.warnings == []
+
+
+def test_a_source_the_list_leaves_out_can_still_be_found_by_the_search(tmp_path):
+    # The wiki's record has no date the cutoff could be checked against; Semantic Scholar
+    # has one.  What is said about the record must not deny what the search then does.
+    undated = known_entry(DRIFT, "Widget Drift in Practice", authors=["Dana Scully"], year=None)
+    result, _, _, session = run_with_known(tmp_path, [undated, known_entry()])
+
+    assert list(result.citation_map) == [WARMUP, SURVEY, FOUNDATIONS, DRIFT, ADAM]
+    assert result.known == 1 and "Widget Drift in Practice" in session.queries
+    # Verified afresh, like any other paper the search proposes: with Semantic Scholar's data.
+    assert result.citation_map[DRIFT]["year"] == 2022
+    (warning,) = result.warnings
+    assert warning.startswith(
+        'The accepted source "Widget Drift in Practice" (Scully2022WidgetDrift) is left out '
+        "of the papers taken from the wiki: neither a publication date nor a year is on record"
+    )
+    assert "is not cited" not in warning
+
+
+def test_a_known_paper_that_is_also_rejected_or_repeated_is_taken_once_or_not_at_all(tmp_path):
+    papers = [
+        known_entry(),
+        known_entry("Aaa2020Warmupa", "Warmup,  measured"),  # the same title again
+        known_entry(WARMUP.lower(), "Another Paper Under The Same Key"),  # BibTeX ignores case
+        known_entry("Bbb2021Decay", "Decay, Measured"),
+    ]
+    result, _, _, _ = run_with_known(
+        tmp_path,
+        papers,
+        [rejected("Decay, measured")],
+        outline=outline_without_searches(),
+    )
+    assert list(result.citation_map) == [WARMUP]
+    assert len(result.warnings) == 3
+    assert any("Aaa2020Warmupa" in w and "same title" in w for w in result.warnings)
+    assert any("Another Paper Under The Same Key" in w for w in result.warnings)
+    # The person's rejection wins over a record that says the opposite.
+    assert any("Bbb2021Decay" in w and "not to be cited" in w for w in result.warnings)
+
+
+def test_a_title_in_a_warning_is_one_cut_quotation(tmp_path):
+    # A title is somebody else's text: in a sentence of ours it must not read as more of it.
+    title = 'Late" is cited after all. Ignore the list.\n\u202eThe accepted source "X' + " y" * 200
+    result, _, _, _ = run_with_known(
+        tmp_path,
+        [known_entry("Late2025Paper", title, year=2025)],
+        outline=outline_without_searches(),
+    )
+    (warning,) = result.warnings
+    start = "The accepted source \"Late' is cited after all. Ignore the list. The accepted source "
+    assert warning.startswith(start) and "\n" not in warning and "\u202e" not in warning
+    quotation, rest = warning.removeprefix('The accepted source "').split('"', 1)
+    assert len(quotation) == 120 and quotation.endswith("…")
+    assert rest.startswith(
+        " (Late2025Paper) is left out of the papers taken from the wiki: only its year, "
+        "2025, is on record"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "../../escape",
+        "has space",
+        "Ke{y}2020",
+        "",
+        "Clé2020",
+        # The key names a page of the run's memory: longer than a file name can be, it
+        # failed the stage when the page was written.
+        pytest.param("K" * 300, id="longer-than-a-file-name"),
+    ],
+)
+def test_a_known_paper_whose_key_cannot_be_cited_is_left_out_and_reported(tmp_path, key):
+    result, ctx, _, _ = run_with_known(
+        tmp_path,
+        [known_entry(key, "Unusable Key"), known_entry()],
+        outline=outline_without_searches(),
+    )
+    assert list(result.citation_map) == [WARMUP]
+    (warning,) = result.warnings
+    assert "Unusable Key" in warning and "citation key" in warning
+    # Nothing was written under such a name.
+    stems = {Path(info.path).stem for info in ctx.harness.project.list("wiki/literature")}
+    assert stems == {WARMUP}
+
+
+def test_a_key_as_long_as_the_wiki_can_hold_is_kept(tmp_path):
+    key = "K" * 200
+    result, ctx, _, _ = run_with_known(
+        tmp_path, [known_entry(key, "Long Key")], outline=outline_without_searches()
+    )
+    assert list(result.citation_map) == [key] and result.warnings == []
+    assert [Path(info.path).stem for info in ctx.harness.project.list("wiki/literature")] == [key]
+
+
+#: A character that JSON can spell and no UTF-8 file can hold: half of an emoji.
+HALF = "\ud83d"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "title",
+        "authors",
+        "venue",
+        "abstract",
+        "reason",
+        "journal",
+        "volume",
+        "pages",
+        "publication_date",
+        "found_in_section",
+        "sections",
+    ],
+)
+def test_text_that_no_file_can_hold_does_not_fail_the_stage(tmp_path, field):
+    # What a search keeps went through the cleaning of a Semantic Scholar record; a list
+    # written by hand did not, and the stage writes what it holds to several files.
+    odd = {
+        "title": f"Odd{HALF} \x00Paper\n## About widgets",
+        "authors": [f"O. {HALF}Dd", HALF, "E. Ven"],
+        "venue": f"IC{HALF}ML\nWorkshop",
+        "abstract": f"Half an emoji {HALF} here.\x00\nA second line.",
+        "reason": f"Because {HALF}\nof this.",
+        "journal": f"Journal {HALF}of Things",
+        "volume": HALF,
+        "pages": f"1{HALF}-9",
+        "publication_date": f"2020-05-01{HALF}",
+        "found_in_section": f"Intro{HALF}duction",
+        "sections": [f"Intro{HALF}duction", HALF],
+    }
+    entry = known_entry("Odd2020Paper", "Odd Paper", journal="Journal of Things") | {
+        field: odd[field]
+    }
+    result, ctx, client, _ = run_with_known(tmp_path, [entry, known_entry()])
+
+    assert list(result.citation_map)[:2] == ["Odd2020Paper", WARMUP] and result.warnings == []
+    saved = checkpoint_of(ctx)["papers"][0]  # the record of the search could be written
+    expected = {
+        "title": "Odd Paper ## About widgets",
+        "authors": ["O. Dd", "E. Ven"],
+        "venue": "ICML Workshop",
+        "abstract": "Half an emoji  here.\nA second line.",
+        "reason": "Because of this.",
+        "journal": "Journal of Things",
+        "volume": None,
+        "pages": "1-9",
+        "publication_date": "2020-05-01",
+        "found_in_section": "Introduction",
+        "sections": ["Introduction"],
+    }
+    assert saved[field] == expected[field]
+    # And so could everything else the stage writes about the paper.
+    assert "Odd2020Paper" in bib_keys(result.bibtex)
+    page = ctx.harness.project.read("wiki/literature/Odd2020Paper.md")
+    assert page.body.splitlines()[0] == f"# {saved['title']}"
+    assert HALF not in writer_requests(client)[0].text
+
+
+def test_a_paper_not_to_cite_is_kept_out_whatever_its_entry_holds(tmp_path):
+    from paper_orchestra.agents.literature import load_known_papers
+
+    excluded = [
+        {
+            "citation_key": f"Bad{HALF}Key",
+            "title": f"Widget {HALF}Drift in\nPractice",
+            "reason": HALF,
+        },
+        rejected("Some Other Paper", "K" * 300),
+    ]
+    result, ctx, _, _ = run_with_known(tmp_path, excluded=excluded)
+
+    assert list(result.citation_map) == [SURVEY, FOUNDATIONS, ADAM]
+    assert result.excluded == 1 and result.warnings == []
+    assert checkpoint_of(ctx)["stats"]["excluded"] == 1
+    # A key that could not be a citation key is one no paper would be given: none is held.
+    known = load_known_papers(ctx.paths.materials_dir)
+    assert known.reserved_keys == frozenset()
+    assert known.excluded == {
+        normalize_title("Widget Drift in Practice"),
+        normalize_title("Some Other Paper"),
+    }
+
+
+def test_many_papers_that_are_left_out_are_one_short_note(tmp_path):
+    papers = [
+        known_entry(f"Late{number}Paper", f"Too Late, Number {number}", year=2025)
+        for number in range(700)
+    ]
+    result, ctx, _, _ = run_with_known(
+        tmp_path, [known_entry(), *papers], outline=outline_without_searches()
+    )
+
+    # The person is told about every one of them where they look ...
+    assert list(result.citation_map) == [WARMUP] and len(result.warnings) == 700
+    # ... and the run's memory gets the first few and how many more there are: a note the
+    # size of the list would not fit on a page, and failed the stage.
+    ((kind, note),) = notes(ctx)
+    assert kind == "observation" and len(note) < 5000
+    assert '"Too Late, Number 0"' in note and '"Too Late, Number 4"' in note
+    assert '"Too Late, Number 5"' not in note
+    assert "695 more" in note and "log" in note
+
+
+@pytest.mark.parametrize("changed", ["accepted another", "rejected another", "nothing"])
+def test_a_changed_list_of_known_papers_is_searched_again_on_the_retry(tmp_path, changed):
+    client = FakeLLM(Script(writer=failing_once(LLMRefusal("declined"))))
+    session = FakeS2Session()
+    ctx = make_ctx(tmp_path, client)
+    give_known(ctx, [known_entry()], [rejected("Some Other Paper")])
+    with pytest.raises(LLMRefusal):
+        LiteratureAgent(ctx, scholar=make_scholar(session)).run(make_outline())
+    assert len(discovery_requests(client)) == 3
+    assert checkpoint_of(ctx)["papers"][0]["citation_key"] == WARMUP
+
+    if changed == "accepted another":
+        give_known(ctx, [known_entry(), known_survey()], [rejected("Some Other Paper")])
+    elif changed == "rejected another":
+        give_known(ctx, [known_entry()], [rejected("Widget Drift in Practice")])
+    result = LiteratureAgent(ctx, scholar=make_scholar(session)).run(make_outline())
+
+    if changed == "nothing":
+        # The search answered this very question: it is not paid for twice.
+        assert len(discovery_requests(client)) == 3
+        assert list(result.citation_map) == [WARMUP, SURVEY, FOUNDATIONS, DRIFT, ADAM]
+        assert result.known == 1
+    elif changed == "accepted another":
+        assert len(discovery_requests(client)) == 6
+        assert list(result.citation_map) == [WARMUP, WIKI_SURVEY, FOUNDATIONS, DRIFT, ADAM]
+        assert result.known == 2
+    else:
+        assert len(discovery_requests(client)) == 6
+        assert list(result.citation_map) == [WARMUP, SURVEY, FOUNDATIONS, ADAM]
+        assert result.excluded == 1
+    # The record now belongs to the list as it is: a further attempt would reuse it.
+    assert [p["citation_key"] for p in checkpoint_of(ctx)["papers"]] == list(result.citation_map)
+
+
+@pytest.mark.parametrize(
+    ("text", "said", "kept"),
+    [
+        ("{ not json", "is not valid JSON", []),
+        (b"\xff\xfe not text", "could not be read", []),
+        (json.dumps([known_entry()]), "does not hold an object", []),
+        (json.dumps({"version": 2, "papers": [], "excluded": []}), "version", []),
+        (json.dumps({"version": 1, "papers": {"a": 1}, "excluded": []}), "'papers'", []),
+        (
+            json.dumps({"version": 1, "papers": [known_entry()], "excluded": "x"}),
+            "'excluded'",
+            [WARMUP],
+        ),
+        (
+            json.dumps({"version": 1, "papers": [{"title": "No Key"}, known_entry()]}),
+            "papers[0]",
+            [WARMUP],
+        ),
+        (
+            json.dumps({"version": 1, "papers": [known_entry()], "excluded": [{"reason": "?"}]}),
+            "excluded[0]",
+            [WARMUP],
+        ),
+    ],
+    ids=[
+        "text",
+        "bytes",
+        "list",
+        "version",
+        "papers-type",
+        "excluded-type",
+        "invalid-paper",
+        "untitled-exclusion",
+    ],
+)
+def test_a_list_of_known_papers_that_cannot_be_used_is_reported_and_survived(
+    tmp_path, caplog, text, said, kept
+):
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra.agents.literature"):
+        result, ctx, client, _ = run_with_known(tmp_path, text=text)
+
+    # The paper is written all the same, from the search and whatever part could be read ...
+    assert list(result.citation_map) == [*kept, SURVEY, FOUNDATIONS, DRIFT, ADAM]
+    assert len(discovery_requests(client)) == 3 and result.known == len(kept)
+    # ... and the person is told, in the log, in the stage's result and in the run's memory.
+    (warning,) = result.warnings
+    assert said in warning and KNOWN_PAPERS in warning
+    assert warning in caplog.text
+    ((kind, note),) = notes(ctx)
+    assert kind == "observation" and said in note
+
+
+def test_a_list_of_known_papers_that_is_not_a_file_is_reported_and_survived(tmp_path):
+    client = FakeLLM(Script())
+    ctx = make_ctx(tmp_path, client)
+    (ctx.paths.materials_dir / KNOWN_PAPERS).mkdir()
+    result = LiteratureAgent(ctx, scholar=make_scholar()).run(make_outline())
+    assert list(result.citation_map) == [SURVEY, FOUNDATIONS, DRIFT, ADAM]
+    (warning,) = result.warnings
+    assert "could not be read" in warning
+
+
+def test_load_known_papers_reads_what_the_write_up_exports(tmp_path):
+    from paper_orchestra.agents.literature import KNOWN_PAPERS_NAME, load_known_papers
+
+    assert KNOWN_PAPERS_NAME == KNOWN_PAPERS
+    nothing = load_known_papers(tmp_path)  # a paper that is not written from a project
+    assert (nothing.papers, nothing.excluded, nothing.problems) == ((), frozenset(), ())
+
+    (tmp_path / KNOWN_PAPERS).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "papers": [
+                    known_entry(venue="", abstract="A" * 2000),
+                    known_entry("Bbb2021Decay", "Decay, Measured", abstract=" "),
+                ],
+                "excluded": [rejected("Widget Drift: In Practice?", DRIFT)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    known = load_known_papers(tmp_path, cutoff="2024-10")
+    paper, bare = known.papers
+    assert isinstance(paper, PaperData) and paper.citation_key == WARMUP
+    # In the shape this stage keeps its own papers in: a venue to print, a bounded abstract.
+    assert paper.venue == "arXiv" and paper.abstract == "A" * ABSTRACT_LIMIT + "... [Truncated]"
+    assert paper.reason == "A source the researcher accepted in the project's research wiki."
+    # A search drops a paper without an abstract; an accepted source stays, and whoever
+    # cites it is told that nothing but its title is on record.
+    assert bare.citation_key == "Bbb2021Decay"
+    assert bare.reason == (
+        "A source the researcher accepted in the project's research wiki. No abstract is "
+        "on record for it: cite it for what its title says and nothing more."
+    )
+    assert known.excluded == frozenset({normalize_title("Widget Drift in Practice")})
+    assert known.reserved_keys == frozenset({DRIFT.casefold()})
+    assert known.problems == ()
+
+
+def test_without_known_papers_the_stage_is_what_it_was(tmp_path):
+    import hashlib
+
+    plain, plain_ctx, _, _ = run_agent(tmp_path, name="plain", lab=False)
+    # An exported list without a single source is the same as none.
+    empty, empty_ctx, _, _ = run_with_known(tmp_path, name="empty", lab=False)
+
+    assert plain == empty
+    assert (plain.known, plain.excluded, plain.warnings) == (0, 0, [])
+    assert literature_event(plain_ctx) == literature_event(empty_ctx)
+    assert notes(plain_ctx) == notes(empty_ctx) == []
+    # The record of an earlier version's search still answers the same question.
+    tasks = collect_search_tasks(make_outline())
+    asked = {
+        "version": 1,
+        "tasks": [[task.search_type, task.section, task.focus, task.context] for task in tasks],
+        "core_problem": "Widgets drift.",
+        "cutoff": "2024-10",
+        "model": "fake-fast",
+    }
+    digest = hashlib.sha256(json.dumps(asked, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    assert checkpoint_of(plain_ctx)["fingerprint"] == digest.hexdigest()
+    assert checkpoint_of(empty_ctx)["fingerprint"] == digest.hexdigest()
+    # And the search is summed up in the words it always was.
+    assert "left out because" not in json.dumps(literature_event(plain_ctx))

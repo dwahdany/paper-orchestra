@@ -23,7 +23,11 @@ Each stage is retried on its own, its outcome is persisted in ``state.json``
 after every transition, and a later invocation in the same directory resumes
 after the last stage that completed.  That holds as long as the inputs and the
 settings that shape the paper are the same and the research cutoff did not move
-earlier; otherwise every stage runs again.
+earlier; otherwise every stage runs again.  The inputs are the idea, the
+experimental log, the figures, the template and, for a paper written from a
+research project, the papers its literature starts from and must not cite
+(``raw_materials/known_papers.json``).  A cutoff that moved later starts over
+only when it lets in one of those papers that had been left out as too recent.
 Agents are created through the module-level factory functions below, which
 import lazily, so tests can swap in stubs and importing this module stays cheap.
 """
@@ -118,7 +122,11 @@ class PaperResult:
     pdf_path: Path | None
     base_dir: Path
     #: Per stage: ``status``, ``seconds``, ``attempts``, ``error`` (plus ``outputs``, ``reused``
-    #: and, where they apply, ``tolerated`` and ``after_done``).
+    #: and, where they apply, ``tolerated`` and ``after_done``).  The literature stage adds,
+    #: when it has something to say: ``warnings`` (what the person has to be told about the
+    #: papers it was to start from), ``known_papers`` (how many of them are in the
+    #: bibliography) and ``excluded_candidates`` (how many papers its search proposed that
+    #: were left out because the researcher rejected them as sources).
     stages: dict[str, dict[str, Any]]
     usage: dict[str, Any]
     error: str | None = None
@@ -354,7 +362,10 @@ def _causes(exc: BaseException) -> Iterator[BaseException]:
 
 
 def _fingerprint(cfg: PipelineConfig, paths: RunPaths) -> str:
-    """Digest of what the authors supplied and the run uses: idea, log, figures, template."""
+    """Digest of what the authors supplied and the run uses: idea, log, figures, template,
+    and the list of known papers when the materials hold one."""
+    from paper_orchestra.agents.literature import KNOWN_PAPERS_NAME
+
     digest = hashlib.sha256()
 
     def add(label: str, path: Path) -> None:
@@ -363,6 +374,18 @@ def _fingerprint(cfg: PipelineConfig, paths: RunPaths) -> str:
 
     add("idea", paths.idea)
     add("experimental_log", paths.experimental_log)
+    known_papers = paths.materials_dir / KNOWN_PAPERS_NAME
+    if known_papers.is_file():
+        # The papers the literature starts from and the ones it must not cite: a paper
+        # written from another list is not this list's paper.  Without the file the digest
+        # is what it always was, so a run from raw materials alone resumes as before.
+        try:
+            add("known_papers", known_papers)
+        except OSError:
+            # The literature stage reports a list it cannot read and goes on without it,
+            # so the run does not end here; and what it writes then is not the paper of
+            # the list as it reads once it can be opened.
+            digest.update(b"cannot be read")
     roots = [("template", cfg.template_dir)]
     if cfg.uses_provided_figures:
         # Figures that plotting replaces are not inputs: changing them changes nothing.
@@ -389,6 +412,33 @@ def _cutoff_moved_earlier(previous: dict[str, Any], current: str) -> bool:
     except ValueError:
         return True
     return earlier_cutoff is None or cutoff < earlier_cutoff
+
+
+def _let_in_by_the_cutoff(
+    previous: dict[str, Any], cfg: PipelineConfig, paths: RunPaths
+) -> list[str]:
+    """Citation keys of the known papers that the cutoff admits now and did not admit in
+    the earlier run.
+
+    A later cutoff keeps the literature that was searched valid.  A paper the run was to
+    start from (``known_papers.json``) and left out as too recent is another matter: once
+    the cutoff has moved past it, the paper on disk lacks a source it is to cite.
+    """
+    from paper_orchestra.agents.literature import load_known_papers
+
+    config = previous.get("config")
+    earlier = config.get("research_cutoff") if isinstance(config, dict) else None
+    earlier = earlier.strip() if isinstance(earlier, str) else ""
+    current = (cfg.research_cutoff or "").strip()
+    if earlier == current:
+        return []
+    now = load_known_papers(paths.materials_dir, cutoff=current or None).papers
+    try:
+        before = load_known_papers(paths.materials_dir, cutoff=earlier or None).papers
+    except ValueError:  # that cutoff cannot be read, so neither can what it let in
+        before = ()
+    cited = {paper.citation_key for paper in before}
+    return [paper.citation_key for paper in now if paper.citation_key not in cited]
 
 
 def _changed_settings(previous: dict[str, Any], cfg: PipelineConfig) -> list[str]:
@@ -705,6 +755,9 @@ class _Runner:
         #: Stages that neither another attempt nor going on without them can help, with what
         #: to add to the stage's own error (see :meth:`_blocker`).
         self._blocked: dict[str, str] = {}
+        #: What a stage has to say about its result beyond its files, by stage name: fields
+        #: that go into the stage's record when the attempt that reported them completes.
+        self._remarks: dict[str, dict[str, Any]] = {}
         self._stage_threads: list[threading.Thread] = []
         self._usage_lock = threading.Lock()
         self.state: _State
@@ -841,8 +894,9 @@ class _Runner:
             return None
         if previous.get("inputs") != fingerprint:
             log.warning(
-                "The idea, experimental log, figures or template changed since the previous run "
-                "in %s, so every stage runs again. The project memory there is kept; use a new "
+                "The idea, experimental log, figures, template or list of known papers "
+                "(the sources of a research project) changed since the previous run in %s, "
+                "so every stage runs again. The project memory there is kept; use a new "
                 "output directory for an unrelated paper.",
                 paths.base_dir,
             )
@@ -854,6 +908,20 @@ class _Runner:
                 "every stage runs again: the literature collected then may be too recent.",
                 cfg.research_cutoff,
                 paths.base_dir,
+            )
+            return None
+        let_in = _let_in_by_the_cutoff(previous, cfg, paths)
+        if let_in:
+            shown = ", ".join(let_in[:5]) + (f" and {len(let_in) - 5} more" if let_in[5:] else "")
+            cutoff = (cfg.research_cutoff or "").strip()
+            log.warning(
+                "The research cutoff %s, and %d paper(s) that the previous run in %s was to "
+                "start from and left out as too recent can be cited now (%s), so every stage "
+                "runs again.",
+                f"is now {cutoff}" if cutoff else "was taken away",
+                len(let_in),
+                paths.base_dir,
+                shown,
             )
             return None
         return previous
@@ -1040,6 +1108,8 @@ class _Runner:
             )
             self._record("stage_start", stage=name, attempt=attempt)
             log.info("Stage %s started (attempt %d of %d).", name, attempt, attempts)
+            # What an attempt that failed had to say is not true of this one.
+            self._remarks.pop(name, None)
             started = time.monotonic()
             try:
                 outputs = [Path(path) for path in stage.run()]
@@ -1101,6 +1171,7 @@ class _Runner:
                 seconds=round(seconds, 3),
                 error=None,
                 outputs=[_relative(path, base) for path in outputs],
+                **self._remarks.pop(name, {}),
             )
             self._record(
                 "stage_end",
@@ -1468,7 +1539,8 @@ class _Runner:
             checkpoint.write_bytes(verified)
         _atomic_copy(cfg.template_dir / "template.tex", paths.template_tex)
         _atomic_copy(self.pristine_outline, paths.outline)
-        _literature_agent(self.ctx).run(self._outline_for_agents())
+        result = _literature_agent(self.ctx).run(self._outline_for_agents())
+        self._remarks["literature"] = _literature_remarks(result)
 
         in_place = {
             paths.literature_dir / "outline_v1.json": paths.outline,
@@ -1570,6 +1642,27 @@ class _Runner:
             "ContentRefinementAgent": seconds("refinement"),
             "Total_Time_Span": round(elapsed + self.carried_seconds, 3),
         }
+
+
+def _literature_remarks(result: Any) -> dict[str, Any]:
+    """What the literature agent reported beyond its files, as fields of the stage's record.
+
+    ``warnings``: what the person has to be told about the papers the stage was to start
+    from (a list that could not be read, an accepted source that was left out and why);
+    ``known_papers``: how many of them are in the bibliography; ``excluded_candidates``:
+    how many papers the search proposed that were left out because the researcher
+    rejected them as sources.  Only what there is: a paper written from raw materials
+    alone has none of them, and its record is what it always was.
+    """
+    remarks: dict[str, Any] = {}
+    warnings = [str(warning) for warning in getattr(result, "warnings", None) or ()]
+    if warnings:
+        remarks["warnings"] = warnings
+    for name, attribute in (("known_papers", "known"), ("excluded_candidates", "excluded")):
+        count = getattr(result, attribute, 0)
+        if isinstance(count, int) and count > 0:
+            remarks[name] = count
+    return remarks
 
 
 def _fenced(text: str, language: str) -> str:
