@@ -763,6 +763,22 @@ def test_a_cutoff_that_cannot_be_read_is_never_no_cutoff(written):
     assert "no cutoff'" not in str(refusal.value)  # nothing was kept: it was refused
 
 
+@pytest.mark.parametrize("written", ["", "   "])
+def test_an_empty_cutoff_is_no_cutoff_and_nothing_is_said_about_it(written):
+    """What the store says of a cutoff must be true of what the lookup does with it: the
+    one who looks up papers reads an empty value as none, so it is not reported as
+    something that stops the research."""
+    from paper_orchestra.research.sources import normalize_cutoff
+
+    assert normalize_cutoff(written) is None
+    settings = ProjectSettings.from_dict({"research_cutoff": written})
+    assert settings.research_cutoff is None
+    assert settings.load_problems == [] and settings.cutoff_problem() is None
+    cleared = ProjectSettings.from_dict({"research_cutoff": "2024-06"})
+    cleared.update({"research_cutoff": written})  # the settings form, emptied
+    assert cleared.research_cutoff is None
+
+
 def test_a_summary_taken_from_the_text_carries_no_link_markup():
     body = "See [[topics/warmup|the warmup page]], [[H2]] and [[sources/Smith2020Deep#abstract]].\n"
     page = model.parse_page("wiki/topics/t.md", f"---\ntitle: T\n---\n{body}")

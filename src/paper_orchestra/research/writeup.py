@@ -61,6 +61,8 @@ _WIKI_LINK = re.compile(r"\[\[([^\[\]|#\n]+)(?:#[^\[\]|\n]*)?(?:\|([^\[\]\n]*))?
 _HEADING = re.compile(r"^(#{1,6})(\s+\S.*)$")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _RUN_NUMBER = re.compile(r"-run(\d+)$")
+#: A day as Semantic Scholar gives a publication date and a source record keeps it.
+_DATE = re.compile(r"\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])")
 #: What a figure's file name must not contain: it ends up in a path that LaTeX reads.
 _NOT_IN_A_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 #: Options of the paper run that are not the caller's to set: where it runs and what it reads.
@@ -323,6 +325,28 @@ def _listed(project: Project, page: ResearchPage, relation: str) -> str:
     return ", ".join(names)
 
 
+def _basis(project: Project, finding: ResearchPage) -> tuple[str, str]:
+    """What a reported finding is based on, as the materials say it: the records it
+    names that stand (see :func:`_stands`), and a sentence about the ones that do not.
+
+    A finding is reported when one of its records stands.  The others (runs of an
+    experiment the person rejected since) are in no part of the materials; naming
+    them as its basis would send the writer looking for a run that is not there.
+    """
+    stands, gone = [], []
+    for target in finding.relations.get("based_on", []):
+        (stands if _stands(project, target) else gone).append(_named(project, target))
+    if not gone:
+        return ", ".join(stands), ""
+    several = len(gone) > 1
+    what = "records" if several else "a record"
+    are = "those records are" if several else "that record is"
+    return ", ".join(stands), (
+        f"It also names {', '.join(gone)}, {what} of an experiment that was rejected or is "
+        f"gone: {are} not reported and {'support' if several else 'supports'} nothing here."
+    )
+
+
 def _idea_text(project: Project, runs: list[_Run]) -> str:
     """The idea, the accepted hypotheses with where they stand, and the method that was run."""
     idea = project.page(IDEA_PATH)
@@ -424,6 +448,17 @@ def _abstract(page: ResearchPage) -> str:
     return " ".join(" ".join(quoted).split())
 
 
+def _publication_date(published: Any) -> str | None:
+    """The day a source record says the paper was published, when it says one.
+
+    The literature stage holds the papers it starts from to the research cutoff.  The
+    wiki admitted a source by this date; by its year alone, a paper of the cutoff's own
+    year would be turned away there although the person accepted it here.
+    """
+    text = published.strip() if isinstance(published, str) else ""
+    return text if _DATE.fullmatch(text) else None
+
+
 def _known_papers(project: Project) -> dict[str, Any]:
     """The wiki's sources as the paper's literature stage can take them: the accepted
     ones as papers it starts from (in the shape it keeps verified papers in), the
@@ -447,7 +482,7 @@ def _known_papers(project: Project) -> dict[str, Any]:
                 "journal": None,
                 "volume": None,
                 "pages": None,
-                "publication_date": None,
+                "publication_date": _publication_date(meta.get("published")),
                 "link": str(meta.get("link") or ""),
                 "record": page.path,
             }
@@ -604,15 +639,17 @@ def _log_text(
             "What the person accepted as the meaning of these results.",
         ]
     for page in findings:
+        based_on, not_counted = _basis(project, page)
         relations = [
             f"{label}: {names}."
-            for label, relation in (
-                ("Supports", "supports"),
-                ("Refutes", "refutes"),
-                ("Based on", "based_on"),
+            for label, names in (
+                ("Supports", _listed(project, page, "supports")),
+                ("Refutes", _listed(project, page, "refutes")),
+                ("Based on", based_on),
             )
-            if (names := _listed(project, page, relation))
+            if names
         ]
+        relations += [not_counted] if not_counted else []
         # A number that is on no record does not reach the writers: it is taken out of
         # the text here, whatever a model would make of a sentence asking it not to.
         title, body, gone = experiments.reportable_text(project, page)

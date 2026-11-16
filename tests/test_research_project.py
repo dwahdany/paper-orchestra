@@ -2205,6 +2205,24 @@ def test_no_credential_reaches_the_event_stream(project, monkeypatch):
     assert secret not in json.dumps(project.events())
 
 
+def test_a_credential_is_blanked_wherever_it_stands_in_an_event(project, monkeypatch):
+    """Not only where it is a text among the data: as the name of an entry (a table keyed
+    by what was tried), in a reference, in the name of the agent or the phase."""
+    secret = "sk-audit-FAKE-0123456789abcdef"
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", secret)
+    event = project.emit(
+        "error",
+        "The request was refused.",
+        agent=f"scout {secret}",
+        phase=f"research {secret}",
+        refs=[f"transcripts/{secret}.jsonl"],
+        data={"tried": {secret: 401, "other": [{f"Bearer {secret}": "refused"}]}},
+    )
+    assert secret not in raw(project, "events.jsonl") and secret not in json.dumps(event)
+    assert event["data"]["tried"]["[redacted]"] == 401  # the entry stays, under a blank name
+    assert project.events()[-1] == event
+
+
 def test_events_are_not_appended_through_a_link(project, tmp_path):
     elsewhere = tmp_path / "notes-of-mine.txt"
     elsewhere.write_text("mine\n")
@@ -2362,6 +2380,31 @@ def test_a_failed_creation_leaves_an_existing_empty_directory_as_it_was(tmp_path
     assert Project.create(root, title="T", brief=BRIEF).page("idea").title == "T"
 
 
+def test_an_interrupt_while_a_project_is_moved_in_leaves_the_directory_as_it_was(
+    tmp_path, monkeypatch
+):
+    """Ctrl-C while the finished project is moved into a directory that was there: the
+    build directory is removed on the way out, so nothing would mark what was moved
+    already as an unfinished creation, and the next attempt would be refused for good."""
+    root = tmp_path / "ws" / "mine"
+    root.mkdir(parents=True)
+    real, moved = os.rename, []
+
+    def rename(source, target):
+        if len(moved) == 3:
+            raise KeyboardInterrupt
+        moved.append(target)
+        real(source, target)
+
+    monkeypatch.setattr(os, "rename", rename)
+    with pytest.raises(KeyboardInterrupt):
+        Project.create(root, title="T", brief=BRIEF)
+    monkeypatch.undo()
+    assert len(moved) == 3 and list(root.iterdir()) == []
+    assert [entry.name for entry in (tmp_path / "ws").iterdir()] == ["mine"]
+    assert Project.create(root, title="T", brief=BRIEF).page("idea").title == "T"
+
+
 def test_two_projects_are_not_created_in_one_directory(tmp_path):
     root = tmp_path / "ws" / "same"
     Project.create(root, title="First", brief=BRIEF)
@@ -2391,6 +2434,81 @@ def test_a_missing_idea_page_is_written_again_from_the_brief(project):
     assert Project.open(project.root).problems() == [
         {"path": "wiki/idea.md", "message": "the idea page is missing"}
     ]
+
+
+def test_the_idea_page_is_not_written_again_from_a_brief_behind_a_link(project, tmp_path):
+    """A project directory can come from anywhere.  Opening it must not copy a file from
+    outside it into its wiki."""
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    (outside / "brief.md").write_text("Not of this project.\n")
+    (project.root / "wiki" / "idea.md").unlink()
+    (project.root / "inputs" / "brief.md").unlink()
+    (project.root / "inputs" / "brief.md").symlink_to(outside / "brief.md")
+
+    opened = Project.open(project.root)
+    assert not (project.root / "wiki" / "idea.md").exists()
+    assert {"path": "wiki/idea.md", "message": "the idea page is missing"} in opened.problems()
+
+
+@pytest.mark.parametrize("name", ["wiki", "proposals", "requests", "inputs", "project.json"])
+def test_a_project_whose_own_files_are_a_link_out_of_it_is_not_opened(project, tmp_path, name):
+    """A project directory that came from somebody else, with its wiki (or its inputs, its
+    history ...) linked to a directory of the person's: every command, and every agent
+    session, would read what is there as the project's, and write there."""
+    import shutil
+
+    project.add_request("Use three seeds.")
+    outside = tmp_path / "somewhere-else"
+    shutil.copytree(project.root, outside)
+    target = project.root / name
+    shutil.rmtree(target) if target.is_dir() else target.unlink()
+    target.symlink_to(outside / name, target_is_directory=(outside / name).is_dir())
+
+    with pytest.raises(ProjectError) as refused:
+        Project.open(project.root)
+    said = str(refused.value)
+    assert str(target) in said and "symbolic link" in said and "Remove the link" in said
+    # A link that stays inside the project is the project's own, under another name.
+    target.unlink()
+    kept = project.root / f"{name}-kept"
+    if (outside / name).is_dir():
+        shutil.copytree(outside / name, kept)
+    else:
+        shutil.copy(outside / name, kept)
+    target.symlink_to(kept.name, target_is_directory=kept.is_dir())
+    assert Project.open(project.root).id == project.id
+
+
+def test_an_earlier_version_is_neither_read_nor_filed_through_a_link(project, tmp_path):
+    import shutil
+
+    page = project.create_page("topic", "Adam", "A first text.\n", author="human")
+    project.update_page(page.path, author="human", body="A second text.\n")
+    (version,) = project.history(page.path)
+    kept = project.root / version.path
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    (outside / "private.md").write_text("Not of this project.\n")
+    # The file of the version is a link ...
+    kept.unlink()
+    kept.symlink_to(outside / "private.md")
+    assert project.history(page.path) == []
+    with pytest.raises(NotFound):
+        project.version(page.path, version.stamp)
+    # ... or the directory the versions of the page are kept in.
+    (outside / "kept").mkdir()
+    (outside / "kept" / kept.name).write_text("Not of this project.\n")
+    shutil.rmtree(kept.parent)
+    kept.parent.symlink_to(outside / "kept", target_is_directory=True)
+    assert project.history(page.path) == []
+    with pytest.raises(NotFound):
+        project.version(page.path, version.stamp)
+    # Nothing is filed there either: the page is not changed while its history cannot be kept.
+    with pytest.raises(ProjectError, match=r"symbolic link out of the project.*Remove the link"):
+        project.update_page(page.path, author="human", body="A third text.\n")
+    assert project.page(page.path).body == "A second text.\n"
+    assert sorted(entry.name for entry in (outside / "kept").iterdir()) == [kept.name]
 
 
 def test_a_project_knows_whether_it_is_where_it_was_created(tmp_path):

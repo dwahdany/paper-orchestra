@@ -1182,9 +1182,13 @@ CUTOFF_STOPS_RESEARCH = (
 
 def as_cutoff(value: Any) -> Any:
     """A research cutoff in its usual form where what was meant is plain: a year given
-    as a number (``2024``) and a month or day written with one digit (``2024-6``).
-    Anything else is returned as it is, for the check to judge."""
+    as a number (``2024``), a month or day written with one digit (``2024-6``), and an
+    empty text, which is no cutoff (a settings field that was emptied; it is also how
+    whoever looks up papers reads it, ``sources.normalize_cutoff``).  Anything else is
+    returned as it is, for the check to judge."""
     text = value
+    if isinstance(text, str) and not text.strip():
+        return None
     if isinstance(text, float) and text.is_integer():
         text = int(text)
     if isinstance(text, int) and not isinstance(text, bool):

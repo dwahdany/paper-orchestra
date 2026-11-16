@@ -845,6 +845,36 @@ def test_a_finding_based_on_a_record_that_stands_is_reported_with_the_others_nam
     assert "Mine, on nothing" in log and "On a record that is gone" not in log
 
 
+def test_a_finding_is_not_said_to_be_based_on_the_run_of_a_rejected_experiment(project, tmp_path):
+    """A finding that names two records, one of an experiment the person then rejects:
+    it is reported, for the record that stands, and that is the only one it is said to
+    be based on.  The rejected experiment's run is in no part of the materials."""
+    spike = experiments.runs(project, "E1")[0]["metrics_text"]["spike_b16_no_warmup"]
+    both = project.create_page(
+        "finding",
+        "Both runs",
+        f"The spike was {spike} in the first, and the second failed.\n",
+        author="human",
+        relations={"based_on": ["E1-run1", "E2-run2"], "supports": ["H1"]},
+    )
+    before = text_of(writeup.export_materials(project, tmp_path / "before") / "experimental_log.md")
+    assert "Supports: H1. Based on: E1 run 1, E2 run 2." in before.split(f"### {both.id}: ")[1]
+
+    project.review("E1", "reject", reason="The script measures nothing about warmup.")
+    assert [item["id"] for item in writeup.left_out(project)] == ["F1"]
+    log = text_of(writeup.export_materials(project, tmp_path / "after") / "experimental_log.md")
+    section = flat(log.split(f"### {both.id}: ")[1])
+    assert "Supports: H1. Based on: E2 run 2." in section
+    assert "E1 run 1" not in section.split("It also names")[0]
+    assert (
+        "It also names E1 run 1, a record of an experiment that was rejected or is gone: "
+        "that record is not reported and supports nothing here." in section
+    )
+    # ... and its number, which only that record held, is no longer on record.
+    assert spike not in section and "[a number not on record]" in section
+    assert "## E1 run 1" not in log
+
+
 def test_a_number_found_nowhere_is_taken_out_of_what_the_writer_is_given(project, pipeline):
     project.review("F2", "accept")
     writeup.write_paper(project, template="cvpr2025")
@@ -942,6 +972,32 @@ def test_the_literature_starts_from_the_sources_the_person_accepted(project, exp
         assert f"- {page.id}: " in idea and page.title in idea
     for page in rejected:
         assert page.title in idea.split("## Papers not to cite")[1]
+
+
+def test_a_source_goes_to_the_literature_with_the_date_it_was_admitted_by(project, tmp_path):
+    """A source of the cutoff's own year: the research wiki admitted it by its date of
+    publication.  The paper's literature stage holds a known paper to the same cutoff,
+    and by its year alone it would turn the accepted source away."""
+    from paper_orchestra.agents.literature import load_known_papers
+
+    for key, published in (("Early2024Warmup", "2024-03-01"), ("Undated2024Warmup", "March")):
+        project.write_record(
+            "source",
+            key,
+            f"Warmup in the spring ({key})",
+            "> We measure warmup.\n",
+            fields={"authors": ["A. Early"], "year": 2024, "venue": "ICLR", "published": published},
+        )
+    out = writeup.export_materials(project, tmp_path / "out")
+    papers = {
+        paper["citation_key"]: paper for paper in read_json(out / "known_papers.json")["papers"]
+    }
+    assert papers["Early2024Warmup"]["publication_date"] == "2024-03-01"
+    assert papers["Undated2024Warmup"]["publication_date"] is None  # not a date: not passed on
+
+    known = load_known_papers(out, cutoff="2024-06")
+    assert "Early2024Warmup" in {paper.citation_key for paper in known.papers}
+    assert not [problem for problem in known.problems if "Early2024Warmup" in problem]
 
 
 def test_the_accepted_syntheses_are_background_for_the_paper(project, exported):

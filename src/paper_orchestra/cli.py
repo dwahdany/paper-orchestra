@@ -975,19 +975,8 @@ def _sweep(project: Project) -> None:
 def _stopped(project: Project, command: str = "advance") -> NoReturn:
     """Say that the command was stopped and what goes on from there; exit with 130."""
     root = _quoted(project.root)
-    waiting = ["approved", "queued", "running"]
-    if command == "run" and project.pages(kind="experiment", review="accepted", state=waiting):
-        # `advance` would start the project's next phase, which need not be the run.
-        how = (
-            "The run that was in flight is back in the queue; "
-            f"`paper-orchestra research run {root}` runs it again."
-        )
-    elif command == "run":
-        # The stop came when the run had just ended: its outcome is on record.
-        how = (
-            "No run is waiting to be run again: what had finished is on record. "
-            f"`paper-orchestra research status {root}` shows the experiments."
-        )
+    if command == "run":
+        how = _after_a_stopped_run(project, root)
     else:
         how = (
             "What was in flight is on record as interrupted; "
@@ -995,6 +984,31 @@ def _stopped(project: Project, command: str = "advance") -> NoReturn:
         )
     _say(f"Stopped. {how}", fg=typer.colors.YELLOW, err=True)
     raise typer.Exit(INTERRUPTED)
+
+
+def _after_a_stopped_run(project: Project, root: str) -> str:
+    """What became of the experiments when `research run` was stopped, by their pages: a
+    run that was in flight goes back to the queue; one that had just ended is on record;
+    an approved experiment that was not started yet still waits for its run."""
+    accepted = project.pages(kind="experiment", review="accepted")
+    in_queue = [page for page in accepted if page.state in ("queued", "running")]
+    untouched = [page for page in accepted if page.state == "approved"]
+    # `advance` would start the project's next phase, which need not be the run.
+    again = f"`paper-orchestra research run {root}`"
+    if in_queue:
+        return f"The run that was in flight is back in the queue; {again} runs it again."
+    if untouched:
+        one = len(untouched) == 1
+        waiting = f"{len(untouched)} approved experiment{' still waits' if one else 's still wait'}"
+        return (
+            "No run was left in flight: a run that had finished is on record. "
+            f"{waiting}: {again} runs {'it' if one else 'them'}."
+        )
+    # The stop came when the run had just ended: its outcome is on record.
+    return (
+        "No run is waiting to be run again: what had finished is on record. "
+        f"`paper-orchestra research status {root}` shows the experiments."
+    )
 
 
 def _plural(count: int, kind: str) -> str:
@@ -2008,21 +2022,20 @@ def research_cancel(
         if page.kind != "experiment" or not page.id:
             _fail(f"{experiment} is {page.kind} {page.label}, not an experiment such as E1.")
         name, before = page.id, page.state
-        if before == "approved":
-            experiments.withdraw(opened, name)
-        else:
+        withdrawn = before == "approved" and _withdrawn(opened, name)
+        if not withdrawn:
             experiments.request_cancel(opened, name)
         after = opened.page(name).state
     except (ProjectError, ComputeError) as exc:
         _fail(str(exc))
     again = f"`paper-orchestra research approve {root} {name}` approves a run of it again."
-    if before == "approved":
+    if withdrawn:
         _say(f"{name} is a plan again: its approval was withdrawn and nothing ran. {again}")
-    elif before not in ("queued", "running"):
+    elif before not in ("approved", "queued", "running"):
         _say(f"{name} is {before}: there is nothing to cancel.")
     elif after == "cancelled":
         _say(f"{name} is cancelled. {again}")
-    elif after in ("queued", "running"):
+    elif after in ("approved", "queued", "running"):
         _say(
             f"{name} was told to stop. The worker that runs it ends the job and records the "
             f"run as cancelled; `paper-orchestra research status {root}` shows when it has."
@@ -2030,6 +2043,20 @@ def research_cancel(
     else:
         # Its run had ended already; the page now says how.
         _say(f"{name} is {after}: its run had ended before it could be cancelled.")
+
+
+def _withdrawn(project: Project, name: str) -> bool:
+    """Take back the approval of an experiment that reads ``approved``; false when there
+    was none to take back: the page only read that way (it was saved from an editor)
+    while a process runs the experiment, or after its run had ended."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import ProjectError
+
+    try:
+        experiments.withdraw(project, name)
+    except ProjectError:
+        return False
+    return True
 
 
 @research_app.command("write")

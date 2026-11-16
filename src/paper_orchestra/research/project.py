@@ -178,6 +178,19 @@ _PROJECT_NAMES = frozenset(
         INDEX_FILE,
     }
 )
+#: What a project keeps at the top of its directory and reads, shows to its agents and
+#: writes as its own all the time.  None of them may be a symbolic link that leads out of
+#: the project (``Project.open`` refuses).  ``history`` and ``experiments`` are guarded
+#: where they are read and written, so that the rest of such a project can still be read.
+_OWN_ENTRIES: tuple[str, ...] = (
+    PROJECT_FILE,
+    WIKI_DIR,
+    PROPOSALS_DIR,
+    REQUESTS_DIR,
+    INPUTS_DIR,
+    NOTES_DIR,
+    TRANSCRIPTS_DIR,
+)
 #: Key of project.json: the inode of the directory the project was created as.  A copy
 #: of the directory carries the key and not the inode, which tells it from the original.
 HOME_KEY = "home"
@@ -616,6 +629,11 @@ def _move_contents(built: Path, root: Path, own: str) -> None:
     holds is an unfinished creation, which the next attempt recognises by the build
     directory ``own`` and clears.  Done under the lock of ``root``, so that two
     creations never move into each other.
+
+    Whatever ends the move half way that this process lives to see (the file system
+    refusing, an interrupt) has what was moved taken out again: the caller removes
+    the build directory on its way out, and without that mark the entries would be
+    a directory that every later attempt refuses as not empty.
     """
     with _lock_for(root):
         others = [name for name in _entries(root) if name != own]
@@ -629,13 +647,17 @@ def _move_contents(built: Path, root: Path, own: str) -> None:
                     continue  # ``root`` has its own, and it is held
                 os.rename(built / name, root / name)
                 moved.append(root / name)
-        except OSError as exc:
+        except BaseException as exc:
             for entry in moved:  # the directory is left as empty as it was found
                 if entry.is_dir() and not entry.is_symlink():
                     shutil.rmtree(entry, ignore_errors=True)
                 else:
                     with contextlib.suppress(OSError):
                         entry.unlink()
+            with contextlib.suppress(OSError):
+                (root / LOCK_FILE).unlink()  # made for this move; nothing else is here
+            if not isinstance(exc, OSError):
+                raise
             raise ProjectError(
                 f"The project could not be put in place at {root} ({exc}). Nothing was "
                 "created; choose a place you can write to."
@@ -669,6 +691,44 @@ def _check_storable(what: str, *values: Any) -> None:
                     f"{what} cannot be stored: the text holds half of a surrogate pair at "
                     f"position {exc.start}, which is not a character. Remove it and try again."
                 ) from None
+
+
+def _stays_inside(root: Path, path: Path) -> bool:
+    """Whether ``path`` is still under ``root`` once every symbolic link on the way to it
+    is followed.  A project directory can come from anywhere (an archive, a clone, a
+    shared folder): what a link out of it leads to is not the project's, to read, to
+    show to an agent or to write.  A link that stays inside is the project's own."""
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError):  # a loop of links leads nowhere
+        return False
+
+
+def _check_own_entries(root: Path) -> None:
+    """Raise ``ProjectError`` when one of the files and directories the project reads,
+    shows to its agents and writes as its own is a symbolic link that leads out of the
+    project: it is then not opened at all."""
+    for name in _OWN_ENTRIES:
+        entry = root / name
+        if entry.is_symlink() and not _stays_inside(root, entry):
+            raise ProjectError(
+                f"{entry} is a symbolic link that leads out of the project, so the project "
+                f"is not opened: what is there would be read, shown to the agents and "
+                f"written to as the project's own {name}. Remove the link and put the "
+                f"project's own {name} in its place, inside {root}."
+            )
+
+
+def _blanked(value: Any, secrets: Sequence[str]) -> Any:
+    """``value`` (what a JSON line holds) with every credential blanked out: in its
+    texts, as ``doctor.scrub`` does, and in the names of its entries as well."""
+    if isinstance(value, dict):
+        return {
+            doctor.scrub(str(key), secrets): _blanked(item, secrets) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_blanked(item, secrets) for item in value]
+    return doctor.scrub(value, secrets)
 
 
 def _open_for_append(path: Path) -> Any:
@@ -991,7 +1051,11 @@ class Project:
         """Open the project in ``root``.
 
         Pages written by hand, an older ``project.json`` and unknown settings are
-        all accepted; :meth:`problems` says what was read leniently.  Nothing on
+        all accepted; :meth:`problems` says what was read leniently.  What is not
+        accepted is a project one of whose own files or directories
+        (``project.json``, ``wiki``, ``proposals``, ``requests``, ``inputs``,
+        ``notes``, ``transcripts``) is a symbolic link that leads out of the project:
+        ``ProjectError`` names the link.  Nothing on
         disk is touched, with one exception: a project whose idea page is missing
         (its creation by an earlier version died half way, or the file was removed)
         gets it written again from ``inputs/brief.md``, because nothing can be done
@@ -1003,6 +1067,7 @@ class Project:
                 f"There is no research project at {root}: {PROJECT_FILE} is missing. "
                 "Create one with `paper-orchestra research new`."
             )
+        _check_own_entries(root)
         project = cls(root, clock=clock)
         project.reload()
         project._restore_idea()
@@ -1011,8 +1076,10 @@ class Project:
     def _restore_idea(self) -> None:
         """Write the idea page again from the brief on file, where the page is missing."""
         brief = self.inputs_dir / BRIEF_FILE
-        if (self.root / IDEA_PATH).exists() or brief.is_symlink() or not brief.is_file():
+        if (self.root / IDEA_PATH).exists() or not brief.is_file():
             return
+        if brief.is_symlink() or self.inputs_dir.is_symlink():
+            return  # what a link leads to is not this project's brief
         # A project that cannot be written to (or locked) just now is opened all the same;
         # ``problems`` then says that the idea page is missing.
         with contextlib.suppress(ProjectError, OSError, UnicodeDecodeError), self._lock:
@@ -1370,11 +1437,15 @@ class Project:
     def _versions(self, path: str) -> list[PageVersion]:
         folder = self._history_dir(path)
         versions = []
-        if folder.is_dir():
+        # Only the project's own files: a link out of the project in their place (or on
+        # the way to them) leads to something that is no version of this page.
+        if folder.is_dir() and _stays_inside(self.root, folder):
             for file in folder.iterdir():
                 match = _HISTORY_NAME.match(file.name)
                 moment = parse_stamp(match.group(1)) if match else None
                 if match is None or moment is None or not file.is_file():
+                    continue
+                if file.is_symlink() and not _stays_inside(self.root, file):
                     continue
                 versions.append(
                     PageVersion(
@@ -1403,6 +1474,15 @@ class Project:
         is then filed by the time the file was written, or after everything kept so far,
         so that no version ever replaces another.
         """
+        folder = self._history_dir(page.path)
+        if not _stays_inside(self.root, folder):
+            raise ProjectError(
+                f"{folder} is reached through a symbolic link out of the project, so the "
+                "earlier version of "
+                f"{page.path} cannot be kept there and the page is not changed. Remove the "
+                "link (the project keeps the versions of its pages in a directory of its "
+                "own), then try again."
+            )
         stamp = page.updated
         if parse_stamp(stamp) is None:
             stamp = self._file_stamp(page.path) or self._clock.now()
@@ -2724,9 +2804,10 @@ class Project:
             line = self._event_line(event)
             for secret in secrets_known:
                 # Also where a value was not a string until it was written (a path, an
-                # exception): nothing of the line that is kept holds a credential.
+                # exception) and where it is the name of an entry, a reference, the
+                # agent or the phase: nothing of the line that is kept holds a credential.
                 if secret.encode("utf-8", errors="replace") in line:
-                    event = doctor.scrub(json.loads(line), secrets_known)
+                    event = _blanked(json.loads(line), secrets_known)
                     line = self._event_line(event)
                     break
             if size:

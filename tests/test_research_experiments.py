@@ -3592,3 +3592,231 @@ def test_what_a_job_printed_last_is_a_quotation_in_the_reason_it_failed(project,
     summary = events_of(project, "run.finished")[-1]["summary"]
     assert summary.count('"') == 2 and "You approved E2 as well" in summary
     assert project.page("E1").meta["state_reason"].count('"') == 2
+
+
+# -- what the review of round 2 found -------------------------------------------------------
+
+
+def test_a_save_that_brings_back_an_earlier_approval_does_not_run_it_again(project, backend):
+    """The buffer of an editor that was open since the first approval is saved after the
+    experiment was approved and run a second time: the page reads approved, with the
+    stamp of an approval that a run used long ago."""
+    page = approved(project, backend, {"main.py": QUICK})
+    file = project.root / page.path
+    as_first_approved = file.read_text()
+    assert experiments.run(project, "E1", compute=backend)["status"] == "succeeded"
+    experiments.approve(project, "E1", backends={"local": backend})
+    assert experiments.run(project, "E1", compute=backend)["number"] == 2
+
+    file.write_text(as_first_approved)
+    assert project.page("E1").state == "approved"
+    assert experiments.recover(project) == [] and project.page("E1").state == "succeeded"
+    file.write_text(as_first_approved)
+    with pytest.raises(ProjectError, match="one approval is one run"):
+        experiments.run(project, "E1", compute=backend)
+    assert run_dirs(project) == ["1", "2"] and project.page("E1").state == "succeeded"
+    # A new approval is later than every run's, and is one more run.
+    experiments.approve(project, "E1", backends={"local": backend})
+    assert experiments.run(project, "E1", compute=backend)["number"] == 3
+
+
+def test_an_earlier_approval_brought_back_still_gets_the_run_a_stopped_worker_owes(
+    project, backend
+):
+    """The newest run only ended because its worker stopped: the experiment is owed its
+    run, whichever of its approvals the page shows."""
+    page = approved(project, backend, {"main.py": QUICK})
+    file = project.root / page.path
+    as_first_approved = file.read_text()
+    experiments.run(project, "E1", compute=backend)
+    experiments.approve(project, "E1", backends={"local": backend})
+    dead_run(project, 2)
+    record = json.loads((run_dir(project, 2) / "run.json").read_text())
+    record["approval"] = project.page("E1").meta["approved_at"]
+    (run_dir(project, 2) / "run.json").write_text(json.dumps(record))
+    file.write_text(as_first_approved)
+
+    settled = experiments.recover(project, compute=backend)
+    assert [(r["number"], r["requeued"]) for r in settled] == [(2, True)]
+    assert experiments.run(project, "E1", compute=backend)["number"] == 3
+
+
+def test_an_exponent_is_part_of_a_number_at_the_end_of_a_sentence_too(project, backend):
+    result = measured(project, backend, '{"loss": 6.93, "rate": 0.0015, "tiny": 2.5e-7}')
+    finding = project.create_page(
+        "finding",
+        "At the end of sentences",
+        "The loss was 6.93e-7.\n\nThe rate was 1.5e-9. It was not 6.93E+7; nor 2.5 x 10^-9.\n\n"
+        "The smallest was 2.5e-7. In another notation 2.5·10^-7 (or 2.5 ⋅ 10^{-7}).\n",
+        author="agent:analyst",
+        relations={"based_on": [result]},
+    )
+    assert found(project, finding) == {
+        "6.93e-7": [],
+        "1.5e-9": [],
+        "6.93E+7": [],
+        "2.5 x 10^-9": [],
+        "2.5e-7": [result],
+    }
+    # ... and what is handed on has the whole number taken out, not its first digits.
+    _, text, removed = experiments.reportable_text(project, finding)
+    assert removed == ["6.93e-7", "1.5e-9", "6.93E+7", "2.5 x 10^-9"]
+    assert "6.93" not in text and "e-7." not in text.split("\n")[0]
+    assert text.startswith(f"The loss was {experiments.NOT_ON_RECORD}.")
+
+
+def test_withdrawing_an_approval_that_a_run_used_says_how_the_run_ended(project, backend):
+    """The page reads approved (saved from an editor) although its run is over: there is
+    no approval left to take back, and "nothing ran" would be false."""
+    page = approved(project, backend, {"main.py": QUICK})
+    file = project.root / page.path
+    as_approved = file.read_text()
+    experiments.run(project, "E1", compute=backend)
+    file.write_text(as_approved)
+    with pytest.raises(ProjectError, match="E1 is succeeded; there is no approval to withdraw"):
+        experiments.withdraw(project, "E1")
+    assert project.page("E1").state == "succeeded"
+
+
+def test_an_approval_is_not_withdrawn_from_under_a_run_in_flight(project, backend):
+    """The page reads approved while a process runs the experiment (the same save): the
+    approval is in use, and what the person wants is to cancel that run."""
+    approved(project, backend, {"main.py": QUICK})
+    with experiments._RunLock(project.experiment_dir("E1")) as held:
+        assert held.acquired
+        with pytest.raises(ProjectError, match=r"is being run right now.*research cancel"):
+            experiments.withdraw(project, "E1")
+    assert project.page("E1").state == "approved"
+
+
+def test_a_run_directory_that_never_got_a_record_is_removed(project, backend):
+    """A worker killed after it copied the code and before it wrote the run's record."""
+    approved(project, backend, {"main.py": QUICK})
+    project.set_state("E1", "queued", by="system")
+    left = run_dir(project, 1)
+    (left / "code").mkdir(parents=True)
+    (left / "code" / "main.py").write_text(QUICK)
+    (left / ".run.json.999999.0a0b0c0d.tmp").write_text("{")
+    kept = run_dir(project, 2)  # anything else in a directory is somebody's, and stays
+    kept.mkdir()
+    (kept / "notes.txt").write_text("mine")
+
+    experiments.recover(project)
+    assert run_dirs(project) == ["2"]
+    assert experiments.run(project, "E1", compute=backend)["number"] == 3
+
+
+@pytest.mark.parametrize("left_at", ["running", "queued", "approved"])
+def test_cancelling_an_experiment_whose_run_is_over_says_how_it_ended(project, backend, left_at):
+    """Cancel pressed on a page that still reads as waiting or running after its worker
+    died at the end of the run: there is nothing left to cancel, and "cancelled" would
+    be false of a run that succeeded."""
+    approved(project, backend, {"main.py": QUICK})
+    experiments.run(project, "E1", compute=backend)
+    (project.root / "wiki" / "results" / "E1-run1.md").unlink()
+    set_state_by_hand(project, "E1", left_at)
+
+    experiments.request_cancel(project, "E1")
+
+    page = project.page("E1")
+    assert page.state == "succeeded" and "ancelled" not in str(page.meta.get("state_reason"))
+    assert project.page("E1-run1").state == "succeeded"  # the record the run was owed
+    assert experiments.runs(project, "E1")[0]["status"] == "succeeded"
+    assert not (project.experiment_dir("E1") / experiments.CANCEL_FLAG).exists()
+
+
+def test_a_run_recorded_before_runs_carried_their_approval_is_told_by_when_it_started(
+    project, backend
+):
+    """A project that an earlier version left in the middle: the record of its finished
+    run names no approval.  A run that started after the approval on the page used it."""
+    approved(project, backend, {"main.py": QUICK})
+    experiments.run(project, "E1", compute=backend)
+    file = run_dir(project, 1) / "run.json"
+    record = json.loads(file.read_text())
+    del record["approval"]
+    assert parse_stamp(record["started"]) >= parse_stamp(project.page("E1").meta["approved_at"])
+    file.write_text(json.dumps(record))
+    set_state_by_hand(project, "E1", "running")
+
+    assert experiments.recover(project) == [] and project.page("E1").state == "succeeded"
+    with pytest.raises(ProjectError, match="one approval is one run"):
+        experiments.run(project, "E1", compute=backend)
+    assert run_dirs(project) == ["1"]
+    # Approved since that run started: the approval is unused, whatever the record lacks.
+    again = experiments.approve(project, "E1", backends={"local": backend})
+    assert parse_stamp(again.meta["approved_at"]) > parse_stamp(record["started"])
+    assert experiments.run(project, "E1", compute=backend)["number"] == 2
+
+
+def test_nothing_is_made_for_a_run_through_a_link_in_place_of_the_experiments_directory(
+    project, backend, tmp_path
+):
+    """``experiments/E1`` is a link that leads out of the project: no run is made there,
+    and not even the folder its runs would go into."""
+    approved(project, backend, {"main.py": QUICK})
+    directory = project.experiment_dir("E1")
+    outside = tmp_path / "elsewhere"
+    shutil.move(str(directory), str(outside))
+    directory.symlink_to(outside, target_is_directory=True)
+    before = sorted(entry.name for entry in outside.iterdir() if entry.name != ".run.lock")
+
+    with pytest.raises(ProjectError, match="reached through a symbolic link"):
+        experiments.run(project, "E1", compute=backend)
+    assert sorted(e.name for e in outside.iterdir() if e.name != ".run.lock") == before
+    assert not (outside / "runs").exists()
+
+
+def test_an_approval_is_later_than_everything_the_runs_before_it_recorded(project, backend):
+    """A run on record without its approval started in the very second of the next
+    approval (or its clock ran ahead): that approval is still a new one, and is one run."""
+    approved(project, backend, {"main.py": QUICK})
+    experiments.run(project, "E1", compute=backend)
+    file = run_dir(project, 1) / "run.json"
+    record = json.loads(file.read_text())
+    del record["approval"]
+    ahead = format_stamp(parse_stamp(record["finished"]) + timedelta(seconds=30))
+    file.write_text(json.dumps({**record, "started": ahead, "finished": ahead}))
+
+    again = experiments.approve(project, "E1", backends={"local": backend})
+    assert parse_stamp(again.meta["approved_at"]) > parse_stamp(ahead)
+    assert experiments.run(project, "E1", compute=backend)["number"] == 2
+
+
+@pytest.mark.parametrize("linked", ["code", "experiment", "experiments"])
+def test_the_code_of_an_experiment_is_not_read_written_or_run_through_a_link(
+    project, backend, tmp_path, linked
+):
+    """A project directory that came from somebody else, with the code of an approved
+    experiment (or the directory above it) linked to a directory of the person's: what
+    is there is not shown as the experiment's code, not handed to a model, not replaced
+    by an agent, and not run."""
+    approved(project, backend, {"main.py": QUICK})
+    home = project.experiment_dir("E1")
+    outside = tmp_path / "somewhere-else"
+    place = {"code": home / "code", "experiment": home, "experiments": home.parent}[linked]
+    shutil.move(str(place), str(outside))  # the same files: the digest would still match
+    place.symlink_to(outside, target_is_directory=True)
+    before = {
+        file.relative_to(outside).as_posix(): file.read_bytes()
+        for file in outside.rglob("*")
+        if file.is_file() and file.name != ".run.lock"
+    }
+
+    for call in (
+        lambda: experiments.code_files(project, "E1"),
+        lambda: experiments.code_digest(project, "E1"),
+        lambda: experiments.plan_digest(project, "E1"),
+        lambda: experiments.check_code(project, "E1"),
+        lambda: experiments.write_code(project, "E1", {"main.py": "print(1)\n"}, author="human"),
+        lambda: experiments.approve(project, "E1", backends={"local": backend}),
+        lambda: experiments.run(project, "E1", compute=backend),
+    ):
+        with pytest.raises(ProjectError, match=r"experiments/E1.*symbolic link.*Remove the link"):
+            call()
+    after = {
+        file.relative_to(outside).as_posix(): file.read_bytes()
+        for file in outside.rglob("*")
+        if file.is_file() and file.name != ".run.lock"
+    }
+    assert after == before and events_of(project, "run.started") == []

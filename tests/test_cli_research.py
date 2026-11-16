@@ -1224,6 +1224,8 @@ def test_run_with_nothing_approved_says_how_to_approve(project, engine):
 
 def test_run_exits_with_130_when_it_was_stopped(approved, engine):
     engine.runs = {"E1": KeyboardInterrupt()}
+    # Where the engine leaves an experiment whose run it was told to stop.
+    approved.set_state("E1", "queued", by="system")
 
     result = invoke("run", str(approved.root))
 
@@ -1607,6 +1609,22 @@ def test_cancel_withdraws_an_approval_or_cancels_a_run_that_waits(approved):
     assert unknown.exit_code == 2 and "E9" in flat(unknown.stderr)
 
 
+def test_cancel_of_a_page_that_only_reads_approved_cancels_the_run_in_flight(approved):
+    """The page was saved from an editor while its run was under way: it reads approved,
+    a process is running it.  Cancel does not call it a plan again and say nothing ran."""
+    from paper_orchestra.research import experiments
+
+    directory = approved.experiment_dir("E1")
+    with experiments._RunLock(directory) as running:
+        assert running.acquired
+        told = invoke("cancel", str(approved.root), "E1")
+        assert told.exit_code == 0, told.output
+        assert (directory / experiments.CANCEL_FLAG).is_file()  # what its worker looks for
+    assert "E1 was told to stop" in flat(told.stdout)
+    assert "plan again" not in told.stdout and "nothing ran" not in told.stdout
+    assert approved.page("E1").state == "approved"
+
+
 def a_run_of_e1(project: Project, loss: str = "0.2537") -> None:
     """E1 accepted, with the record of a run that succeeded (as the run module leaves it)."""
     project.review("E1", "accept")
@@ -1699,6 +1717,16 @@ def test_a_stopped_run_is_said_to_be_back_in_the_queue_only_when_it_is(approved,
     assert result.exit_code == 130
     assert "back in the queue" not in flat(result.stderr)
     assert "No run is waiting" in flat(result.stderr)
+    # The same stop while another experiment is approved and was never started: that one
+    # waits for its first run, and no run "that was in flight" went back anywhere.
+    approved.set_state("E2", "approved", by="human")
+    result = invoke("run", str(approved.root), "E1")
+    said = flat(result.stderr)
+    assert result.exit_code == 130 and "back in the queue" not in said
+    assert "No run was left in flight: a run that had finished is on record." in said
+    assert (
+        f"1 approved experiment still waits: `paper-orchestra research run {approved.root}`" in said
+    )
 
 
 def test_an_id_names_the_project_and_not_a_copy_of_its_directory(project, workspace):

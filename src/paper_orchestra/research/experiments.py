@@ -229,6 +229,10 @@ _NAME_PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
 #: A value that reads as itself in a sentence: a word, a number, a path.
 _PLAIN_VALUE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_/.:\-]*")
 _RUN_NUMBER = re.compile(r"[0-9]{1,9}")
+#: Earlier than any stamp: what a stamp that cannot be read counts as among others.
+_EPOCH = datetime.min.replace(tzinfo=UTC)
+#: The name ``utils.common.write_text`` gives a run record while it is being written.
+_TEMPORARY_RECORD = re.compile(rf"\.{re.escape(RUN_FILE)}\.\d{{1,10}}\.[0-9a-f]{{8}}\.tmp")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _TRUE = frozenset({"true", "yes", "on", "1"})
@@ -833,8 +837,23 @@ def job_spec(plan: ExperimentPlan, *, timeout: float | None = None) -> JobSpec:
 
 
 def code_dir(project: Project, experiment_id: str) -> Path:
-    """``experiments/E<n>/code``: where the files of the experiment live (not created)."""
-    return project.experiment_dir(_experiment_id(project, experiment_id)) / CODE_DIR
+    """``experiments/E<n>/code``: where the files of the experiment live (not created).
+
+    ``ProjectError`` when that place is reached through a symbolic link.  A project
+    directory can come from anywhere; what a link there leads to is not the code of
+    the experiment, to be shown as such, handed to a model, replaced by an agent or
+    run: every reader and writer of the code comes through here.
+    """
+    name = _experiment_id(project, experiment_id)
+    path = project.experiment_dir(name) / CODE_DIR
+    if not _in_project(project, path):
+        raise ProjectError(
+            f"{EXPERIMENTS_DIR}/{name}/{CODE_DIR} is reached through a symbolic link, so "
+            f"the code of {name} is not read, written or run: what the link leads to is "
+            "not this project's. Remove the link and put the experiment's own directory "
+            "in its place, inside the project."
+        )
+    return path
 
 
 def _code_paths(directory: Path) -> Iterator[tuple[str, Path]]:
@@ -1964,10 +1983,12 @@ def _record_approval(
     with project.locked():
         current = project.page(page.path)
         # An approval is told from the one before it by its stamp, which a run takes
-        # with it: two approvals within a second are still two.
+        # with it: two approvals within a second are still two.  It is later than
+        # everything the runs so far recorded, so that none of them reads as its run.
         earlier = [_text(current.meta.get("approved_at"))]
-        earlier += [_text(record.get("approval")) for record in runs(project, name)]
-        stamp = stamp_after(_now(), max(earlier))
+        for record in runs(project, name):
+            earlier += [_text(record.get(key)) for key in ("approval", "started", "finished")]
+        stamp = stamp_after(_now(), max(earlier, key=lambda text: parse_stamp(text) or _EPOCH))
         if current.updated != page.updated or _current_digest(project, name) != code:
             raise Conflict(
                 f"{name} changed while it was being approved (its page or its code was "
@@ -2064,7 +2085,8 @@ def _new_run_dir(project: Project, experiment_id: str) -> tuple[int, Path]:
     may rest on.
     """
     folder = _runs_dir(project, experiment_id)
-    folder.mkdir(parents=True, exist_ok=True)
+    if _in_project(project, folder):  # looked at first: nothing is made through a link
+        folder.mkdir(parents=True, exist_ok=True)
     if not _in_project(project, folder):
         raise ProjectError(
             f"{folder} is reached through a symbolic link, so no run is made there: a run "
@@ -2871,11 +2893,14 @@ def _run_of_approval(project: Project, page: ResearchPage) -> tuple[int, dict[st
     """The run that used the approval now on ``page``, as ``(number, record)``: the
     newest run of the experiment, when it is settled, will not be repeated by itself
     (it is not ``requeued`` and no repair of it is owed) and carries the stamp of that
-    approval.  ``None`` when the approval has not been used.
+    approval, or of a later one.  ``None`` when the approval has not been used.
 
     One approval is one run.  The record of a run is written before the experiment's
     page moves, so a worker that stops or dies in between leaves a page that still
-    reads as waiting or running; this is what tells that its run is over.
+    reads as waiting or running; this is what tells that its run is over.  Approvals
+    are stamped in order (:func:`_record_approval`), so a page whose stamp is earlier
+    than its newest run's shows an approval from before that run: a copy of the page
+    saved from an editor that was open since then.  That approval was used long ago.
     """
     stamp = _text(page.meta.get("approved_at"))
     found = _numbered_runs(project, str(page.id)) if stamp and page.id else []
@@ -2885,7 +2910,13 @@ def _run_of_approval(project: Project, page: ResearchPage) -> tuple[int, dict[st
     unsettled = record.get("status") in (None, "running")
     if unsettled or record.get("requeued") or record.get("repair_owed"):
         return None
-    return (number, record) if _text(record.get("approval")) == stamp else None
+    # A record from before runs carried their approval is told by when the run started.
+    used = _text(record.get("approval")) or _text(record.get("started"))
+    if used != stamp:
+        of_page, of_run = parse_stamp(stamp), parse_stamp(used)
+        if of_page is None or of_run is None or of_run < of_page:
+            return None  # approved since that run (or the two cannot be compared)
+    return number, record
 
 
 def _conclude(project: Project, page: ResearchPage) -> dict[str, Any] | None:
@@ -3917,9 +3948,7 @@ def _settle_stale(
     secrets = _secrets(project, plan)
     left_alone = False
     for _, directory in _run_dirs(project, plan.id):
-        with contextlib.suppress(OSError):
-            if not any(directory.iterdir()):
-                directory.rmdir()  # made by a worker that was killed before it wrote anything
+        _remove_unrecorded(directory)
     for number, record in _numbered_runs(project, plan.id):
         if record.get("status") != "running":
             continue
@@ -3969,6 +3998,27 @@ def _settle_stale(
         reason = settled[-1].get("error") if settled else "The worker stopped before the run began."
         _move(project, page.path, "queued", reason)
     return settled
+
+
+def _remove_unrecorded(directory: Path) -> None:
+    """Remove a run directory that never became a run: made by a worker that was killed
+    before it wrote the run's record.  It holds nothing, or only the copy of the code
+    and a record that was still being written.  Anything else in a directory without a
+    record (a log, results, a file someone put there) is left as it is."""
+    with contextlib.suppress(OSError):
+        if os.path.lexists(directory / RUN_FILE):
+            return
+        entries = list(directory.iterdir())
+        litter = [entry for entry in entries if _TEMPORARY_RECORD.fullmatch(entry.name)]
+        others = [entry for entry in entries if entry not in litter]
+        if any(entry.name != CODE_DIR or not _real_dir(entry) for entry in others):
+            return
+        for entry in litter:
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
+        for entry in others:
+            shutil.rmtree(entry, ignore_errors=True)
+        directory.rmdir()
 
 
 def _stop_remote(attempt: _Attempt, backend_for: Callable[[Mapping[str, Any]], Any]) -> None:
@@ -4062,19 +4112,28 @@ def withdraw(project: Project, ref: str) -> ResearchPage:
     Nothing is cancelled and nothing is recorded as a run: the experiment is simply
     a plan again, to be approved when the person wants it run.  ``ProjectError``
     for an experiment that is not ``approved`` (a queued or running one is ended
-    with :func:`request_cancel`).
+    with :func:`request_cancel`), and for one whose page only reads that way: a
+    process is running it at this moment, or the run it was approved for is over
+    (the page is then moved to how that run ended, as :func:`recover` would).
     """
     page = _experiment(project, ref)
-    if page.state != "approved":
-        how = (
-            " Cancel its run instead (`paper-orchestra research cancel`, or Cancel in the app)."
-            if page.state in ("queued", "running")
-            else ""
-        )
-        raise ProjectError(f"{page.id} is {page.state}; there is no approval to withdraw.{how}")
-    return project.set_state(
-        page.path, "planned", by=HUMAN, reason="You withdrew the approval of its run."
-    )
+    cancel = " Cancel its run instead (`paper-orchestra research cancel`, or Cancel in the app)."
+    if page.state == "approved":
+        with _RunLock(project.experiment_dir(str(page.id))) as lock:
+            if not lock.acquired:
+                # The page was saved from an editor while the run was under way.
+                raise ProjectError(
+                    f"{page.id} is being run right now, so its approval is in use and "
+                    f"cannot be withdrawn.{cancel}"
+                )
+            page = _experiment(project, page.path)
+            if page.state == "approved" and _conclude(project, page) is None:
+                return project.set_state(
+                    page.path, "planned", by=HUMAN, reason="You withdrew the approval of its run."
+                )
+            page = _experiment(project, page.path)  # as its run, long over, left it
+    how = cancel if page.state in ("queued", "running") else ""
+    raise ProjectError(f"{page.id} is {page.state}; there is no approval to withdraw.{how}")
 
 
 def recover(
@@ -4161,11 +4220,14 @@ NOT_ON_RECORD = "[a number not on record]"
 #: A number as a text writes it: a minus sign where one can stand (not the hyphen of
 #: ``0.1-0.2`` or ``E1-run1``), the digits as ``leakscan.NUMBER`` reads them, and an
 #: exponent (``1.5e-9``, ``2.5 x 10^-7``).  Sign and exponent are part of the number:
-#: ``-0.121`` is not 0.121 and ``1.5e-9`` is not 1.5.
+#: ``-0.121`` is not 0.121 and ``1.5e-9`` is not 1.5.  The full stop that ends a sentence
+#: ends the number too (``... was 1.5e-9.``); only a decimal after the exponent
+#: (``1.5e-9.2``) says that it was no exponent.
 _QUOTED_NUMBER = re.compile(
     rf"(?P<sign>(?<![\w.)\]%])[-\u2212])?(?P<digits>{NUMBER.pattern})"
-    r"(?:[eE](?P<exp>[+\-\u2212]?\d{1,3})(?![\w.])"
-    r"|\s*(?:\u00d7|x|\*|\\times|\\cdot)\s*10\s*\^\s*\{?\s*(?P<pow>[+\-\u2212]?\d{1,3})\s*\}?)?"
+    r"(?:[eE](?P<exp>[+\-\u2212]?\d{1,3})(?!\w|\.\d)"
+    r"|\s*(?:\u00d7|\u00b7|\u22c5|x|\*|\\times|\\cdot)\s*10\s*\^\s*\{?\s*"
+    r"(?P<pow>[+\-\u2212]?\d{1,3})\s*\}?)?"
 )
 
 
@@ -4188,6 +4250,9 @@ class _Quoted:
     #: The value in plain digits, without its sign; then, for ``12,345``, the items of
     #: the list it may also be.
     readings: tuple[str, ...]
+    #: Whether it is written with an exponent.  Such a number says its own magnitude:
+    #: it is not also read as a percentage of a fraction (``2.5e-9`` is not 2.5e-7).
+    scaled: bool = False
 
     @property
     def value(self) -> str:
@@ -4209,7 +4274,8 @@ def _quoted_spans(text: str) -> Iterator[tuple[_Quoted, int, int]]:
             except (InvalidOperation, ValueError):
                 continue
         negative = bool(match.group("sign")) and readings[0] != "0"
-        yield _Quoted(match.group(0), negative, tuple(readings)), match.start(), match.end()
+        quoted = _Quoted(match.group(0), negative, tuple(readings), scaled=bool(power))
+        yield quoted, match.start(), match.end()
 
 
 def _quoted_numbers(text: str) -> Iterator[_Quoted]:
@@ -4257,11 +4323,13 @@ class _Index:
 
         A number written with a minus sign is held only as a negative value.  One
         written without is the value or its size: "a drop of 0.25" quotes a recorded
-        change of -0.25.  ``12,345`` is one number, or the two items of a list.
+        change of -0.25.  ``12,345`` is one number, or the two items of a list.  One
+        written with an exponent is held at that magnitude only.
         """
+        as_percent = not quoted.scaled
         if quoted.negative:
-            return sorted(self._holding(quoted.key))
-        found = self._either_sign(quoted.value)
+            return sorted(self._holding(quoted.key, as_percent))
+        found = self._either_sign(quoted.value, as_percent)
         if quoted.readings[1:]:
             found |= set.intersection(*(self._either_sign(part) for part in quoted.readings[1:]))
         return sorted(found)
@@ -4272,19 +4340,21 @@ class _Index:
         quoted = _Quoted(number, number.startswith("-"), (number.lstrip("-"), *parts))
         return [self.paths[position] for position in self.holders(quoted)]
 
-    def _either_sign(self, number: str) -> set[int]:
-        holders = self._holding(number)
+    def _either_sign(self, number: str, as_percent: bool = True) -> set[int]:
+        holders = self._holding(number, as_percent)
         if self._any_negative and number != "0":
-            holders |= self._holding(f"-{number}")
+            holders |= self._holding(f"-{number}", as_percent)
         return holders
 
-    def _holding(self, number: str) -> set[int]:
+    def _holding(self, number: str, as_percent: bool = True) -> set[int]:
+        """The pieces that hold ``number``: as written, rounded, and (``as_percent``) with
+        the decimal point moved two places either way."""
         holders = set(self._exact.get(number, ()))
         try:
             value = Decimal(number)
         except InvalidOperation:
             return holders
-        for scaled in (value, value / 100, value * 100):
+        for scaled in (value, value / 100, value * 100) if as_percent else (value,):
             if len(holders) == len(self.paths):
                 break  # everything holds it already
             # The same value written another way (51.25% of a fraction 0.5125), or one
@@ -4715,7 +4785,8 @@ def number_check(project: Project, page: ResearchPage | str) -> list[dict[str, A
     text file under ``inputs/``).  ``in_basis`` says whether one of them is a
     record the page names in ``based_on``.  A number is held as written, rounded
     to the digits the page gives (0.8765 is quoted as 0.88), or with the decimal
-    point moved two places (0.913 and 91.3%).  An empty ``found_in`` means that
+    point moved two places (0.913 and 91.3%; not a number written with an
+    exponent, which says its own magnitude).  An empty ``found_in`` means that
     nothing on record holds the number.  ``page`` is a page or a reference to one.
 
     This is an occurrence check: it does not tie a number to the metric or the
