@@ -148,8 +148,12 @@ def scout(request: FakeRequest) -> str:
 
 
 def theorist(request: FakeRequest) -> str:
+    # What the hypotheses rest on: an accepted question, else a topic.  The person may have
+    # rejected every question, and the idea itself is not something a hypothesis can be
+    # motivated by, so the last resort is to name nothing.
     question = re.search(r"questions/(Q\d+)-", request.system or "")
-    motivated_by = question.group(1) if question else "idea"
+    topic = re.search(r"(topics/[\w-]+)\.md", request.system or "")
+    motivated_by = question.group(1) if question else topic.group(1) if topic else ""
     number = _round(request)
     for slug, title in (
         (f"scripted-effect-is-there-r{number}", "The scripted effect is there"),

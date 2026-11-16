@@ -77,6 +77,9 @@ body {
   background: var(--ground); color: var(--ink);
   font: 13px/1.45 var(--sans); font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; overflow: hidden;
+  /* titles and text come from models and from the web: a word longer than its column is
+     broken, never allowed to push the page wider than the window */
+  overflow-wrap: anywhere;
 }
 h1, h2, h3, p, ul, ol, dl, dd, figure, pre, blockquote { margin: 0; }
 ul, ol { padding: 0; list-style: none; }
@@ -1041,3 +1044,18 @@ a.choice { text-decoration: none; }
 .limits-form { display: grid; gap: 8px; margin-top: 10px; max-width: 360px; }
 .limits-form label { display: grid; grid-template-columns: 92px 84px 1fr; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-2); } .limits-form input { height: 28px; }
 .limits-form .btn { justify-self: start; } .limits-form .note { margin: 0; }
+
+/* ---------- a run the person cancelled; a run that succeeded on repaired code ---------- */
+.failure.k-cancelled .fail-t { color: var(--ink); } .failure.k-cancelled .fail-t .ic { color: var(--ink-3); }
+.repair-ok { margin: 0 0 16px; padding: 10px 14px 4px; border: 1px dashed var(--prop-line); border-radius: 6px; background: var(--prop-wash); }
+.repair-ok h4 { display: flex; align-items: center; gap: 7px; font-size: 13px; letter-spacing: 0; text-transform: none; color: var(--ink); } .repair-ok h4 .ic { color: var(--prop); flex: none; }
+.repair-ok > p { margin: 4px 0 8px; }
+
+/* ---------- after "keep editing on top of the new version": a note, not an alarm ---------- */
+.conflict-kept { border-style: dashed; border-color: var(--prop-line); background: var(--prop-wash); }
+.conflict-kept details { margin-top: 0; } .conflict-kept > p { margin-top: 8px; font-size: 12px; }
+
+/* ---------- an experiment that was put back to planned says why ---------- */
+.page-reason-back { color: var(--prop); }
+.approve .approve-back { margin: 8px 0 12px; }
+.ex-sub .t-prop { color: var(--prop); }

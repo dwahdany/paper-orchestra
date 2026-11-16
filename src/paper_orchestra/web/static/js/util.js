@@ -69,7 +69,9 @@ export function plain(text) {
     .replace(new RegExp('\\bat (' + stamp + ')', 'g'), (all, s) => (parseStamp(s) == null ? all : ago(s)))
     .replace(new RegExp(stamp, 'g'), (s) => (parseStamp(s) == null ? s : dateTime(s)))
     .replace(/\bhuman (changed|edited|wrote|saved|decided|accepted|rejected|updated|deleted|created|approved)\b/g, 'you $1')
-    .replace(/\bby (?:the )?human\b(?!-)/g, 'by you');
+    .replace(/\bby (?:the )?human\b(?!-)/g, 'by you')
+    .replace(/\bat the person's request\b/g, 'at your request')
+    .replace(/\bRaise settings\.limits\.\w+ in the project's settings\b/g, 'Raise the limit');
 }
 /** "38 min ago", "2 h ago", "3 days ago", then the date. */
 export const ago = (stamp, now = Date.now()) => {

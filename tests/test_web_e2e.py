@@ -2,7 +2,8 @@
 
 ``tests/e2e/web_check.js`` drives the frontend through the flows a person goes through
 (see ``tests/e2e/README.md``).  Here it gets what it needs: a temporary workspace with the
-demo project, and a server on a free loopback port whose workers use the scripted model
+demo project and the same project filled up to 150 pages, and a server on a free loopback
+port whose workers use the scripted model
 of ``tests/e2e/scripted_model.py``.  The server and the browser are child processes; this
 process opens no socket (it learns the server's address from what the server prints).
 
@@ -31,6 +32,8 @@ CHECK = E2E_DIR / "web_check.js"
 #: The exit status of ``web_check.js`` when no browser could be started.
 NO_BROWSER = 3
 ADDRESS = re.compile(r"running at (http://127\.0\.0\.1:\d+)/")
+#: The option of ``paper-orchestra ui`` that ends the workers with the server.
+STOP_WORKERS = "--stop-workers-on-exit"
 
 
 def _playwright_missing() -> str | None:
@@ -52,7 +55,7 @@ def _run(command: list[str], *, env: dict[str, str], timeout: float) -> subproce
 
 
 def _stop(process: subprocess.Popen) -> None:
-    """Stop the server the way Ctrl-C does (it then stops its workers), then make sure."""
+    """Stop the server the way Ctrl-C does, then make sure."""
     if process.poll() is None:
         process.send_signal(signal.SIGINT)
         try:
@@ -76,22 +79,38 @@ def server(tmp_path):
         "PAPER_ORCHESTRA_E2E_PAUSE": "0.5",
         "PYTHONUNBUFFERED": "1",
     }
-    built = _run(
-        [
-            sys.executable,
-            "-m",
-            "paper_orchestra",
-            "research",
-            "demo",
-            "--dir",
-            str(workspace / "demo"),
-        ],
-        env=env,
-        timeout=180,
+    # The demo project, and beside it the same project filled up to 150 pages: the checks
+    # of a large project (the map folded, a large inbox decided at once, nothing typed in
+    # one project turning up in another) need a second project to look at.
+    for name, extra in (("demo", []), ("large", ["--pages", "150"])):
+        built = _run(
+            [
+                sys.executable,
+                "-m",
+                "paper_orchestra",
+                "research",
+                "demo",
+                "--dir",
+                str(workspace / name),
+                *extra,
+            ],
+            env=env,
+            timeout=180,
+        )
+        assert built.returncode == 0, (
+            f"the {name} project could not be built:\n{built.stdout}\n{built.stderr}"
+        )
+    # A server that is stopped leaves its workers running unless it is told otherwise. A
+    # check that fails half way would leave one behind, so the server of the test takes
+    # its workers with it where the command line has the option for that.
+    described = _run(
+        [sys.executable, "-m", "paper_orchestra", "ui", "--help"],
+        env={**env, "COLUMNS": "200"},
+        timeout=60,
     )
-    assert built.returncode == 0, (
-        f"the demo project could not be built:\n{built.stdout}\n{built.stderr}"
-    )
+    # The help is drawn as a table whose cells may be wrapped: compare without the drawing.
+    offered = STOP_WORKERS in re.sub(r"[^\w-]+", "", described.stdout)
+    with_workers = [STOP_WORKERS] if offered else []
     process = subprocess.Popen(
         [
             sys.executable,
@@ -103,6 +122,7 @@ def server(tmp_path):
             "--port",
             "0",
             "--no-browser",
+            *with_workers,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

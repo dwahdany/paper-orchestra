@@ -79,8 +79,14 @@ const SIZES = [
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
   const listing = await (await fetch(BASE + '/api/projects')).json();
-  const demo = listing.projects.find((p) => /^Demonstration/.test(p.title));
-  const large = listing.projects.find((p) => /150 pages/.test(p.title));
+  /* the demo project and the large one (`research demo --pages 150` gives both the same
+     title) are told apart by how many pages they hold */
+  let demo = null, large = null;
+  for (const row of listing.projects) {
+    const view = await (await fetch(BASE + '/api/projects/' + row.id)).json();
+    if (/150 pages/.test(row.title) || ((view.counts || {}).pages || 0) >= 140) large = large || row;
+    else if (/^Demonstration/.test(row.title) && !demo) demo = row;
+  }
   if (!demo) { console.error('The workspace has no demo project.'); process.exit(2); }
   const browser = await chromium.launch();
   const errors = [];

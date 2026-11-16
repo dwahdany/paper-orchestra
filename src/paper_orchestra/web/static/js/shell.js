@@ -3,7 +3,7 @@
 
 import { VIEWS, app, hrefOf, link } from './core.js';
 import { connection } from './api.js';
-import { clock, duration, hm, html, listOf, money, parseStamp, plural, raw, tf } from './util.js';
+import { clock, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, tf } from './util.js';
 import { KIND, STAGES, icon, phaseName } from './vocab.js';
 
 const MARK = raw('<svg class="brand-mark" width="18" height="18" viewBox="-10 -10 20 20" aria-hidden="true"><circle r="8"/><circle class="core" r="3"/></svg>');
@@ -36,12 +36,17 @@ export function engineView(store) {
   else if (busy && kind === 'run') mode = 'experiment';
   else if (busy && kind === 'write') mode = 'writing';
   else if (mode === 'running') mode = 'stopped';              // state.json says running, nothing runs: settled at the next look
-  const budget = mode === 'checkpoint' && last && last.status === 'interrupted' && last.error ? last.error : null;
+  let budget = mode === 'checkpoint' && last && last.status === 'interrupted' && last.error ? plain(last.error) : null;
+  /* The phase stopped at the limit for models, and the limit has been raised since: the
+     stop is over. (The record of the phase keeps the sentence of the moment it stopped.) */
+  const limits = (p.settings || {}).limits || {}, spent = state.spent || {};
+  const lifted = !!budget && /model budget/i.test(last.error) && limits.model_usd != null && (spent.model_usd || 0) < limits.model_usd;
+  if (lifted) budget = null;
   const died = mode === 'stopped' && !!state.error;
   const exit = worker.last_exit || null;
   const crashed = !busy && exit && !exit.stopped && exit.code !== 0 && exit.code != null && (exit.kind === 'advance' || exit.code < 0) && mode !== 'failed' && !died;
   return {
-    mode, stopping, kind, budget, died, crashed, exit,
+    mode, stopping, kind, budget, lifted, died, crashed, exit,
     round: state.round || 0,
     /* a worker that has just started has not written its phase yet: it is the one it was asked for */
     phase: busy && kind === 'advance' && state.status !== 'running' ? worker.phase || state.next_phase || state.phase : state.phase || (busy ? worker.phase : null),
@@ -74,7 +79,25 @@ export function waitingSentence(store) {
   if (edits) parts.push(plural(edits, 'suggested edit'));
   return listOf(parts) + (items.length === 1 ? ' is' : ' are') + ' waiting for you.';
 }
-export const continueLabel = (next) => (next === 'run' ? 'Run the approved experiments' : next === 'research' ? 'Continue to research' : next ? 'Continue to ' + phaseName(next) : 'Continue');
+/** What the main button does next. The run phase runs what is approved; with nothing
+    approved it goes straight on, to the analysis of results nobody has read yet when
+    there are any, and the button says so instead of promising a run. */
+export function continueLabel(next, store) {
+  if (next === 'run' && store) {
+    const ready = store.experiments.filter((x) => x.review === 'accepted' && (x.state === 'approved' || x.state === 'queued')).length;
+    if (ready === 1) return 'Run the approved experiment';
+    if (!ready) return store.pages.some((p) => p.kind === 'result' && !(p.meta || {}).analysed) ? 'Continue to analysis' : 'Continue without a run';
+  }
+  return next === 'run' ? 'Run the approved experiments' : next === 'research' ? 'Continue to research' : next ? 'Continue to ' + phaseName(next) : 'Continue';
+}
+/** Why the button does not say "run" when the next phase is the run phase. */
+export function continueTip(next, store) {
+  if (next !== 'run' || !store) return '';
+  const label = continueLabel(next, store);
+  if (label === 'Continue to analysis') return 'No experiment is approved to run. The results that are there have not been analysed yet: that comes next.';
+  if (label === 'Continue without a run') return 'No experiment is approved to run. Approve one under Experiments first, or go on without a run.';
+  return '';
+}
 const PAUSE = raw('<svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5v9M10.5 3.5v9"/></svg>');
 const RING = raw('<svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.2"/></svg>');
 
@@ -197,7 +220,7 @@ export function strip(store) {
     const since = (parseStamp(e.started) || 0) - 2000;
     const last = store.activity.slice().reverse().find((ev) => /^(agent\.activity|page\.created|phase\.started|proposal\.created|run\.started|run\.finished|experiment\.state)$/.test(ev.type) && (parseStamp(ev.ts) || 0) >= since);
     return html`<div class="strip s-running" role="status"><span class="live-dot" aria-hidden="true"></span><span class="strip-kicker">Round ${e.round || 1} · ${phaseName(e.phase) || 'starting'}</span>
-      <span class="strip-text">${e.stopping ? 'Stopping: the phase ends at its next step and can be resumed.' : last ? html`<b>${last.agent || 'engine'}</b> ${last.summary}` : 'Starting…'}</span>
+      <span class="strip-text">${e.stopping ? 'Stopping: the phase ends at its next step and can be resumed.' : last ? (String(last.summary || '').toLowerCase().startsWith('the ' + String(last.agent || 'engine').toLowerCase() + ' ') ? last.summary : html`<b>${last.agent || 'engine'}</b> ${last.summary}`) : 'Starting…'}</span>
       ${e.started ? html`<span class="strip-clock" data-since="${e.started}">${clock((Date.now() - (parseStamp(e.started) || Date.now())) / 1000)}</span>` : ''}
       <span class="strip-actions">${toggle('activity')}${stopButton(store, e)}</span></div>
       ${open ? html`<div class="strip-log" data-follow>${activityLines(store, 40)}</div>` : ''}`;
@@ -216,7 +239,7 @@ export function strip(store) {
     const text = e.mode === 'failed' ? e.error : e.died ? e.error : crashText(store, e.exit);
     return html`<div class="strip s-failed" role="alert"><span class="strip-mark">${icon('warn')}</span><span class="strip-kicker">${title}</span>
       <span class="strip-text">${text}</span>
-      <span class="strip-actions">${toggle('log')}<a class="btn" href="#/setup">Open Setup</a><button class="btn btn-primary" data-act="continue">${e.mode === 'failed' ? 'Retry ' + phaseName(phase) : e.died && phase ? 'Resume ' + phaseName(phase) : e.fresh || !e.next ? 'Start again' : 'Try again: ' + continueLabel(e.next).replace(/^Continue to /, '').replace(/^Run /, 'run ')}</button></span></div>
+      <span class="strip-actions">${toggle('log')}<a class="btn" href="#/setup">Open Setup</a><button class="btn btn-primary" data-act="continue">${e.mode === 'failed' ? 'Retry ' + phaseName(phase) : e.died && phase ? 'Resume ' + phaseName(phase) : e.fresh || !e.next ? 'Start again' : 'Try again: ' + continueLabel(e.next, store).replace(/^Continue to /, '').replace(/^Continue /, '').replace(/^Run /, 'run ')}</button></span></div>
       ${open ? html`<div class="strip-log"><p class="strip-fix">What was written so far is kept. Put the cause right (credentials are checked under Setup), then retry: the phase resumes where it stopped.</p>${workerLogHTML(store)}${activityLines(store, 12)}</div>` : ''}`;
   }
   if (e.fresh) {
@@ -233,12 +256,12 @@ export function strip(store) {
     return html`<div class="strip s-budget" role="status"><span class="strip-mark">${icon('warn')}</span><span class="strip-kicker">Budget reached · round ${e.round || 1}</span>
       <span class="strip-text">${e.budget}</span>
       <span class="strip-actions">${editing ? html`<form class="limit-form" data-form="limit"><label class="sr" for="limit-usd">New limit for models, in dollars</label><span class="quiet">Models, up to $</span><input id="limit-usd" name="usd" data-input="limit" inputmode="decimal" value="${editing.value}" size="6"><button class="btn btn-primary" type="submit">Set the limit</button><button class="btn btn-quiet" type="button" data-act="limit-cancel">Cancel</button></form>`
-        : html`<button class="btn" data-act="limit-edit">Raise the limit…</button><button class="btn btn-primary" data-act="continue">${continueLabel(e.next)} ${icon('right')}</button>`}</span></div>`;
+        : html`<button class="btn" data-act="limit-edit">Raise the limit…</button><button class="btn btn-primary" data-act="continue">${continueLabel(e.next, store)} ${icon('right')}</button>`}</span></div>`;
   }
   return html`<div class="strip s-checkpoint"><span class="strip-mark">${PAUSE}</span>
-    <span class="strip-kicker">Checkpoint · round ${e.round || 1}${e.phase ? ', after ' + phaseName(e.phase) : ''}</span><span class="strip-text">${waitingSentence(store)}</span>
+    <span class="strip-kicker">Checkpoint · round ${e.round || 1}${e.phase ? (e.lifted ? ', during ' : ', after ') + phaseName(e.phase) : ''}</span><span class="strip-text">${e.lifted ? 'The limit for models is raised. ' + cap1(phaseName(e.next || e.phase)) + ' stopped at the old one and can go on where it stopped. ' : ''}${waitingSentence(store)}</span>
     <span class="strip-actions">${n ? html`<a class="btn" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${n}</a>` : ''}
-      <button class="btn btn-primary" data-act="continue"${n ? raw(' data-tip="Proposals you have not decided stay in the inbox"') : ''}>${continueLabel(e.next)} ${icon('right')}</button></span></div>`;
+      <button class="btn btn-primary" data-act="continue" data-tip="${[continueTip(e.next, store), n ? 'Proposals you have not decided stay in the inbox.' : ''].filter(Boolean).join(' ')}">${e.lifted ? 'Resume ' + phaseName(e.next || e.phase) : continueLabel(e.next, store)} ${icon('right')}</button></span></div>`;
 }
 
 /* ---------- the status bar ---------- */

@@ -4,7 +4,7 @@
 
 import { app, link } from './core.js';
 import { api } from './api.js';
-import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, minutes, money, plural, raw, storage, tf } from './util.js';
+import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, minutes, money, plain, plural, raw, storage, tf } from './util.js';
 import { STATES, TONE, agentName, glyph, icon, kindName, pageGlyph } from './vocab.js';
 
 /* ---------- naming a page ---------- */
@@ -344,7 +344,7 @@ function editorHTML(store, page, view, mode) {
       <button class="btn btn-quiet" type="button" data-act="edit-cancel">Close</button>
       <button class="btn btn-primary" type="submit"${draft.saving ? raw(' disabled') : ''}>${submit} <kbd>Ctrl S</kbd></button></div>
     ${draft.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span><b>Not saved.</b> ${draft.error} Your text is still here.</span></div>` : ''}
-    ${conflict ? conflictHTML(draft, conflict) : ''}
+    ${conflict ? conflictHTML(draft, conflict) : draft.theirs ? theirsHTML(draft.theirs) : ''}
     <div class="ed-fields"><label><span>Title</span><input id="ed-title" name="title" value="${draft.title}" autocomplete="off"></label>
       <label><span>Summary</span><input id="ed-summary" name="summary" value="${draft.summary}" autocomplete="off" placeholder="One line, shown in lists and on the map"></label>
       ${states ? html`<label class="ed-state"><span>State</span><select id="ed-state" name="state">${states.map((s) => html`<option${s === draft.state ? raw(' selected') : ''}>${s}</option>`)}</select></label>` : ''}</div>
@@ -359,6 +359,13 @@ function conflictHTML(draft, conflict) {
     <div class="review-actions"><button class="btn btn-primary" type="button" data-act="conflict-mine">Save my version over it</button>
       <button class="btn" type="button" data-act="conflict-rebase">Keep editing on top of the new version</button>
       <button class="btn btn-neg-quiet" type="button" data-act="conflict-theirs">Discard my draft, show the new version</button></div></div>`;
+}
+/** After "keep editing on top of the new version": what that version changed stays in
+    sight until the person saves, because their text does not contain it. */
+function theirsHTML(theirs) {
+  return html`<div class="conflict conflict-kept"><details open data-keep="theirs"><summary>You are editing on top of the version ${who(theirs.by || 'human')} saved ${ago(theirs.at)}. Your text does not contain what it changed:</summary>
+    ${theirs.rows.length ? diffRows(theirs.rows) : html`<p class="quiet">Only its fields changed (title, summary or state), not the text.</p>`}</details>
+    <p class="quiet">Copy over what you want to keep. Saving replaces that version with your text; it stays in the history.</p></div>`;
 }
 export const diffRows = (rows) => html`<div class="diff">${rows.map((r) => (r[0] === '…' ? html`<div class="d dgap">⋯</div>` : html`<div class="d d${r[0] === '+' ? 'a' : r[0] === '-' ? 'r' : 'c'}"><span class="d-s">${r[0] === ' ' ? '' : r[0] === '-' ? '−' : '+'}</span><span>${r[1]}</span></div>`))}</div>`;
 
@@ -422,7 +429,7 @@ export function panelHTML(store, page, opt) {
     <h1 class="page-title">${page.title}</h1>
     ${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
     <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by">${byline(page)}</span></div>
-    ${page.kind === 'experiment' && page.meta && page.meta.state_reason && page.state === 'failed' ? html`<p class="page-reason">${icon('warn')}${page.meta.state_reason}</p>` : ''}
+    ${page.kind === 'experiment' && page.meta && page.meta.state_reason && (page.state === 'failed' || page.state === 'planned') ? html`<p class="page-reason${page.state === 'planned' ? ' page-reason-back' : ''}">${icon('warn')}${plain(page.meta.state_reason)}</p>` : ''}
     ${app.ui.confirmDelete === page.path ? html`<div class="note note-neg confirm" role="alertdialog" aria-label="Delete this page"><span><b>Delete this page?</b> Its last version stays under <code>history/</code>; pages that link to it keep the link as text.</span>
       <span class="row"><button class="btn btn-neg" data-act="delete" data-ref="${page.path}">Delete</button><button class="btn btn-quiet" data-act="delete-cancel">Cancel</button></span></div>` : ''}
   </header>`;

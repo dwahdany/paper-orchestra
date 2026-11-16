@@ -1,9 +1,9 @@
 /* What the person can do: one table of actions (the `data-act` attributes of the markup),
    one handler each for clicks, submits, typing, changes, drops and keys. */
 
-import { VIEWS, app, go, select } from './core.js';
+import { VIEWS, app, codeKey, go, reasonsKey, requestKey, select } from './core.js';
 import { api, connection, Unreachable } from './api.js';
-import { $, ago, bytes, cap, plain, plural } from './util.js';
+import { $, ago, bytes, cap, lineDiff, plain, plural, storage } from './util.js';
 import { STAGES, EXTRA_KINDS, agentName } from './vocab.js';
 import { dropDraft, isDirty, label, schedulePreview, touchDraft } from './page.js';
 import { mapView } from './map.js';
@@ -13,6 +13,13 @@ import { clearToast, closeOverlay, openHelp, openNewPage, openPalette, overlayOp
 import { theme } from './shell.js';
 
 const GRACE_MS = 5000;
+/** The reasons being typed are kept on this device until the rejection they belong to is made. */
+function keepReasons() {
+  if (!app.store) return;
+  const typed = {};
+  Object.keys(app.ui.reasons).forEach((ref) => { if (String(app.ui.reasons[ref] || '').trim()) typed[ref] = app.ui.reasons[ref]; });
+  if (Object.keys(typed).length) storage.set(reasonsKey(app.store.pid), typed); else storage.remove(reasonsKey(app.store.pid));
+}
 let batchCounter = 0;
 const store = () => app.store;
 const message = (error) => (error instanceof Unreachable ? 'The server is not answering.' : (error && error.message) || 'Something went wrong.');
@@ -83,8 +90,21 @@ export async function flushAll() {
   const waiting = s.unsent();
   if (waiting.length) await flush(waiting);
 }
-function later(entries) {
-  setTimeout(() => flush(entries), GRACE_MS);
+/* The decisions still in their grace period, oldest first, one entry per toast. Undo takes
+   back the newest; the one before it is then offered, for as long as its own period lasts. */
+const waiting = [];
+function later(entries, decision) {
+  const batch = { entries, decision };
+  waiting.push(batch);
+  setTimeout(() => { forget(batch); flush(entries); }, GRACE_MS);
+  return batch;
+}
+function forget(batch) { const i = waiting.indexOf(batch); if (i >= 0) waiting.splice(i, 1); }
+const stillOpen = (batch) => batch.entries.some((entry) => !entry.sent && !entry.cancelled);
+/** What the toast adds while earlier decisions can still be taken back as well. */
+function earlier() {
+  const n = waiting.filter(stillOpen).length - 1;
+  return n > 0 ? (n === 1 ? 'The decision before it' : 'The ' + n + ' before it') + ' can still be taken back too.' : '';
 }
 function decide(ref, decision, options) {
   options = options || {};
@@ -96,10 +116,11 @@ function decide(ref, decision, options) {
   app.ui.flash = { key: entry.target, at: Date.now(), decision };
   app.ui.rejecting = null;
   delete app.ui.reasons[ref];
+  keepReasons();
   delete app.ui.checked[ref];
   if (options.immediate) { app.render('decide'); return flush([entry]); }
-  later([entry]);
-  say(describe([entry], decision), { undo: [entry] });
+  later([entry], decision);
+  say(describe([entry], decision), { undo: [entry], note: earlier() });
   if (next !== undefined && next !== app.route.sel) go({ sel: next, sub: '' }, true); else app.render('decide');
   return entry;
 }
@@ -112,17 +133,28 @@ function bulk(decision, reason) {
   app.ui.checked = {};
   app.ui.rejecting = null;
   delete app.ui.reasons.bulk;
-  later(entries);
-  say(describe(entries, decision), { undo: entries });
+  keepReasons();
+  later(entries, decision);
+  say(describe(entries, decision), { undo: entries, note: earlier() });
   if (app.route.view === 'inbox') go({ sel: '', sub: '' }, true); else app.render('bulk');
 }
 function undo() {
-  const t = app.ui.toast;
-  if (!t || !t.undo || !store()) return false;
-  const n = store().retract(t.undo);
+  if (!store()) return false;
+  /* the newest decision that has not been sent: the one the toast names, or the one before */
+  let batch = null;
+  for (let i = waiting.length - 1; i >= 0 && !batch; i--) if (stillOpen(waiting[i])) batch = waiting[i];
+  if (!batch) return false;
+  const n = store().retract(batch.entries);
+  forget(batch);
   clearToast();
-  if (n) { app.ui.flash = null; say(n === 1 ? 'Taken back. Nothing was sent.' : 'Taken back: ' + n + ' decisions. Nothing was sent.'); app.render('undo'); }
-  return !!n;
+  if (!n) return false;
+  app.ui.flash = null;
+  const took = n === 1 ? 'Taken back: ' + batch.entries[0].label + '.' : 'Taken back: ' + n + ' decisions.';
+  const before = waiting.filter(stillOpen).pop();
+  if (before) say(took + ' ' + describe(before.entries, before.decision), { undo: before.entries });
+  else say(took + ' Nothing was sent.');
+  app.render('undo');
+  return true;
 }
 
 /* ---------- editing a page ---------- */
@@ -187,6 +219,7 @@ async function advance() {
   try {
     const answer = await api.advance(s.pid, {});
     if (answer.worker) s.project.worker = answer.worker;
+    if (app.ui.toast && app.ui.toast.kind !== 'error' && !app.ui.toast.undo) clearToast();   // "Stopping…" is no longer true
     if (app.route.view !== 'map' && app.route.view !== 'overview') go({ view: 'map', sel: '', sub: '' });
     s.refresh();
     app.render('advance');
@@ -200,7 +233,11 @@ async function stopAgents() {
   try {
     const answer = await api.stop(s.pid);
     if (answer.worker) s.project.worker = answer.worker;
-    say(answer.worker && answer.worker.state === 'idle' ? 'Nothing was running.' : 'Stopping. What was written so far is kept; the phase can be resumed.');
+    const kind = (answer.worker || {}).kind;
+    say(answer.worker && answer.worker.state === 'idle' ? 'Nothing was running.'
+      : kind === 'run' ? 'Stopping the run. The experiment is queued again: it runs with the next run phase, or now.'
+      : kind === 'write' ? 'Stopping the write-up. What it has written is kept; it can be started again.'
+      : 'Stopping. What was written so far is kept; the phase can be resumed.');
     s.refresh();
     app.render('stop');
   } catch (error) { sayError('Not stopped: ' + message(error)); }
@@ -360,7 +397,7 @@ const ACT = {
   'edit-cancel': () => go({ sub: '' }),
   'draft-discard': (el) => { dropDraft(store(), el.dataset.ref); if (app.route.sub === 'edit') go({ sub: '' }); else app.render('draft'); say('The draft is discarded. The page is as it was.'); },
   'conflict-mine': () => { const d = app.ui.drafts[draftKey(app.route.sel)]; if (!d || !d.conflict) return; d.base_updated = d.conflict.updated; d.conflict = null; saveEdit(app.route.sel); },
-  'conflict-rebase': () => { const d = app.ui.drafts[draftKey(app.route.sel)]; if (!d || !d.conflict) return; const c = d.conflict; d.base = { title: c.title, summary: c.summary || '', state: c.state || '', body: c.body || '' }; d.base_updated = c.updated; d.conflict = null; touchDraft(store(), app.route.sel, 'body', d.body); say('You are now editing on top of the newer version. Saving replaces it with your text.'); app.render('conflict'); },
+  'conflict-rebase': () => { const d = app.ui.drafts[draftKey(app.route.sel)]; if (!d || !d.conflict) return; const c = d.conflict; d.theirs = { rows: lineDiff(d.base.body, c.body || ''), by: (c.meta || {}).updated_by || c.author || '', at: c.updated }; d.base = { title: c.title, summary: c.summary || '', state: c.state || '', body: c.body || '' }; d.base_updated = c.updated; d.conflict = null; touchDraft(store(), app.route.sel, 'body', d.body); say('You are now editing on top of the newer version. What it changed stays above the text, so that you can carry it over: saving replaces that version with your text.'); app.render('conflict'); },
   'conflict-theirs': () => { dropDraft(store(), app.route.sel); store().invalidate(app.route.sel); go({ sub: '' }); },
   history: (el) => { const r = app.route, path = el.dataset.ref || r.sel; go({ sel: path, sub: r.sub === 'history' && r.sel === path ? '' : 'history' }); },
   version: (el) => { const path = el.dataset.ref; app.ui.histVersion[path] = app.ui.histVersion[path] === el.dataset.stamp ? '' : el.dataset.stamp; app.render('version'); },
@@ -373,8 +410,9 @@ const ACT = {
       await api.deletePage(s.pid, path);
       app.ui.confirmDelete = null;
       dropDraft(s, path);
+      s.forget(path);
+      if (app.route.sel === path) go({ sel: '', sub: '' });
       await s.refreshNow();
-      go({ sel: '', sub: '' });
       say('Deleted ' + (page ? label(page) : 'the page') + '. Its last version is kept under history/.');
     } catch (error) { app.ui.confirmDelete = null; sayError('Not deleted: ' + message(error)); app.render('delete'); }
   },
@@ -425,7 +463,8 @@ const ACT = {
   },
   'cancel-run': async (el) => {
     const s = store(), eid = el.dataset.eid;
-    try { await api.cancel(s.pid, eid); say('Cancelling the run of ' + eid + '. It is recorded as cancelled.'); s.refresh(); }
+    const waiting = ['approved', 'queued'].indexOf((s.expById.get(eid) || {}).state) >= 0;   // approved, not started: the approval is taken back
+    try { await api.cancel(s.pid, eid); say(waiting ? eid + ' will not run: its approval is taken back. Approve it again when you want it run.' : 'Cancelling the run of ' + eid + '. It is recorded as cancelled.'); s.invalidateExperiment(eid); s.refresh(); }
     catch (error) { sayError('Not cancelled: ' + message(error)); }
   },
   'show-run': (el) => { const eid = el.dataset.eid, n = +el.dataset.run; const s = store(), entry = s.exps.get(eid); const runs = ((entry && entry.data && entry.data.runs) || []).slice().sort((a, b) => b.number - a.number); const now = app.ui.runOpen[eid] === undefined ? (runs[0] && runs[0].status !== 'running' ? runs[0].number : null) : app.ui.runOpen[eid]; app.ui.runOpen[eid] = now === n ? null : n; app.render('ui'); },
@@ -437,11 +476,11 @@ const ACT = {
     const file = files.find((f) => f.name === name);
     if (!file) return;
     app.ui.codeTab[eid] = name;
-    app.ui.codeEdit[eid + '/' + name] = { text: file.text, error: null, saving: false };
+    if (!app.ui.codeEdit[eid + '/' + name]) app.ui.codeEdit[eid + '/' + name] = { text: file.text, error: null, saving: false };
     app.render('ui');
     setTimeout(() => { const t = $('#code-text'); if (t) { t.focus(); t.scrollIntoView({ block: 'nearest' }); } }, 0);
   },
-  'code-cancel': (el) => { delete app.ui.codeEdit[el.dataset.key]; app.render('ui'); },
+  'code-cancel': (el) => { delete app.ui.codeEdit[el.dataset.key]; if (store()) storage.remove(codeKey(store().pid, el.dataset.key)); app.render('ui'); },
 };
 /** Run an action by name (the palette does). */
 app.act = (name, el) => { if (ACT[name]) return ACT[name](el || { dataset: {} }); return undefined; };
@@ -454,6 +493,7 @@ async function saveCode(form) {
   try {
     const answer = await api.putCode(s.pid, eid, name, edit.text);
     delete app.ui.codeEdit[key];
+    storage.remove(codeKey(s.pid, key));
     s.invalidateExperiment(eid);
     await s.refreshNow();
     const problems = answer.problems || [];
@@ -463,8 +503,18 @@ async function saveCode(form) {
   app.render('saved');
 }
 
+/* What a second click of a double click may do again. Everything else is done once: after
+   the first click the page has changed under the pointer (the next proposal has moved up
+   into the place of the accepted one, a form has opened where the button was), so a second
+   click would decide something the person never looked at. */
+const REPEATABLE = { 'zoom-in': 1, 'zoom-out': 1, 'feed-more': 1, 'code-tab': 1 };
+
 export function installActions() {
   document.addEventListener('click', (ev) => {
+    if (ev.detail > 1) {
+      const again = ev.target.closest('[data-act], button[type=submit], input[type=submit]');
+      if (again && !REPEATABLE[again.dataset.act]) { ev.preventDefault(); return; }
+    }
     const actEl = ev.target.closest('[data-act]');
     if (actEl && ACT[actEl.dataset.act]) {
       if (actEl.disabled || actEl.getAttribute('aria-disabled') === 'true') return;
@@ -497,7 +547,7 @@ export function installActions() {
       const target = rq.about && app.route.sel && s.byPath.has(app.route.sel) ? app.route.sel : null;
       rq.sending = true; rq.error = null;
       app.render('request');
-      api.addRequest(s.pid, text, target).then(async () => { rq.text = ''; await s.refreshNow(); say('Added. It goes to the next phase that runs.'); }, (error) => { rq.error = message(error); })
+      api.addRequest(s.pid, text, target).then(async () => { rq.text = ''; storage.remove(requestKey(s.pid)); await s.refreshNow(); say('Added. It goes to the next phase that runs.'); }, (error) => { rq.error = message(error); })
         .finally(() => { rq.sending = false; app.render('request'); });
     } else if (kind === 'limit') {
       const usd = Number(String(form.elements.usd.value).replace(/[$,\s]/g, ''));
@@ -548,9 +598,9 @@ export function installActions() {
       s.text = t.value; keepComposer();
       if (was !== composerReady(s) || s.error) { s.error = null; app.render('start'); }
     } else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.dataset.name === 'model_usd') app.render('start'); }
-    else if (what === 'reason') app.ui.reasons[t.dataset.ref] = t.value;
-    else if (what === 'request') app.ui.request.text = t.value;
-    else if (what === 'code') { const edit = app.ui.codeEdit[t.dataset.key]; if (edit) edit.text = t.value; }
+    else if (what === 'reason') { app.ui.reasons[t.dataset.ref] = t.value; keepReasons(); }
+    else if (what === 'request') { app.ui.request.text = t.value; if (store()) { if (t.value.trim()) storage.set(requestKey(store().pid), t.value); else storage.remove(requestKey(store().pid)); } }
+    else if (what === 'code') { const edit = app.ui.codeEdit[t.dataset.key]; if (edit) { edit.text = t.value; edit.restored = false; if (store()) storage.set(codeKey(store().pid, t.dataset.key), t.value); } }
     /* drawn again while typing, never on blur: a render between the press and the release of a
        button would swallow the click that follows the typing */
     else if (what === 'ap-minutes') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).minutes = t.value; app.render('backend'); }
@@ -594,6 +644,15 @@ export function installActions() {
     if (composer().uploading) return;
     filesOfDrop(ev.dataTransfer).then((files) => { if (files.length) addFiles(files); });
   });
+
+  /* A <select> whose list is open: the render loop leaves the page alone until the choice
+     is made or given up (the list would close under the pointer if its markup were
+     written again while the agents are at work). */
+  const isSelect = (el) => !!el && el.tagName === 'SELECT';
+  document.addEventListener('mousedown', (ev) => { if (isSelect(ev.target) || isSelect(ev.target.parentElement)) app.choosingAt = Date.now(); }, true);
+  document.addEventListener('keydown', (ev) => { if (isSelect(ev.target) && (ev.key === ' ' || ev.key === 'F4' || (ev.altKey && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp')))) app.choosingAt = Date.now(); else if (isSelect(ev.target) && ev.key === 'Escape') app.choosingAt = 0; }, true);
+  document.addEventListener('change', (ev) => { if (isSelect(ev.target)) app.choosingAt = 0; }, true);
+  document.addEventListener('focusout', (ev) => { if (isSelect(ev.target)) app.choosingAt = 0; }, true);
 
   /* tooltips for anything with data-tip: on hover and on keyboard focus */
   const tipEl = $('#tip');
@@ -647,6 +706,9 @@ export function installActions() {
     if (mod && ev.key.toLowerCase() === 'k') { ev.preventDefault(); if (overlayOpen()) closeOverlay(); else openPalette(); return; }
     if (typing || mod || ev.altKey || overlayOpen()) return;
     const k = ev.key;
+    /* A key that is held down repeats. Moving through a list may repeat; deciding may not:
+       A held a moment too long would accept one proposal after the other, unread. */
+    if (ev.repeat && !/^(Arrow|[jJkK+\-=]$)/.test(k)) return;
     if (k === '/') { ev.preventDefault(); openPalette(); return; }
     if (k === '?') { openHelp(); return; }
     if (k === 't' || k === 'T') { theme.toggle(); return; }

@@ -52,6 +52,37 @@ export const app = {
   hooks: {},
 };
 
+const freshMap = () => ({ fold: null, round: null, lineageOnly: false, deep: false, open: {} });
+/** Where what the person is typing is kept on this device until it is sent or saved. */
+export const requestKey = (pid) => 'po-request:' + pid;
+export const codeKey = (pid, key) => 'po-code:' + pid + ':' + key;
+export const reasonsKey = (pid) => 'po-reasons:' + pid;
+
+/** The interface state that belongs to one project. Another project starts without it: the
+    unsaved code of E1 here must never turn up in the E1 of another project, nor an
+    instruction typed for this one be sent to that one. What was being typed for the project
+    that opens (an instruction, an edit of a code file) is read back from this device. */
+export function openProjectUi(pid) {
+  const ui = app.ui;
+  const reasons = storage.get(reasonsKey(pid), {});
+  ui.checked = {}; ui.rejecting = null; ui.confirmDelete = null;
+  ui.reasons = reasons && typeof reasons === 'object' && !Array.isArray(reasons) ? reasons : {};
+  ui.activityOpen = false; ui.logOpen = false; ui.feedLimit = 40; ui.map = freshMap();
+  ui.approve = {}; ui.codeTab = {}; ui.codeEdit = {}; ui.runOpen = {}; ui.asDiff = {}; ui.histVersion = {};
+  ui.newPage = null; ui.limitEdit = null; ui.limits = null; ui.limitsOpen = false;
+  ui.editProposal = {}; ui.reapprove = null; ui.showLessons = false; ui.focusEditor = '';
+  ui.paper = { templates: ui.paper.templates, template: ui.paper.template };
+  ui.request = { text: String(storage.get(requestKey(pid), '') || ''), about: true };
+  const prefix = codeKey(pid, '');
+  storage.keys(prefix).forEach((key) => {
+    const text = storage.get(key);
+    if (typeof text !== 'string') return;
+    const name = key.slice(prefix.length), cut = name.indexOf('/');
+    ui.codeEdit[name] = { text, error: null, saving: false, restored: true };
+    if (cut > 0) ui.codeTab[name.slice(0, cut)] = name.slice(cut + 1);   // the file with the unsaved edit is the one shown
+  });
+}
+
 const decode = (text) => { try { return decodeURIComponent(text); } catch (e) { return text; } };
 
 /** `#/p/<pid>/<view>/<selection>/<sub>`, `#/library`, `#/start`, `#/setup`. */

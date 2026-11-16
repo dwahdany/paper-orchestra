@@ -3,7 +3,9 @@
    node tests/e2e/web_check.js --base http://127.0.0.1:8600 [--only a,b] [--skip a,b] [--shots DIR]
 
    The server must serve a workspace that holds the demo project
-   (`paper-orchestra research demo --dir <workspace>/demo`) and must have been started with
+   (`paper-orchestra research demo --dir <workspace>/demo`; with the large one beside it,
+   `research demo --dir <workspace>/large --pages 150`, the checks of a large project run
+   too) and must have been started with
    PAPER_ORCHESTRA_SCRIPTED_CLIENT=scripted_model:client and this directory on PYTHONPATH, so
    that the phases it starts run on the scripted model. The flows change the project: give
    every run a fresh copy. tests/test_web_e2e.py does all of that; README.md says how to do it
@@ -54,6 +56,18 @@ async function until(page, fn, argument, timeout, what) {
 const text = (page, selector) => page.locator(selector).first().textContent({ timeout: 4000 }).catch(() => '');
 const count = (page, selector) => page.locator(selector).count();
 const inboxCount = async (page) => +(await page.textContent('.views .count').catch(() => '0')) || 0;
+/** The number on the inbox tab right now (nothing there is zero), without waiting for it. */
+const waitingNow = (page) => page.evaluate(() => +((document.querySelector('.views .count') || {}).textContent || 0));
+/** What has the keyboard, in a few words. */
+const focusOf = (page) => page.evaluate(() => { const a = document.activeElement; return a.tagName.toLowerCase() + (a.id ? '#' + a.id : '') + (a.className && typeof a.className === 'string' ? '.' + a.className.split(' ')[0] : '') + (a.dataset && a.dataset.check ? '[check]' : ''); });
+/** Requests the page makes that the server refuses, while `fn` runs. */
+async function refused(page, fn) {
+  const out = [];
+  const note = (r) => { if (r.status() >= 400) out.push(r.status() + ' ' + r.request().method() + ' ' + r.url().replace(BASE, '')); };
+  page.on('response', note);
+  try { await fn(); await sleep(600); } finally { page.off('response', note); }
+  return out;
+}
 async function shot(page, name) { if (SHOTS) { fs.mkdirSync(SHOTS, { recursive: true }); await page.screenshot({ path: path.join(SHOTS, name + '.png') }); } }
 async function open(page, hash, ready) {
   await page.goto(BASE + '/' + hash);
@@ -152,6 +166,26 @@ CHECKS.map = async ({ page, pid }) => {
   ok((await count(page, '.node.dim')) < 20, 'the whole lineage is lit when asked for');
   await page.selectOption('#map-lineage', 'near');
   await page.keyboard.press('Escape');
+  /* a double click on a node selects it: the second click neither unselects it nor clears the selection */
+  await page.locator('.node.k-hypothesis.r-accepted').first().dblclick();
+  await page.waitForTimeout(700);
+  ok(/\/map\/H\d+$/.test(await page.evaluate(() => location.hash)), 'a double click on a node leaves it selected: ' + (await page.evaluate(() => location.hash)));
+  await page.keyboard.press('Escape');
+  /* a list of choices that is open is not closed by what arrives meanwhile: the page waits for the choice */
+  await page.focus('#map-lineage');
+  await page.dispatchEvent('#map-lineage', 'mousedown');
+  await page.evaluate(() => { document.querySelector('#map-lineage').dataset.same = '1'; });
+  const before = await count(page, '.map-svg .node');
+  const arrived = await api('POST', '/api/projects/' + pid + '/pages', { kind: 'topic', title: 'Written while a list was open', body: 'x' });
+  ok(arrived.status === 201, 'a page arrives while the list is open');
+  await sleep(1500);
+  ok((await page.evaluate(() => document.querySelector('#map-lineage').dataset.same)) === '1' && (await count(page, '.map-svg .node')) === before, 'the page is not drawn again while a list of choices is open');
+  await page.selectOption('#map-lineage', 'all');
+  await until(page, (n) => document.querySelectorAll('.map-svg .node').length === n + 1, before, 5000, 'and is drawn, with what arrived, once the choice is made');
+  await page.selectOption('#map-lineage', 'near');
+  await api('DELETE', '/api/projects/' + pid + '/pages/' + pagePath(arrived.data.page.path));
+  await until(page, (n) => document.querySelectorAll('.map-svg .node').length === n, before, 5000, 'the page written for this goes again');
+  await page.evaluate(() => document.activeElement.blur());
   /* zoom keeps the headings pinned */
   await page.keyboard.press('+');
   await page.keyboard.press('0');
@@ -237,6 +271,35 @@ CHECKS.inbox = async ({ page, pid }) => {
   await open(page, '#/p/' + pid + '/inbox', '.in-list');
   await until(page, () => /rejected/.test((document.querySelector('.in-old:has(.pn-id)') || {}).textContent || '') && [...document.querySelectorAll('.in-old')].some((r) => /E3/.test(r.textContent) && /rejected/.test(r.textContent)), null, 5000, 'and the page is shown as it is now: rejected');
   await page.click('.toast [data-act="toast-x"]');
+  /* a double click decides once: the row that moves up under the pointer is not decided too */
+  await open(page, '#/p/' + pid + '/inbox', '.in-row');
+  const two = await waitingNow(page);
+  if (two >= 2) {
+    await page.locator('.in-row:not(.in-old) [data-act="accept"]').first().dblclick();
+    await sleep(300);
+    ok((await waitingNow(page)) === two - 1, 'a double click on Accept decides one proposal, not two: ' + two + ' -> ' + (await waitingNow(page)));
+    await page.keyboard.press('z');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, two, 3000, 'and that one is taken back by undo');
+    /* a key held down decides once: A a moment too long does not accept the next proposal as well */
+    await page.keyboard.down('a'); await page.keyboard.down('a'); await page.keyboard.down('a'); await page.keyboard.up('a');
+    await sleep(300);
+    ok((await waitingNow(page)) === two - 1, 'A held down accepts one proposal, not one after the other: ' + two + ' -> ' + (await waitingNow(page)));
+    await page.keyboard.press('z');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, two, 3000, 'which undo takes back');
+    /* decisions made one after the other can each be taken back, the newest first */
+    await page.keyboard.press('a');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n - 1, two, 3000, 'A accepts the proposal in front');
+    await page.keyboard.press('a');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n - 2, two, 3000, 'and again the next one');
+    ok(/before it can still be taken back/.test(await text(page, '.toast')), 'the toast says that the earlier decision can still be taken back: ' + (await text(page, '.toast')).replace(/\s+/g, ' '));
+    await page.keyboard.press('z');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n - 1, two, 3000, 'Z takes back the newest decision');
+    ok((await count(page, '.toast [data-act="undo"]')) === 1, 'and offers the one before it');
+    await page.keyboard.press('z');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, two, 3000, 'Z again takes back the one before');
+    await sleep(5600);
+    ok((await api('GET', '/api/projects/' + pid)).data.counts.pending.total === two, 'none of the decisions taken back reached the server');
+  }
   /* bulk: select two, accept them together, take it back */
   await open(page, '#/p/' + pid + '/inbox', '.in-row');
   const waiting = await inboxCount(page);
@@ -310,6 +373,21 @@ CHECKS.wiki = async ({ page, pid }) => {
   await page.click('.hist-i [data-act="restore"] >> nth=0');
   await until(page, () => !document.querySelector('.history'), null, 6000, 'restoring returns to the page');
   ok((await api('GET', '/api/projects/' + pid + '/pages/Q3')).data.page.body.includes('Theirs:'), 'the restored text is the page again');
+  /* the other way out of a conflict: keep editing on top of the newer version, with what it changed in sight */
+  await open(page, '#/p/' + pid + '/wiki/Q4/edit', 'textarea#ed-body');
+  ok((await focusOf(page)) === 'textarea#ed-body', 'an editor that opens has the keyboard: ' + (await focusOf(page)));
+  const q4 = (await api('GET', '/api/projects/' + pid + '/pages/Q4')).data.page;
+  await page.fill('textarea#ed-body', q4.body + '\nMine: a second thought.\n');
+  await api('PUT', '/api/projects/' + pid + '/pages/' + pagePath(q4.path), { body: q4.body + '\nTheirs: written in another window.\n', base_updated: q4.updated });
+  await page.keyboard.press('Control+s');
+  await page.waitForSelector('.conflict');
+  await page.click('[data-act="conflict-rebase"]');
+  await page.waitForSelector('.conflict-kept');
+  ok(/Theirs: written in another window/.test(await text(page, '.conflict-kept .diff')), 'after "keep editing" what the newer version changed stays in sight');
+  ok((await page.inputValue('textarea#ed-body')).includes('Mine: a second thought'), 'and the text is still mine');
+  await page.keyboard.press('Control+s');
+  await until(page, () => !document.querySelector('form.editor'), null, 6000, 'the next save goes through');
+  ok((await api('GET', '/api/projects/' + pid + '/pages/Q4')).data.page.body.includes('Mine: a second thought'), 'and my text is the page');
   /* a page of the person's own, then delete it */
   await page.click('[data-act="new-page"]');
   await page.waitForSelector('#np-title');
@@ -324,9 +402,12 @@ CHECKS.wiki = async ({ page, pid }) => {
   const mine = (await api('GET', '/api/projects/' + pid + '/pages/' + pagePath('wiki/topics/a-note-of-my-own.md'))).data;
   ok(mine && mine.page && mine.page.author === 'human' && mine.page.review === 'accepted', 'a page by the person is accepted as written');
   await shot(page, 'wiki-own-page');
-  await page.click('.page-tools [data-act="delete-ask"]');
-  await page.click('.confirm [data-act="delete"]');
-  await until(page, () => !/a-note-of-my-own/.test(location.hash), null, 6000, 'deleting leaves the page');
+  const lost = await refused(page, async () => {
+    await page.click('.page-tools [data-act="delete-ask"]');
+    await page.click('.confirm [data-act="delete"]');
+    await until(page, () => !/a-note-of-my-own/.test(location.hash), null, 6000, 'deleting leaves the page');
+  });
+  ok(!lost.length, 'a deleted page is not asked for again: ' + lost.join(', '));
   ok((await api('GET', '/api/projects/' + pid + '/pages/' + pagePath('wiki/topics/a-note-of-my-own.md'))).status === 404, 'the page is gone from the wiki');
   /* a number that is in no record is flagged in the text and explained in the margin */
   const made = await api('POST', '/api/projects/' + pid + '/pages', { kind: 'finding', title: 'A finding with a number from nowhere', body: '## What was observed\n\nThe spike was 0.121 without warmup, and 73.25 times smaller with it.\n', relations: { based_on: ['results/E1-run1'] } });
@@ -370,6 +451,9 @@ CHECKS.experiments = async ({ page, pid }) => {
   await page.click('.metrics-all summary');
   ok((await count(page, '.metrics-all[open] tr')) === 6, 'and opens in place');
   ok(/written by the designer/.test(await text(page, '.code-by')), 'the code says who wrote it and when: ' + (await text(page, '.code-by')));
+  await until(page, () => { const log = document.querySelector('.run.open .log-body'); return log && !log.dataset.empty; }, null, 5000, 'the log of the finished run is read');
+  const inFile = (await api('GET', '/api/projects/' + pid + '/experiments/E1/runs/1/log?offset=0')).data.text;
+  ok((await page.textContent('.run.open .log-body')) === inFile, 'the log of a finished run is shown as the file is, once: ' + (await page.textContent('.run.open .log-body')).length + ' characters shown, ' + inFile.length + ' in the file');
   await shot(page, 'experiment-metrics');
   await open(page, '#/p/' + pid + '/experiments', '.ex-table');
   /* a failed run: what kind of failure, the traceback, the repair with its diff */
@@ -405,10 +489,30 @@ CHECKS.experiments = async ({ page, pid }) => {
   await page.waitForSelector('#code-text');
   const code = await page.inputValue('#code-text');
   await page.fill('#code-text', 'import time\nfor i in range(600):\n    print("waiting", i, flush=True)\n    time.sleep(0.25)\n' + code);
+  await page.reload();
+  await page.waitForSelector('#code-text');
+  ok((await page.inputValue('#code-text')).startsWith('import time\nfor i in range(600)'), 'code that is being edited survives a reload');
+  ok(/unsaved edit of main\.py was restored/.test(await text(page, '.code-bar')), 'and the editor says that it was restored: ' + (await text(page, '.code-bar')).trim().slice(0, 80));
   await page.click('.code-bar button[type=submit]');
   await until(page, () => !document.querySelector('#code-text') && /waiting/.test(document.querySelector('.code-n').textContent), null, 6000, 'the edited code is saved and shown');
   ok(/written by you/.test(await text(page, '.code-by')), 'and says that you wrote it: ' + (await text(page, '.code-by')));
-  await page.click('[data-act="reapprove"]');
+  /* code that changes under an approval takes the approval back, and the page says why */
+  const again = await api('POST', '/api/projects/' + pid + '/experiments/E4/approve', { backend: 'local' });
+  ok(again.status === 200, 'the experiment is approved through the API: ' + again.status);
+  const now = (await api('GET', '/api/projects/' + pid + '/experiments/E4')).data.code.files.find((f) => f.name === 'main.py').text;
+  await api('PUT', '/api/projects/' + pid + '/experiments/E4/code/main.py', { text: now + '\n# changed after the approval\n' });
+  await api('POST', '/api/projects/' + pid + '/experiments/E4/run');
+  let back = null;
+  for (let i = 0; i < 80; i++) { back = (await api('GET', '/api/projects/' + pid + '/pages/E4')).data.page; if (back.state === 'planned' && back.meta.state_reason) break; await sleep(250); }
+  ok(back.state === 'planned' && !!back.meta.state_reason, 'code that changed after the approval is not run, and the experiment is planned again with the reason: ' + back.state + ' ' + (back.meta.state_reason || ''));
+  await idle(pid);
+  await until(page, () => !!document.querySelector('.approve .approve-back'), null, 8000, 'an experiment whose approval was taken back says so where it is approved again');
+  const why = (await text(page, '.approve .approve-back')).replace(/\s+/g, ' ').trim();
+  ok(/changed after the approval/.test(why) && /by you/.test(why) && !/\d{4}-\d\d-\d\dT|human/.test(why), 'with the reason, in the app\'s words: ' + why);
+  ok(/did not run and is planned again/.test(await text(page, '.toast-error')), 'and it is said aloud, wherever the person is looking: ' + (await text(page, '.toast-error')).replace(/\s+/g, ' ').trim().slice(0, 90));
+  await shot(page, 'experiment-approval-taken-back');
+  await page.click('.toast [data-act="toast-x"]');
+  if (!(await count(page, '.approve [data-act="approve"][data-start]'))) await page.click('[data-act="reapprove"]');
   await page.waitForSelector('.approve [data-act="approve"][data-start]');
   await page.fill('.approve-fields input[type=number]', '2');
   await page.click('.approve [data-act="approve"][data-start]');
@@ -416,10 +520,32 @@ CHECKS.experiments = async ({ page, pid }) => {
   await until(page, () => /waiting 3/.test((document.querySelector('.run-live .log-body') || {}).textContent || ''), null, 20000, 'its log streams');
   await page.click('.run-live [data-act="cancel-run"]');
   await until(page, () => /cancelled/.test((document.querySelector('.page-status .tag-state') || {}).textContent || ''), null, 30000, 'the cancelled run ends as cancelled');
+  await page.waitForSelector('.failure.k-cancelled');
+  ok(/Cancelled by you/.test(await text(page, '.failure.k-cancelled .fail-t')) && (await count(page, '.failure.k-cancelled .code-err')) === 0, 'a run the person cancelled is said plainly, not as an error: ' + (await text(page, '.failure.k-cancelled')).trim().slice(0, 80));
   await shot(page, 'experiment-cancelled');
   await idle(pid);
   const e4 = (await api('GET', '/api/projects/' + pid + '/experiments/E4')).data;
   ok(e4.page.state === 'cancelled' && e4.runs.length === 2 && e4.runs[1].status === 'cancelled', 'the run record says cancelled: ' + e4.page.state);
+  /* a run that is under way when the agents are stopped is queued again, and is not "cancelled by you" */
+  const slow = await api('POST', '/api/projects/' + pid + '/experiments/E4/approve', { backend: 'local', timeout_seconds: 120, start: true });
+  ok(slow.status === 200 && slow.data.worker, 'a third run starts: ' + slow.status);
+  await until(page, () => /waiting 2/.test((document.querySelector('.run-live .log-body') || {}).textContent || ''), null, 20000, 'and is under way');
+  await page.keyboard.press('1');
+  await page.waitForSelector('.strip.s-running [data-act="stop"]');
+  ok(/Experiment/.test(await text(page, '.strip-kicker')) && /E4/.test(await text(page, '.strip-text')), 'the strip says which experiment runs: ' + (await text(page, '.strip-text')).trim().slice(0, 60));
+  await page.click('.strip [data-act="stop"]');
+  await until(page, () => /Stopping the run/.test((document.querySelector('.toast') || {}).textContent || ''), null, 5000, 'stopping says that it is the run that is stopped');
+  await idle(pid);
+  const queued = (await api('GET', '/api/projects/' + pid + '/experiments/E4')).data;
+  ok(queued.page.state === 'queued' && queued.runs.length === 3 && !!queued.runs[2].requeued, 'the experiment is queued again: ' + queued.page.state + ', ' + queued.runs.length + ' runs');
+  await page.keyboard.press('4');
+  await page.waitForSelector('.run.open .failure.k-cancelled');
+  ok(/Stopped when you stopped the agents/.test(await text(page, '.run.open .failure .fail-t')) && /queued again/.test(await text(page, '.run.open .failure')), 'its run says that it was stopped with the agents and is queued again: ' + (await text(page, '.run.open .failure .fail-t')));
+  await shot(page, 'experiment-stopped-with-the-agents');
+  /* an approval can be taken back before the run */
+  await page.click('.callout [data-act="cancel-run"]');
+  await until(page, () => /cancelled/.test((document.querySelector('.page-status .tag-state') || {}).textContent || ''), null, 10000, '"Do not run it" takes the approval back');
+  ok(/will not run/.test(await text(page, '.toast')), 'and says so: ' + (await text(page, '.toast')).trim().slice(0, 70));
   /* a run stopped at its time limit: a limit, not a bug */
   const short = await api('POST', '/api/projects/' + pid + '/experiments/E4/approve', { backend: 'local', timeout_seconds: 3, start: true });
   ok(short.status === 200 && short.data.worker, 'a run with a three-second limit starts: ' + short.status);
@@ -430,6 +556,15 @@ CHECKS.experiments = async ({ page, pid }) => {
   ok((await count(page, '.failure .repair')) === 0, 'no repair is shown for a limit');
   await shot(page, 'experiment-timeout');
   await idle(pid);
+  /* a run that succeeds only after the runner repaired the code says so, with what was changed */
+  await open(page, '#/p/' + pid + '/experiments/E2', '.failure [data-act="rerun"]');
+  await page.click('.failure [data-act="rerun"]');
+  await until(page, () => /succeeded/.test((document.querySelector('.page-status .tag-state') || {}).textContent || '') && !!document.querySelector('.run.open .repair-ok'), null, 90000, 'a run that succeeded on repaired code says that the runner changed the code');
+  await page.click('.run.open .repair-ok summary');
+  ok((await count(page, '.run.open .repair-ok pre.diff .diff-add')) >= 1, 'and shows what was changed as a diff');
+  ok(/written by the runner/.test(await text(page, '.code-by')), 'the code says that the runner wrote it: ' + (await text(page, '.code-by')));
+  await shot(page, 'experiment-repaired');
+  await idle(pid);
   /* approve without starting; the engine's run phase takes it, and the analysis follows */
   await open(page, '#/p/' + pid + '/experiments/E1', '[data-act="reapprove"]');
   await page.click('[data-act="reapprove"]');
@@ -439,7 +574,7 @@ CHECKS.experiments = async ({ page, pid }) => {
   const findings = (await api('GET', '/api/projects/' + pid + '/pages?kind=finding')).data.pages.length;
   await page.keyboard.press('1');
   await page.waitForSelector('.strip [data-act="continue"]');
-  ok(/Run the approved experiments/.test(await text(page, '.strip [data-act="continue"]')), 'the strip offers to run what is approved: ' + (await text(page, '.strip [data-act="continue"]')));
+  ok(/Run the approved experiment/.test(await text(page, '.strip [data-act="continue"]')), 'the strip offers to run what is approved: ' + (await text(page, '.strip [data-act="continue"]')));
   await page.click('.strip [data-act="continue"]');
   await until(page, () => !!document.querySelector('.strip.s-running'), null, 15000, 'the run phase starts from the strip');
   await until(page, () => /analysis/.test((document.querySelector('.strip-kicker') || {}).textContent || ''), null, 90000, 'after the runs the analysis starts by itself');
@@ -461,6 +596,9 @@ CHECKS.agents = async ({ page, pid }) => {
   ok((await count(page, '.arg .arg-ev .chip')) >= 4, 'with their experiments and findings');
   ok((await count(page, '.smap .smap-st')) === 8 && (await count(page, '.trk')) >= 2, 'the strip map and the rounds are there');
   await page.fill('#rq-text', 'Compare against RMSprop as well.');
+  await page.reload();
+  await page.waitForSelector('#rq-text');
+  ok((await page.inputValue('#rq-text')) === 'Compare against RMSprop as well.', 'an instruction that is being typed survives a reload: ' + JSON.stringify(await page.inputValue('#rq-text')));
   await page.click('.rq-form button[type=submit]');
   await until(page, () => /RMSprop/.test((document.querySelector('.rqs') || {}).textContent || ''), null, 5000, 'the instruction is listed');
   const requests = (await api('GET', '/api/projects/' + pid + '/requests')).data.requests;
@@ -533,6 +671,11 @@ CHECKS.agents = async ({ page, pid }) => {
   await until(page, () => /step \d of 5/.test((document.querySelector('.run-live .log-body, .run.open .log-body') || {}).textContent || ''), null, 20000, 'the log of the accepted run streams');
   await until(page, () => /succeeded/.test((document.querySelector('.page-status .tag-state') || {}).textContent || '') && !!document.querySelector('.run.open .metrics tr'), null, 30000, 'and it ends with its metrics');
   ok(/steps/.test(await text(page, '.run.open .metrics')), 'the metrics are the ones the script wrote: ' + (await text(page, '.run.open .metrics')).trim().slice(0, 60));
+  /* nothing is approved any more and a result waits to be read: the button says what it will do */
+  await page.keyboard.press('1');
+  await page.waitForSelector('.strip [data-act="continue"]');
+  const ready = (await api('GET', '/api/projects/' + pid + '/experiments')).data.experiments.filter((x) => x.review === 'accepted' && (x.state === 'approved' || x.state === 'queued')).length;
+  if (!ready) ok(/Continue to analysis/.test(await text(page, '.strip [data-act="continue"]')), 'with nothing approved and a result not analysed, the strip offers the analysis, not a run: ' + (await text(page, '.strip [data-act="continue"]')).trim());
   const done = (await api('GET', '/api/projects/' + pid + '/pages/' + planned.id)).data.page;
   ok(done.review === 'accepted' && done.state === 'succeeded', 'accepted and run in one decision: ' + done.review + ' ' + done.state);
   await idle(pid);
@@ -563,7 +706,9 @@ CHECKS.states = async ({ page, pid, context }) => {
   ok(/failed/i.test(await text(page, '.strip-kicker')), 'the strip names the failed phase: ' + (await text(page, '.strip-kicker')));
   ok(/scripted failure/i.test(await text(page, '.strip-text')), 'with its error: ' + (await text(page, '.strip-text')));
   ok((await count(page, '.top-status.st-failed')) === 1, 'the header says so too');
-  await page.click('[data-act="toggle-activity"]');
+  if (!(await count(page, '.strip-log'))) await page.click('[data-act="toggle-activity"]');   // open already when an earlier check opened the activity
+  await page.waitForSelector('.strip-log .strip-fix');
+  ok(await page.evaluate(() => document.querySelector('.strip-log').scrollTop === 0), 'the log of a failure opens at its top, where the advice and the worker\'s words are');
   await shot(page, 'state-failed-phase');
   await idle(pid);
   await api('DELETE', '/api/projects/' + pid + '/requests/' + made.data.request.id);
@@ -576,6 +721,7 @@ CHECKS.states = async ({ page, pid, context }) => {
   started = await api('POST', '/api/projects/' + pid + '/advance', { phase: 'hypothesize' });
   await until(page, () => !!document.querySelector('.strip.s-budget'), null, 30000, 'a spent budget stops at a checkpoint that says so');
   ok(/budget/i.test(await text(page, '.strip-text')), 'the strip quotes the budget: ' + (await text(page, '.strip-text')));
+  ok(!/settings\.limits/.test(await text(page, '.strip-text')), 'in the app\'s words, not as the name of a setting');
   await shot(page, 'state-budget');
   await idle(pid);
   await page.click('[data-act="limit-edit"]');
@@ -583,6 +729,9 @@ CHECKS.states = async ({ page, pid, context }) => {
   await page.keyboard.press('Enter');
   await until(page, () => !document.querySelector('.limit-form'), null, 5000, 'the limit is raised from the strip');
   ok((await api('GET', '/api/projects/' + pid)).data.settings.limits.model_usd === limits.model_usd, 'the new limit is in project.json');
+  /* the stop is over once the limit is raised: the app no longer says that the budget is reached */
+  await until(page, () => !!document.querySelector('.strip.s-checkpoint') && /limit for models is raised/.test(document.querySelector('.strip-text').textContent), null, 6000, 'with the limit raised the strip no longer says that the budget is reached');
+  ok(/Resume hypotheses/.test(await text(page, '.strip [data-act="continue"]')) && (await count(page, '.top-status.st-budget')) === 0, 'and offers to go on where the phase stopped: ' + (await text(page, '.strip [data-act="continue"]')).trim());
   /* the server unreachable: say so, keep the draft, come back */
   await open(page, '#/p/' + pid + '/wiki/Q2/edit', 'textarea#ed-body');
   await page.fill('#ed-summary', 'Typed while the server was away');
@@ -598,6 +747,14 @@ CHECKS.states = async ({ page, pid, context }) => {
   await page.keyboard.press('Control+s');
   await until(page, () => !document.querySelector('form.editor'), null, 6000, 'the save goes through afterwards');
   ok((await api('GET', '/api/projects/' + pid + '/pages/Q2')).data.page.summary === 'Typed while the server was away', 'and is on the server');
+  /* a page that could not be read while the server was away is read by itself when it is back */
+  await open(page, '#/p/' + pid + '/wiki/Q2', '.page-wiki .prose');
+  await context.setOffline(true);
+  await page.click('.wiki-index .idx:has-text("Q5")');
+  await page.waitForSelector('.wiki-main .note-neg');
+  ok(/could not be loaded/.test(await text(page, '.wiki-main .note-neg')), 'a page that cannot be read says so: ' + (await text(page, '.wiki-main .note-neg')).trim().slice(0, 70));
+  await context.setOffline(false);
+  await until(page, () => !!document.querySelector('.page-wiki .prose') && !document.querySelector('.wiki-main .note-neg') && /\/wiki\/Q5$/.test(location.hash), null, 15000, 'and is read by itself when the server answers again');
   /* the event stream is live again: a change made elsewhere arrives without a reload */
   const pending = (await api('GET', '/api/projects/' + pid)).data.counts.pending.total;
   await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, pending, 8000, 'the inbox count is current after the reconnect');
@@ -639,6 +796,21 @@ CHECKS.keys = async ({ page, pid }) => {
   await page.keyboard.press('j');
   await page.keyboard.press('j');
   ok((await count(page, '.in-row.cur')) === 1, 'J and K move through the inbox');
+  /* the keyboard keeps its place when the page is drawn again */
+  if ((await count(page, '.in-row:not(.in-old)')) >= 2) {
+    await page.locator('.in-row:not(.in-old) .in-check input').first().focus();
+    await page.keyboard.press('Space');
+    ok(/\[check\]/.test(await focusOf(page)) && (await count(page, '.in-row:not(.in-old) .in-check input:checked')) === 1, 'a checkbox ticked by the keyboard keeps the focus: ' + (await focusOf(page)));
+    await page.keyboard.press('Space');
+    ok(/\[check\]/.test(await focusOf(page)) && (await count(page, '.in-row:not(.in-old) .in-check input:checked')) === 0, 'so that Space unticks it again');
+    await page.locator('.in-row:not(.in-old) .in-main >> nth=1').focus();
+    await page.keyboard.press('Enter');
+    await until(page, () => document.activeElement.classList.contains('in-main') && document.activeElement.getAttribute('aria-current') === 'true', null, 3000, 'a row opened with Enter keeps the focus');
+    await page.keyboard.press('e');
+    await until(page, () => document.activeElement.id === 'ed-body', null, 5000, 'E opens the editor with the keyboard in the text');
+    await page.keyboard.press('Escape'); await page.keyboard.press('Escape');
+    await until(page, () => !document.querySelector('form.editor'), null, 3000, 'Escape leaves the editor');
+  }
   /* everything can be reached by Tab, and focus is visible */
   await open(page, '#/p/' + pid + '/overview', '.ov-head');
   await page.keyboard.press('Tab'); await page.keyboard.press('Tab'); await page.keyboard.press('Tab');
@@ -749,22 +921,24 @@ CHECKS.paper = async ({ page, pid }) => {
 };
 
 /* a large project: the map stays usable */
-CHECKS.large = async ({ page, large }) => {
-  if (!large) { notes.push('large: no project with 150 pages in the workspace, skipped'); return; }
+CHECKS.large = async ({ page, pid, large }) => {
+  if (!large) { notes.push('large: no project with 150 pages in the workspace (research demo --dir <workspace>/large --pages 150), skipped'); return; }
+  const pages = (await api('GET', '/api/projects/' + large + '/pages')).data.pages.length;
   const t0 = Date.now();
   await open(page, '#/p/' + large + '/map', '.map-svg .node');
   const took = Date.now() - t0;
   const nodes = await count(page, '.map-svg .node');
   const bundles = await count(page, '.map-svg .node.k-bundle');
   ok(bundles >= 3, 'sources are folded into bundles: ' + bundles);
-  ok(nodes < 110, 'far fewer marks than pages are drawn: ' + nodes);
-  ok(took < 6000 * SLOW, 'the map of 150 pages opens in ' + took + ' ms');
+  ok(pages >= 140 && nodes < pages - 15, 'fewer marks than pages are drawn: ' + nodes + ' for ' + pages + ' pages');
+  ok(took < 6000 * SLOW, 'the map of ' + pages + ' pages opens in ' + took + ' ms');
   const over = await page.evaluate(OVERFLOW);
   ok(!over.length, 'large map overflow: ' + over.join('; '));
   await shot(page, 'large-map');
-  /* a bundle opens when its topic is selected */
-  await page.click('.map-svg .node.k-bundle >> nth=0');
-  await until(page, () => /\/map\/.+/.test(location.hash), null, 4000, 'clicking a bundle selects the topic that cites it');
+  /* a bundle opens when its topic is selected (by the keyboard: the bundle may lie below the sheet) */
+  await page.focus('.map-svg .node.k-bundle[aria-label*="cited by"] >> nth=0');
+  await page.keyboard.press('Enter');
+  await until(page, () => /\/map\/.+/.test(location.hash), null, 4000, 'opening a bundle selects the topic that cites it');
   const after = await count(page, '.map-svg .node.k-source');
   ok(after >= 2, 'and its sources unfold: ' + after);
   await shot(page, 'large-map-open');
@@ -783,10 +957,129 @@ CHECKS.large = async ({ page, large }) => {
     await page.selectOption('#map-round', '');
   }
   await page.keyboard.press('Escape');
+  /* Tab reaches every node, also those below the sheet: the map moves to show the one that has the keyboard */
+  const vp0 = await page.evaluate(() => document.querySelector('.map-svg .vp').getAttribute('transform'));
+  await page.focus('.map-canvas');
+  let outside = 0;
+  for (let i = 0; i < 70; i++) {
+    await page.keyboard.press('Tab');
+    outside += await page.evaluate(() => {
+      const node = document.activeElement.closest && document.activeElement.closest('.map-svg .node');
+      if (!node) return 0;
+      const sheet = document.querySelector('.map-canvas').getBoundingClientRect(), foot = document.querySelector('.map-foot').getBoundingClientRect(), mark = node.querySelector('.gl').getBoundingClientRect();
+      return mark.top < sheet.top + 34 || mark.bottom > foot.top || mark.left < sheet.left || mark.right > sheet.right ? 1 : 0;
+    });
+  }
+  ok(!outside, 'a node that has the keyboard is on the sheet: ' + outside + ' of 70 were not');
+  ok((await page.evaluate(() => document.querySelector('.map-svg .vp').getAttribute('transform'))) !== vp0, 'the map moved to follow the keyboard');
   await open(page, '#/p/' + large + '/wiki', '.wiki-index .idx');
   ok((await count(page, '.wiki-index .idx')) >= 140, 'the wiki index lists all pages');
   await page.fill('#idx-filter', 'hypothesis 1');
   await until(page, () => document.querySelectorAll('.wiki-index .idx').length < 40, null, 3000, 'the filter narrows the index');
+  await page.fill('#idx-filter', '');
+  /* every proposal of a large inbox at once, and back */
+  await open(page, '#/p/' + large + '/inbox', '.in-row');
+  const all = await waitingNow(page);
+  await page.check('.in-all input');
+  await page.keyboard.press('Shift+A');
+  await until(page, () => !document.querySelector('.views .count'), null, 4000, 'accepting all ' + all + ' proposals empties the inbox at once');
+  await page.keyboard.press('z');
+  await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, all, 4000, 'and one undo brings all of them back');
+  /* an approval taken back before any run: the experiment says so and can be approved again */
+  const unrun = (await api('GET', '/api/projects/' + large + '/experiments')).data.experiments.find((x) => x.review === 'accepted' && x.state === 'approved' && !x.runs);
+  if (unrun) {
+    await open(page, '#/p/' + large + '/experiments/' + unrun.id, '.callout [data-act="cancel-run"]');
+    await page.click('.callout [data-act="cancel-run"]');
+    await until(page, () => /Cancelled before it ran/.test((document.querySelector('.callout h2') || {}).textContent || ''), null, 10000, 'an experiment cancelled before it ran says so');
+    ok(/at your request/.test(await text(page, '.callout')) && !/the person/.test(await text(page, '.callout')), 'in the app\'s words: ' + (await text(page, '.callout')).replace(/\s+/g, ' ').trim().slice(0, 100));
+    await page.click('.callout [data-act="reapprove"]');
+    await page.waitForSelector('.approve [data-act="approve"]:not([data-start])');
+    await page.click('.approve [data-act="approve"]:not([data-start])');
+    await until(page, () => /Approved to run/.test((document.querySelector('.callout h2') || {}).textContent || ''), null, 10000, 'and can be approved again');
+  } else notes.push('large: no approved experiment without a run in the large project; "cancelled before it ran" was not looked at');
+  /* what is being typed in one project stays in that project */
+  await open(page, '#/p/' + pid + '/overview', '#rq-text');
+  await page.fill('#rq-text', 'Typed for the first project only.');
+  const planned = (await api('GET', '/api/projects/' + pid + '/experiments')).data.experiments.find((x) => x.state !== 'running' && x.state !== 'queued' && x.review !== 'rejected');
+  const twin = planned && (await api('GET', '/api/projects/' + large + '/experiments')).data.experiments.find((x) => x.id === planned.id);
+  if (twin) {
+    await open(page, '#/p/' + pid + '/experiments/' + planned.id, '[data-act="edit-code"]');
+    await page.click('[data-act="edit-code"]');
+    await page.waitForSelector('#code-text');
+    await page.fill('#code-text', '# typed in the first project only\n');
+  }
+  await page.click('.brand');
+  await page.waitForSelector('.lib-row');
+  await open(page, '#/p/' + large + '/overview', '#rq-text');
+  ok((await page.inputValue('#rq-text')) === '', 'an instruction typed in one project is not in the box of another: ' + JSON.stringify(await page.inputValue('#rq-text')));
+  if (twin) {
+    await page.keyboard.press('4');
+    await page.waitForSelector('.ex-table');
+    await page.click('.ex-row:has(.ex-id b:text-is("' + twin.id + '")) .ex-name a');
+    await page.waitForSelector('.exp-code');
+    await page.waitForSelector('.exp-code .code-n, .exp-code .quiet');
+    ok((await count(page, '#code-text')) === 0, 'code being edited in one project does not open in the experiment of the same name in another');
+    await page.click('.brand');
+    await page.waitForSelector('.lib-row');
+    await open(page, '#/p/' + pid + '/experiments/' + planned.id, '#code-text');
+    ok((await page.inputValue('#code-text')).startsWith('# typed in the first project only'), 'and is still there when the first project is opened again');
+    await page.click('[data-act="code-cancel"]');
+  }
+  await open(page, '#/p/' + pid + '/overview', '#rq-text');
+  ok((await page.inputValue('#rq-text')) === 'Typed for the first project only.', 'the instruction is still in the box of its own project');
+  await page.fill('#rq-text', '');
+};
+
+/* hostile text: titles and bodies with markup, scripts, odd Unicode and words longer than any
+   column never run and never push a view wider than the window */
+CHECKS.hostile = async ({ page, pid }) => {
+  const LONG = 'Pneumonoultramicroscopicsilicovolcanoconiosis'.repeat(5);
+  const ODD = '\u202Eevil\u202C Z\u0351\u036B\u0343a\u0363\u0346l\u0367\u034Ago\u0310\u033D \uD83D\uDE80 <img src=x onerror="window.__ran=1"> <script>window.__ran=2</script> &amp; "q" \'s\' ';
+  const was = (await api('GET', '/api/projects/' + pid)).data.title;
+  const make = async (kind, title, body, fields, relations) => { const made = await api('POST', '/api/projects/' + pid + '/pages', { kind, title, body, fields: fields || {}, relations: relations || {} }); ok(made.status === 201, 'a ' + kind + ' with a hostile title is created: ' + made.status); return made.data.page; };
+  const q = await make('question', ODD + LONG, 'Body with ' + LONG + ' and ' + ODD + '\n\n`' + LONG + '`\n\n[[H1]] [x](javascript:window.__ran=3)\n', { summary: LONG + ' ' + ODD });
+  const h = await make('hypothesis', LONG + ' ' + ODD, '## Statement\n\n' + ODD + LONG + '\n', { summary: ODD }, { motivated_by: [q.id] });
+  const e = await make('experiment', LONG + ODD, '## Objective\n\n' + LONG + '\n\n## Metrics and success criteria\n\n`' + LONG + '`\n', { summary: LONG, mode: 'script' }, { tests: [h.id] });
+  const f = await make('finding', ODD + ' ' + LONG, '## What was observed\n\n' + LONG + ' 12.345 ' + ODD + '\n', { summary: LONG });
+  const asked = await api('POST', '/api/projects/' + pid + '/requests', { text: LONG + ' ' + ODD, target: q.path });
+  await api('PATCH', '/api/projects/' + pid, { title: ODD + LONG });
+  const STICKS = () => {
+    const out = [];
+    document.querySelectorAll('#view *, #top *, #status *, #toast *, #overlay *').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (!r.width || r.right <= innerWidth + 1 || el.closest('svg, pre, textarea, .table-wrap, .ed-prev')) return;
+      for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) if (/(auto|scroll|hidden|clip)/.test(getComputedStyle(p).overflowX)) return;
+      out.push(el.tagName.toLowerCase() + '.' + String(el.className).split(' ')[0] + ' reaches ' + Math.round(r.right));
+    });
+    return Array.from(new Set(out)).slice(0, 4);
+  };
+  const routes = ['#/library', '#/p/PID/map', '#/p/PID/map/' + q.id, '#/p/PID/wiki/' + q.id, '#/p/PID/wiki/' + q.id + '/edit', '#/p/PID/wiki/' + q.id + '/history', '#/p/PID/wiki/' + f.id, '#/p/PID/inbox', '#/p/PID/inbox/' + h.id, '#/p/PID/experiments', '#/p/PID/experiments/' + e.id, '#/p/PID/overview/' + q.id, '#/p/PID/paper'];
+  for (const width of [1440, 820]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const r of routes) {
+      const hash = r.replace('PID', pid);
+      await open(page, hash);
+      await page.waitForTimeout(250);
+      const over = (await page.evaluate(OVERFLOW)).concat(await page.evaluate(STICKS));
+      ok(!over.length, width + ' ' + r + ' hostile text makes the view wider than the window: ' + over.join('; '));
+      ok(!(await page.evaluate(() => window.__ran)), width + ' ' + r + ' markup from a page ran as code');
+    }
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await shot(page, 'hostile-paper');
+  await open(page, '#/p/' + pid + '/wiki/' + q.id, '.page-wiki .prose');
+  ok((await count(page, '.wiki-main img[src="x"], .wiki-main script, .page-title i, .page-title b')) === 0, 'markup in a title and a body is shown as text');
+  ok((await count(page, '.prose a[href^="javascript"]')) === 0, 'a javascript: link is not a link');
+  await shot(page, 'hostile-wiki');
+  await page.keyboard.press('Control+k');
+  await page.keyboard.type('pneumono');
+  await until(page, () => document.querySelectorAll('.pal-i').length >= 2, null, 4000, 'the palette finds the pages with the long titles');
+  ok(!(await page.evaluate(STICKS)).length, 'the palette holds a title of any length: ' + (await page.evaluate(STICKS)).join('; '));
+  await page.keyboard.press('Escape');
+  /* tidy up: the pages and the title go, so that a later check finds the project as it was */
+  for (const made of [f, e, h, q]) await api('DELETE', '/api/projects/' + pid + '/pages/' + pagePath(made.path));
+  if (asked.data && asked.data.request) await api('DELETE', '/api/projects/' + pid + '/requests/' + asked.data.request.id);
+  await api('PATCH', '/api/projects/' + pid, { title: was });
 };
 
 /* ------------------------------------------------------------------------------------ */
@@ -797,9 +1090,16 @@ CHECKS.large = async ({ page, large }) => {
     if (listing.status !== 200) await sleep(250);
   }
   if (listing.status !== 200) { console.error('The server at ' + BASE + ' does not answer: ' + listing.status + ' ' + JSON.stringify(listing.data)); process.exit(2); }
-  const demo = listing.data.projects.find((p) => /^Demonstration/.test(p.title));
+  /* the demo project and, when it is there, the large one (`research demo --pages 150`
+     gives both the same title): told apart by how many pages they hold */
+  let demo = null, large = '';
+  for (const row of listing.data.projects) {
+    const view = (await api('GET', '/api/projects/' + row.id)).data;
+    const pages = Object.values((view && view.counts && view.counts.by_kind) || {}).reduce((a, b) => a + b, 0);
+    if (/150 pages/.test(row.title) || pages >= 140) large = large || row.id;
+    else if (/^Demonstration/.test(row.title) && !demo) demo = row;
+  }
   if (!demo) { console.error('The workspace has no demo project (paper-orchestra research demo --dir <workspace>/demo).'); process.exit(2); }
-  const large = (listing.data.projects.find((p) => /150 pages/.test(p.title)) || {}).id || '';
   let browser;
   try { browser = await chromium.launch(); }
   catch (error) { console.error('No browser could be started: ' + String(error.message).split('\n')[0]); process.exit(3); }
@@ -808,7 +1108,7 @@ CHECKS.large = async ({ page, large }) => {
   let current = '';
   const page = await context.newPage();
   watch(page, () => current);
-  const order = ['screens', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'keys', 'paper', 'large', 'composer'];
+  const order = ['screens', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'keys', 'paper', 'large', 'composer', 'hostile'];
   const unknown = (ONLY || []).concat(SKIP).filter((name) => order.indexOf(name) < 0);
   if (unknown.length) { console.error('not a check: ' + unknown.join(', ') + ' (the checks are: ' + order.join(', ') + '; separate several with commas)'); await browser.close(); process.exit(2); }
   for (const name of order) {

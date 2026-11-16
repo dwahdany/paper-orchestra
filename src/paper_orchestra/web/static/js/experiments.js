@@ -3,8 +3,8 @@
    starts from a button the person presses. */
 
 import { app, link } from './core.js';
-import { api } from './api.js';
-import { $$, ago, clock, dateTime, duration, html, join, minutes, money, parseStamp, plural, raw, setHTML, tf } from './util.js';
+import { api, connection, Unreachable } from './api.js';
+import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf } from './util.js';
 import { TONE, agentName, glyph, icon, pageGlyph } from './vocab.js';
 import { afterRender, approvalChoice, backendName, label, pageName, pageTip, reviewBar, reviewTag, stateTag, who } from './page.js';
 
@@ -25,13 +25,13 @@ function subline(store, x) {
   const run = x.last_run || {};
   if (x.review === 'rejected') return html`rejected${(x.meta || {}).decision_reason ? ': ' + x.meta.decision_reason : ''}`;
   if (x.review === 'proposed') return html`waiting for you · proposed ${ago(x.updated)}`;
-  if (x.state === 'planned' || !x.state) return html`accepted · runs only after you approve it`;
+  if (x.state === 'planned' || !x.state) return (x.meta || {}).state_reason ? html`<span class="t-prop">back to planned · ${plain(x.meta.state_reason)}</span>` : html`accepted · runs only after you approve it`;
   if (x.state === 'approved') return html`approved · runs with the next run phase, or now`;
   if (x.state === 'queued') return html`queued · starts when a worker takes it`;
   if (x.state === 'running') return html`<span class="ex-tail" data-tail="${x.id}">${store.tails[x.id] || 'run ' + (run.number || '') + ' started ' + ago(run.started)}</span>`;
   if (x.state === 'succeeded') return html`${metricLine(run) || 'succeeded'}`;
   if (x.state === 'failed') return html`<span class="t-neg">${(x.meta && x.meta.state_reason) || run.error || 'failed'}</span>`;
-  if (x.state === 'cancelled') return html`cancelled ${ago(run.finished)}`;
+  if (x.state === 'cancelled') return run.finished ? html`cancelled ${ago(run.finished)}` : html`cancelled before it ran`;
   return '';
 }
 function stateCell(x) {
@@ -77,13 +77,15 @@ async function fetchLog(store, eid, number, entry) {
     entry.next = piece.next;
     const first = !entry.loaded;
     entry.loaded = true;
-    if (first && !entry.live) app.render('log', true);
     entry.error = null;
     $$('[data-log="' + CSS.escape(eid + '/' + number) + '"]').forEach((el) => {
       const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
       if (piece.reset || el.dataset.empty) { el.textContent = entry.text; delete el.dataset.empty; } else if (text) el.append(text);
       if (stick) el.scrollTop = el.scrollHeight;
     });
+    /* the log of a run that has ended is also where its failure quotes from: drawn again,
+       after the text is in place (a render before it would be given the same text twice) */
+    if (first && !entry.live) app.render('log', true);
     const lines = entry.text.trimEnd().split('\n');
     const tail = lines[lines.length - 1];
     if (tail) { store.tails[eid] = tail; $$('[data-tail="' + CSS.escape(eid) + '"]').forEach((el) => { el.textContent = tail; }); }
@@ -96,6 +98,11 @@ function logOf(store, eid, run) {
   if (!entry) { entry = { text: '', next: null, loaded: false, loading: false, live: false }; logs.set(key, entry); fetchLog(store, eid, run.number, entry); }
   const live = run.status === 'running';
   if (entry.live && !live) fetchLog(store, eid, run.number, entry);   // the last lines, once it has ended
+  else if (entry.error instanceof Unreachable && connection.ok && !entry.loading) {
+    /* the server was gone when the log was asked for, and is back */
+    entry.error = null;
+    fetchLog(store, eid, run.number, entry);
+  }
   entry.live = live;
   if (live) { following = { store, eid, number: run.number, entry }; if (!pollTimer) pollTimer = setInterval(poll, 1200); }
   return entry;
@@ -148,6 +155,7 @@ function approveHTML(store, page, data) {
   const sum = pick ? backendName(pick.backend, pick.backend === 'modal' ? gpu : '') + ', for at most ' + minutes(+limitMin || planMin) + (pick.max_usd ? ' and ' + money(pick.max_usd * ((+limitMin || planMin) * 60) / Math.max(1, pick.timeout_seconds || planMin * 60)) : '') : '';
   return html`<section class="approve" id="approve" data-eid="${eid}"><h2>Where should it run?</h2>
     ${proposed ? html`<p class="approve-say"><b>Proposed</b> by the ${agentName(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(page.updated)}. It is not part of the wiki until you accept it, and it will not run until you approve it.</p>` : ''}
+    ${!proposed && page.state === 'planned' && (page.meta || {}).state_reason ? html`<p class="note note-warn approve-back" role="status">${icon('warn')}<span><b>It is planned again and waits for your approval.</b> ${plain(page.meta.state_reason)}</span></p>` : ''}
     ${data.plan_error ? html`<p class="note note-warn">${icon('warn')}<span>The plan cannot be read as it is: ${data.plan_error}</span></p>` : ''}
     <div class="backends" role="radiogroup" aria-label="Backend">${options.map(row)}</div>
     ${data.options_error ? html`<p class="note note-warn">${icon('warn')}<span>${data.options_error}</span></p>` : ''}
@@ -213,20 +221,34 @@ function failureHTML(store, page, data, run) {
     say = html`<p>This is the backend's own failure, not the experiment's: the job did not get to run its code to an end. Nothing in the code was repaired.</p>`;
     actions = html`${again}${elsewhere}${html`<a class="choice" href="#/setup"><b>Open Setup</b><span>What this machine can use, and what is missing.</span></a>`}`;
   } else if (kind === 'cancelled') {
-    title = 'Cancelled';
-    say = html`<p>You cancelled this run. Nothing was repaired or retried.</p>`;
-    actions = html`${again}${elsewhere}`;
+    /* stopped together with the agents: the experiment is queued again, the page offers "Run now" above */
+    title = run.requeued ? 'Stopped when you stopped the agents' : 'Cancelled by you';
+    say = run.requeued
+      ? html`<p>This run was under way${run.seconds != null ? ' for ' + duration(run.seconds) : ''} when you pressed Stop. The experiment is queued again: it runs with the next run phase, or now. What the run had written is kept below.</p>`
+      : html`<p>The run was stopped at your request${run.seconds != null ? ' after ' + duration(run.seconds) : ''}. Nothing was repaired or retried, and what it had written is kept below.</p>`;
+    actions = run.requeued ? '' : html`${again}${elsewhere}`;
   } else {
     const repairs = run.repairs || [];
     title = 'Failed with a programming error';
     say = html`<p>${repairs.length ? html`The runner repaired the code ${repairs.length === 1 ? 'once' : repairs.length + ' times'} before this run (${repairs.length} of ${limits.repair_rounds != null ? limits.repair_rounds : 3} repairs used), and it failed again.` : 'The code ended with an error. The runner has not repaired it.'}</p>`;
     actions = html`${edit}${again}${elsewhere}`;
   }
+  /* a run the person cancelled is their own doing: it is said plainly, not as an alarm */
+  if (kind === 'cancelled') return html`<div class="failure k-cancelled"><h3 class="fail-t">${icon('stop')}${title}</h3>${say}${actions ? html`<div class="choices">${actions}</div>` : ''}${repairsHTML(run, false)}</div>`;
   return html`<div class="failure k-${kind}"><h3 class="fail-t">${icon('warn')}${title}</h3>
-    <pre class="code code-err" tabindex="0" data-follow>${kind === 'program' && tail ? tail : run.error || 'No error message was recorded.'}</pre>
+    <pre class="code code-err" tabindex="0" data-follow>${kind === 'program' && tail ? tail : plain(run.error) || 'No error message was recorded.'}</pre>
     ${say}
     <div class="choices">${actions}</div>
-    ${(run.repairs || []).length ? html`<div class="repair"><h4>What the runner changed before this run</h4>${run.repairs.map((r) => html`<details class="repair-i"${(run.repairs.length === 1 ? raw(' open') : '')}><summary>Repair ${r.round}${r.after_run ? ' after run ' + r.after_run : ''}${(r.files || []).length ? ' · ' + r.files.join(', ') : ''}</summary><p>${r.reason}</p>${r.diff ? diffText(r.diff) : ''}</details>`)}</div>` : ''}</div>`;
+    ${repairsHTML(run, false)}</div>`;
+}
+/** What the runner changed in the code before a run, with the diffs. A run that succeeded
+    only after a repair says so: its numbers come from code the person has not read yet. */
+function repairsHTML(run, succeeded) {
+  const repairs = run.repairs || [];
+  if (!repairs.length) return '';
+  return html`<div class="repair${succeeded ? ' repair-ok' : ''}"><h4>${succeeded ? html`${icon('warn')}The runner changed the code before this run` : 'What the runner changed before this run'}</h4>
+    ${succeeded ? html`<p>The run before it failed with a programming error, and the runner repaired the code ${repairs.length === 1 ? 'once' : repairs.length + ' times'}. These metrics come from the repaired code: read what changed before you rely on them.</p>` : ''}
+    ${repairs.map((r) => html`<details class="repair-i" data-keep="repair:${run.experiment}#${run.number}/${r.round}"${(repairs.length === 1 && !succeeded ? raw(' open') : '')}><summary>Repair ${r.round}${r.after_run ? ' after run ' + r.after_run : ''}${(r.files || []).length ? ' · ' + r.files.join(', ') : ''}</summary><p>${r.reason}</p>${r.diff ? diffText(r.diff) : ''}</details>`)}</div>`;
 }
 
 /** The metrics the plan names under "Metrics and success criteria". A name can stand for a
@@ -279,6 +301,7 @@ function runBlock(store, page, data, run, open) {
   const result = run.result_page && store.byPath.get(run.result_page);
   return html`<div class="run open">${head}<div class="run-b">
     ${failed ? failureHTML(store, page, data, run) : ''}
+    ${run.status === 'succeeded' ? repairsHTML(run, true) : ''}
     ${run.status === 'succeeded' ? html`<div class="res-grid"><div><h3 class="sec-h">Metrics <span class="quiet">metrics.json, as the run wrote it</span></h3>${metricsHTML(run, data)}</div>
       <div><h3 class="sec-h">Artifacts</h3>${artifactsHTML(store, eid, run)}
         ${findings.length ? html`<h3 class="sec-h res-h">Findings from this run</h3>${findings.map((f) => html`<a class="lin" href="${link({ view: 'wiki', sel: f.path, sub: '' })}" data-sel="${f.path}">${pageGlyph(f, 16)}<span class="lin-name"><b>${f.id}</b> ${f.title}</span></a>`)}` : ''}</div></div>` : ''}
@@ -325,7 +348,7 @@ function codeSection(store, page, data) {
       ${editing != null ? html`<form class="code-edit" data-form="code" data-eid="${eid}" data-name="${name}">
           <label class="sr" for="code-text">${name}</label><textarea id="code-text" name="text" data-input="code" data-key="${editKey}" spellcheck="false" wrap="off">${editing.text}</textarea>
           ${editing.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span><b>Not saved.</b> ${editing.error} Your text is still here.</span></p>` : ''}
-          <div class="code-bar"><span class="quiet">The earlier version is kept. A changed file is parsed, not run; an approved run must be approved again.</span><button class="btn btn-quiet" type="button" data-act="code-cancel" data-key="${editKey}">Discard</button><button class="btn btn-primary" type="submit"${editing.saving ? raw(' disabled') : ''}>Save ${name}</button></div></form>`
+          <div class="code-bar"><span class="quiet">${editing.restored ? html`<b>Your unsaved edit of ${name} was restored.</b> ` : ''}The earlier version is kept. A changed file is parsed, not run; an approved run must be approved again.</span><button class="btn btn-quiet" type="button" data-act="code-cancel" data-key="${editKey}">Discard</button><button class="btn btn-primary" type="submit"${editing.saving ? raw(' disabled') : ''}>Save ${name}</button></div></form>`
         : file ? html`${codeBy(page, file)}${codeHTML(file.text)}` : ''}`
       : html`<p class="quiet">${plan.mode === 'repo' ? 'No patch: the command runs on a clean copy of the repository.' : 'No code has been written for this experiment yet.'}</p>`}
   </section>`;
@@ -353,14 +376,22 @@ function detailHTML(store, page, route) {
   else if (page.state === 'approved' || page.state === 'queued') {
     top = html`<section class="callout"><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
       <p>${busy ? 'The agents are at work; it runs when they reach it, or when they have stopped.' : 'It runs with the next run phase, or now.'}</p>
-      <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy ? raw(' disabled') : ''}>${icon('play')}Run now</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button></div></section>`;
+      <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy ? raw(' disabled') : ''}>${icon('play')}Run now</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
+        <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="Take the approval back: it is recorded as cancelled and can be approved again">Do not run it</button></div></section>`;
   } else if (page.state === 'running' && latest && latest.status === 'running') top = liveHTML(store, page, data, latest);
+  else if (page.review === 'accepted' && !runs.length && (page.state === 'cancelled' || page.state === 'failed' || page.state === 'succeeded') && app.ui.reapprove !== eid) {
+    /* it ended without a run on record (the approval was taken back before it started): not a dead end */
+    top = html`<section class="callout"><h2>${page.state === 'cancelled' ? 'Cancelled before it ran' : cap(page.state) + ', with no run on record'}</h2>
+      <p>${meta.state_reason ? plain(meta.state_reason) + ' ' : ''}Nothing ran. Approve it again when you want it run.</p>
+      <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Approve it again…</button></div></section>`;
+  }
   else if (page.state === 'running') top = html`<section class="callout"><h2><span class="live-dot" aria-hidden="true"></span>Starting…</h2><p>The run is being set up.</p></section>`;
   const openRun = app.ui.runOpen[eid] === undefined ? (latest && latest.status !== 'running' ? latest.number : null) : app.ui.runOpen[eid];
   const again = page.review === 'accepted' && (page.state === 'succeeded' || page.state === 'cancelled' || page.state === 'failed') && app.ui.reapprove !== eid;
+  const listed = runs.filter((r) => !(r.status === 'running' && page.state === 'running'));
   return html`${head}${top}
-    ${runs.length ? html`<section class="exp-runs"><h2 class="sec-t">Runs <span class="quiet">${runs.length}</span>${again ? html`<button class="btn btn-s tabs-r" data-act="reapprove" data-eid="${eid}">Run again…</button>` : ''}</h2>
-      ${runs.filter((r) => !(r.status === 'running' && page.state === 'running')).map((r) => runBlock(store, page, data, r, r.number === openRun))}</section>` : ''}
+    ${listed.length ? html`<section class="exp-runs"><h2 class="sec-t">${listed.length < runs.length ? 'Earlier runs' : 'Runs'} <span class="quiet">${listed.length}</span>${again ? html`<button class="btn btn-s tabs-r" data-act="reapprove" data-eid="${eid}">Run again…</button>` : ''}</h2>
+      ${listed.map((r) => runBlock(store, page, data, r, r.number === openRun))}</section>` : ''}
     <div class="exp-cols"><section class="exp-plan"><h2 class="sec-t">Plan</h2><div class="prose prose-s" data-plan="1" data-prose="${page.path}">${raw(data.html)}</div></section>${codeSection(store, page, data)}</div>
     ${runs.length ? '' : html`<section class="exp-runs"><h2 class="sec-t">Runs</h2><p class="quiet">It has not run yet.</p></section>`}`;
 }

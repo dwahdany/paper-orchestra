@@ -4,9 +4,9 @@
    the open route into the page, keeping scroll positions and the caret. A render caused by
    the event stream waits while the person is in the middle of typing. */
 
-import { app, parseHash } from './core.js';
+import { app, openProjectUi, parseHash } from './core.js';
 import { api, connection, Unreachable } from './api.js';
-import { $, $$, clock, html, parseStamp, setHTML } from './util.js';
+import { $, $$, clock, html, parseStamp, plain, setHTML } from './util.js';
 import { Store } from './store.js';
 import { banner, statusbar, topbar } from './shell.js';
 import { label, noteTrail } from './page.js';
@@ -18,17 +18,56 @@ import { overviewView } from './overview.js';
 import { paperView } from './paper.js';
 import { libraryView, loadLibrary, setupView, startView } from './home.js';
 import { flushAll, installActions } from './actions.js';
-import { renderToast } from './overlays.js';
+import { renderToast, sayError } from './overlays.js';
 
 app.views = { map: mapView, wiki: wikiView, inbox: inboxView, experiments: experimentsView, overview: overviewView, paper: paperView, start: startView, library: libraryView, setup: setupView };
 
 const KEEP = ['.idx-scroll', '.in-scroll', '.exp-rail', '.wiki-rail'];
 const KEEP_SAME = ['.wiki-main', '.in-detail', '.exp-main', '.overview', '.library', '.setup', '.start', '.paper', '.ed-prev'];
 const TYPING_MS = 1200;
+const CHOOSING_MS = 12000;
 let lastKey = '', pending = 0, waitingForPause = 0;
+
+/* ---------- the keyboard keeps its place across a render ---------- */
+const data = (el, names) => names.filter((k) => el.dataset[k] != null).map((k) => '[data-' + k + '="' + CSS.escape(el.dataset[k]) + '"]').join('');
+/** What names the focused element once the markup around it has been written again: its id,
+    or what it does and to what. `n` tells apart several that answer to the same name. */
+function focusKey(el) {
+  if (!el || !el.closest || !el.closest('#top, #view, #status, #toast')) return null;
+  const tag = el.tagName.toLowerCase();
+  let sel = '';
+  if (el.id) sel = '#' + CSS.escape(el.id);
+  else if (el.dataset.check) sel = 'input[data-check="' + CSS.escape(el.dataset.check) + '"]';
+  else if (el.dataset.act) sel = tag + '[data-act="' + CSS.escape(el.dataset.act) + '"]' + data(el, ['ref', 'eid', 'run', 'name', 'stamp', 'key', 'i', 'path', 'start', 'backend', 'minutes']);
+  else if (el.dataset.input) sel = tag + '[data-input="' + CSS.escape(el.dataset.input) + '"]' + data(el, ['eid', 'name', 'kind', 'ref', 'key']) + (el.type === 'radio' ? '[value="' + CSS.escape(el.value) + '"]' : '');
+  else if (tag === 'a' && el.getAttribute('href')) sel = 'a[href="' + CSS.escape(el.getAttribute('href')) + '"]';
+  else if (el.classList.contains('node') && el.dataset.key) sel = '.node[data-key="' + CSS.escape(el.dataset.key) + '"]';
+  else if (el.dataset.log) sel = '[data-log="' + CSS.escape(el.dataset.log) + '"]';
+  if (!sel) return null;
+  let n = 0;
+  try { n = Math.max(0, $$(sel).indexOf(el)); } catch (e) { return null; }
+  const text = /^(INPUT|TEXTAREA)$/.test(el.tagName) && el.type !== 'checkbox' && el.type !== 'radio';
+  let caret = null;
+  try { if (text && el.selectionStart != null) caret = [el.selectionStart, el.selectionEnd, el.scrollTop]; } catch (e) { /* a field without a caret */ }
+  return { sel, n, caret };
+}
+function refocus(key) {
+  if (!key) return;
+  const list = $$(key.sel);
+  const el = list[Math.min(key.n, list.length - 1)];
+  if (!el || el === document.activeElement || el.disabled || !el.focus) return;
+  el.focus({ preventScroll: true });
+  if (key.caret && el.setSelectionRange) { try { el.setSelectionRange(key.caret[0], key.caret[1]); } catch (e) { /* not a text field */ } el.scrollTop = key.caret[2]; }
+}
 
 function onStoreChange(reason, background, event) {
   if (reason === 'run.log') { if (app.hooks.runLog) app.hooks.runLog(event); return; }
+  /* An experiment the person approved was put back to planned instead of being run (its
+     code or plan is no longer what was approved): said aloud, wherever the person is looking. */
+  if (reason === 'event' && event && event.type === 'experiment.state') {
+    const d = event.data || {};
+    if (d.by === 'system' && d.state === 'planned' && d.previous && d.previous !== 'planned' && d.reason) sayError((d.id || 'The experiment') + ' did not run and is planned again: ' + plain(d.reason).replace(/^Not run:\s*/i, ''));
+  }
   renderSoon(reason, background !== false);
 }
 /** Several changes in one frame make one render. */
@@ -40,8 +79,7 @@ function renderSoon(reason, background) {
 function openProject(pid) {
   if (app.store && app.store.pid === pid) return app.store;
   if (app.store) { flushAll(); app.store.close(); }
-  app.ui.checked = {}; app.ui.rejecting = null; app.ui.confirmDelete = null; app.ui.activityOpen = false; app.ui.feedLimit = 40;
-  app.ui.map = { fold: null, round: null, lineageOnly: false, deep: false, open: {} };
+  openProjectUi(pid);
   mapView.reset();
   app.store = new Store(pid, onStoreChange);
   app.store.load();
@@ -64,6 +102,13 @@ function render(reason, background) {
     waitingForPause = setTimeout(() => render(reason, true), TYPING_MS - typed + 30);
     return;
   }
+  if (background && active && active.tagName === 'SELECT' && Date.now() - (app.choosingAt || 0) < CHOOSING_MS) {
+    /* a list of choices is open: writing its markup again would close it under the pointer.
+       The page changes when the choice is made or given up (or after a while, at the latest) */
+    clearTimeout(waitingForPause);
+    waitingForPause = setTimeout(() => render(reason, true), 400);
+    return;
+  }
   const route = parseHash(location.hash);
   let store = null;
   if (route.name === 'project') {
@@ -79,8 +124,8 @@ function render(reason, background) {
   KEEP.concat(same ? KEEP_SAME : []).forEach((sel) => { const el = $(sel, main); if (el) saved[sel] = el.scrollTop; });
   const logs = same ? $$('.log-body', main).map((el) => ({ key: el.dataset.log, top: el.scrollTop, stuck: el.scrollTop + el.clientHeight >= el.scrollHeight - 30 })) : [];
   const opened = same ? $$('details[data-keep][open]', main).map((el) => el.dataset.keep) : [];
-  const focusId = active && active.id && main.contains(active) ? active.id : '';
-  const caret = focusId && active.selectionStart != null ? [active.selectionStart, active.selectionEnd, active.scrollTop] : null;
+  const focused = focusKey(active);
+  if (!same) app.ui.focusEditor = route.name === 'project' && route.sub === 'edit' ? key : '';
 
   setHTML($('#top'), topbar(route));
   const viewKey = route.name === 'project' ? route.pid + '/' + route.view + (store.loaded ? '' : '/loading') : route.name;
@@ -102,19 +147,19 @@ function render(reason, background) {
 
   Object.keys(saved).forEach((sel) => { const el = $(sel, main); if (el) el.scrollTop = saved[sel]; });
   logs.forEach((log) => { const el = $('.log-body[data-log="' + CSS.escape(log.key || '') + '"]', main); if (el && !log.stuck) el.scrollTop = log.top; });
-  if (focusId) {
-    const el = document.getElementById(focusId);
-    if (el && el !== document.activeElement) {
-      el.focus({ preventScroll: true });
-      if (caret && el.setSelectionRange) { try { el.setSelectionRange(caret[0], caret[1]); } catch (e) { /* not a text field */ } el.scrollTop = caret[2]; }
-    }
-  }
   opened.forEach((keep) => { const el = $('details[data-keep="' + CSS.escape(keep) + '"]', main); if (el) el.open = true; });
-  if (app.ui.rejecting) { const input = $('.reject-form input', main); if (input && document.activeElement !== input) input.focus(); }
   renderToast();
   const ban = $('#banner');
   ban.hidden = connection.ok;
   setHTML(ban, banner());
+  /* the keyboard is where it was: on the same control, though its markup is new */
+  refocus(focused);
+  /* an editor that has just opened takes the keyboard: E, then type */
+  if (app.ui.focusEditor === key) {
+    const body = $('#ed-body', main);
+    if (body) { app.ui.focusEditor = ''; if (!main.contains(document.activeElement) || !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) body.focus({ preventScroll: true }); }
+  }
+  if (app.ui.rejecting) { const input = $('.reject-form input', main); if (input && document.activeElement !== input) input.focus(); }
   const page = store && store.loaded && route.sel ? store.byPath.get(route.sel) : null;
   document.title = (store && store.loaded ? (page ? label(page) + ' · ' : '') + store.project.title : { start: 'New project', setup: 'Setup', library: 'Projects', project: 'Project' }[route.name]) + ' · PaperOrchestra';
   app.lastRenderKey = key;
@@ -149,7 +194,8 @@ window.addEventListener('hashchange', () => {
 window.addEventListener('resize', () => renderSoon('resize', true));
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => render('theme'));
 connection.on((ok) => {
-  if (ok) { if (app.store && app.store.loaded) app.store.refreshNow(); else if (app.store) app.store.load(); if (app.route.name === 'library') loadLibrary(true); }
+  /* the server is back: what could not be read while it was gone is asked for again */
+  if (ok) { if (app.store && app.store.loaded) { app.store.retryFailed(); app.store.refreshNow(); } else if (app.store) app.store.load(); if (app.route.name === 'library') loadLibrary(true); }
 });
 /* while the server is gone, ask again every few seconds; fetches flip the state back */
 setInterval(() => { if (!connection.ok) api.health().catch(() => {}); }, 3000);

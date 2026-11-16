@@ -150,7 +150,7 @@ export const overviewView = {
     const idle = e.mode !== 'running' && e.mode !== 'experiment' && e.mode !== 'writing';
     const actions = !idle ? html`<a class="btn btn-l" href="${link({ view: 'map', sel: '', sub: '' })}">Watch on the map</a><button class="btn btn-l" data-act="stop"${e.stopping ? raw(' disabled') : ''}>${icon('stop')}${e.stopping ? 'Stopping…' : 'Stop'}</button>`
       : html`${items.length ? html`<a class="btn btn-l" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${items.length}</a>` : ''}
-        <button class="btn btn-l btn-primary" data-act="continue">${e.fresh ? 'Start research' : e.mode === 'failed' ? 'Retry ' + phaseName(e.next || e.phase) : e.mode === 'stopped' ? 'Resume ' + phaseName(e.next || e.phase) : continueLabel(e.next)} ${icon('right')}</button>
+        <button class="btn btn-l btn-primary" data-act="continue">${e.fresh ? 'Start research' : e.mode === 'failed' ? 'Retry ' + phaseName(e.next || e.phase) : e.mode === 'stopped' ? 'Resume ' + phaseName(e.next || e.phase) : continueLabel(e.next, store)} ${icon('right')}</button>
         ${e.mode === 'failed' || e.died || e.crashed ? html`<a class="btn btn-l" href="#/setup">Open Setup</a>` : ''}`;
     const waiting = items.length ? items.map((it) => { const sum = summaryOf(it); return html`<div class="ov-item" data-ref="${it.ref}"><a class="ov-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', it.page.state, 18)}
         <span class="in-name">${pageName(it.page)}</span>${sum ? html`<span class="in-sum">${sum}</span>` : ''}<span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)} · ${ago(it.when)}</span></a>

@@ -13,7 +13,7 @@ let toastTimer = 0;
 export function renderToast() {
   const el = $('#toast'), t = app.ui.toast;
   if (!el) return;
-  setHTML(el, t ? html`<div class="toast${t.kind === 'error' ? ' toast-error' : ''}" role="${t.kind === 'error' ? 'alert' : 'status'}">${t.kind === 'error' ? icon('warn') : ''}<span class="toast-t">${t.text}${t.undo ? html` <span class="toast-q">Not sent yet.</span>` : ''}</span>
+  setHTML(el, t ? html`<div class="toast${t.kind === 'error' ? ' toast-error' : ''}" role="${t.kind === 'error' ? 'alert' : 'status'}">${t.kind === 'error' ? icon('warn') : ''}<span class="toast-t">${t.text}${t.undo ? html` <span class="toast-q">Not sent yet.${t.note ? ' ' + t.note : ''}</span>` : ''}</span>
     ${t.undo ? html`<button class="btn btn-s" data-act="undo">${icon('undo')}Undo <kbd>Z</kbd></button><i class="toast-timer" aria-hidden="true"></i>` : ''}
     ${t.action ? html`<a class="btn btn-s" href="${t.action.href}" data-act="toast-x-follow">${t.action.label}</a>` : ''}
     <button class="ibtn" data-act="toast-x" aria-label="Dismiss">${icon('x')}</button></div>` : html``);
@@ -21,7 +21,7 @@ export function renderToast() {
 /** Say something briefly. `options.undo` is the batch of decisions that can still be taken back. */
 export function say(text, options) {
   options = options || {};
-  app.ui.toast = { text, kind: options.kind || 'info', undo: options.undo || null, action: options.action || null };
+  app.ui.toast = { text, kind: options.kind || 'info', undo: options.undo || null, note: options.note || '', action: options.action || null };
   renderToast();
   clearTimeout(toastTimer);
   if (options.kind !== 'error' || options.ms) toastTimer = setTimeout(() => { if (app.ui.toast && app.ui.toast.text === text) { app.ui.toast = null; renderToast(); } }, options.ms || (options.undo ? 5200 : 6000));
@@ -72,7 +72,7 @@ function commands() {
     const e = engineView(store);
     VIEWS.forEach((v, i) => add('Go to ' + v[1], String(i + 1), () => go({ view: v[0], sub: '', sel: v[0] === 'paper' ? '' : r.sel })));
     if (e.mode === 'running' || e.mode === 'experiment' || e.mode === 'writing') add('Stop the agents', 'ends at the next step', () => app.act('stop'));
-    else add(e.fresh ? 'Start research' : e.mode === 'failed' ? 'Retry the failed phase' : continueLabel(e.next), 'runs up to the next checkpoint', () => app.act('continue'));
+    else add(e.fresh ? 'Start research' : e.mode === 'failed' ? 'Retry the failed phase' : continueLabel(e.next, store), 'runs up to the next checkpoint', () => app.act('continue'));
     add('New page', 'a page of your own', () => app.act('new-page'));
     add('Leave an instruction for the agents', 'on the overview', () => { go({ view: 'overview', sel: r.sel, sub: '' }); setTimeout(() => { const el = $('#rq-text'); if (el) el.focus(); }, 60); });
     add(app.ui.showRejected ? 'Hide rejected pages' : 'Show rejected pages', '', () => app.act('toggle-rejected'));

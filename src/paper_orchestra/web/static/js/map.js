@@ -66,7 +66,9 @@ function mount(root, store) {
   });
   const endDrag = (ev) => {
     const was = drag; drag = null; canvas.classList.remove('panning');
-    if (was && !was.moved && ev.type === 'pointerup' && !ev.target.closest('.node') && V.route.sel) select('');
+    /* a click on the empty sheet clears the selection; not the second click of a double
+       click on a node, under which the map has just moved */
+    if (was && !was.moved && ev.type === 'pointerup' && !ev.target.closest('.node') && V.route.sel && performance.now() - (V.pickedAt || 0) > 500) select('');
   };
   svg.addEventListener('pointerup', endDrag);
   svg.addEventListener('pointercancel', endDrag);
@@ -79,7 +81,8 @@ function mount(root, store) {
   svg.addEventListener('click', (ev) => {
     if (ev.target.closest('.n-btn')) return; // handled by the action dispatcher
     const n = ev.target.closest('.node');
-    if (!n) return;
+    if (!n || ev.detail > 1) return;          // the second click of a double click would unselect what the first selected
+    V.pickedAt = performance.now();
     if (n.dataset.bundle) openBundle(n.dataset.key);
     else select(n.dataset.key === V.route.sel ? '' : n.dataset.key);
   });
@@ -88,7 +91,13 @@ function mount(root, store) {
     if (n) tip(n.dataset.key); else if (e) edgeTip(e, ev); else hideTip();
   });
   svg.addEventListener('mouseleave', hideTip);
-  svg.addEventListener('focusin', (ev) => { const n = ev.target.closest('.node'); if (n && !ev.target.closest('.n-btn')) tip(n.dataset.key); });
+  svg.addEventListener('focusin', (ev) => {
+    const n = ev.target.closest('.node');
+    if (!n) return;
+    /* Tab can reach a node that lies outside the sheet: the map moves so that it shows */
+    if (ev.target.matches(':focus-visible')) reveal(n.dataset.key);
+    if (!ev.target.closest('.n-btn')) tip(n.dataset.key);
+  });
   svg.addEventListener('focusout', hideTip);
   svg.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
@@ -97,6 +106,18 @@ function mount(root, store) {
     else if (n) { ev.preventDefault(); if (n.dataset.bundle) openBundle(n.dataset.key); else select(n.dataset.key); }
   });
   if (window.ResizeObserver) new ResizeObserver(() => { cancelAnimationFrame(V._raf); V._raf = requestAnimationFrame(() => { if (V.root && V.root.contains(canvas)) draw(); }); }).observe(canvas);
+}
+
+/** Move the map just far enough that a node is on the sheet (below the headings, above the legend). */
+function reveal(key) {
+  const s = V.st, n = s.lay && s.lay.nodes[key];
+  if (!n || !s.W) return;
+  const x = s.tx + s.k * n.x, y = s.ty + s.k * n.y;
+  const top = 34 + 28, bottom = s.H - (s.bottom || 0) - 28, left = 24, right = Math.max(left, s.W - 180);
+  const dx = x < left ? left - x : x > right ? right - x : 0, dy = y < top ? top - y : y > bottom ? bottom - y : 0;
+  if (!dx && !dy) return;
+  s.tx += dx; s.ty += dy; s.user = true;
+  applyT();
 }
 
 function openBundle(key) {
@@ -254,7 +275,10 @@ function draw() {
   const logTop = oldLog ? oldLog.scrollTop : 0, logStuck = !oldLog || oldLog.scrollTop + oldLog.clientHeight >= oldLog.scrollHeight - 24;
   setHTML($('.strip-slot', root), strip(store));
   const newLog = $('.strip-log', root);
-  if (newLog) newLog.scrollTop = logStuck ? newLog.scrollHeight : logTop;
+  /* a running phase is followed; the log of a failure opens at its top, where the advice and
+     the worker's own words are */
+  const follows = (el) => !!el && el.hasAttribute('data-follow');
+  if (newLog) newLog.scrollTop = follows(newLog) ? (logStuck ? newLog.scrollHeight : logTop) : oldLog && !follows(oldLog) ? logTop : 0;
   $$('.strip-slot .strip-pre', root).forEach((el) => { el.scrollTop = el.scrollHeight; });
   const panel = $('.panel', root);
   const keep = panel.dataset.key === sel ? panel.scrollTop : 0;
@@ -503,7 +527,7 @@ function emptyHTML(store) {
   return html`<div class="empty-card"><h2>The map is empty beyond your idea.</h2>
     <p>${e.fresh ? 'Research has not started.' : 'Nothing has been written yet.'} Intake reads ${files ? 'your ' + plural(files, 'file') : 'the idea'}, then the scout looks for prior work, verifies every paper and writes down what is known and what is open. It pauses at the first checkpoint and nothing is accepted without you.</p>
     <p class="empty-meta">The limit for models in this project is $${limits.model_usd != null ? Number(limits.model_usd).toFixed(2) : '…'}.</p>
-    <div class="row"><button class="btn btn-primary" data-act="continue">${e.fresh ? 'Start research' : continueLabel(e.next)} ${icon('right')}</button>${idea ? html`<a class="btn" href="${link({ view: 'wiki', sel: idea.path, sub: 'edit' })}">Edit the idea first</a>` : ''}</div></div>`;
+    <div class="row"><button class="btn btn-primary" data-act="continue">${e.fresh ? 'Start research' : continueLabel(e.next, store)} ${icon('right')}</button>${idea ? html`<a class="btn" href="${link({ view: 'wiki', sel: idea.path, sub: 'edit' })}">Edit the idea first</a>` : ''}</div></div>`;
 }
 
 function tip(key) {

@@ -250,6 +250,23 @@ export class Store {
   }
   invalidateExperiment(eid) { const entry = this.exps.get(eid); if (entry) { entry.key = null; entry.gen += 1; } }
 
+  /** A page that was deleted is gone at once, here and in every other tab that hears of it:
+      it must not be asked for again on the way to the next refetch of the lists. */
+  forget(path) {
+    if (!path || !this.server || !this.server.pages.some((p) => p.path === path)) return;
+    this.server.pages = this.server.pages.filter((p) => p.path !== path);
+    this.views.delete(path);
+    this.derive();
+  }
+
+  /** Forget what could not be loaded, so that it is asked for again when it is next shown. */
+  retryFailed() {
+    for (const entry of this.views.values()) if (entry.error && !entry.loading) { entry.error = null; entry.key = null; entry.gen += 1; }
+    for (const entry of this.exps.values()) if (entry.error && !entry.loading) { entry.error = null; entry.key = null; entry.gen += 1; }
+    for (const [key, entry] of this.versions) if (entry.error) this.versions.delete(key);
+    if (this.paper && this.paper.error) this.paper = null;
+  }
+
   version(path, stamp) {
     const key = path + '@' + stamp;
     let entry = this.versions.get(key);
@@ -353,6 +370,7 @@ export class Store {
     this.activity.push(event);
     if (type === 'agent.activity' && /named the project/i.test(event.summary || '')) this.refresh();
     if (this.activity.length > MAX_ACTIVITY) this.activity.splice(0, this.activity.length - MAX_ACTIVITY);
+    if (type === 'page.deleted') this.forget((event.data || {}).path || (event.refs || [])[0]);
     if (STRUCTURAL.test(type)) {
       (event.refs || []).forEach((ref) => this.invalidate(ref));
       const data = event.data || {};
