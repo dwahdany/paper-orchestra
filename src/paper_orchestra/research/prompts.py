@@ -466,6 +466,7 @@ def intake_message(
     rejected: Sequence[Mapping[str, Any]] = (),
     requests: Sequence[Mapping[str, Any]] = (),
     instruction: str | None = None,
+    untitled: bool = False,
 ) -> str:
     """The text that opens the intake session; the files themselves follow as parts."""
     if attached:
@@ -485,6 +486,13 @@ def intake_message(
         )
     parts += _earlier(pending, rejected)
     parts += _requests(requests, instruction)
+    if untitled:
+        parts.append(
+            "The researcher gave the project no title, so it shows the first line of the "
+            "idea, cut off. Give it one with name_project: a few plain words that say what "
+            "the research is about, the way the researcher would name a folder for it. It "
+            "is a label, not a claim, and they can rename it."
+        )
     parts.append(
         "Write the topic pages that say what each attachment contributes, and the "
         "questions the idea and the attachments leave open."

@@ -235,6 +235,50 @@ def test_a_folder_that_cannot_be_listed_is_reported_as_left_out(tmp_path, monkey
     assert manifest["skipped"] == [{"path": "material/locked", "reason": "cannot be read"}]
 
 
+def test_a_title_taken_from_the_brief_is_provisional_until_someone_names_the_project(tmp_path):
+    brief = "Warmup is said to matter most for large batches. I suspect the opposite under Adam."
+    project = Project.create(tmp_path / "p", title="", brief=brief)
+    assert project.title_is_provisional
+    assert Project.open(project.root).title_is_provisional
+
+    # An agent may name a project that has no name of its own, once.
+    project.rename("Warmup at small batch sizes under Adam", by="agent:intake")
+    reopened = Project.open(project.root)
+    assert reopened.title == "Warmup at small batch sizes under Adam"
+    assert not reopened.title_is_provisional
+    # The idea page showed the provisional title; it follows.  Its text is the person's.
+    idea = reopened.page("wiki/idea.md")
+    assert idea.title == "Warmup at small batch sizes under Adam" and idea.body.strip() == brief
+    assert idea.author == "human"
+    with pytest.raises(NotAllowed, match="already has a title"):
+        reopened.rename("Something else", by="agent:scout")
+    assert Project.open(project.root).title == "Warmup at small batch sizes under Adam"
+
+    # The person may always rename it, and their title is never provisional.
+    reopened.rename("  My   own title ", by="human")
+    assert Project.open(project.root).title == "My own title"
+    for bad in ("", "   ", "x" * 300):
+        with pytest.raises(ProjectError):
+            reopened.rename(bad, by="human")
+
+
+def test_a_title_the_person_gave_is_not_an_agents_to_change(tmp_path):
+    project = Project.create(tmp_path / "p", title="Mine", brief="An idea.")
+    assert not project.title_is_provisional
+    with pytest.raises(NotAllowed):
+        project.rename("Theirs", by="agent:intake")
+    # Renaming through the settings (the web app's form) also makes the title the person's.
+    other = Project.create(tmp_path / "q", title="", brief="Another idea entirely.")
+    other.title = "Chosen in the app"
+    other.save_settings()
+    assert not Project.open(other.root).title_is_provisional
+    # Saving settings without touching the title leaves a provisional title provisional.
+    third = Project.create(tmp_path / "r", title="", brief="A third idea.")
+    third.settings.update({"limits": {"model_usd": 3}})
+    third.save_settings()
+    assert Project.open(third.root).title_is_provisional
+
+
 def test_a_title_is_taken_from_the_brief_when_none_is_given(tmp_path):
     project = Project.create(tmp_path / "p", title="", brief="\nWhy do seeds matter?\nMore text.")
     assert project.title == "Why do seeds matter?"

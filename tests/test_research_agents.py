@@ -571,6 +571,48 @@ def test_a_second_intake_is_told_what_the_first_proposed_and_what_was_rejected(t
     assert '"Why 4000?": Not the point' in text
 
 
+def test_intake_names_a_project_that_the_person_left_untitled(tmp_path):
+    # Started from the composer, a project has only the idea's first line as its title,
+    # cut off where it got too long.  Intake has read the idea and can name it.
+    brief = "Warmup is said to matter most for large batches. I suspect the opposite under Adam."
+    project = Project.create(tmp_path / "untitled", title="", brief=brief)
+    said: list[str] = []
+
+    def intake(request: FakeRequest) -> str:
+        assert "name_project" in request.text
+        for title in ("x", "Warmup at small batch sizes under Adam.", "A second name"):
+            said.append(request.call_tool("name_project", {"title": title}))
+        return "Named it."
+
+    agents.run_intake(context(project, intake, phase="intake"))
+
+    assert "3 to 80 characters" in said[0]
+    assert said[1].startswith('The project is now called "Warmup at small batch sizes under Adam"')
+    assert "already has a title" in said[2]
+    named = Project.open(project.root)
+    assert named.title == "Warmup at small batch sizes under Adam"
+    assert not named.title_is_provisional
+    assert any(
+        event["type"] == "agent.activity" and "named the project" in event["summary"]
+        for event in named.events()
+    )
+
+
+def test_intake_is_not_offered_the_name_of_a_project_the_person_titled(tmp_path):
+    project = make_project(tmp_path)  # the person's title
+    offered: list[list[str]] = []
+
+    def intake(request: FakeRequest) -> str:
+        offered.append(sorted(request.tools))
+        assert "name_project" not in request.text
+        return "Nothing to add."
+
+    agents.run_intake(context(project, intake, phase="intake"))
+
+    assert "name_project" not in offered[0]
+    assert Project.open(project.root).title == "Warmup and variance"
+
+
 def test_intake_cannot_rewrite_the_idea_page(tmp_path):
     project = make_project(tmp_path)
     errors: list[str] = []

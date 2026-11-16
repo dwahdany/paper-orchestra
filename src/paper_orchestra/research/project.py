@@ -105,6 +105,9 @@ __all__ = [
 ]
 
 PROJECT_FILE = "project.json"
+#: Key of project.json that says the title is only the brief's first line.
+TITLE_FROM_BRIEF = "title_from_brief"
+TITLE_LIMIT = 120
 STATE_FILE = "state.json"
 EVENTS_FILE = "events.jsonl"
 INPUTS_DIR = "inputs"
@@ -573,6 +576,8 @@ class Project:
         self.created = ""
         self.settings = ProjectSettings()
         self._extra: dict[str, Any] = {}
+        #: The title as project.json holds it, to tell a renaming from a settings change.
+        self._title_on_file = ""
         self._file_problems: list[str] = []
         #: Size of events.jsonl when this process last wrote it, and the last seq in it.
         self._tail: tuple[int, int] = (0, 0)
@@ -609,7 +614,8 @@ class Project:
         cls._check_free(root)
         typed = cls._typed_settings(settings)
         brief = str(brief or "")
-        title = _one_line(title) or _clip(brief.strip().split("\n", 1)[0], 80) or "Untitled project"
+        given = _one_line(title)
+        title = given or _clip(brief.strip().split("\n", 1)[0], 80) or "Untitled project"
         chosen, skipped = _gather_inputs(files)
         made = not root.exists()
         try:
@@ -624,6 +630,9 @@ class Project:
             project.id = f"p-{secrets.token_hex(6)}"
             project.title = title
             project.settings = typed
+            if not given:
+                project._extra[TITLE_FROM_BRIEF] = True
+            project._title_on_file = title
             with project._lock:
                 # Once more, now that no other writer can be at work in this directory: two
                 # requests to create the same project must not write into each other.
@@ -757,6 +766,7 @@ class Project:
             if key not in ("schema", "id", "title", "created", "settings")
         }
         self._file_problems = problems + self.settings.load_problems
+        self._title_on_file = self.title
         self.wiki.name = self.title
 
     def _write_project_file(self) -> None:
@@ -783,9 +793,48 @@ class Project:
             raise ProjectError("A project needs a title.")
         with self._lock:
             self.title = title
+            if title != self._title_on_file:
+                self._extra.pop(TITLE_FROM_BRIEF, None)  # someone chose this one
             self._write_project_file()
+            self._title_on_file = title
             self._file_problems = []
             self.wiki.name = title
+            self._changed()
+
+    @property
+    def title_is_provisional(self) -> bool:
+        """Whether the title is only the first line of the brief, because the person gave none."""
+        return bool(self._extra.get(TITLE_FROM_BRIEF))
+
+    def rename(self, title: str, *, by: str) -> None:
+        """Give the project the title ``title``.
+
+        The person may always.  An agent may only where the title is still the
+        provisional one taken from the brief (``NotAllowed`` otherwise): a name
+        the person chose, or one already given, is not an agent's to change.
+        The idea page carried the provisional title and follows it; its text is
+        the person's and is not touched.
+        """
+        by = normalize_author(by)
+        title = _one_line(title)
+        if not title or len(title) > TITLE_LIMIT:
+            raise ProjectError(
+                f"A project's title is one line of at most {TITLE_LIMIT} characters."
+            )
+        with self._lock:
+            self.reload()
+            if by != HUMAN and not self.title_is_provisional:
+                raise NotAllowed(
+                    f'The project already has a title ("{self.title}"). Only the person renames it.'
+                )
+            previous = self.title
+            self.title = title
+            self._extra.pop(TITLE_FROM_BRIEF, None)
+            self._write_project_file()
+            self._title_on_file = title
+            self.wiki.name = title
+            if self.wiki.exists(IDEA_PATH) and self.page(IDEA_PATH).title == previous:
+                self.update_page(IDEA_PATH, author=SYSTEM, fields={"title": title})
             self._changed()
 
     # -- places ------------------------------------------------------------------

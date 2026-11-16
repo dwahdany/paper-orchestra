@@ -66,6 +66,7 @@ from paper_orchestra.research.model import (
     ProjectError,
     Request,
     ResearchPage,
+    agent_author,
     creatable_kinds,
     kind_for_path,
     moved_on,
@@ -754,17 +755,54 @@ def read_inputs(project: Project, capabilities: Capabilities) -> Inputs:
     return inputs
 
 
+def name_project_tool(ctx: AgentContext) -> ToolSpec:
+    """Intake's tool for naming a project that only has the brief's first line as its title."""
+    project = ctx.project
+
+    def handler(tool_input: dict[str, Any]) -> str:
+        title = " ".join(str(tool_input.get("title") or "").split()).rstrip(".")
+        if not 3 <= len(title) <= 80:
+            raise ToolError(
+                "title must be one short line of 3 to 80 characters: a few words that say "
+                "what the research is about"
+            )
+        try:
+            project.rename(title, by=agent_author("intake"))
+        except ProjectError as exc:
+            raise ToolError(str(exc)) from exc
+        ctx.activity(f'The intake named the project "{title}".', agent="intake")
+        return f'The project is now called "{title}". The researcher can rename it.'
+
+    return ToolSpec(
+        name="name_project",
+        description=(
+            "Give the project a title. Offered only while the project has none of its own "
+            "(it shows the first line of the idea). One short line, at most 80 characters, "
+            "that says what the research is about."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"title": {"type": "string", "description": "The title, one line."}},
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+        handler=handler,
+    )
+
+
 def run_intake(ctx: AgentContext) -> AgentReport:
     """Put into the wiki what the person's attached files contribute."""
     project = ctx.project
     capabilities = ctx.harness.client_for(model_for(project, "intake")).capabilities
     inputs = read_inputs(project, capabilities)
-    session = _Session(ctx, "intake")
+    untitled = project.title_is_provisional
+    session = _Session(ctx, "intake", tools=[name_project_tool(ctx)] if untitled else ())
     pending, rejected = _earlier(ctx, "intake")
     message = prompts.intake_message(
         idea=_idea(project),
         attached=inputs.attached,
         unread=inputs.unread,
+        untitled=untitled,
         pending=pending,
         rejected=rejected,
         requests=_request_items(ctx),
