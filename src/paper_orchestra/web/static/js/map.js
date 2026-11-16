@@ -16,7 +16,7 @@
 
 import { app, link, select } from './core.js';
 import { $, $$, esc, html, plural, raw, setHTML, tf } from './util.js';
-import { KIND, STAGES, TONE, glyph, glyphInner, icon, kindName, relOf, shownState } from './vocab.js';
+import { KIND, STAGES, TONE, glyph, glyphInner, icon, kindName, relOf, shownState, successWords } from './vocab.js';
 import { layout, routeRefs } from './layout.js';
 import { afterRender, label, panelHTML, shortTitle, statusLine, trailHTML } from './page.js';
 import { continueControl, engineView, strip } from './shell.js';
@@ -607,7 +607,9 @@ function draw() {
     const state = shownState(pg);
     const cls = 'node k-' + pg.kind + ' r-' + (pg.review === 'proposed' || pg.review === 'rejected' ? pg.review : 'accepted') + ' t-' + (TONE[state] || 'none') + (change ? ' has-change' : '') + (it.tight ? ' n-tight' : '') + dimCls +
       (flash && flash.key === pg.path ? ' flash-' + flash.decision : '') + (prev && !prev.has(pg.path) ? ' pop' : '');
-    const aria = kindName(pg.kind) + ' ' + (pg.id && pg.kind !== 'source' ? pg.id : '') + ', ' + pg.title + ', ' + pg.review + (state ? ', ' + state : '') + (change ? ', change proposed' : '');
+    /* (a cancelled or failed experiment whose earlier run succeeded says so, as its line does) */
+    const won = successWords(pg);
+    const aria = kindName(pg.kind) + ' ' + (pg.id && pg.kind !== 'source' ? pg.id : '') + ', ' + pg.title + ', ' + pg.review + (state ? ', ' + state : '') + (won ? ', ' + won : '') + (change ? ', change proposed' : '');
     nd += '<g class="' + cls + '" data-key="' + esc(pg.path) + '" transform="translate(' + n.x + ' ' + n.y + ')" tabindex="' + tab + '" role="button" aria-label="' + esc(aria) + '"' + (pg.path === sel ? ' aria-pressed="true"' : '') + '>' +
       bg + glyphInner(pg.kind, pg.review, state, { change }) + l1 + l2 + btn + '</g>';
   });

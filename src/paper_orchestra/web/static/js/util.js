@@ -29,6 +29,9 @@ export function html(strings, ...values) {
   return new Safe(out);
 }
 export const join = (parts, separator = '') => new Safe(parts.map(piece).join(piece(separator)));
+/** A sentence of the server that names a command between backticks (`paper-orchestra
+    doctor`), with the command set as code instead of the marks. */
+export const codeSpans = (text) => join(String(text == null ? '' : text).split('`').map((part, i) => (i % 2 ? html`<code>${part}</code>` : part)));
 /** Put built markup into an element. Refuses a plain string, which would not be escaped. */
 export function setHTML(element, markup) {
   if (!(markup instanceof Safe)) throw new TypeError('setHTML takes the result of html`...`');
@@ -77,17 +80,28 @@ export function plain(text) {
     .replace(/\b(?:to follow it, )?run (?:it|the research phase next) with `paper-orchestra research advance [^`]*--phase research`, or Continue with research in the app\b/g, (all) => (all.startsWith('to follow it') ? 'to follow it, ' : '') + 'choose “Search the literature again” when you continue')
     .replace(/ \(next: research\)/g, '');
 }
-/** What a phase did, from what the engine wrote when it paused ("The theorist proposed 2
-    hypotheses. 2 hypotheses and 6 findings await your review. Next: designing experiments
-    for the hypotheses you accepted."). The count of what waits and what comes next were
-    true at that moment only; the page shows both live beside it, so the stale ones are left
-    out, and so is the heading the page already has. */
-export const checkpointDid = (summary) => plain(String(summary || '')
-  .replace(/^Round \d+, [^:.]{1,40}:\s*/, '')
-  /* what comes next is said by the button, from the state as it is now */
-  .replace(/(^|[.!?]\s+)Next: [^.]*\.\s*$/, '$1')
-  .replace(/(^|[.!?]\s+)[^.!?]*\b(?:(?:is|are) waiting for you|awaits? your review)\.\s*$/, '$1')
-  .trim());
+/** Why something will not happen, as the server says it of an experiment ("it is not what
+    was approved at <stamp> (main.py: changed after the approval (written by agent:designer
+    at <stamp>))"): in the app's words for times and for who did it. */
+export const whyNot = (reason) => plain(reason).replace(/\bagent:(\w+)/g, 'the $1').replace(/[.\s]+$/, '');
+/** What the phases did before a checkpoint, as the page says it beside the live count of
+    what waits and the button that says what comes next. The engine keeps that account by
+    itself (`did` of the checkpoint); the heading the page already has is left out. A
+    checkpoint of an earlier version has only its sentence (`summary`: "The theorist
+    proposed 2 hypotheses. 2 hypotheses and 6 findings await your review. Next: designing
+    experiments for the hypotheses you accepted."), whose count and whose "Next" were true
+    at that moment only: there they are cut off. Takes the checkpoint, or such a sentence. */
+export function checkpointDid(checkpoint) {
+  const heading = /^Round \d+, [^:.]{1,40}:\s*/;
+  if (checkpoint && typeof checkpoint === 'object' && typeof checkpoint.did === 'string') return plain(checkpoint.did.replace(heading, '').trim());
+  const summary = checkpoint && typeof checkpoint === 'object' ? checkpoint.summary : checkpoint;
+  return plain(String(summary || '')
+    .replace(heading, '')
+    /* what comes next is said by the button, from the state as it is now */
+    .replace(/(^|[.!?]\s+)Next: [^.]*\.\s*$/, '$1')
+    .replace(/(^|[.!?]\s+)[^.!?]*\b(?:(?:is|are) waiting for you|awaits? your review)\.\s*$/, '$1')
+    .trim());
+}
 /** "38 min ago", "2 h ago", "3 days ago", then the date. */
 export const ago = (stamp, now = Date.now()) => {
   const t = parseStamp(stamp);

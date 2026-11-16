@@ -1225,6 +1225,89 @@ def test_an_edit_whose_page_is_gone_can_only_be_rejected(project):
     assert project.review(proposal.id, "reject").review == "rejected"
 
 
+def test_what_is_said_of_a_decision_and_of_bookkeeping_is_in_the_persons_words(project):
+    topic = project.create_page("topic", "Why warmup helps", "Three accounts.\n", author="human")
+    hypothesis(project)
+    project.review("H1", "accept")
+    turned_down = project.propose_edit(
+        topic.path, author="agent:analyst", summary="Add a fourth account", body="Four.\n"
+    )
+    taken = project.propose_edit(
+        "H1", author="agent:analyst", summary="The run supports it", fields={"summary": "Held."}
+    )
+
+    project.review(turned_down.id, "reject", reason="Not supported by a source")
+    project.review(taken.id, "accept")
+
+    # Both decisions name the page by what it is called, as every other line does: the
+    # file of a page is nothing the person was shown.
+    rejected, accepted = [e for e in project.events() if e["type"] == "review.decided"][-2:]
+    assert rejected["summary"] == (
+        'You rejected the analyst\'s edit to topic "Why warmup helps": Not supported by a source.'
+    )
+    assert "wiki/topics" not in rejected["summary"]
+    assert accepted["summary"].startswith(
+        'You accepted the analyst\'s edit to hypothesis H1 "Warmup reduces variance": '
+    )
+    assert rejected["data"]["path"] == topic.path  # the path stays, for programs
+
+    # What code notes on a page is told as what happened to the page.
+    experiment(project)
+    result = project.write_record(
+        "result", "E1-run1", "E1 run 1: Sweep", "ok\n", fields={"state": "succeeded"}
+    )
+    project.write_record(
+        "result", "E1-run1", "E1 run 1: Sweep", "ok, again\n", fields={"state": "succeeded"}
+    )
+    project.update_page(result.path, author="system", fields={"analysed": 1})
+    project.update_page("E1", author="system", fields={"problems": ["main.py is missing"]})
+    project.update_page("E1", author="system", fields={"problems": None})
+    said = [event["summary"] for event in project.events()[-5:]]
+    assert said == [
+        'Result "E1 run 1: Sweep" was recorded.',
+        'Result "E1 run 1: Sweep" was recorded again.',
+        'Result "E1 run 1: Sweep" was handed to the analysis.',
+        'Experiment E1 "Sweep warmup length" was checked: 1 problem is listed on its page.',
+        'Experiment E1 "Sweep warmup length" was checked again: no problem is left.',
+    ]
+    assert not any("pipeline" in event["summary"].lower() for event in project.events())
+
+
+def test_naming_the_project_says_that_the_idea_page_took_the_title(tmp_path):
+    project = Project.create(tmp_path / "untitled", title="", brief="An idea about warmup.\n")
+
+    project.rename("Warmup for small batches", by="agent:intake")
+
+    event = project.events()[-1]
+    assert event["type"] == "page.updated"
+    assert event["summary"] == (
+        'The idea page was given the project\'s title, "Warmup for small batches".'
+    )
+
+
+def test_taking_an_approval_back_is_said_as_that(project):
+    experiment(project)
+    project.review("E1", "accept")
+    project.set_state("E1", "approved", by="human")
+
+    project.set_state("E1", "planned", by="human", reason="Not yet")
+
+    event = project.events()[-1]
+    assert event["type"] == "experiment.state"
+    assert event["summary"] == (
+        'The approval of experiment E1 "Sweep warmup length" was taken back: it is a plan again.'
+    )
+    assert (event["data"]["previous"], event["data"]["state"], event["data"]["by"]) == (
+        "approved",
+        "planned",
+        "human",
+    )
+    # Put back by the run because it changed, it is not the person who took anything back.
+    project.set_state("E1", "approved", by="human")
+    project.set_state("E1", "planned", by="system", reason="Not run: its code changed.")
+    assert project.events()[-1]["summary"] == 'Experiment E1 "Sweep warmup length" is now planned.'
+
+
 # -- lifecycle ------------------------------------------------------------------
 
 
@@ -1321,9 +1404,8 @@ def test_records_are_written_by_code_and_accepted(project):
     )
     assert source.meta["year"] == 2020 and source.round == 1 and source.state is None
     assert project.resolve("smith2020deep") == source.path
-    assert project.events()[-1]["summary"] == (
-        'The pipeline recorded source Smith2020Deep "Deep things".'
-    )
+    # Said as what happened, not as who in the machinery did it.
+    assert project.events()[-1]["summary"] == 'Source Smith2020Deep "Deep things" was recorded.'
 
     experiment(project)
     result = project.write_record(

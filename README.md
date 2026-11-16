@@ -40,18 +40,18 @@ cp .env.example .env
 uv run paper-orchestra doctor
 ```
 
-`doctor` reports which credential the model provider will use (never the secret itself), whether TeX and Modal are available, and where memory is stored. The research agents need a Claude model (they work through the memory tool); see [Models and authentication](#models-and-authentication).
+`doctor` reports which credential the model provider will use (never the secret itself), whether TeX and Modal are available, and where memory is stored. The research agents need a Claude model (they work through the memory tool); see [Models and authentication](#models-and-authentication). On a fresh install without credentials `doctor` says so and exits 1; the demonstration and the app below work without them.
 
 ## Quick start
 
 See the app first, without any model call or credential:
 
 ```bash
-uv run paper-orchestra research demo        # builds ./research/demo-warmup
+uv run paper-orchestra research demo        # builds ./research/demo-warmup (a second run: demo-warmup-2)
 uv run paper-orchestra ui                   # prints the app's link and opens it in your browser
 ```
 
-The demonstration project is a small study of learning-rate warmup. Its experiment runs are real (a few seconds of numpy on your machine, with their logs, metrics and figures); its pages and activity were written by hand and say so.
+The demonstration project is a small study of learning-rate warmup. Its experiment runs are real (a few seconds of numpy on your machine, with their logs, metrics and figures); its pages and activity were written by hand and say so. Without a model, Continue there runs the approved experiment on your machine and then pauses, saying that the analysis needs one; nothing else in the app needs a credential.
 
 Start a project of your own in the app with **New project**, or from the command line:
 
@@ -118,7 +118,7 @@ Which kinds need your review is a setting (`review` in `project.json`): by defau
 
 At a checkpoint nothing happens until you say so. You can edit any page, add pages of your own, decide what was proposed, and leave an instruction ("also look at schedule-free optimisers"). An instruction is for one role (scout, theorist, designer, analyst), and then given to that role's next phase, or for all four, and then shown to each of their phases until the round's analysis is done.
 
-`research advance`, and **Continue** in the app, first runs what you approved and analyses results that have no analysis yet. If anything ran, it stops at the checkpoint after that analysis, and the phase that was next stays next. Otherwise it goes on with that phase. `--phase` starts with the phase named instead (intake then goes on to research, a run to its analysis).
+`research advance`, and **Continue** in the app, first runs what you approved and analyses results that have no analysis yet. If anything ran, it stops at the checkpoint after that analysis, and the phase that was next stays next. Otherwise it goes on with that phase. `--phase` starts with the phase named instead (intake then goes on to research, a run to its analysis). A run you cancelled is not analysed. Where no model can be used, what you approved still runs, without repairs, and the call pauses after it with one sentence about what to set up; if there is nothing to run, `advance` says that sentence and exits with 3.
 
 A round after the first begins with hypotheses. Another look at the literature is your choice: `research advance --phase research`, or "Search the literature again" in the list beside Continue in the app. The analyst can recommend one in the round's journal, and the checkpoint after the analysis repeats the recommendation. An instruction for the scout waits for that phase, and every checkpoint says so.
 
@@ -136,7 +136,7 @@ An experiment is a page (objective, method, metrics and success criteria, resour
 
 The contract of an experiment's code: write `metrics.json` (a flat object of numbers, true/false or short strings), put figures and tables under `artifacts/`, print progress, be deterministic given a seed. Only what the run itself writes counts as its result: a `metrics.json` or `artifacts/` that was there before is removed before the command starts and noted on the run.
 
-**Approval.** Accepting an experiment's page accepts the plan. It runs only after you approve the run, in the app ("Accept and run", or the approval form) or with `research approve`, which says what it approved to run: the command, the code files, the packages, the backend, the time limit and the network setting (`research cancel` takes the approval back). The approval records a digest of the code and of how it runs. A run starts, or resumes after a crash, only while the experiment still has that digest; otherwise it is a plan again and says what changed. (The runner's repairs of a failed run are recorded with their diff and allowed.) One approval is one run.
+**Approval.** Accepting an experiment's page accepts the plan. It runs only after you approve the run, in the app ("Accept and run", or the approval form) or with `research approve`, which says what it approved to run: the command, the code files, the packages, the backend, the time limit and the network setting (`research cancel` takes the approval back). The approval records a digest of the code and of how it runs. A run starts, or resumes after a crash, only while the experiment still has that digest; otherwise it is a plan again and says what changed. (The runner's repairs of a failed run are recorded with their diff and allowed.) One approval is one run. An approved experiment whose code or plan changed is listed as needing approval again and is not counted in what Continue will run.
 
 Three things are never taken from the plan, which an agent may have written. The backend is the project's (Modal for a GPU) unless you choose another, at this approval or at an earlier one of the same experiment. The network is off unless you allow it, and a plan that asks for it must be answered either way. And an experiment becomes approved only through your approval, never by an edit of its page.
 
@@ -161,7 +161,7 @@ The workspace is a directory of projects (default `./research`).
 - **Overview**: the checkpoint, the argument so far (each hypothesis with its experiments and findings), live activity, an instruction box, spending.
 - **Paper**: the optional write-up.
 
-**Access.** The server listens on your machine only (`127.0.0.1`) and still asks for an access token, because other users and programs on the same machine can reach a local port. Once it listens, `ui` prints one link that carries the token (`http://127.0.0.1:8600/?token=...`) and opens it in your browser; from then on a cookie holds it. With `--no-browser`, through `ssh -L`, or where the browser cannot read the file the server hands it (a browser installed as a snap or Flatpak), open the printed link yourself. Every start makes a new token, and a tab left open says that it needs the new link. Set `PAPER_ORCHESTRA_UI_TOKEN` (16 characters or more) for the server's command to keep one token across restarts. A program sends `Authorization: Bearer <token>`.
+**Access.** The server listens on your machine only (`127.0.0.1`) and still asks for an access token, because other users and programs on the same machine can reach a local port. Once it listens, `ui` prints one link that carries the token (`http://127.0.0.1:8600/?token=...`) and opens it in your browser; from then on a cookie holds it. With `--no-browser`, through `ssh -L`, or where the browser cannot read the file the server hands it (a browser installed as a snap or Flatpak), open the printed link yourself. Where the server's output goes to a file that other users can read, the link is not written there and the message says what to do. Every start makes a new token, and a tab left open says that it needs the new link. Set `PAPER_ORCHESTRA_UI_TOKEN` (16 characters or more) for the server's command to keep one token across restarts. A program sends `Authorization: Bearer <token>`.
 
 Without the token nobody can read a project, change anything or start anything, and the token is on no command line, in no file of a project and in no worker's environment. Three things it does not keep out:
 
@@ -209,7 +209,7 @@ Pages are plain Markdown with `key: value` front matter. You can edit them with 
 
 All agents, of the research workspace and of the paper pipeline, default to `claude-fable-5-2`. A project's models are set per role in its `project.json` (`models.research` for intake and the scout, `models.reasoning` for the theorist and the analyst, `models.coding` for the designer and the runner); the app's options for a new project set the reasoning effort, not the models. Two ways to authenticate:
 
-**API key.** Set `ANTHROPIC_API_KEY`.
+**API key.** Set `ANTHROPIC_API_KEY`. The web app reads credentials when it starts: after setting one, stop `paper-orchestra ui` and start it again (the agents and experiments it started go on meanwhile).
 
 **Workload Identity Federation (keyless).** Set the federation variables and provide an OIDC identity token from your platform:
 

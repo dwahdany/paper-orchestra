@@ -1,7 +1,7 @@
 /* What lies over the page: the toast (with the short undo), the command palette, the
    keyboard sheet and the small dialog that adds a page. */
 
-import { VIEWS, app, go } from './core.js';
+import { VIEWS, app, defaults, go } from './core.js';
 import { api } from './api.js';
 import { $, $$, debounce, html, raw, setHTML } from './util.js';
 import { KIND, STAGES, glyph, icon, kindName, pageGlyph } from './vocab.js';
@@ -10,6 +10,19 @@ import { engineView, nextStep, phaseChoices, theme } from './shell.js';
 
 /* ---------- toast ---------- */
 let toastTimer = 0;
+/** Where the toast stands: at the foot of the window, in the middle, unless that is where
+    the view keeps something to read or to press. On the map it stands above the legend and
+    the tools; in the inbox over the proposal, not over the list and its last column. */
+function placeToast(el) {
+  const box = el.firstElementChild;
+  el.style.bottom = ''; el.style.left = '';
+  if (!box) return;
+  const foot = $('.map-view .map-foot'), pane = $('.inbox .in-detail');
+  if (foot) { const top = foot.getBoundingClientRect().top; if (top > 0) el.style.bottom = Math.round(window.innerHeight - top + 10) + 'px'; }
+  const at = pane ? pane.getBoundingClientRect() : null;
+  /* (beside the list only where the proposal has a column of its own, wide enough for the toast) */
+  if (at && at.left > 200 && at.width >= box.offsetWidth + 24) el.style.left = Math.round(at.left + at.width / 2) + 'px';
+}
 export function renderToast() {
   const el = $('#toast'), t = app.ui.toast;
   if (!el) return;
@@ -17,6 +30,7 @@ export function renderToast() {
     ${t.undo ? html`<button class="btn btn-s" data-act="undo">${icon('undo')}Undo <kbd>Z</kbd></button><i class="toast-timer" aria-hidden="true"></i>` : ''}
     ${t.action ? html`<a class="btn btn-s" href="${t.action.href}" data-act="toast-x-follow">${t.action.label}</a>` : ''}
     <button class="ibtn" data-act="toast-x" aria-label="Dismiss">${icon('x')}</button></div>` : html``);
+  placeToast(el);
 }
 /** Say something briefly. `options.undo` is the batch of decisions that can still be taken back. */
 export function say(text, options) {
@@ -77,7 +91,7 @@ function commands() {
       /* what a press of the main button does, and the phases that can be chosen in its place */
       const step = nextStep(store, e);
       /* (where a phase has to be named before anything goes on, only the phases are offered) */
-      if (!step.pick && !step.blocked) add(step.label, step.href ? 'opens Experiments' : 'runs up to the next checkpoint', () => (step.href ? go(step.href) : app.act('continue')));
+      if (!step.pick && !step.blocked) add(step.label, step.href === '#/setup' ? 'opens Setup' : step.href ? 'opens Experiments' : 'runs up to the next checkpoint', () => (step.href ? go(step.href) : app.act('continue')));
       phaseChoices(store, e, step).forEach((c) => add(c.title, 'a phase of your choice', () => app.act('continue-phase', { dataset: { phase: c.phase } })));
     }
     add('New page', 'a page of your own', () => app.act('new-page'));
@@ -184,16 +198,37 @@ export function openHelp() {
 }
 
 /* ---------- a page of the person's own ---------- */
+/** The kinds this dialog offers until the server has said which a person can write. */
 const NEW_KINDS = ['topic', 'question', 'hypothesis', 'experiment', 'finding', 'journal'];
+/** The kinds of page a person can write, as the server lists them (`creatable_kinds` of
+    /api/defaults): in the order this dialog had, with what the server adds after it (a
+    lesson, which is the person's alone). A kind no agent writes says so (`kind_writers`). */
+function newKinds() {
+  const d = defaults();
+  const listed = d && Array.isArray(d.creatable_kinds) ? d.creatable_kinds.filter((k) => typeof k === 'string' && k) : null;
+  const kinds = listed && listed.length ? NEW_KINDS.filter((k) => listed.indexOf(k) >= 0).concat(listed.filter((k) => NEW_KINDS.indexOf(k) < 0)) : NEW_KINDS;
+  const writers = (d && d.kind_writers && typeof d.kind_writers === 'object' && d.kind_writers) || {};
+  return kinds.map((k) => ({ kind: k, name: kindName(k), hint: (KIND[k] || {}).hint || '', yours: Array.isArray(writers[k]) && !writers[k].length }));
+}
 export function openNewPage() {
   const ui = app.ui.newPage || (app.ui.newPage = { kind: 'topic', title: '', error: null, saving: false });
+  const kinds = newKinds();
+  if (!kinds.some((k) => k.kind === ui.kind)) ui.kind = kinds[0].kind;
   const ov = openOverlay('new-page', html`<form class="dialog" role="dialog" aria-modal="true" aria-label="New page" data-form="new-page">
     <h2>A page of your own</h2><p class="quiet">It is accepted as you write it: your pages are never changed by an agent, which proposes an edit instead.</p>
-    <label><span>Kind</span><select id="np-kind" name="kind" data-input="new-page-kind">${NEW_KINDS.map((k) => html`<option value="${k}"${ui.kind === k ? raw(' selected') : ''}>${KIND[k].one} · ${KIND[k].hint}</option>`)}</select></label>
-    <label><span>Title</span><input id="np-title" name="title" data-input="new-page-title" value="${ui.title}" autocomplete="off" placeholder="${ui.kind === 'question' ? 'What is still open?' : ui.kind === 'hypothesis' ? 'A claim that an experiment could refute' : 'What the page is about'}"></label>
+    <label><span>Kind</span><select id="np-kind" name="kind" data-input="new-page-kind">${kinds.map((k) => html`<option value="${k.kind}"${ui.kind === k.kind ? raw(' selected') : ''}>${k.name}${k.hint ? ' · ' + k.hint : ''}${k.yours ? ' · only you write these' : ''}</option>`)}</select></label>
+    <label><span>Title</span><input id="np-title" name="title" data-input="new-page-title" value="${ui.title}" autocomplete="off" placeholder="${ui.kind === 'question' ? 'What is still open?' : ui.kind === 'hypothesis' ? 'A claim that an experiment could refute' : ui.kind === 'lesson' ? 'What the agents should do differently' : 'What the page is about'}"></label>
     ${ui.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span>${ui.error}</span></p>` : ''}
     <div class="dialog-bar"><button class="btn btn-quiet" type="button" data-act="overlay-x">Cancel</button><button class="btn btn-primary" type="submit"${ui.saving ? raw(' disabled') : ''}>Create and write it</button></div></form>`);
   const title = $('#np-title', ov);
   if (title) { title.focus(); title.setSelectionRange(title.value.length, title.value.length); }
+  /* opened before the server had said which kinds there are: drawn again, once, when it has */
+  if (!defaults() && !ui.waiting) {
+    ui.waiting = setInterval(() => {
+      const open = app.ui.newPage === ui && $('#overlay').dataset.kind === 'new-page';
+      if (open && !defaults()) return;
+      clearInterval(ui.waiting);
+      if (open) openNewPage();
+    }, 150);
+  }
 }
-

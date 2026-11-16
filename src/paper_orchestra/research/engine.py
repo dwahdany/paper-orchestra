@@ -20,6 +20,10 @@ at its checkpoint as well.
 What ``advance()`` does when no phase is named: it first runs what the person
 approved and analyses results that have no analysis yet, pauses after that
 analysis when anything ran, and otherwise goes on with the phase that was next.
+A run needs no model and never waits for one.  Every other phase does: where the
+project's models cannot be used, ``advance()`` stops before the first such phase,
+at a checkpoint when something was done before it and with :class:`ModelNeeded`
+(one sentence, nothing recorded) when nothing was.
 Which phase is next is never changed by what an agent or a request says: more
 research is asked for by naming the phase.
 
@@ -77,6 +81,7 @@ from paper_orchestra.research.model import (
     format_stamp,
     is_agent,
     parse_stamp,
+    phase_name,
 )
 from paper_orchestra.research.project import EVENTS_FILE, EXPERIMENTS_DIR, STATE_FILE, Project
 from paper_orchestra.research.sources import CutoffError
@@ -87,10 +92,12 @@ __all__ = [
     "PHASES",
     "Engine",
     "EngineError",
+    "ModelNeeded",
     "WorkerBusy",
     "as_worker",
     "next_step",
     "phase_in_words",
+    "phase_name",
     "read_state",
     "state_problem",
     "worker_alive",
@@ -157,6 +164,10 @@ def phase_in_words(name: Any) -> str:
     Whoever else names a phase to the person (the web server, when it refuses a
     second worker) asks here, so that a phase has one name wherever it is read.
     What is no phase of the engine keeps the name it came with.
+
+    Where a phase is named by itself and not in a sentence ("checkpoint after
+    hypotheses", "next: analysis"), its name is ``phase_name`` (from
+    ``research.model``, exported here as well): the words of the app.
     """
     return f"the {_NOUN.get(name, name) if isinstance(name, str) else name} phase"
 
@@ -173,6 +184,20 @@ class EngineError(ProjectError):
 
 class WorkerBusy(EngineError):
     """Another worker is running this project."""
+
+
+class ModelNeeded(EngineError):
+    """The phase that would run needs a model, and the project's models cannot be used.
+
+    Nothing is wrong with the project and nothing happened to it: the message is the
+    one sentence that says which models, why, and what to set up.  ``need`` is what
+    ``agents.model_need`` found, ``phase`` the phase that was not started.
+    """
+
+    def __init__(self, message: str, *, phase: str, need: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.need = dict(need)
 
 
 class _BudgetSpent(Exception):
@@ -485,13 +510,18 @@ def state_problem(project: Project) -> str | None:
     return None
 
 
-def next_step(project: Project, state: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def next_step(
+    project: Project,
+    state: Mapping[str, Any] | None = None,
+    *,
+    client_for: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
     """What an ``advance()`` with no phase named would do as the project stands, for
     whoever shows it (the label of the app's Continue button)::
 
         {"will_run": ["run", "analyze"], "then": "hypothesize",
          "experiments": ["E1"], "results": 0,
-         "checkpoint_of": None, "needs_phase": False}
+         "checkpoint_of": None, "needs_phase": False, "blocked": None}
 
     ``will_run`` are the phases the call runs, in order, when each of them
     completes, and ``then`` is the phase its checkpoint names as next.  What the
@@ -504,19 +534,31 @@ def next_step(project: Project, state: Mapping[str, Any] | None = None) -> dict[
     would be refused, because nothing on file says where the project stands
     (:func:`state_problem`): a phase has to be named.
 
+    ``blocked`` says where the call stops because a phase needs a model and the
+    project's models cannot be used: ``{"phase", "needs": "model", "settings",
+    "models", "message"}``, with the phase that is not started, the entries of
+    ``settings.models`` concerned, their models, and the one sentence that says
+    what is missing and what to do.  ``will_run`` then ends before that phase
+    (what needs no model, a run, still happens) and ``then`` names it; with
+    nothing in ``will_run`` the call would be refused with that sentence
+    (:class:`ModelNeeded`).  The models are looked at only when ``client_for``
+    is given: how a model's client is found, as :class:`Engine` takes it
+    (``llm.router.get_client`` for the clients a worker would get).  Nothing is
+    contacted for it and nothing spent.  Without it ``blocked`` is ``None``.
+
     The answer comes from the rules :meth:`Engine.advance` itself goes by, applied
     to a copy of the state.  It assumes that the experiments which wait do run:
     when none of them can (each changed since its approval, say), ``advance()``
     goes on with the phase that was next in the same call and its checkpoint says
-    why.  Whether the models can be used and what the budgets allow is not looked
-    at: a call that is refused for that says so itself.
+    why.  What the budgets allow is not looked at: a call that is refused for
+    that says so itself.
 
     For a project nobody is working on.  Nothing is written and no lock is taken;
     ``state`` is what :func:`read_state` returned, for a caller that holds it
     already (it is not changed).
     """
     mine = copy.deepcopy(dict(state)) if state is not None else read_state(project)
-    return Engine._reading(project, mine)._forecast()
+    return Engine._reading(project, mine, client_for)._forecast()
 
 
 def _is_zombie(pid: int) -> bool:
@@ -801,6 +843,10 @@ class Engine:
         is the Semantic Scholar client of the research phase."""
         self.project = project
         self.harness = harness or agents.build_harness(project, client_for=client_for)
+        self._client_for: Callable[[str], Any] | None = self.harness.client_for
+        #: Whether the project's models can be used, asked once for each call that works
+        #: (``settings`` asked about -> what ``agents.model_need`` found).
+        self._needs: dict[tuple[str, ...], dict[str, Any] | None] = {}
         self._compute = _Compute(project, compute)
         self._scholar = scholar
         self._stop = threading.Event()
@@ -820,18 +866,26 @@ class Engine:
         self._lost: str | None = None
 
     @classmethod
-    def _reading(cls, project: Project, state: dict[str, Any]) -> Engine:
+    def _reading(
+        cls,
+        project: Project,
+        state: dict[str, Any],
+        client_for: Callable[[str], Any] | None = None,
+    ) -> Engine:
         """An engine that only reads: it holds ``project`` and ``state`` (its own to
         change) and nothing of what work needs, no harness, no backend, no lock.
 
         The rules that decide which phase comes next read the state and the
         project's pages and nothing else, so :func:`next_step` asks them here
-        instead of repeating them.
+        instead of repeating them.  With ``client_for`` it can also tell whether
+        the models could be used; without, it does not look.
         """
         reader = cls.__new__(cls)
         reader.project = project
         reader._state = state
         reader._lock = threading.RLock()
+        reader._client_for = client_for
+        reader._needs = {}
         return reader
 
     # -- public ------------------------------------------------------------------
@@ -862,6 +916,8 @@ class Engine:
         analysed before the phase that was next.  When anything ran, the call ends
         at the checkpoint after that analysis and the phase that was next stays
         next; when nothing could run, it goes on with that phase in the same call.
+        A run the person cancelled is no result: when that is all that ran, the
+        call pauses after the run phase, and nothing is analysed.
         A named phase is run as named: a run phase asked for by name pauses also
         when nothing ran, and says so.
 
@@ -875,19 +931,30 @@ class Engine:
         budget ended a phase early: its summary and a ``budget.warning`` event say
         so, and the same call resumes the phase once the limit is raised),
         ``stopped`` (interrupted; the same call resumes) or ``failed`` (a phase
-        failed twice, or cannot run as the project is set; ``error`` says why).  Raises
-        :class:`WorkerBusy` when another worker has the project,
-        :class:`EngineError` when the project's models cannot serve the agents or
-        when nothing on file says where the project stands and no phase is named,
-        and ``KeyboardInterrupt`` after recording the interruption.
+        failed twice, or cannot run as the project is set; ``error`` says why).
+
+        Nothing that needs no model waits for one.  Every phase but the run needs
+        the project's models; where they cannot be used (no credential, a model
+        without tools), the call stops before the first phase that needs them.
+        When a phase completed before that (the run of what was approved), it
+        pauses at that phase's checkpoint, which says in one sentence what is
+        missing and what to do.  When nothing was done, it raises
+        :class:`ModelNeeded` with that sentence, and the project is left as it
+        stood: no event, no phase on record, nothing spent.
+
+        Raises :class:`WorkerBusy` when another worker has the project,
+        :class:`ModelNeeded` as said above, :class:`EngineError` when nothing on
+        file says where the project stands and no phase is named, and
+        ``KeyboardInterrupt`` after recording the interruption.
         """
         if phase is not None and phase not in PHASES:
             raise EngineError(f"{phase!r} is not a phase; the phases are: {', '.join(PHASES)}.")
         instruction = (instruction or "").strip() or None
         with self._working():
-            self._refuse_unusable_models()
             if phase is None:
                 self._refuse_unknown_position()
+            # A phase that had completed without its checkpoint counts as done in this call.
+            done: str | None = self._unsettled_phase() if phase is None else None
             name: str | None = phase or self._first_phase()
             told: list[str] = []
             notes: list[str] = []
@@ -895,6 +962,11 @@ class Engine:
             if phase is None and name:
                 name, back = self._comes_first(name)
             while name:
+                need = self._model_need(name)
+                if need is not None:
+                    self._wait_for_a_model(name, need, done, told, notes)
+                    break
+                done = name
                 outcome = self._run_phase(name, instruction)
                 if outcome.status != "completed" or outcome.report is None:
                     break
@@ -956,6 +1028,7 @@ class Engine:
             _refuse_unwritable_state(self.project)
             self._stop.clear()
             self.project.reload()
+            self._needs.clear()  # the settings, and what is configured, as they are now
             # What writers that were killed left behind does not pile up crash by crash.
             swept = self.project.sweep_temporary_files()
             if swept:
@@ -1176,15 +1249,49 @@ class Engine:
         """
         return experiments.mask_credentials(self.project, str(text))
 
-    def _refuse_unusable_models(self) -> None:
-        problems = [
-            self._clean(problem) for problem in agents.model_problems(self.project, self.harness)
-        ]
-        if not problems:
-            return
-        message = " ".join(problems)
-        self.project.emit("error", _one_line(message, 600), data={"problems": problems})
-        raise EngineError(message)
+    def _models_need(self, settings: Sequence[str] | None = None) -> dict[str, Any] | None:
+        """What keeps the project's models (those of ``settings``; all of them without)
+        from being used, as ``agents.model_need`` finds it; ``None`` when they can be,
+        and for an engine that was not told how a client is found.  Asked once for
+        each call that works: nothing is contacted, but a client is built for it."""
+        if self._client_for is None:
+            return None
+        key = tuple(settings or ())
+        if key not in self._needs:
+            self._needs[key] = agents.model_need(self.project, self._client_for, settings=settings)
+        return self._needs[key]
+
+    def _model_need(self, name: str) -> dict[str, Any] | None:
+        """What keeps the phase ``name`` from starting for want of a model; ``None`` when
+        nothing does.
+
+        The run phase needs none: it executes what the person approved.  Every
+        other phase is an agent's session, and starts only when all the project's
+        models can be used, as before: a round whose research can be paid for and
+        whose design then cannot be done is refused before anything is spent.
+        """
+        return None if name == "run" else self._models_need()
+
+    def _wait_for_a_model(
+        self,
+        name: str,
+        need: Mapping[str, Any],
+        done: str | None,
+        told: Sequence[str],
+        notes: Sequence[str],
+    ) -> None:
+        """Stop before the phase ``name``, which needs a model that cannot be used.
+
+        ``done`` is the phase this call completed last.  With one, the call pauses
+        at its checkpoint, which keeps what the phases did (``told``, ``notes``)
+        and says what is missing in one sentence; ``name`` is next.  With none,
+        nothing was done and nothing is recorded: :class:`ModelNeeded` carries the
+        sentence to whoever asked.
+        """
+        sentence = agents.need_sentence(need, phase_in_words(name).capitalize())
+        if done is None:
+            raise ModelNeeded(sentence, phase=name, need=need)
+        self._checkpoint(done, self._state["round"], name, told, notes, missing=[sentence])
 
     def _position_unknown(self) -> bool:
         """Whether nothing on file says where the project stands although agents have
@@ -1988,13 +2095,21 @@ class Engine:
         return None
 
     def _follows(
-        self, name: str, *, ran: bool, back: str | None = None, named: bool = False
+        self,
+        name: str,
+        *,
+        ran: bool,
+        back: str | None = None,
+        named: bool = False,
+        results: bool | None = None,
     ) -> tuple[str | None, str | None]:
         """What follows the phase ``name`` once it has completed: ``(the phase that
         runs at once, None)``, or ``(None, the phase its checkpoint names as next)``
         when the call pauses there.
 
-        ``ran`` says whether the run phase executed an experiment; ``back`` and
+        ``ran`` says whether the run phase executed an experiment, and ``results``
+        whether a result is there to analyse after it (looked up when it is not
+        given; a forecast says what the runs it foretells will leave).  ``back`` and
         ``named`` are those of :meth:`_after`.  This is the rule alone, without the
         checkpoint: :meth:`_after` acts on it and :func:`next_step` foretells by it.
         """
@@ -2002,12 +2117,15 @@ class Engine:
             return "research", None
         aside = self._return_phase() or back
         if name == "run":
-            if ran or self._new_results():
+            to_analyse = bool(self._new_results()) if results is None else results
+            if to_analyse:
                 return "analyze", None
-            if aside is not None and not named:
+            if aside is not None and not named and not ran:
                 # Nothing ran, so there is nothing to pause for: what could not be run
                 # is said at the checkpoint of the phase that was next.
                 return aside, None
+            # What ran left nothing to analyse (the person cancelled it): the call
+            # pauses here instead of going on with a phase they did not ask for.
             return None, aside or "run"
         if name == "analyze":
             return None, aside or _NEXT[name]
@@ -2018,14 +2136,16 @@ class Engine:
         :func:`next_step`.  Changes this engine's state as the phases would, and
         nothing on disk: only for an engine that reads (:meth:`_reading`)."""
         self._settle_dead_worker()
-        waiting = [str(page.id or page.path) for page in self._awaiting_run()]
+        waiting, held = self._will_start()
         said: dict[str, Any] = {
             "will_run": [],
             "then": None,
             "experiments": waiting,
+            "not_running": held,
             "results": len(self._new_results()),
             "checkpoint_of": None,
             "needs_phase": False,
+            "blocked": None,
         }
         if self._position_unknown():
             return {**said, "needs_phase": True}
@@ -2045,10 +2165,49 @@ class Engine:
         if name:
             name, back = self._comes_first(name)
         while name and len(said["will_run"]) <= len(PHASES):
+            need = self._model_need(name)
+            if need is not None:
+                # The call stops here, as :meth:`advance` does: before this phase.
+                said["then"] = name
+                said["blocked"] = {
+                    "phase": name,
+                    "needs": need["needs"],
+                    "settings": list(need["settings"]),
+                    "models": list(need["models"]),
+                    "message": agents.need_sentence(need, phase_in_words(name).capitalize()),
+                }
+                break
             said["will_run"].append(name)
             self._assume_completed(name)
-            name, said["then"] = self._follows(name, ran=name == "run" and bool(waiting), back=back)
+            # A run that starts is taken to leave a result, which is then analysed.
+            runs = name == "run" and bool(waiting)
+            name, said["then"] = self._follows(
+                name, ran=runs, back=back, results=runs or bool(said["results"])
+            )
         return said
+
+    def _will_start(self) -> tuple[list[str], list[dict[str, str]]]:
+        """Of the experiments a run phase is owed, the ones a run would start (their
+        ids) and the ones it would not, each with the reason: ``[{"id", "reason"}]``.
+
+        The run phase takes up every experiment that reads as approved, and
+        ``research.experiments`` starts only what still is what the person
+        approved; the others go back to planned there.  Whoever foretells a press
+        must not count them as runs.
+        """
+        waiting: list[str] = []
+        held: list[dict[str, str]] = []
+        for page in self._awaiting_run():
+            name = str(page.id or page.path)
+            try:
+                reason = experiments.will_not_run(self.project, page.path)
+            except (ProjectError, OSError):
+                reason = None  # it cannot be told here; the run says it
+            if reason is None:
+                waiting.append(name)
+            else:
+                held.append({"id": name, "reason": reason})
+        return waiting, held
 
     def _assume_completed(self, name: str) -> None:
         """For a forecast: the records as :meth:`_run_phase` leaves them once the phase
@@ -2139,6 +2298,7 @@ class Engine:
         *,
         budget_said: bool = False,
         recommends: ResearchPage | None = None,
+        missing: Sequence[str] = (),
     ) -> None:
         """Pause for the person: say what was done, what needs their eye, what comes next.
 
@@ -2152,6 +2312,16 @@ class Engine:
         phase that is next (:meth:`_recommending`).  ``notes`` say so in a sentence;
         the checkpoint and its event also carry it as ``recommends`` and
         ``recommends_page``, for whoever shows the choice beside the recommendation.
+
+        ``missing`` is what the phase that is next lacks to start, where that is why
+        the call pauses here (a model that cannot be used, in one sentence).  It is
+        said at the pause, in the event and in the checkpoint's summary.
+
+        The checkpoint keeps the account by itself as ``did``: what was done and
+        what the person has to know, without the count of what waited, without what
+        was next and without ``missing``.  Those were true at this moment only;
+        whoever shows the checkpoint later says them as they are then, beside
+        ``did`` (a model may have been set up since: :func:`next_step` tells).
         """
         recommended = (
             {"recommends": "research", "recommends_page": recommends.path} if recommends else {}
@@ -2167,13 +2337,8 @@ class Engine:
             f"{_and(waiting)} {verb} your review." if waiting else "Nothing awaits your review."
         )
         resumes = " (it resumes where it stopped)" if following == name and name != "run" else ""
-        closing = [
-            *notes,
-            *self._waiting_for_research(following),
-            *self._unpriced_note(),
-            review,
-            f"Next: {_DOING[following]}{resumes}.",
-        ]
+        account = [*notes, *self._waiting_for_research(following), *self._unpriced_note()]
+        closing = [*account, *missing, review, f"Next: {_DOING[following]}{resumes}."]
         refs = [page.path for page in self.project.pages(review="proposed")][:50]
         event = self._emit(
             "checkpoint",
@@ -2201,6 +2366,9 @@ class Engine:
                     "at": event["ts"],
                     "summary": " ".join(
                         part.strip() for part in [*told, *closing] if part and part.strip()
+                    ),
+                    "did": " ".join(
+                        part.strip() for part in [*told, *account] if part and part.strip()
                     ),
                     "pending": dict(pending["by_kind"]),
                     **_recommendation(recommended),
@@ -2381,13 +2549,15 @@ class Engine:
             return {run.get("number"): run for run in runs if run.get("status") != "running"}
 
         before = set(settled())
+        repair, unrepaired = self._repairer(ctx)
         try:
             return experiments.run(
                 project,
                 experiment,
                 compute=compute or self._compute,
                 should_stop=self._stopping,
-                repair=agents.make_repair(ctx),
+                repair=repair,
+                unrepaired=unrepaired,
                 limits=self._run_limits(limits),
             )
         finally:
@@ -2397,6 +2567,29 @@ class Engine:
             new = [run for number, run in settled().items() if number not in before]
             pages = [project.resolve(f"{experiment}-run{run.get('number')}") for run in new]
             ctx.note(path for path in pages if path)
+
+    def _repairer(self, ctx: AgentContext) -> tuple[Callable[..., Any] | None, str | None]:
+        """The callback that repairs a failed run, or ``None`` and why there is none.
+
+        A run needs no model and never waits for one.  The repair of a run that
+        failed for a programming error does, the runner's: where that model cannot
+        be used, the run happens all the same, a failure stands, and its record
+        says why nothing was tried (``experiments.run(..., unrepaired=...)``).
+        """
+        setting = agents.MODEL_ROLES["runner"]
+        try:
+            need = self._models_need((setting,))
+        except Exception as exc:
+            # Whatever is wrong with the model must not keep an approved run from running.
+            log.warning("The model for repairs could not be asked about.", exc_info=True)
+            why = self._clean(_one_line(f"{type(exc).__name__}: {exc}", 200))
+            return None, (
+                f"a repair needs a model, and the one set for {setting} could not be "
+                f"looked at ({why})."
+            )
+        if need is None:
+            return agents.make_repair(ctx), None
+        return None, agents.need_sentence(need, "a repair")
 
     def _planned_again(self) -> list[str]:
         """One sentence for each accepted experiment that went back to ``planned`` with a
@@ -2560,8 +2753,17 @@ class Engine:
     # -- analysis ----------------------------------------------------------------
 
     def _new_results(self) -> list[ResearchPage]:
-        """Result records no analysis has been given yet."""
-        return [page for page in self.project.pages(kind="result") if not page.meta.get("analysed")]
+        """Result records no analysis has been given yet.
+
+        The record of a run the person cancelled is not among them: it is kept, as
+        every settled run's is, but a run that was cut short on purpose measured
+        nothing anyone should draw a finding from.
+        """
+        return [
+            page
+            for page in self.project.pages(kind="result")
+            if not page.meta.get("analysed") and page.state != "cancelled"
+        ]
 
     def _journal_name(self, ctx: AgentContext) -> str:
         """The journal page of this round: ``round-2``, or the next free name when an

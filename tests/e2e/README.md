@@ -69,6 +69,38 @@ against what the server answers:
   reload;
 - the composer offers the model efforts and compute backends `GET /api/defaults` lists;
 - `[redacted]` and `***` in a log are plain text, not an error;
+- a project whose models cannot be used (where everybody is who tries the demonstration
+  without credentials) is something to set up, not an accident. The server says beforehand
+  where a press stops for want of a model (`next_step.blocked`): the main button promises
+  the run of what is approved and no analysis, the engine's one sentence stands beside it
+  once, with the way to Setup and the word that the app is started again afterwards, and no
+  phase that needs a model is offered. The press runs the approved experiment and pauses
+  at a checkpoint after the runs; from then on the main button leads to Setup. A press
+  that is made all the same (a button drawn while a model could still be used) ends its
+  worker with `last_exit.reason: "needs_model"`: the app says once that nothing was
+  started, and the strip, the top bar, the overview and the library go on saying
+  checkpoint, also after a reload; no log is offered and nothing is "stopped
+  unexpectedly". Such a worker ends within half a second and writes no event, so the page
+  does not wait for the event stream to report it: while it holds a worker as busy and
+  hears nothing, it asks the project view. Setup says what works without credentials
+  (`without_credentials` of `GET /api/doctor`). On a third copy of the demo project, which
+  no other check touches, with the scripted model switched off (below);
+- an approved experiment whose code changed after the approval will not run
+  (`will_not_run` of its rows, `not_running` of the forecast): its page, the list beside
+  it, the table and the map show it as needing approval again, the main button does not
+  promise its run, and the sentence beside the button says that it will not run and why,
+  in the app's words, with a link to the experiment that the keyboard reaches;
+- a run the person cancelled is no result: an experiment whose first run succeeded and
+  whose second was cancelled says "cancelled; run 1 succeeded" wherever its state is said
+  (`last_success` of its rows), the words lead to the record of that run, and the main
+  button counts one new result to analyse;
+- a suggested edit that was decided can be found again: on the page it was about
+  (`decided_proposals` of its view) and in the inbox's list of what was decided, where a
+  rejection stands with its reason; a proposal the person edited is still said to be
+  proposed when the agent proposed it; the New dialog offers the kinds the server lists
+  (`creatable_kinds` of `GET /api/defaults`), a lesson among them; a tooltip shows a key
+  as a key, and the one of the main button does not lie over the top bar; the paper view
+  stops saying "Writing…" in the frame in which the top bar does;
 - a server that was restarted has a new access token and refuses the cookie the browser
   holds: the app says "This server was restarted; open the new link printed in its
   terminal.", in the banner, at the foot of the project and where a page could not be read;
@@ -122,9 +154,13 @@ and the package's `ui` extra are needed. Nothing leaves the machine: the phases 
 WS=$(mktemp -d)
 uv run paper-orchestra research demo --dir "$WS/demo"                # about 6 s: its runs are real
 uv run paper-orchestra research demo --dir "$WS/large" --pages 150   # for the `large` check
+uv run paper-orchestra research demo --dir "$WS/nomodel"             # for the `nomodel` check
 
 # The server's access token, for the server and for the checks (16 characters or more).
 export PAPER_ORCHESTRA_UI_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+# A file that does not exist yet: while it does, the scripted model is switched off. The
+# `nomodel` check writes and removes it; the server and the checks are given the same name.
+export PAPER_ORCHESTRA_E2E_NO_MODEL="$WS/no-model"
 
 PYTHONPATH=tests/e2e \
 PAPER_ORCHESTRA_SCRIPTED_CLIENT=scripted_model:client \
@@ -138,10 +174,16 @@ To look at the app yourself meanwhile, open the link the server printed.
 
 The flows change the project, so every run needs a fresh workspace. Options:
 
-- `--only map,inbox` / `--skip composer`: the checks are `screens`, `map`, `inbox`, `wiki`,
-  `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`, `composer`,
-  `hostile`. They are written to run in that order on one fresh demo project; a single one
-  also runs alone.
+- `--only map,inbox` / `--skip composer`: the checks are `screens`, `nomodel`, `map`,
+  `inbox`, `wiki`, `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`,
+  `composer`, `hostile`. They are written to run in that order on one fresh demo project; a
+  single one also runs alone.
+- `nomodel` looks at the project in the folder `nomodel` (a third copy of the demo
+  project, told from the other two by the name of its folder) while the scripted model is
+  switched off. It says in a `note` line that it was skipped when the workspace has no
+  such project, when `PAPER_ORCHESTRA_E2E_NO_MODEL` is not set, or when the server is on
+  another machine (the file is the switch). It comes before every check that starts
+  agents: the switch is the server's, not one project's.
 - `--shots DIR`: photographs of the moving states (a running phase, a live log, a failure)
   as the checks pass them.
 - `--scheme dark`: the flows in the dark theme. The checks are meant to pass in both
@@ -197,3 +239,11 @@ The marks are words in the text of the instruction:
 
 The last two concern the analyst alone: the `rules` check leaves them in an instruction
 for the analyst, through the box on the overview, and the next analysis is given it.
+
+It can also be switched off, to show a project without a usable model. While the file that
+`PAPER_ORCHESTRA_E2E_NO_MODEL` names exists, the scripted client offers no tools and no
+memory tool, which no agent can work with: the server's forecast says that a model is
+needed (`next_step.blocked`), a worker whose phase needs one starts nothing and ends for
+that reason, and the run of an approved experiment still happens. Remove the file and the
+models can be used again; the switch takes effect at once. Without the variable nothing
+changes.

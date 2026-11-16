@@ -5,7 +5,7 @@
 import { app, link } from './core.js';
 import { api } from './api.js';
 import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, listOf, minutes, money, parseStamp, plain, plural, raw, storage, tf } from './util.js';
-import { STATES, TONE, agentName, glyph, icon, kindName, pageGlyph, shownState } from './vocab.js';
+import { STATES, TONE, agentName, earlierSuccess, glyph, icon, kindName, lapsed, pageGlyph, shownState, successWords } from './vocab.js';
 
 /* ---------- naming a page ---------- */
 export function shortTitle(page) {
@@ -25,7 +25,16 @@ export const pageTip = (page) => kindName(page.kind) + (hasId(page) ? ' ' + page
     that, wherever its page is shown: not "running", which is what its file still says. */
 export function stateTag(page) {
   const state = shownState(page);
-  return state ? html`<span class="tag tag-state t-${TONE[state] || 'none'}">${glyph(page.kind, 'accepted', state, 14)}${state}</span>` : '';
+  return state ? html`<span class="tag tag-state t-${TONE[state] || 'none'}">${glyph(page.kind, 'accepted', state, 14)}${state}</span>${alsoSucceeded(page)}` : '';
+}
+/** Beside the state of an experiment that reads cancelled or failed: the earlier run of it
+    that succeeded, as the server names it, with the way to its record. The state is how the
+    last approved run ended, not that the experiment has no result. */
+export function alsoSucceeded(page) {
+  const won = earlierSuccess(page);
+  if (!won) return '';
+  const record = typeof won.result_page === 'string' && app.store ? app.store.byPath.get(won.result_page) : null;
+  return record ? html`<a class="st-also" href="${link({ view: 'wiki', sel: record.path, sub: '' })}" data-sel="${record.path}" data-tip="Its result record">${successWords(page)}</a>` : html`<span class="st-also">${successWords(page)}</span>`;
 }
 export const reviewTag = (page) => (page.review === 'proposed' ? html`<span class="tag tag-proposed">Proposed</span>` : page.review === 'rejected' ? html`<span class="tag tag-rejected">Rejected</span>` : '');
 export const who = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : 'the ' + agentName(author));
@@ -51,11 +60,15 @@ export function statusParts(store, page) {
     const run = row.last_run || {};
     if (page.state === 'running') return page.interrupted || row.interrupted ? ['interrupted', 'needs you'] : ['running'];
     if (page.state === 'succeeded') return ['succeeded'].concat(run.seconds != null ? [durationShort(run.seconds)] : []);
-    if (page.state === 'failed') return ['failed', 'needs you'];
+    /* an earlier run that succeeded is said with a state that would read as "no result" */
+    const won = successWords(page);
+    if (page.state === 'failed') return ['failed', won || 'needs you'];
+    /* approved, and no longer what was approved: it will not run until it is approved again */
+    if (lapsed(page)) return ['needs approval again'];
     if (page.state === 'approved') return ['approved', 'runs next'];
     if (page.state === 'queued') return ['queued'];
     if (page.state === 'planned') return ['planned', 'not approved'];
-    return [page.state || 'planned'];
+    return [page.state || 'planned'].concat(won ? [won] : []);
   }
   if (page.kind === 'result') return [page.state || ''];
   if (page.kind === 'finding') {
@@ -169,6 +182,10 @@ export const unacceptLink = (page) => (canUnaccept(page) && app.ui.rejecting !==
 /** The question it opens: a reason, as for any rejection. */
 export const unacceptForm = (page) => (canUnaccept(page) && app.ui.rejecting === page.path ? html`<div class="note note-unaccept" data-unaccept="${page.path}"><span><b>Reject ${label(page)} after all?</b> It is kept with your reason, and nothing is built on it from here on.${page.kind === 'experiment' ? ' What already rests on its runs is not changed: you are told what that is.' : ''}</span>${rejectForm(page.path)}</div>` : '');
 
+/** When a proposal was proposed: when its page was first written. (An edit of the person's
+    moves `updated`, which the line of who changed the page last says.) */
+export const proposedAt = (page) => page.created || page.updated;
+
 /* ---------- review bar: accept / edit, then accept / reject ---------- */
 export function reviewBar(store, page, opt) {
   opt = opt || {};
@@ -180,7 +197,7 @@ export function reviewBar(store, page, opt) {
     const entry = exp && !opt.compact ? store.experiment(page.id) : null;
     const canRun = !!(entry && entry.data && (entry.data.options || []).some((o) => o.can_run) && !entry.data.plan_error);
     parts.push(html`<div class="review${opt.compact ? ' review-compact' : ''}" data-ref="${page.path}">
-      ${opt.compact ? '' : html`<p class="review-say"><b>Proposed</b> by ${who(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(page.updated)}. It is not part of the wiki until you accept it${exp ? ', and it will not run until you approve it' : ''}.</p>`}
+      ${opt.compact ? '' : html`<p class="review-say"><b>Proposed</b> by ${who(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(proposedAt(page))}. It is not part of the wiki until you accept it${exp ? ', and it will not run until you approve it' : ''}.</p>`}
       ${exp && !opt.compact ? runOn(store, page, entry) : ''}
       ${app.ui.rejecting === page.path ? rejectForm(page.path) : html`<div class="review-actions">
         ${exp
@@ -200,7 +217,7 @@ export function reviewBar(store, page, opt) {
     const entry = page.kind === 'experiment' && page.id ? store.experiment(page.id) : null;
     const rests = entry && entry.data ? restsOnHTML(store, entry.data.dependents) : '';
     parts.push(html`<div class="note note-rejected"><b>Rejected</b> by ${who(meta.decided_by || 'human')}${meta.decided_at ? ', ' + dateTime(meta.decided_at) : ''}.${meta.decision_reason ? html` <q>${meta.decision_reason}</q>` : ''}
-      <span class="note-sub">The page is kept. Agents see its title and this reason, nothing else. <button class="linkish" data-act="reaccept" data-ref="${page.path}">Accept it after all</button></span>
+      <span class="note-sub">The page is kept. ${meta.decision_reason ? 'Agents see its title and this reason, nothing else.' : 'No reason was given. Agents see its title, nothing else.'} <button class="linkish" data-act="reaccept" data-ref="${page.path}">Accept it after all</button></span>
       ${String(rests) ? html`<div class="rested">${rests}</div>` : ''}</div>`);
   }
   return join(parts);
@@ -229,6 +246,26 @@ function changeNote(store, page, proposal, opt) {
       ${text && !opt.compact ? html`<button class="btn" data-act="edit-proposal" data-ref="${proposal.id}" data-path="${page.path}">Edit</button>` : ''}
       <button class="btn btn-neg-quiet" data-act="reject-ask" data-ref="${proposal.id}">Reject…${key('R')}</button></div>`}
   </div>`;
+}
+
+/* ---------- suggested edits that were decided ---------- */
+/** What was suggested for this page before, and what the person decided: the server lists
+    it with the page (`decided_proposals`, the latest decision first), so that a suggestion
+    that was turned down, and the reason, can be found where it was made. Nothing where the
+    server lists none. */
+export function decidedEditsHTML(store, view) {
+  const list = (view && Array.isArray(view.decided_proposals) ? view.decided_proposals : []).filter((p) => p && (p.review === 'accepted' || p.review === 'rejected'));
+  if (!list.length) return '';
+  const row = (p) => {
+    const fields = Object.entries(p.fields || {}).map(([name, value]) => name + ' → ' + value);
+    const what = [p.summary || '', fields.join(', ')].filter(Boolean).join(' · ') || (p.changes_text ? 'An edit to the text' : 'An edit');
+    return html`<li class="de de-${p.review}" data-decided="${p.id}"><span class="de-m">${icon(p.review === 'rejected' ? 'x' : 'check')}</span><div><p class="de-what">${what}</p>
+      <p class="de-how">Suggested by ${who(p.author)}${p.round ? ' in round ' + p.round : ''}; ${p.review} by ${who(p.decided_by || 'human')}${p.decided_at ? ' ' + ago(p.decided_at) : ''}.${p.review === 'rejected' ? (p.decision_reason ? html` <q>${p.decision_reason}</q>` : ' No reason was given.') : ''}</p></div></li>`;
+  };
+  const shown = list.slice(0, 3), rest = list.slice(3);
+  return html`<section class="decided-edits" aria-label="Suggested edits that were decided"><h3 class="rail-h">Suggested edits, decided <span class="quiet">${list.length}</span></h3>
+    <ul class="des">${shown.map(row)}</ul>
+    ${rest.length ? html`<details class="de-more" data-keep="decided-edits"><summary>${rest.length} earlier</summary><ul class="des">${rest.map(row)}</ul></details>` : ''}</section>`;
 }
 
 /* ---------- what rests on an experiment ---------- */
@@ -506,7 +543,7 @@ function attachmentsHTML(store) {
 export function notesHTML(store, page, opt) {
   const entry = store.views.get(page.path);
   const view = entry && entry.data;
-  return html`${reviewBar(store, page, opt)}${view && opt.part !== 'page' ? numberCheckHTML(store, view) : ''}`;
+  return html`${reviewBar(store, page, opt)}${view && opt.part !== 'page' ? numberCheckHTML(store, view) : ''}${view && opt.margin ? decidedEditsHTML(store, view) : ''}`;
 }
 
 /* ---------- the page ---------- */
@@ -556,6 +593,7 @@ export function panelHTML(store, page, opt) {
       ${notesHTML(store, page, opt.notes === 'rail' ? { part: 'page' } : {})}
       ${bodyHTML(store, page, view)}
       ${page.kind === 'idea' ? attachmentsHTML(store) : ''}
+      ${opt.notes === 'rail' ? '' : decidedEditsHTML(store, view)}
       ${lineageHTML(store, page)}`;
   }
   const versions = view ? (view.history || []).length + 1 : null;

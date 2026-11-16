@@ -815,6 +815,36 @@ def test_a_summary_taken_from_the_text_carries_no_link_markup():
     assert model.plain_links("[[a/b.md]] and [[c|]]") == "b and c"
 
 
+def test_a_summary_taken_from_a_long_first_line_ends_where_a_word_ends_and_says_so():
+    brief = (
+        "I think warmup matters most for small batches when the optimiser is adaptive, and "
+        "I suspect that with larger batches the early second-moment estimates are less noisy."
+    )
+    page = model.parse_page("wiki/idea.md", f"---\ntitle: Idea\n---\n{brief}\n\nMore.\n")
+
+    # Not cut in the middle of a sentence as if that were all of it.
+    assert page.summary.endswith("…") and len(page.summary) <= 140
+    assert brief.startswith(page.summary[:-1]) and brief[len(page.summary) - 1] == " "
+    # A first line that fits is the summary as it is.
+    short = model.parse_page("wiki/topics/t.md", "---\ntitle: T\n---\nA short line.\n\nMore.\n")
+    assert short.summary == "A short line."
+    # A paragraph whose lines were broken by hand is one piece of text: where its first
+    # line ends is not where the thought does.
+    wrapped = model.parse_page(
+        "wiki/idea.md",
+        "---\ntitle: Idea\n---\n> A note.\n\nWarmup is assumed to matter most for large "
+        "batches. I suspect that with\nadaptive optimisers it is small batches that need "
+        "it.\n\nMore.\n",
+    )
+    assert wrapped.summary == (
+        "Warmup is assumed to matter most for large batches. I suspect that with adaptive "
+        "optimisers it is small batches that need it."
+    )
+    # The items of a list are not run together.
+    listed = model.parse_page("wiki/topics/l.md", "---\ntitle: L\n---\n- one\n- two\n")
+    assert listed.summary == "- one"
+
+
 @pytest.mark.parametrize("left_by_a_hand_edit", ["approved", "queued"])
 def test_the_end_of_a_run_can_be_recorded_whatever_state_the_page_was_left_in(
     left_by_a_hand_edit,

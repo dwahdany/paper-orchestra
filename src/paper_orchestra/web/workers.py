@@ -53,6 +53,12 @@ project's files.  What this module guarantees:
   reason a command gives when it refuses); for a write-up that is a
   ``paper.finished`` event, so that the paper's own events say how the last
   write-up ended, to this server and to the next.
+* **A worker that needed a model is not one that died.**  ``research advance``
+  ends with its own exit code when the phase that would run needs a model and
+  none can be used.  Nothing happened to the project, so no error is written:
+  ``last_exit["reason"]`` is ``"needs_model"``, for whoever shows it as
+  something to set up.  (What is missing is said by the engine's forecast,
+  which the project view carries.)
 
 No ``preexec_fn`` (unsafe in a threaded server) and no parent-death signal (it
 follows the thread that started the child, and server threads end): the child
@@ -97,6 +103,7 @@ __all__ = [
     "HEARTBEAT_AHEAD_SECONDS",
     "HEARTBEAT_STALE_SECONDS",
     "KINDS",
+    "NEEDS_A_MODEL_EXIT",
     "RECORD_FILE",
     "WORKER_LOCK_FILE",
     "WORKER_LOG",
@@ -135,6 +142,12 @@ HEARTBEAT_STALE_SECONDS = 60.0
 #: heartbeat is at most a moment ahead; another machine's clock may differ by more.
 HEARTBEAT_AHEAD_SECONDS = 5.0
 HEARTBEAT_AHEAD_SECONDS_ELSEWHERE = 60.0
+
+#: The exit code of ``research advance`` when it started nothing because the phase that
+#: would run needs a model and none can be used (the command line's ``NEEDS_A_MODEL``;
+#: named here so that the server need not import the command line).  Such an end is no
+#: death: ``last_exit["reason"]`` says ``needs_model`` and no error is reported.
+NEEDS_A_MODEL_EXIT = 3
 
 _SETTLED_PHASES = frozenset({"completed", "failed", "interrupted", "skipped"})
 _POLL_SECONDS = 0.1
@@ -1159,6 +1172,7 @@ class Workers:
                 "at": _now(),
                 "stopped": False,
                 "interrupted_phase": phase,
+                "reason": None,
                 "forgotten": True,
             }
             self._settle_later(root)
@@ -1176,7 +1190,10 @@ class Workers:
         and what to do, :meth:`stop` refuses and :meth:`forget` clears it), and
         ``None`` when the project is idle.  ``last_exit`` describes the last
         worker seen to end: ``{"kind", "code", "at", "stopped",
-        "interrupted_phase"}`` (and ``"forgotten": True`` after :meth:`forget`).
+        "interrupted_phase", "reason"}`` (and ``"forgotten": True`` after
+        :meth:`forget`).  ``reason`` is ``"needs_model"`` when the agents were
+        not started because the phase that would run needs a model and none
+        can be used (no worker died: it is something to set up), else ``None``.
         Looking is also what notices a worker that died: its phase is then
         recorded as interrupted.
 
@@ -1698,13 +1715,21 @@ class Workers:
             phase = self._settle(entry, code)
         except Exception:
             log.exception("Could not settle the state of %s.", entry.root)
+        # The command's own word for "the next phase needs a model, nothing was started".
+        # With a phase left running it is not that, whatever the number.
+        needs_model = (
+            unexpected and entry.kind == "advance" and code == NEEDS_A_MODEL_EXIT and phase is None
+        )
         self._last_exit[key] = {
             "kind": entry.kind,
             "code": code,
             "at": _now(),
             "stopped": entry.stop_requested,
             "interrupted_phase": phase,
+            "reason": "needs_model" if needs_model else None,
         }
+        if needs_model:
+            return  # nothing died, and nothing ran that could have left a run behind
         if unexpected and (phase is not None or self._ended_badly(entry, code)):
             self._report_death(entry, code, phase)
         if entry.kind in ("advance", "run") and code != 0:
@@ -1718,8 +1743,8 @@ class Workers:
 
         Killed by a signal, always.  Otherwise a failure it left no account of.  For
         the engine: ``state.json`` untouched since the worker started means it
-        stopped before the engine could record anything (no credentials, a broken
-        project).  For a run: no event since it started (the command refused,
+        stopped before the engine could record anything (a broken project, a
+        command that could not start).  For a run: no event since it started (the command refused,
         another worker holds the project); one that failed at its work is on record
         in its own events.  For a write-up: no event of the paper's since it
         started.  A write-up tells its start and its end in ``paper.`` events and
@@ -1845,6 +1870,7 @@ class Workers:
                     "at": _now(),
                     "stopped": False,
                     "interrupted_phase": phase,
+                    "reason": None,
                 }
             else:
                 _take_name_off(root, None)

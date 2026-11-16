@@ -2,10 +2,10 @@
    map, the rounds, what waits, the argument so far, activity, instructions, spend. */
 
 import { app, defaults, link } from './core.js';
-import { MONTH_NAMES, ago, checkpointDid, clock, cutoffParts, cutoffWords, dayOf, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, setHTML } from './util.js';
-import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, icon, pageGlyph, phaseName, roleName, shownState } from './vocab.js';
+import { MONTH_NAMES, ago, checkpointDid, clock, cutoffParts, cutoffWords, dayOf, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, setHTML, whyNot } from './util.js';
+import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, icon, lapsed, pageGlyph, phaseName, roleName, shownState } from './vocab.js';
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
-import { UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
+import { DEMO_COST, UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
@@ -20,12 +20,22 @@ export function stripMap(store) {
       ${wait ? html`<div class="smap-wait">${wait} waiting</div>` : ''}</div>`;
   })}</div>`;
 }
-/** The small one for the library: a dot per stage and the number of pages. */
+/** The small one for the library: a dot per stage and the number of pages. What a number
+    counts is said when it is pointed at: "14 sources", "6 questions, 1 of them waiting". */
 export function stripMapSmall(counts, waiting) {
-  return html`<div class="smap smap-s">${STAGES.map((k) => { const n = (counts || {})[k] || 0; const w = (waiting || {})[k] || 0; return html`<div class="smap-st${n ? '' : ' none'}${w ? ' wait' : ''}"><div class="smap-dot"></div><div class="smap-n">${k === 'idea' || !n ? '' : n}</div></div>`; })}</div>`;
+  return html`<div class="smap smap-s">${STAGES.map((k) => {
+    const n = (counts || {})[k] || 0, w = (waiting || {})[k] || 0;
+    const says = k === 'idea' ? 'The idea' : (n ? plural(n, KIND[k].one.toLowerCase(), KIND[k].many.toLowerCase()) : 'No ' + KIND[k].many.toLowerCase() + ' yet') + (w ? ', ' + w + ' of them waiting for you' : '');
+    return html`<div class="smap-st${n ? '' : ' none'}${w ? ' wait' : ''}" data-tip="${says}"><div class="smap-dot"></div><div class="smap-n">${k === 'idea' || !n ? '' : n}</div></div>`;
+  })}</div>`;
 }
 
-function roundsHTML(store, e) {
+/** The rounds as lines of phases: what ran, where the project stands, what comes. A phase
+    that ran twice in a row (a run with nothing approved, then the run of what was) is one
+    mark that says so, and a phase that comes round again in the open round says "again":
+    neither reads as a stutter. */
+export function roundsLine(store, e) {
+  e = e || engineView(store);
   const phases = ((store.project.state || {}).phases || []);
   if (!phases.length && !e.next) return '';
   const rounds = {};
@@ -46,17 +56,28 @@ function roundsHTML(store, e) {
   /* (a phase that is resumed is drawn as the record it has; it comes again after what runs first) */
   if (step && step.back) coming.unshift(...step.steps, ...(retry && step.back === e.next ? [step.back] : []));
   const here = e.mode !== 'running' && e.mode !== 'idle';
+  /* records of one phase that follow one another, all but the last completed, are one mark */
+  const marks = (list) => list.reduce((out, ph) => {
+    const before = out[out.length - 1];
+    if (before && before.phase === ph.phase && before.status === 'completed') out[out.length - 1] = Object.assign({}, ph, { times: before.times + 1, produced: (before.produced || []).concat(ph.produced || []), seconds: before.seconds == null && ph.seconds == null ? null : (before.seconds || 0) + (ph.seconds || 0), requests: (before.requests || []).concat(ph.requests || []) });
+    else out.push(Object.assign({ times: 1 }, ph));
+    return out;
+  }, []);
+  /* a phase that ran to its end in the open round, or is to come earlier in it, and comes round
+     once more (not one that is resumed: its mark says "interrupted", and it has not ended) */
+  const ended = (rounds[current] || []).filter((ph) => ph.status === 'completed').map((ph) => ph.phase);
+  const next = (ph, i) => html`<span class="trk-p s-next"><i></i>${phaseName(ph)}${ended.indexOf(ph) >= 0 || coming.indexOf(ph) < i ? ' again' : ''}</span>`;
   return html`<div class="trks">${Object.keys(rounds).sort((a, b) => a - b).map((r) => {
-    const list = rounds[r], open = +r === current;
+    const list = marks(rounds[r]), open = +r === current;
     return html`<div class="trk"><span class="trk-r">Round ${r}</span>${list.map((ph, i) => {
       const isLast = open && i === list.length - 1;
       const made = (ph.produced || []).length;
       const told = (ph.requests || []).length;
-      const tip = (ph.status === 'completed' ? '' : ph.status + ' · ') + (made ? plural(made, 'page') + ' written · ' : '') + (ph.seconds != null ? duration(ph.seconds) : '') + (ph.attempts > 1 ? ' · ' + ph.attempts + ' attempts' : '') + (told ? ' · given ' + plural(told, 'instruction') : '') + (ph.error ? ' · ' + plain(ph.error) : '');
-      return html`<span class="trk-p s-${ph.status}" data-tip="${tip || ph.status}"><i></i>${phaseName(ph.phase)}${ph.status === 'failed' ? ' (failed)' : ph.status === 'interrupted' ? ' (interrupted)' : ph.status === 'running' ? ' (running)' : ''}</span>
+      const tip = (ph.status === 'completed' ? '' : ph.status + ' · ') + (ph.times > 1 ? 'ran ' + ph.times + ' times · ' : '') + (made ? plural(made, 'page') + ' written · ' : '') + (ph.seconds != null ? duration(ph.seconds) : '') + (ph.attempts > 1 ? ' · ' + ph.attempts + ' attempts' : '') + (told ? ' · given ' + plural(told, 'instruction') : '') + (ph.error ? ' · ' + plain(ph.error) : '');
+      return html`<span class="trk-p s-${ph.status}" data-tip="${tip || ph.status}"><i></i>${phaseName(ph.phase)}${ph.times === 2 ? ' (twice)' : ph.times > 2 ? ' (' + ph.times + ' times)' : ''}${ph.status === 'failed' ? ' (failed)' : ph.status === 'interrupted' ? ' (interrupted)' : ph.status === 'running' ? ' (running)' : ''}</span>
         ${ph.status === 'completed' && CHECKPOINT_AFTER[ph.phase] ? html`<span class="trk-c${isLast && here && e.mode === 'checkpoint' ? ' open' : ''}" data-tip="Checkpoint">${isLast && here && e.mode === 'checkpoint' ? 'you are here' : ''}</span>` : isLast && here ? html`<span class="trk-c open">you are here</span>` : ''}`;
-    })}${open ? coming.map((ph) => html`<span class="trk-p s-next"><i></i>${phaseName(ph)}</span>`) : ''}</div>`;
-  })}${phases.length ? '' : html`<div class="trk"><span class="trk-r">Round 1</span>${coming.map((ph) => html`<span class="trk-p s-next"><i></i>${phaseName(ph)}</span>`)}</div>`}</div>`;
+    })}${open ? coming.map(next) : ''}</div>`;
+  })}${phases.length ? '' : html`<div class="trk"><span class="trk-r">Round 1</span>${coming.map(next)}</div>`}</div>`;
 }
 
 /** Each hypothesis with its experiments, its findings and where it stands. */
@@ -190,8 +211,8 @@ function spendHTML(store) {
   const frac = (a, b) => (b > 0 ? Math.max(0, Math.min(1, a / b)) : 0);
   const phases = ((p.state || {}).phases || []).filter((ph) => ph.seconds != null);
   const agentSeconds = phases.reduce((a, ph) => a + (ph.seconds || 0), 0);
-  return html`<div class="spend-big">
-    <div><b>${money(spent.model_usd || 0)}</b><span>of ${money(limits.model_usd)} for models</span><progress class="meter-p${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend, of the limit"></progress></div>
+  return html`${p.demonstration ? html`<p class="quiet spend-demo" data-demonstration>${DEMO_COST}</p>` : ''}<div class="spend-big">
+    <div><b>${money(spent.model_usd || 0)}</b><span>of ${money(limits.model_usd)} for models${p.demonstration ? ', in the story' : ''}</span><progress class="meter-p${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend, of the limit"></progress></div>
     <div><b>${money(spent.experiment_usd || 0)}</b><span>of ${money(limits.experiment_usd)} for experiments</span><progress class="meter-p" max="1" value="${frac(spent.experiment_usd || 0, limits.experiment_usd)}" aria-label="Experiment spend, of the limit"></progress></div>
     <div><b>${duration(agentSeconds) || '0 s'}</b><span>of agent time · ${duration(spent.experiment_seconds || 0) || '0 s'} of runs</span></div></div>
     ${phases.length ? html`<details class="spend-more"><summary>Time by phase</summary><table class="metrics"><tbody>${phases.map((ph) => html`<tr><td>Round ${ph.round} · ${phaseName(ph.phase)}${ph.status !== 'completed' ? ' (' + ph.status + ')' : ''}</td><td class="n">${duration(ph.seconds)}</td><td class="n">${plural((ph.produced || []).length, 'page')}</td></tr>`)}</tbody></table></details>` : ''}
@@ -208,6 +229,8 @@ export const overviewView = {
     const interrupted = store.experiments.filter((x) => x.state === 'running' && x.interrupted && x.review !== 'rejected');
     const broken = store.experiments.filter((x) => x.state === 'failed' && x.review !== 'rejected');
     const waitingApproval = store.experiments.filter((x) => x.review === 'accepted' && (x.state === 'planned' || !x.state));
+    /* approved, and no longer what was approved: it will not run until it is approved again */
+    const changed = store.experiments.filter((x) => lapsed(x));
     const lastAct = store.activity.slice().reverse().find((ev) => ev.agent);
     const headline = e.unverified ? 'This server cannot verify the project\'s worker.'
       : e.unknown && !e.crashed ? 'Where this project stands is not known.'
@@ -237,22 +260,28 @@ export const overviewView = {
         ${run && est ? html`<progress class="meter-p" max="1" value="0" data-since="${run.started}" data-total="${est * 60}" aria-label="Elapsed, of the estimate"></progress>` : ''}<code class="ov-tail" data-tail="${x.id}">${store.tails[x.id] || ''}</code></a>`; })}
       ${broken.map((x) => html`<a class="ov-run ov-broken" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">failed${x.runs > 1 ? ' ' + x.runs + ' times' : ''} · ${(x.meta || {}).state_reason || (x.last_run || {}).error || 'needs a decision from you'}</span></a>`)}
       ${interrupted.map((x) => html`<a class="ov-run ov-broken" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">interrupted · the worker that ran it is gone · run it again, or cancel it</span></a>`)}
+      ${changed.map((x) => html`<a class="ov-run ov-broken" data-will-not-run="${x.id}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">needs approval again · ${whyNot(x.will_not_run)}</span></a>`)}
       ${waitingApproval.map((x) => html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">accepted · runs only after you approve it</span></a>`)}`;
-    const anyWatch = running.length + broken.length + interrupted.length + waitingApproval.length;
+    const anyWatch = running.length + broken.length + interrupted.length + waitingApproval.length + changed.length;
     /* What the checkpoint said, as it said it then. (What the analyst recommended is among it;
        whether that still stands is the checkpoint's field, shown beside the button.) The
        count of instructions that wait for the scout is said live beside the button instead. */
     const why = idle ? researchReasons(store, e) : [];
-    let did = e.mode === 'checkpoint' && !e.budget && p.checkpoint ? checkpointDid(p.checkpoint.summary) : '';
+    let did = e.mode === 'checkpoint' && !e.budget && p.checkpoint ? checkpointDid(p.checkpoint) : '';
     if (why.some((w) => w.kind === 'requests')) did = did.replace(/\d+ requests? for the scout waits? for the research phase[^.]*\.\s*/, '');
-    did = did.trim();
+    /* A pause for want of a model: the engine's sentence about it stands beside the button for
+       as long as it is true (the forecast carries it), and is said once. In the account of what
+       the phases did it would be said twice, and go on being said once a model can be used. */
+    const need = idle ? nextStep(store, e).need : null;
+    if (need) did = did.replace(need.message, '');
+    did = did.replace(/\bThe [a-z ]{3,40} phase needs a model, and [^]*?show what is configured\)\.\s*/, '').trim();
     const beside = idle ? continueNotes(store, e, !!did) : '';
     setHTML(root, html`<div class="overview"><div class="ov-wrap">
       <header class="ov-head"><div class="ov-state">${e.working ? html`<span class="live-dot"></span>` : ''}${p.title}${e.unknown ? '' : ' · ' + (e.round ? 'round ' + e.round : 'new')}</div><h1>${headline}</h1><p class="ov-sub">${sub}</p>
         ${did ? html`<p class="ov-note">${cap1(phaseName(p.checkpoint.phase)) || 'The last phase'} finished ${ago(p.checkpoint.at)}: ${did}</p>` : ''}
         <div class="row ov-actions">${actions}</div>${String(beside) ? html`<div class="ov-next">${beside}</div>` : ''}</header>
       ${problemsHTML(store)}
-      <section class="ov-map" aria-label="Where things stand"><a class="ov-maplink" href="${link({ view: 'map', sel: '', sub: '' })}">Open the map <kbd>1</kbd></a>${stripMap(store)}${roundsHTML(store, e)}</section>
+      <section class="ov-map" aria-label="Where things stand"><a class="ov-maplink" href="${link({ view: 'map', sel: '', sub: '' })}">Open the map <kbd>1</kbd></a>${stripMap(store)}${roundsLine(store, e)}</section>
       <div class="ov-cols"><div class="ov-col">
         <section class="ov-sec"><h2>Waiting for you<span>${items.length}</span></h2>${waiting}</section>
         ${anyWatch ? html`<section class="ov-sec"><h2>Experiments that need watching</h2>${watch}</section>` : ''}

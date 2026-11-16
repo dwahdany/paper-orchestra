@@ -839,7 +839,7 @@ def page_from_parts(
     summary = wiki_page.summary
     if not str(meta.get("summary") or "").strip():
         # Taken from the first sentence of the text, where a link is markup, not words.
-        summary = plain_links(summary)
+        summary = plain_links(_summary_from(body))
     updated = str(meta.get("updated") or "")
     if file_stamp and parse_stamp(updated) is None:
         updated = file_stamp
@@ -859,6 +859,43 @@ def page_from_parts(
         meta=dict(meta),
         body=body,
     )
+
+
+#: How long a summary taken from a page's text may be (what the wiki takes of a first line).
+_SUMMARY_CHARS = 140
+#: What begins a line that is no text to summarise (as ``memory.wiki`` has it), and what
+#: begins the item of a list, which is not run together with the next.
+_NOT_TEXT = ("#", "<!--", "---", "```", "|", ">")
+_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
+
+
+def _summary_from(body: str) -> str:
+    """The summary of a page that states none: the first paragraph of its text, whole
+    where it is short, else cut where a word ends and marked as cut.
+
+    The wiki takes the first line of the text.  Where a paragraph's lines were
+    broken by hand, or the line is long, that is the start of a sentence cut
+    anywhere, shown as if the author had stopped there.
+    """
+    paragraph: list[str] = []
+    for line in (raw.strip() for raw in body.splitlines()):
+        ends = not line or line.startswith(_NOT_TEXT)
+        if not paragraph:
+            if ends:
+                continue  # before the text begins
+            paragraph.append(line)
+            if _LIST_ITEM.match(line):
+                break
+        elif ends or _LIST_ITEM.match(line):
+            break
+        else:
+            paragraph.append(line)
+    text = " ".join(paragraph)
+    if len(text) <= _SUMMARY_CHARS:
+        return text
+    cut = text[: _SUMMARY_CHARS - 1]
+    whole = cut.rsplit(None, 1)[0] if " " in cut else cut
+    return whole.rstrip(" ,;:") + "…"
 
 
 #: ``[[target#anchor|label]]`` as a page's text writes a link to another page.
@@ -1136,6 +1173,29 @@ class Request:
 
 def _optional_text(value: Any) -> str | None:
     return str(value) if value not in (None, "") else None
+
+
+# ---------------------------------------------------------------------------
+# What a phase is called
+# ---------------------------------------------------------------------------
+
+#: What each phase of the engine is called where a person reads its name by itself (a
+#: heading, "checkpoint after ...", "next: ..."): the words of the app, and of the command
+#: line.  The names a file, an option or a program uses are the keys.
+PHASE_NAMES: dict[str, str] = {
+    "intake": "intake",
+    "research": "research",
+    "hypothesize": "hypotheses",
+    "design": "experiment design",
+    "run": "runs",
+    "analyze": "analysis",
+}
+
+
+def phase_name(phase: Any) -> str:
+    """``hypotheses`` for ``hypothesize``, ``analysis`` for ``analyze``: a phase as a
+    person reads it.  What is no phase of the engine keeps the name it came with."""
+    return PHASE_NAMES.get(phase, str(phase)) if isinstance(phase, str) else str(phase)
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ import { app, askHealth, openProjectUi, parseHash } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $, $$, clock, html, parseStamp, plain, setHTML } from './util.js';
 import { Store } from './store.js';
-import { banner, statusbar, topbar } from './shell.js';
+import { banner, nextStep, statusbar, topbar } from './shell.js';
 import { label, noteTrail } from './page.js';
 import { mapView } from './map.js';
 import { wikiView } from './wiki.js';
@@ -18,7 +18,7 @@ import { overviewView } from './overview.js';
 import { paperView } from './paper.js';
 import { libraryView, loadLibrary, setupView, startView } from './home.js';
 import { flushAll, installActions } from './actions.js';
-import { renderToast, sayError } from './overlays.js';
+import { renderToast, say, sayError } from './overlays.js';
 
 app.views = { map: mapView, wiki: wikiView, inbox: inboxView, experiments: experimentsView, overview: overviewView, paper: paperView, start: startView, library: libraryView, setup: setupView };
 
@@ -73,8 +73,26 @@ function showCurrent(main) {
   });
 }
 
+/** A press that started nothing because its phase needs a model, and none can be used: the
+    worker ended for that reason a moment ago (the server says so by a field of its exit).
+    Said once, wherever the person is looking, as something to set up; the engine's sentence
+    is the forecast's, which stands beside the main button from then on. */
+function tellModelNeeded(store, opened) {
+  const exit = ((store.project || {}).worker || {}).last_exit;
+  if (!exit || exit.reason !== 'needs_model' || !exit.at || store.behind) return;
+  const key = store.pid + '@' + exit.at;
+  if (app.ui.toldNeed === key) return;
+  app.ui.toldNeed = key;
+  /* (one that ended before this page was opened is not news: the page says what is missing) */
+  if (opened || Date.now() - (parseStamp(exit.at) || 0) > 30000) return;
+  const need = nextStep(store).need;
+  /* (a toast is plain text: the marks around a command the sentence names are left out) */
+  say('Nothing was started. ' + (need ? need.message.replace(/`/g, '') : 'The phase needs a model, and none can be used.'), { ms: 14000, action: { href: '#/setup', label: 'Open Setup' } });
+}
+
 function onStoreChange(reason, background, event) {
   if (reason === 'run.log') { if (app.hooks.runLog) app.hooks.runLog(event); return; }
+  if ((reason === 'refresh' || reason === 'load') && app.store && app.store.loaded) tellModelNeeded(app.store, reason === 'load');
   /* An experiment the person approved was put back to planned instead of being run (its
      code or plan is no longer what was approved): said aloud, wherever the person is looking. */
   if (reason === 'event' && event && event.type === 'experiment.state') {
@@ -187,6 +205,8 @@ app.render = render;
 function tick() {
   const now = Date.now();
   if (app.route.name === 'library' && !document.hidden) loadLibrary();   // a project that is running, or was just named, shows without a reload
+  /* a worker the page holds as busy, and silence: it may have ended between two looks of the stream */
+  if (app.store && !document.hidden) app.store.checkWorker();
   $$('[data-since]').forEach((el) => {
     const started = parseStamp(el.dataset.since);
     if (started == null) return;

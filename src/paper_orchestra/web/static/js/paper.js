@@ -96,10 +96,16 @@ export const paperView = {
     if (!store.paper) store.loadPaper();
     const paper = store.paper || {};
     const state = paper.state || null, last = lastOf(paper);
-    const running = !!paper.running || e.mode === 'writing';
+    const busy = !!(store.project.worker || {}).state && store.project.worker.state !== 'idle';
+    /* What was read of the paper says "running", and the worker is gone since (its end came
+       with the event stream): the write-up is over. How it ended is asked for at once, not
+       at the next poll, and until the answer is there nothing is called "Writing…". */
+    const stale = !!paper.running && !busy;
+    /* (asked once in a while at most: a server that went on saying "running" must not be asked without end) */
+    if (stale && Date.now() - (store.paperAskedAt || 0) > 1500) { store.paperAskedAt = Date.now(); store.loadPaper(); }
+    const running = e.mode === 'writing' || (!!paper.running && !stale);
     clearInterval(pollTimer);
     if (running) pollTimer = setInterval(() => { if (app.store === store && app.route.view === 'paper') store.loadPaper(); else clearInterval(pollTimer); }, 3000);
-    const busy = !!(store.project.worker || {}).state && store.project.worker.state !== 'idle';
     const accepted = store.pages.filter((p) => p.kind === 'finding' && p.review === 'accepted');
     const findings = accepted.length, left = leftOut(paper);
     const worker = store.project.worker || {};

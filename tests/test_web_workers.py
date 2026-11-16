@@ -78,6 +78,12 @@ if mode == "quick":
     write_state("checkpoint", "completed")
     print("done at a checkpoint", flush=True)
     sys.exit(0)
+if mode == "no-model":
+    # Like the command when the phase that would run needs a model and none can be used:
+    # it says so once and leaves with the exit code for that; no phase was started.
+    print("The intake phase needs a model, and the model set for research cannot be used "
+          "because no Anthropic credentials were found: set ANTHROPIC_API_KEY.", flush=True)
+    sys.exit(3)
 if mode == "die":
     write_state("running", "running")
     ready()
@@ -418,6 +424,8 @@ def test_a_worker_that_dies_is_recorded_as_interrupted_and_reported(project, mak
         "at": status["last_exit"]["at"],
         "stopped": False,
         "interrupted_phase": "research",
+        # Exit code 3 with a phase left running is a death like any other.
+        "reason": None,
     }
     state = state_of(project)
     assert state["status"] == "stopped" and state["worker"] is None
@@ -432,6 +440,38 @@ def test_a_worker_that_dies_is_recorded_as_interrupted_and_reported(project, mak
     workers.start(project.root, "advance", mode="quick")
     assert workers.wait(project.root, timeout=60)
     assert state_of(project)["status"] == "checkpoint"
+
+
+def test_a_worker_that_needs_a_model_is_told_apart_from_one_that_died_by_a_field(
+    project, make_workers
+):
+    from paper_orchestra import cli
+
+    assert workers_module.NEEDS_A_MODEL_EXIT == cli.NEEDS_A_MODEL
+    workers = make_workers("no-model")
+    events = len(project.events())
+
+    workers.start(project.root, "advance")
+    assert workers.wait(project.root, timeout=60)
+
+    status = workers.status(project.root)
+    assert status["state"] == "idle"
+    assert status["last_exit"] == {
+        "kind": "advance",
+        "code": 3,
+        "at": status["last_exit"]["at"],
+        "stopped": False,
+        "interrupted_phase": None,
+        "reason": "needs_model",
+    }
+    # Nothing died: no error is written into the project's events, and what the command
+    # said stands once in the worker's log.
+    assert len(project.events()) == events
+    assert (project.root / WORKER_LOG).read_text().count("needs a model") == 1
+    # Any other kind of worker that ends with that code is not what this is about.
+    workers.start(project.root, "run", experiments=["E1"])
+    assert workers.wait(project.root, timeout=60)
+    assert workers.status(project.root)["last_exit"]["reason"] is None
 
 
 def test_an_engine_that_fails_before_it_records_anything_is_reported(tmp_path, project):

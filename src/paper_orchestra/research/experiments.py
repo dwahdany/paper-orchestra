@@ -1143,6 +1143,30 @@ def approval(project: Project, ref: str) -> dict[str, Any]:
     }
 
 
+def will_not_run(project: Project, ref: str) -> str | None:
+    """Why a run of the experiment would not start as it stands, as the rest of a
+    sentence about it (``it is not what was approved at ... (main.py: changed ...)``);
+    ``None`` when a run would start.
+
+    This is the answer :func:`run` gives when it is asked, told beforehand to
+    whoever lists what waits to run: the page is not accepted, is not approved
+    (or queued, or left running), the approval on it was used by a run that is
+    over (one approval is one run), nothing records what was approved, or the
+    plan or the code is no longer that.  Nothing is written and no lock is
+    taken; an experiment that another process is running right now is not told
+    apart from one that waits.
+    """
+    page = _experiment(project, ref)
+    if page.review != "accepted":
+        return f"its page is {page.review}, not accepted"
+    if page.state not in ("approved", "queued", "running"):
+        return f"it is {page.state}, not approved"
+    if _run_of_approval(project, page) is not None:
+        return "the run it was approved for is over (one approval is one run)"
+    fields = _run_fields(_read(project, page).plan)
+    return _departure(project, page, fields, _current_digest(project, str(page.id)))
+
+
 def _code_name(name: Any) -> str:
     problem = _name_problem(name)
     if problem:
@@ -1304,7 +1328,7 @@ def write_code(
         authors = _authors(directory)
         if actor_class(author) == "agent":
             _check_not_the_persons(directory, checked, authors)
-        _write_files(directory, checked, authors, author, experiment_id)
+        _write_files(directory, checked, authors, author, experiment_id, project.now())
     return check_code(project, experiment_id)
 
 
@@ -1328,10 +1352,11 @@ def _write_files(
     authors: dict[str, dict[str, str]],
     author: str,
     experiment_id: str,
+    stamp: str,
 ) -> None:
     """Write the checked ``files``, keeping each version that is replaced and noting who
-    wrote the new one."""
-    stamp = _now()
+    wrote the new one and when (``stamp``, by the project's clock: it is held against
+    the stamps of the experiment's page)."""
     try:
         for name, text in files.items():
             target = directory / name
@@ -2044,6 +2069,22 @@ def runs(project: Project, experiment_id: str) -> list[dict[str, Any]]:
     reached through a symbolic link: only the project's own files are read.
     """
     return [record for _, record in _numbered_runs(project, experiment_id)]
+
+
+def last_success(project: Project, ref: str) -> dict[str, Any] | None:
+    """The latest run of the experiment that succeeded: ``{"number", "result_page"}``,
+    with the path of its result record (``None`` when it has none); ``None`` when no
+    run of it succeeded.
+
+    An experiment's state says how its latest approved run ended.  One that reads
+    ``cancelled`` or ``failed`` may still have a result from a run before that, and
+    whoever shows the state can say so with this.
+    """
+    name = _experiment_id(project, ref)
+    for number, record in reversed(_numbered_runs(project, name)):
+        if record.get("status") == "succeeded":
+            return {"number": number, "result_page": project.resolve(f"results/{name}-run{number}")}
+    return None
 
 
 def _run_number(name: str) -> int | None:
@@ -3136,6 +3177,7 @@ class _Session:
         repair: Callable[..., Mapping[str, str] | None] | None,
         on_log: Callable[[str], None] | None,
         limits: Mapping[str, Any] | None,
+        unrepaired: str | None = None,
     ) -> None:
         self.project = project
         self._compute = compute
@@ -3152,6 +3194,8 @@ class _Session:
         self._user_stop = should_stop
         self._user_log = on_log
         self._repair = repair
+        #: Why there is no repairer, for the notes of a run that one could have repaired.
+        self._unrepaired = _one_line(unrepaired) if unrepaired else None
         self._repairs: list[dict[str, Any]] = []
         self._rounds = 0
         self._current: _Attempt | None = None
@@ -3497,13 +3541,17 @@ class _Session:
 
     # -- repairs -----------------------------------------------------------------
 
-    def _repairable(self, record: Mapping[str, Any]) -> bool:
-        curable = (
-            self._repair is not None
-            and record["status"] == "failed"
+    def _repairable(self, record: dict[str, Any]) -> bool:
+        wanted = (
+            record["status"] == "failed"
             and record.get("error_kind") in _REPAIRABLE
             and self._rounds < self.limits.repair_rounds
         )
+        if wanted and self._repair is None and self._unrepaired:
+            # Nobody is there to repair it (no model can be used): the failure stands,
+            # and the run says why nothing was tried.
+            self._note(record, f"The failure was not repaired: {self._unrepaired}")
+        curable = wanted and self._repair is not None
         if curable:
             self._interrupted = self._stop_reason()
             if self._interrupted == "stop":
@@ -3722,6 +3770,7 @@ def run(
     repair: Callable[[ExperimentPlan, dict[str, Any], str], Mapping[str, str] | None] | None = None,
     on_log: Callable[[str], None] | None = None,
     limits: Mapping[str, Any] | None = None,
+    unrepaired: str | None = None,
 ) -> dict[str, Any]:
     """Run one approved experiment and return the record of its last run.
 
@@ -3767,7 +3816,9 @@ def run(
     returns corrected files (``{name: text}``), they are written as the runner,
     recorded with their diff under ``repairs`` of the next run, and the
     experiment runs again as that next run; at most ``limits.repair_rounds``
-    times.
+    times.  Without ``repair`` a failure stands; ``unrepaired`` is then why there
+    is no repairer (no model can be used), noted on the record of a run that
+    failed for an error of its own code.
 
     ``limits`` overrides ``experiment_seconds``, ``experiment_usd`` and
     ``repair_rounds`` of the project's settings for this call.  The time limit
@@ -3814,6 +3865,7 @@ def run(
             repair=repair,
             on_log=on_log,
             limits=limits,
+            unrepaired=unrepaired,
         )
         return session.run()
 

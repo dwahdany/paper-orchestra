@@ -63,6 +63,65 @@ def test_the_project_opens_cleanly_and_says_that_it_is_a_demonstration(demo):
     assert "it is small batches that need it" in idea.body
 
 
+def test_the_project_is_marked_as_a_demonstration_for_whoever_shows_its_cost(demo, tmp_path):
+    # The model cost on file is the story's: no model was called.  Whoever shows it (the
+    # library, the status) is told by the project itself, not by the wording of a page.
+    assert demo.demonstration is True
+    assert read_json(demo.root / "project.json")["demonstration"] is True
+    assert read_json(demo.root / "usage.json")["estimated_cost_usd"] == ILLUSTRATIVE_MODEL_USD
+    plain = Project.create(tmp_path / "plain", title="Plain", brief="x")
+    assert plain.demonstration is False and "demonstration" not in read_json(
+        plain.root / "project.json"
+    )
+
+
+def test_the_code_of_the_story_carries_the_storys_times(demo):
+    """The story's clock is in the past.  Code stamped with the time of the build would
+    read as written after the person had accepted the plan it belongs to."""
+    accepted = parse_stamp(demo.page("E4").meta["decided_at"])
+    paused = parse_stamp(read_json(demo.root / "state.json")["checkpoint"]["at"])
+    for name in ("E3", "E4"):
+        written = experiments.code_authors(demo, name)
+        assert written, name
+        for file, entry in written.items():
+            assert entry["author"] == "agent:designer"
+            assert parse_stamp(entry["written"]) <= paused, (name, file)
+    for entry in experiments.code_authors(demo, "E4").values():
+        assert parse_stamp(entry["written"]) < accepted
+
+
+def test_the_demonstration_goes_on_without_a_credential_as_far_as_no_model_is_needed(copy):
+    """What the README offers: the demonstration, with no model call and no credential.
+    Its one press runs the approved experiment and then says what the analysis needs."""
+    from paper_orchestra.llm.router import get_client, reset_clients
+    from paper_orchestra.research.engine import Engine, ModelNeeded, next_step
+
+    reset_clients()
+    said = next_step(copy, client_for=get_client)
+    assert (said["will_run"], said["experiments"]) == (["run"], ["E4"])
+    assert said["blocked"]["phase"] == "analyze" and said["blocked"]["needs"] == "model"
+    seen = copy.events()[-1]["seq"]
+
+    state = Engine(copy).advance()
+
+    assert copy.page("E4").state == "succeeded"
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "run",
+        "analyze",
+    )
+    # What the run did is the account; what the analysis lacks is said at the pause only.
+    assert state["checkpoint"]["did"] == "1 experiment ran: E4 succeeded."
+    assert state["checkpoint"]["summary"].count("needs a model") == 1
+    assert state["checkpoint"]["summary"].count("ANTHROPIC_API_KEY") == 1
+    new = [event["type"] for event in copy.events(after=seen)]
+    assert "error" not in new and "phase.failed" not in new and "run.finished" in new
+    assert state["spent"]["model_usd"] == ILLUSTRATIVE_MODEL_USD
+    # Pressed again, there is nothing left that needs no model.
+    with pytest.raises(ModelNeeded, match="The analysis phase needs a model"):
+        Engine(copy).advance()
+
+
 def test_a_directory_that_is_in_use_is_refused_and_left_as_it_was(tmp_path):
     (tmp_path / "taken").mkdir()
     (tmp_path / "taken" / "file").write_text("x")
@@ -403,6 +462,10 @@ def test_a_checkpoint_of_the_second_round_is_waiting_for_the_person(demo):
     )
     assert state["checkpoint"]["round"] == 2 and state["checkpoint"]["phase"] == "design"
     assert "waiting for you" in state["checkpoint"]["summary"]
+    # What the phase did is kept apart from what waited then, as the engine keeps it:
+    # without the heading, which whoever shows it says from the round and the phase.
+    assert state["checkpoint"]["did"] == "2 experiments are planned."
+    assert state["checkpoint"]["summary"].startswith("Round 2, design: 2 experiments")
     assert state["worker"] is None and state["error"] is None
     phases = [(record["round"], record["phase"]) for record in state["phases"]]
     assert phases == [

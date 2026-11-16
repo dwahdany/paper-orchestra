@@ -4,19 +4,30 @@
 
 import { app, link } from './core.js';
 import { api, connection, Unreachable } from './api.js';
-import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf } from './util.js';
-import { TONE, agentName, glyph, icon, pageGlyph, shownState } from './vocab.js';
-import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, planProblemsHTML, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
+import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf, whyNot } from './util.js';
+import { TONE, agentName, glyph, icon, lapsed, pageGlyph, shownState, successWords } from './vocab.js';
+import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, planProblemsHTML, proposedAt, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
 
 const GROUPS = [
-  ['Needs your approval', (x) => x.review !== 'rejected' && (x.review === 'proposed' || x.state === 'planned' || !x.state)],
+  /* (also one that reads approved and is no longer what was approved: it will not run until it is approved again) */
+  ['Needs your approval', (x) => x.review !== 'rejected' && (x.review === 'proposed' || x.state === 'planned' || !x.state || lapsed(x))],
   /* the page says "running" and nothing is running it: its worker is gone, and it waits for the person */
   ['Interrupted', (x) => x.review === 'accepted' && x.state === 'running' && !!x.interrupted],
-  ['Approved, queued and running', (x) => x.review === 'accepted' && (x.state === 'approved' || x.state === 'queued' || (x.state === 'running' && !x.interrupted))],
+  ['Approved, queued and running', (x) => x.review === 'accepted' && !lapsed(x) && (x.state === 'approved' || x.state === 'queued' || (x.state === 'running' && !x.interrupted))],
   ['Failed', (x) => x.review === 'accepted' && x.state === 'failed'],
   ['Finished', (x) => x.review === 'accepted' && (x.state === 'succeeded' || x.state === 'cancelled')],
   ['Rejected', (x) => x.review === 'rejected'],
 ];
+/** The heading an experiment is listed under, in the table and in the rail. */
+export const groupName = (x) => (GROUPS.find((g) => g[1](x)) || [''])[0];
+/** Where an experiment stands, in the few words a narrow list has room for: its state as
+    it is shown, and with a state that reads as "no result" the earlier run that succeeded. */
+export function standingWords(x) {
+  if (x.review === 'proposed') return 'proposed · ' + agentName(x.author);
+  if (x.review === 'rejected') return 'rejected';
+  const state = shownState(x) || 'planned', won = successWords(x);
+  return won ? state + '; ' + won : state;
+}
 const IMAGE = /\.(png|jpe?g|gif|webp|svg)$/i;
 
 const whereOf = (x) => { const m = x.meta || {}; return m.backend ? backendName(m.backend, m.gpu) : m.mode === 'gpu' ? 'not chosen · needs a GPU' : m.mode === 'repo' ? 'not chosen · your repository' : 'not chosen'; };
@@ -26,23 +37,26 @@ const sinceClock = (stamp) => html`<span data-since="${stamp}">${clock((Date.now
 function subline(store, x) {
   const run = x.last_run || {};
   if (x.review === 'rejected') return html`rejected${(x.meta || {}).decision_reason ? ': ' + x.meta.decision_reason : ''}`;
-  if (x.review === 'proposed') return html`waiting for you · proposed ${ago(x.updated)}`;
+  if (x.review === 'proposed') return html`waiting for you · proposed ${ago(proposedAt(x))}`;
   if (x.state === 'planned' || !x.state) return (x.meta || {}).state_reason ? html`<span class="t-prop">back to planned · ${plain(x.meta.state_reason)}</span>` : html`accepted · runs only after you approve it`;
+  if (lapsed(x)) return html`<span class="t-prop">will not run · ${whyNot(x.will_not_run)} · approve it again</span>`;
   if (x.state === 'approved') return html`approved · runs first when you continue, or now`;
   if (x.state === 'queued') return html`queued · runs first when you continue, or now`;
   if (x.state === 'running' && x.interrupted) return html`<span class="t-prop">interrupted · the worker that ran it is gone · run it again, or cancel it</span>`;
   if (x.state === 'running') return html`<span class="ex-tail" data-tail="${x.id}">${store.tails[x.id] || 'run ' + (run.number || '') + ' started ' + ago(run.started)}</span>`;
   if (x.state === 'succeeded') return html`${metricLine(run) || 'succeeded'}`;
-  if (x.state === 'failed') return html`<span class="t-neg">${(x.meta && x.meta.state_reason) || run.error || 'failed'}</span>`;
-  if (x.state === 'cancelled') return run.finished ? html`cancelled ${ago(run.finished)}` : html`cancelled before it ran`;
+  /* (an earlier run that succeeded is said with a state that would read as "no result") */
+  const won = successWords(x);
+  if (x.state === 'failed') return html`<span class="t-neg">${(x.meta && x.meta.state_reason) || run.error || 'failed'}</span>${won ? ' · ' + won : ''}`;
+  if (x.state === 'cancelled') return html`${run.finished ? 'cancelled ' + ago(run.finished) : 'cancelled before it ran'}${won ? '; ' + won : ''}`;
   return '';
 }
 function stateCell(x) {
   if (x.review === 'rejected') return html`<span class="tag tag-rejected">rejected</span>`;
   if (x.review === 'proposed') return html`<span class="tag tag-proposed">proposed</span>`;
   /* (an interrupted run has its own mark and word: the page says "running", and nothing runs it) */
-  const state = shownState(x) || 'planned';
-  return html`<span class="st-word t-${TONE[state] || 'open'}">${glyph('experiment', 'accepted', state, 14)}${state}</span>`;
+  const state = shownState(x) || 'planned', won = successWords(x);
+  return html`<span class="st-word t-${TONE[state] || 'open'}">${glyph('experiment', 'accepted', state, 14)}${state}</span>${won ? html`<span class="st-also">${won}</span>` : ''}`;
 }
 function timeCell(x) {
   const run = x.last_run || {}, m = x.meta || {};
@@ -170,7 +184,7 @@ function approveHTML(store, page, data) {
   };
   const sum = pick ? backendName(pick.backend, pick.backend === 'modal' ? gpu : '') + ', for at most ' + minutes(+limitMin || planMin) + (pick.max_usd ? ' and ' + money(pick.max_usd * ((+limitMin || planMin) * 60) / Math.max(1, pick.timeout_seconds || planMin * 60)) : '') : '';
   return html`<section class="approve" id="approve" data-eid="${eid}"><h2>Where should it run?</h2>
-    ${proposed ? html`<p class="approve-say"><b>Proposed</b> by ${who(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(page.updated)}. It is not part of the wiki until you accept it, and it will not run until you approve it.</p>` : ''}
+    ${proposed ? html`<p class="approve-say"><b>Proposed</b> by ${who(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(proposedAt(page))}. It is not part of the wiki until you accept it, and it will not run until you approve it.</p>` : ''}
     ${!proposed && page.state === 'planned' && (page.meta || {}).state_reason ? html`<p class="note note-warn approve-back" role="status">${icon('warn')}<span><b>It is planned again and waits for your approval.</b> ${plain(page.meta.state_reason)}</span></p>` : ''}
     ${data.plan_error ? html`<p class="note note-warn">${icon('warn')}<span>The plan cannot be read as it is: ${data.plan_error}</span></p>` : ''}
     <div class="backends" role="radiogroup" aria-label="Backend">${options.map(row)}</div>
@@ -429,10 +443,17 @@ function detailHTML(store, page, route) {
   else if ((page.state === 'approved' || page.state === 'queued') && data.approval && data.approval.digest && data.approval.matches === false) {
     /* approved, and then the plan or the code changed: a run would be refused, so the page
        says so before the person presses anything, with what changed and by whom */
-    const changes = (data.approval.changed || []).map((c) => plain(String(c)).replace(/\bagent:(\w+)/g, 'the $1').replace(/\bwritten by human\b/g, 'written by you'));
+    const changes = (data.approval.changed || []).map((c) => whyNot(String(c)));
     top = html`<section class="callout callout-changed"><h2>${icon('warn')}Changed since you approved it</h2>
       <p>You approved this experiment${data.approval.at ? ' ' + ago(data.approval.at) : ''}. It is no longer what you approved, so it will not run as it is. Look at what changed, then approve it again.</p>
       ${changes.length ? html`<ul class="changed-list">${changes.map((c) => html`<li>${c}</li>`)}</ul>` : ''}
+      <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Look and approve again…</button>
+        ${cancelButton(eid, does, {})}</div></section>`;
+  } else if (lapsed(row) || lapsed(Object.assign({}, page, { will_not_run: data.will_not_run }))) {
+    /* it reads approved and would not run for another reason the server names (the run it was
+       approved for is over, or nothing records what was approved): said before a press */
+    top = html`<section class="callout callout-changed" data-will-not-run="${eid}"><h2>${icon('warn')}It will not run as it stands</h2>
+      <p>${cap(whyNot(row.will_not_run || data.will_not_run))}. Approve it again when you want it run.</p>
       <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Look and approve again…</button>
         ${cancelButton(eid, does, {})}</div></section>`;
   } else if (page.state === 'approved' || page.state === 'queued') {
@@ -495,7 +516,7 @@ export const experimentsView = {
       if (!list.length) return '';
       return html`<div class="idx-group"><h3>${g[0]}<span>${list.length}</span></h3>${list.map((x) => html`
         <a class="idx idx-2 r-${x.review}${x.path === cur.path ? ' cur' : ''}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}"${x.path === cur.path ? raw(' aria-current="page"') : ''}>${pageGlyph(x, 16)}
-          <span class="idx-name">${pageName(x)}<span class="idx-sub">${x.review === 'proposed' ? 'proposed · ' + agentName(x.author) : x.review === 'rejected' ? 'rejected' : x.state === 'running' && x.interrupted ? 'interrupted' : x.state || 'planned'}</span></span></a>`)}</div>`;
+          <span class="idx-name">${pageName(x)}<span class="idx-sub">${standingWords(x)}</span></span></a>`)}</div>`;
     });
     setHTML(root, html`<div class="exp"><nav class="exp-rail" aria-label="Experiments"><a class="back" href="${link({ view: 'experiments', sel: '', sub: '' })}">All experiments</a>${rail}<p class="rail-budget">${budgetLine(store)}</p></nav>
       <div class="exp-main"><div class="exp-page">${detailHTML(store, cur, route)}</div></div></div>`);

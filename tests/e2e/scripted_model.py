@@ -26,6 +26,12 @@ instruction given with a press of Continue):
 
 The last two concern the analyst alone: leave them in a request for the analyst, which
 its next phase is given and closes.  Every other role ignores them.
+
+A project without a usable model (the state of everybody who has no credential yet) is
+shown by a switch: while the file that ``PAPER_ORCHESTRA_E2E_NO_MODEL`` names exists, the
+client offers no tools and no memory tool, which no agent can work with.  The server's
+forecast and every worker then say that a model is needed (the run of an approved
+experiment still happens); remove the file and the models can be used again.
 """
 
 from __future__ import annotations
@@ -35,10 +41,13 @@ import os
 import re
 import time
 
+from paper_orchestra.llm.base import Capabilities
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory.wiki import split_front_matter
 
 PAUSE = float(os.environ.get("PAPER_ORCHESTRA_E2E_PAUSE", "0.5"))
+#: Names a file; while it exists the scripted model is one that no agent can work with.
+NO_MODEL_ENV = "PAPER_ORCHESTRA_E2E_NO_MODEL"
 FAILURE_MARK = "[scripted-failure]"
 #: In an instruction the analyst reads: its journal page recommends more research.
 RESEARCH_MARK = "[scripted-more-research]"
@@ -344,6 +353,17 @@ def respond(request: FakeRequest) -> str:
     return handler(request)
 
 
+class _Scripted(FakeLLM):
+    """The scripted client, with the switch that makes it a model without tools."""
+
+    @property
+    def capabilities(self) -> Capabilities:  # type: ignore[override]
+        switch = os.environ.get(NO_MODEL_ENV, "").strip()
+        if switch and os.path.exists(switch):
+            return Capabilities(tools=False, memory_tool=False)
+        return FakeLLM.capabilities
+
+
 def client() -> FakeLLM:
     """The client ``PAPER_ORCHESTRA_SCRIPTED_CLIENT=scripted_model:client`` names."""
-    return FakeLLM(respond)
+    return _Scripted(respond)

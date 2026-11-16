@@ -929,14 +929,42 @@ def unified_diff(
     return "\n".join([f"--- {old_label}", f"+++ {new_label}", *hunks])
 
 
+#: The head of a hunk as ``diff -u`` writes it: where it begins in the old text and how
+#: many lines of it it covers.
+_HUNK_HEAD = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@$")
+
+
+def _hunk_in_words(line: str) -> str | None:
+    """Where a hunk is, for a person: ``From line 27``; ``None`` for a line that is not
+    the head of a hunk."""
+    head = _HUNK_HEAD.match(line)
+    if head is None:
+        return None
+    start, covers = int(head.group(1)), head.group(2)
+    if covers == "0":  # nothing of the old text: lines are put in after ``start``
+        return f"After line {start}" if start else "At the top"
+    return f"From line {start}"
+
+
 def diff_html(diff: str) -> str:
-    """A unified diff as HTML: one escaped ``<span>`` per line, classed by what it is."""
+    """A unified diff as HTML: one escaped ``<span>`` per line, classed by what it is.
+
+    The lines of the text read as a diff writes them (``+``, ``-`` or a space, then
+    the line).  What heads the diff and its hunks is said in words, because a person
+    reads this, not ``patch``: the two labels as a legend (``− the page as it is``,
+    ``+ as the analyst suggests it``) and ``From line 27`` for ``@@ -27,7 +27,10 @@``.
+    Only the first two lines can be the labels and only a line without a prefix can
+    head a hunk, so a line of the text that looks like either stays text.
+    """
     spans = []
-    for line in diff.split("\n") if diff else []:
-        if line.startswith(("+++", "---")):
-            kind = "diff-file"
-        elif line.startswith("@@"):
-            kind = "diff-hunk"
+    for index, line in enumerate(diff.split("\n") if diff else []):
+        where = _hunk_in_words(line)
+        if index == 0 and line.startswith("--- "):
+            kind, line = "diff-file", f"− {line[4:]}"
+        elif index == 1 and line.startswith("+++ "):
+            kind, line = "diff-file", f"+ {line[4:]}"
+        elif where is not None:
+            kind, line = "diff-hunk", where
         elif line.startswith("+"):
             kind = "diff-add"
         elif line.startswith("-"):

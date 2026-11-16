@@ -25,6 +25,8 @@ pytest.importorskip("markdown_it")
 
 from fastapi.testclient import TestClient
 
+from paper_orchestra.llm.base import LLMConfigError
+from paper_orchestra.llm.fake import FakeLLM
 from paper_orchestra.research import Project, ProjectError
 from paper_orchestra.research.model import Conflict, ResearchPage
 from paper_orchestra.web import api as api_module
@@ -84,6 +86,15 @@ class FakeServices(Services):
         self.refuse_approval: str | None = None
         self.authors: dict[tuple[str, str], dict[str, str]] = {}
         self.paper_gap: str | None = None
+        #: What finding a model's client raises here; ``None``: every model can be used.
+        self.no_client: Exception | None = None
+
+    def client_for(self, model):
+        # The tests have no credentials; what a press will do is tested with models that
+        # can be used, and without them where a test says so.
+        if self.no_client is not None:
+            raise self.no_client
+        return FakeLLM("x")
 
     def load_plan(self, project, ref):
         page = project.page(ref)
@@ -817,6 +828,16 @@ def test_a_page_comes_with_what_the_wiki_view_shows(client, project):
     assert "-Adam divides by a running average." in proposal["diff"].splitlines()
     assert "+Adam divides by a running average of squared gradients." in proposal["diff"]
     assert '<span class="diff-line diff-add">+Adam divides' in proposal["diff_html"]
+    # The diff is headed in the words of the app: which side is the page, which the
+    # suggestion and whose, and where the change is; not "agent:analyst" and "@@ -1 +1 @@".
+    assert proposal["diff"].splitlines()[:2] == [
+        "--- the page as it is",
+        "+++ as the analyst suggests it",
+    ]
+    assert "− the page as it is" in proposal["diff_html"]
+    assert "+ as the analyst suggests it" in proposal["diff_html"]
+    assert "agent:" not in proposal["diff_html"] and "@@" not in proposal["diff_html"]
+    assert '<span class="diff-line diff-hunk">From line 1</span>' in proposal["diff_html"]
     assert "average <ins>of squared gradients</ins>." in proposal["marked_html"]
     assert 'class="wikilink"' in proposal["marked_html"]  # the unchanged block, as it reads
     assert (proposal["words_added"], proposal["words_removed"]) == (3, 0)
@@ -3371,6 +3392,107 @@ def test_the_default_settings_are_served(client):
     # ... and the words the engine's own sentences use for the phases.
     assert body["phase_words"]["hypothesize"] == "the hypothesis phase"
     assert set(body["phase_words"]) == set(body["phases"])
+    # What a phase is called by itself ("checkpoint after ..."): one list, for the app and
+    # the command line alike.
+    assert body["phase_names"] == {
+        "intake": "intake",
+        "research": "research",
+        "hypothesize": "hypotheses",
+        "design": "experiment design",
+        "run": "runs",
+        "analyze": "analysis",
+    }
+    # The kinds of page the person can write, as ``POST .../pages`` takes them, and which
+    # agents write each: a lesson is the person's alone, and a form has to offer it.
+    assert body["creatable_kinds"] == [
+        "question", "topic", "hypothesis", "experiment", "finding", "journal", "lesson",
+    ]  # fmt: skip
+    assert body["kind_writers"]["lesson"] == []
+    assert body["kind_writers"]["journal"] == ["analyst"]
+    assert body["kind_writers"]["topic"] == ["intake", "scout"]
+
+
+def test_every_kind_the_defaults_offer_can_be_created_and_a_lesson_among_them(client, project):
+    for kind in client.get("/api/defaults").json()["creatable_kinds"]:
+        made = client.post(
+            url(project, "/pages"),
+            json={"kind": kind, "title": f"My {kind}", "body": "Mine.\n"},
+        )
+        assert made.status_code == 201, (kind, made.text)
+        assert made.json()["page"]["author"] == "human" and made.json()["page"]["kind"] == kind
+    assert project.pages(kind="lesson")[0].review == "accepted"
+
+
+def test_a_decided_edit_is_listed_with_the_decision_and_its_reason(client, project):
+    (pending,) = project.proposals()
+    path = "/pages/wiki/topics/adaptive-optimisers.md"
+    assert client.get(url(project, path)).json()["decided_proposals"] == []
+    project.review(pending.id, "reject", reason="The source says otherwise")
+    second = project.propose_edit(
+        "topics/adaptive-optimisers", author="agent:analyst", summary="Name RAdam",
+        body="Adam divides by a running average. RAdam rectifies it.\n\nSee [[idea]].\n",
+    )  # fmt: skip
+    project.review(second.id, "accept")
+
+    # For the inbox's Decided list: every decided edit with the page it was about.
+    decided = client.get(url(project, "/proposals"), params={"review": "rejected"}).json()
+    (row,) = decided["proposals"]
+    assert (row["id"], row["review"], row["decided_by"]) == (pending.id, "rejected", "human")
+    assert row["decision_reason"] == "The source says otherwise" and row["decided_at"]
+    assert row["page"]["title"] == "Adaptive optimisers" and row["summary"]
+    everything = client.get(url(project, "/proposals"), params={"review": "all"}).json()
+    assert [r["review"] for r in everything["proposals"]] == ["rejected", "accepted"]
+
+    # On the page itself: what was suggested and what became of it, the latest first.
+    view = client.get(url(project, path)).json()
+    assert view["proposals"] == []
+    first, earlier = view["decided_proposals"]
+    assert (first["id"], first["review"], first["decision_reason"]) == (second.id, "accepted", None)
+    assert (earlier["id"], earlier["review"]) == (pending.id, "rejected")
+    assert earlier["decision_reason"] == "The source says otherwise"
+    assert earlier["author"] == "agent:analyst" and earlier["summary"]
+    assert earlier["changes_text"] is True and earlier["fields"] == {
+        "summary": "How Adam scales its steps, precisely."
+    }
+    assert "body" not in earlier  # a list of what was decided, not the texts again
+
+
+def test_an_edit_of_the_persons_leaves_the_time_of_the_proposal_as_it_was(client, project):
+    path = "/pages/wiki/hypotheses/H1-warmup-reduces-early-variance.md"
+    before = client.get(url(project, path)).json()["page"]
+    time.sleep(1.1)  # stamps have a resolution of a second
+
+    edited = client.put(
+        url(project, path),
+        json={"body": "## Statement\n\nSharper.\n", "base_updated": before["updated"]},
+    ).json()["page"]
+
+    # Still a proposal of the theorist's, proposed when it was proposed: ``created``.
+    # ``updated`` and ``meta.updated_by`` say who touched it last and when.
+    assert (edited["review"], edited["author"]) == ("proposed", "agent:theorist")
+    assert edited["created"] == before["created"] and edited["updated"] > before["updated"]
+    assert edited["meta"]["updated_by"] == "human"
+    row = next(r for r in client.get(url(project, "/pages")).json()["pages"] if r["id"] == "H1")
+    assert row["created"] == before["created"] and row["meta"]["updated_by"] == "human"
+
+
+def test_a_snippet_of_a_search_is_text_without_the_marks_of_a_page(client, project):
+    project.create_page(
+        "topic",
+        "Spikes",
+        "| run | value |\n|---|---|\n| spike_b16_no_warmup | 0.121 |\n\n"
+        "## What it means\n\nThe **spike** of [[topics/adaptive-optimisers|Adam]] is in "
+        "[[H1]], `main.py` says.\n",
+        author="human",
+        summary="Where the loss spikes.",
+    )
+
+    table = client.get(url(project, "/search"), params={"q": "spike_b16_no_warmup"}).json()
+    prose = client.get(url(project, "/pages"), params={"q": "Adam says"}).json()
+
+    assert table["hits"][0]["snippet"] == "spike_b16_no_warmup · 0.121"
+    snippets = [row["snippet"] for row in prose["pages"] if row["title"] == "Spikes"]
+    assert snippets == ["The spike of Adam is in H1, main.py says."]
 
 
 def test_a_request_can_be_addressed_to_one_role(client, project):
@@ -4469,6 +4591,22 @@ def row_of(client, directory: str) -> dict[str, Any]:
     return next(row for row in rows if row["dir"] == directory)
 
 
+def test_a_demonstration_is_marked_where_its_cost_is_shown(client, workspace, project):
+    demo = Project.create(
+        workspace / "demo", title="Demonstration: warmup", brief="x", demonstration=True
+    )
+    phases_ran(demo)  # $0.75 "spent" on models, which no model was paid
+
+    row = row_of(client, "demo")
+    view = client.get(url(demo)).json()
+
+    assert row["demonstration"] is True and view["demonstration"] is True
+    assert row["spent"]["model_usd"] == 0.75
+    # Any other project says that it is none.
+    assert row_of(client, "warmup")["demonstration"] is False
+    assert client.get(url(project)).json()["demonstration"] is False
+
+
 def test_a_lost_state_is_shown_as_the_engine_reads_it_with_the_problem_in_a_field_of_its_own(
     client, workspace
 ):
@@ -4534,9 +4672,11 @@ def test_where_a_project_stands_is_said_not_guessed(client, workspace, project):
         "will_run": ["intake", "research"],
         "then": "hypothesize",
         "experiments": [],
+        "not_running": [],
         "results": 0,
         "checkpoint_of": None,
         "needs_phase": False,
+        "blocked": None,
     }
     row = row_of(client, "fresh")
     assert (row["status"], row["state_source"], row["state_problem"]) == (
@@ -4772,10 +4912,14 @@ def test_the_stream_says_where_a_project_with_a_lost_state_stands(stream, worksp
 
 
 def approved_experiment(project: Project, services: FakeServices) -> None:
-    """H1 and E1 accepted and the run of E1 approved, as the person does it."""
+    """H1 and E1 accepted and the run of E1 approved, as the person does it: through the
+    experiments module, which records what was approved.  (What a press will run is
+    measured against that record; the stand-in's approval leaves none.)"""
+    from paper_orchestra.research import experiments
+
     project.review("H1", "accept")
     project.review("E1", "accept")
-    services.approve(project, "E1")
+    experiments.approve(project, "E1")
 
 
 def test_the_project_says_what_a_press_of_continue_will_do(client, project, services, caplog):
@@ -4792,9 +4936,11 @@ def test_the_project_says_what_a_press_of_continue_will_do(client, project, serv
         "will_run": ["run", "analyze"],
         "then": "design",
         "experiments": ["E1"],
+        "not_running": [],
         "results": 0,
         "checkpoint_of": None,
         "needs_phase": False,
+        "blocked": None,
     }
     # It is the engine's own answer, not a second rule of the server's.
     assert said == engine.next_step(Project.open(project.root))
@@ -4826,6 +4972,87 @@ def test_the_project_says_what_a_press_of_continue_will_do(client, project, serv
     assert client.get(url(project)).json()["next_step"] is None
     # The library does not ask at all: its rows stay cheap.
     assert "next_step" not in client.get("/api/projects").json()["projects"][0]
+
+
+NO_CREDENTIALS = LLMConfigError(
+    "No Anthropic credentials were found. Configure one of:\n  1. API key: set "
+    "ANTHROPIC_API_KEY (for example in a .env file).\n  2. Workload Identity Federation."
+)
+
+
+def test_the_project_says_beforehand_that_a_press_needs_a_model(client, project, services):
+    phases_ran(project, "intake", "research", "hypothesize", following="design")
+    assert client.get(url(project)).json()["next_step"]["blocked"] is None
+
+    services.no_client = NO_CREDENTIALS
+    said = client.get(url(project)).json()["next_step"]
+
+    # Nothing would run, and the reason is a field with the one sentence to show: no
+    # worker has to be started and refused to find it out.
+    assert (said["will_run"], said["then"]) == ([], "design")
+    blocked = said["blocked"]
+    assert (blocked["phase"], blocked["needs"]) == ("design", "model")
+    assert blocked["settings"] == ["research", "reasoning", "coding"]
+    assert blocked["message"].startswith(
+        "The design phase needs a model, and the model set for research, reasoning and coding"
+    )
+    assert "set ANTHROPIC_API_KEY" in blocked["message"]
+    assert "\n" not in blocked["message"] and "run the command" not in blocked["message"]
+    # The library does not ask at all: its rows stay cheap.
+    assert "next_step" not in client.get("/api/projects").json()["projects"][0]
+
+
+def test_whether_a_model_can_be_used_is_found_out_once_in_a_while_not_at_every_look(
+    real, project, monkeypatch
+):
+    """The server's own answer (no stand-in): with no credential configured, as here,
+    making a model's client fails anew every time it is tried, and costs as much as
+    making one.  A project is looked at often; the refusal is remembered for a while."""
+    from paper_orchestra.llm import router
+
+    phases_ran(project, "intake", "research", "hypothesize", following="design")
+    asked: list[str] = []
+    real_client = router.get_client
+
+    def counting(model: str):
+        asked.append(model)
+        return real_client(model)
+
+    monkeypatch.setattr(router, "get_client", counting)
+    router.reset_clients()
+
+    first = real.get(url(project)).json()["next_step"]
+    for _ in range(5):
+        assert real.get(url(project)).json()["next_step"] == first
+
+    assert first["blocked"]["needs"] == "model" and first["will_run"] == []
+    assert "no Anthropic credentials were found" in first["blocked"]["message"]
+    assert len(asked) == 1  # three roles, one model, one look for six views
+
+
+def test_a_remembered_refusal_does_not_keep_what_earlier_looks_left_on_it():
+    """The refusal the server remembers is one exception, raised at every look.  Raised as
+    it is, it would gather the frames of every look in its traceback, and hold on to
+    what they held (a project, a request) for as long as it is remembered."""
+    from paper_orchestra.config import DEFAULT_MODEL
+    from paper_orchestra.llm import router
+    from paper_orchestra.llm.base import LLMConfigError
+
+    router.reset_clients()
+    services = Services()
+
+    def depth() -> int:
+        """How many frames the refusal carries when it arrives."""
+        with pytest.raises(LLMConfigError) as refusal:
+            services.client_for(DEFAULT_MODEL)
+        frames, at = 0, refusal.value.__traceback__
+        while at is not None:
+            frames, at = frames + 1, at.tb_next
+        return frames
+
+    depth()  # the look that finds out, with the frames of making a client
+    remembered = [depth() for _ in range(6)]
+    assert remembered == [remembered[0]] * 6
 
 
 def test_the_checkpoint_carries_the_recommendation_for_as_long_as_it_stands(
@@ -4866,6 +5093,71 @@ def test_the_checkpoint_carries_the_recommendation_for_as_long_as_it_stands(
         state["checkpoint"].update(recommends="research", recommends_page=page)
         (project.root / "state.json").write_text(json.dumps(state))
         assert client.get(url(project)).json()["checkpoint"]["recommends"] is None
+
+
+# -- what will run, and what a cancelled run leaves ----------------------------------
+
+
+def test_an_approved_experiment_that_changed_is_listed_as_one_that_will_not_run(real, project):
+    phases_ran(project, "intake", "research", "hypothesize", following="design")
+    project.review("H1", "accept")
+    project.review("E1", "accept")
+    assert real.post(url(project, "/experiments/E1/approve")).status_code == 200
+
+    def everywhere() -> list[Any]:
+        """What each place that lists the experiment says about its run."""
+        row = real.get(url(project, "/experiments")).json()["experiments"][0]
+        page = real.get(url(project, "/pages"), params={"kind": "experiment"}).json()["pages"][0]
+        view = real.get(url(project, "/experiments/E1")).json()
+        assert row["state"] == page["state"] == view["page"]["state"] == "approved"
+        return [row["will_not_run"], page["will_not_run"], view["will_not_run"]]
+
+    assert everywhere() == [None, None, None]
+    said = real.get(url(project)).json()["next_step"]
+    assert (said["experiments"], said["not_running"]) == (["E1"], [])
+
+    # The person edits the code after approving it.
+    changed = real.put(url(project, "/experiments/E1/code/main.py"), json={"text": "print(2)\n"})
+    assert changed.status_code == 200
+
+    reasons = everywhere()
+    assert len(set(reasons)) == 1 and reasons[0].startswith("it is not what was approved at ")
+    assert "main.py" in reasons[0]
+    # ... and the press is not said to run it: the forecast names it with the reason.
+    said = real.get(url(project)).json()["next_step"]
+    assert said["experiments"] == []
+    assert said["not_running"] == [{"id": "E1", "reason": reasons[0]}]
+    assert said["will_run"][0] == "run" and "analyze" not in said["will_run"]
+    # A look wrote nothing: the page still reads approved, as the person left it.
+    assert project.page("E1").state == "approved"
+
+    # Approved again as it is now, it runs.
+    assert real.post(url(project, "/experiments/E1/approve")).status_code == 200
+    assert everywhere() == [None, None, None]
+
+
+def test_a_cancelled_experiment_whose_earlier_run_succeeded_says_so(client, project):
+    project.review("E1", "accept")
+    a_finding(project)  # run 1 succeeded, with its result record
+    add_run(project, 2, status="cancelled")
+    for state in ("approved", "queued", "running", "cancelled"):
+        project.set_state("E1", state, by="human" if state == "approved" else "system")
+
+    row = client.get(url(project, "/experiments")).json()["experiments"][0]
+    page = client.get(url(project, "/pages"), params={"kind": "experiment"}).json()["pages"][0]
+    view = client.get(url(project, "/experiments/E1")).json()
+
+    # "cancelled" is how its last run ended; that an earlier one succeeded is said with it.
+    success = {"number": 1, "result_page": "wiki/results/E1-run1.md"}
+    assert row["state"] == page["state"] == "cancelled"
+    assert row["last_success"] == page["last_success"] == view["last_success"] == success
+    assert row["last_run"]["number"] == 2 and row["last_run"]["status"] == "cancelled"
+
+    # An experiment that reads succeeded says it by its state; one that never succeeded
+    # has nothing to add.
+    second = second_experiment(project)
+    rows = client.get(url(project, "/experiments")).json()["experiments"]
+    assert next(r for r in rows if r["id"] == second.id)["last_success"] is None
 
 
 # -- taking an approval back ---------------------------------------------------------

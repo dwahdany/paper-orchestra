@@ -18,6 +18,8 @@ import { STAGES, relOf } from './vocab.js';
 const VERDICT = { supports: 1, refutes: 1, answers: 1 };
 const STRUCTURAL = /^(page\.|review\.decided|proposal\.created|experiment\.state|run\.started|run\.finished|request\.(created|withdrawn)|phase\.|checkpoint|budget\.warning|error|paper\.|project\.)/;
 const MAX_ACTIVITY = 600;
+/** How long nothing is heard of a project with a worker before the page asks whether the worker is still there. */
+const SILENCE_MS = 4000;
 
 export class Store {
   constructor(pid, onChange) {
@@ -48,6 +50,8 @@ export class Store {
     this.tails = {};                     // experiment id -> the last log line seen
     this.workerLog = null;
     this.paper = null;
+    this.decidedEdits = null;            // the edit proposals that were decided, latest first; null until asked for
+    this._decidedAt = 0;
     this.live = 'connecting';            // connecting | live | reconnecting
     this.source = null;
     this.closed = false;
@@ -61,6 +65,7 @@ export class Store {
        state before, and nothing is said from it meanwhile. */
     this.behind = false;
     this._moves = 0;
+    this.heardAt = Date.now();           // when the server was last heard about this project (an event, a state, the lists)
   }
 
   /* ---------- loading ---------- */
@@ -107,6 +112,7 @@ export class Store {
         const lists = await this.fetchLists();
         if (this.closed) return;
         this.server = lists;
+        this.heardAt = Date.now();
         this.refreshError = null;
         if (moves === this._moves) this.behind = false;
         for (const [ref, entry] of this.overlay) if (entry.done) this.overlay.delete(ref);
@@ -172,7 +178,8 @@ export class Store {
     proposals.forEach((p) => { const list = this.changeFor.get(p.target) || []; list.push(p); this.changeFor.set(p.target, list); });
 
     const items = [];
-    this.pages.forEach((page) => { if (page.review === 'proposed') items.push({ ref: page.path, type: 'page', page, kind: page.kind, author: page.author, round: page.round, when: page.updated }); });
+    /* (when a proposal was proposed is when its page was first written; a later edit of the person's moves `updated` only) */
+    this.pages.forEach((page) => { if (page.review === 'proposed') items.push({ ref: page.path, type: 'page', page, kind: page.kind, author: page.author, round: page.round, when: page.created || page.updated }); });
     proposals.forEach((p) => { const page = this.byPath.get(p.target); items.push({ ref: p.id, type: 'edit', prop: p, page, kind: page.kind, author: p.author, round: p.round, when: p.created }); });
     const order = (it) => { const i = STAGES.indexOf(it.kind); return (i < 0 ? 50 : i) * 10 + (it.type === 'page' ? 0 : 1); };
     this.pendingItems = items.sort((a, b) => order(a) - order(b) || String(a.when).localeCompare(String(b.when)));
@@ -182,7 +189,10 @@ export class Store {
       if (!page) return row;
       /* an interrupted run is marked on the row of either list: the page's mark follows the one that says so */
       if (row.interrupted && page.state === 'running' && page.interrupted == null) page.interrupted = true;
-      return Object.assign({}, row, { review: page.review, state: page.state, title: page.title });
+      /* so is an approval that no longer holds, and a run that succeeded before the one the state is about */
+      if (row.will_not_run && page.will_not_run == null) page.will_not_run = row.will_not_run;
+      if (row.last_success && page.last_success == null) page.last_success = row.last_success;
+      return Object.assign({}, row, { review: page.review, state: page.state, title: page.title, will_not_run: row.will_not_run || page.will_not_run || null, last_success: row.last_success || page.last_success || null });
     });
     this.expById = new Map(this.experiments.map((row) => [row.id, row]));
     this.requests = s.requests;
@@ -316,19 +326,40 @@ export class Store {
     this.onChange('activity');
   }
 
+  /** The edit proposals the person has decided, for the inbox's list of what was decided
+      (GET .../proposals?review=all: every proposal, of which the pending ones are in the
+      lists already). Asked for when that list is shown, and again when a decision was made
+      since; a server that cannot say leaves the list as it was. */
+  loadDecided(force) {
+    if (this.closed || this._decidedBusy || (!force && this.decidedEdits && Date.now() - this._decidedAt < 60000)) return;
+    this._decidedBusy = true;
+    api.proposals(this.pid, 'all').then((data) => { this.takeDecided((data && data.proposals) || []); }, () => { if (!this.decidedEdits) this.decidedEdits = []; })
+      .finally(() => { this._decidedBusy = false; this._decidedAt = Date.now(); if (!this.closed) this.onChange('decided', true); });
+  }
+  /** Keep of a listing of edit proposals the ones that were decided, the latest decision
+      first, without the text they proposed. */
+  takeDecided(rows) {
+    this.decidedEdits = (Array.isArray(rows) ? rows : [])
+      .filter((p) => p && (p.review === 'accepted' || p.review === 'rejected') && p.decided_at && typeof p.target === 'string')
+      .map((p) => ({ id: p.id, target: p.target, author: p.author, round: p.round, created: p.created, summary: p.summary || '', fields: p.fields || {}, review: p.review, decided_by: p.decided_by, decided_at: p.decided_at, decision_reason: p.decision_reason || '' }))
+      .sort((a, b) => String(b.decided_at).localeCompare(String(a.decided_at)));
+  }
+
   async loadPaper() {
     try { this.paper = await api.paper(this.pid); } catch (error) { this.paper = { error }; }
     this.onChange('paper', true);
   }
 
-  /** Why a worker ended, in its own words (missing credentials, a crash before the engine wrote anything). */
+  /** Why a worker ended, in its own words (a crash before the engine wrote anything). */
   lookAtWorker() {
     const p = this.project;
     if (!p) return;
     const exit = p.worker && p.worker.last_exit;
     const state = p.state || {};
-    /* (how a write-up ended is said by the paper view, from the project's events: its worker's log is not read for it) */
-    const wanted = state.status === 'failed' || (state.status === 'stopped' && state.error) || (exit && !exit.stopped && exit.code !== 0 && exit.kind !== 'write');
+    /* (how a write-up ended is said by the paper view, from the project's events: its worker's log is not read for it;
+       a worker that started nothing because its phase needs a model, `reason: needs_model`, has no log worth reading:
+       the forecast carries the one sentence about it) */
+    const wanted = state.status === 'failed' || (state.status === 'stopped' && state.error) || (exit && !exit.stopped && exit.code !== 0 && exit.kind !== 'write' && exit.reason !== 'needs_model');
     const key = wanted ? [state.status, state.error, exit && exit.at].join('|') : null;
     if (!wanted) { this.workerLog = null; return; }
     if (this.workerLog && this.workerLog.key === key) return;
@@ -372,8 +403,29 @@ export class Store {
     };
   }
 
+  /** A worker that starts nothing ends within half a second and writes no event. All the
+      stream has of its end is one `state` frame (the engine rewrites state.json when a worker
+      comes and goes), and a page that did not get that frame would hold the worker as busy
+      for good. So a page that holds a worker as busy, and has heard nothing of the project
+      for a while, asks the project view whether that is still so (one cheap request), and
+      reads the lists again when it is not: a second line, for a frame that was missed.
+      Called once a second; it asks every few seconds of silence at most. */
+  async checkWorker() {
+    const worker = (this.project || {}).worker || {}, held = worker.state;
+    /* (a worker this server cannot verify is not this page's to follow: the server says when it is gone) */
+    if (this.closed || !this.loaded || this._checking || !held || held === 'idle' || worker.verified === false || connection.denied || Date.now() - this.heardAt < SILENCE_MS) return;
+    this._checking = true;
+    this.heardAt = Date.now();
+    try {
+      const view = await api.project(this.pid);
+      const now = view && view.worker ? view.worker.state : held;
+      if (!this.closed && now !== (((this.project || {}).worker || {}).state)) await this.refreshNow();
+    } catch (error) { /* a server that is away is the shell's to say; it is asked again later */ } finally { this._checking = false; }
+  }
+
   takeState(data) {
     if (!this.project || !data || !data.state) return;
+    this.heardAt = Date.now();
     const before = this.project.state || {};
     const moved = before.status !== data.state.status || before.phase !== data.state.phase || before.round !== data.state.round
       || (before.phases || []).length !== (data.state.phases || []).length
@@ -394,6 +446,7 @@ export class Store {
   }
 
   handle(event) {
+    this.heardAt = Date.now();
     const seq = event.seq || 0;
     if (seq && seq <= this.lastSeq) return;
     if (seq) this.lastSeq = seq;
@@ -419,6 +472,8 @@ export class Store {
       if (type === 'run.finished' || (/^(review\.decided|page\.)/.test(type) && /^(experiment|result|source)$/.test(data.kind || 'experiment'))) this.invalidateFindings();
       if (/^(review\.decided|page\.)/.test(type) && /^(finding|hypothesis|result)$/.test(data.kind || '')) this.invalidateRejected();
       if (this.paper && /^(paper\.|review\.decided|run\.finished|page\.)/.test(type)) this.loadPaper();
+      /* a decision was made, here or in another window: what was decided is read again where it is listed */
+      if (this.decidedEdits && type === 'review.decided') this.loadDecided(true);
       this.refresh();
     }
     this.onChange('event', true, event);

@@ -24,6 +24,12 @@ if TYPE_CHECKING:
 
 S2_KEY_ENV = "SEMANTIC_SCHOLAR_API_KEY"
 REDACTED = "[redacted]"
+#: What works with no credential at all, said where a first look finds none.
+WITHOUT_CREDENTIALS = (
+    "The demonstration and the app work without credentials: `paper-orchestra research "
+    "demo` builds a project to look at and `paper-orchestra ui` opens it. Running "
+    "approved experiments needs none either; the agents need a model."
+)
 
 _PACKAGES = (
     "anthropic",
@@ -119,8 +125,10 @@ def _provider_report(model: str) -> dict[str, Any]:
     return row
 
 
-def _environment_credential(provider: str, environ: Mapping[str, str]) -> str | None:
-    """A cheap hint for providers other than the default one (no client is built)."""
+def environment_credential(provider: str, environ: Mapping[str, str]) -> str | None:
+    """Which credential of ``provider`` the environment holds (``api_key``, ``auth_token``,
+    ``workload_identity``, ``vertex_ai``), or ``None`` when it holds none.  A cheap look:
+    no client is built, and a profile on disk is not seen."""
     if provider == "anthropic":
         if environ.get("ANTHROPIC_API_KEY"):
             return "api_key"
@@ -143,7 +151,7 @@ def _other_providers(default: str | None, environ: Mapping[str, str]) -> list[di
         {
             "provider": provider,
             "sdk_installed": _sdk_installed(module),
-            "credential_source": _environment_credential(provider, environ),
+            "credential_source": environment_credential(provider, environ),
         }
         for provider, module in _PROVIDER_SDKS.items()
         if provider != default
@@ -200,6 +208,8 @@ def collect(model: str | None = None) -> dict[str, Any]:
 
     ``ok`` is false when the provider of ``model`` (default: the default model)
     has no usable credentials; the other sections are informational.
+    ``without_credentials`` is one line on what works all the same, for whoever
+    shows a report that is not ``ok``.
     """
     environ = os.environ
     model = model or DEFAULT_MODEL
@@ -215,6 +225,7 @@ def collect(model: str | None = None) -> dict[str, Any]:
         "memory": _memory_report(environ),
         "packages": _package_versions(),
         "ok": bool(provider["usable"]),
+        "without_credentials": WITHOUT_CREDENTIALS,
     }
     return scrub(report, secret_values(environ))
 
@@ -308,3 +319,5 @@ def render(report: Mapping[str, Any], console: Console) -> None:
         console.print(Text(f"Warning: {warning}", style="yellow"))
     if not provider["usable"]:
         console.print(Text(f"{name} cannot be used: {provider['error']}", style="red"))
+        # The newcomer runs this first: nothing here stops them from looking around.
+        console.print(Text(str(report.get("without_credentials") or WITHOUT_CREDENTIALS)))

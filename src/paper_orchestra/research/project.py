@@ -208,6 +208,9 @@ _OWN_ENTRIES: tuple[str, ...] = (
 #: Key of project.json: the inode of the directory the project was created as.  A copy
 #: of the directory carries the key and not the inode, which tells it from the original.
 HOME_KEY = "home"
+#: Key in ``project.json`` of a project that was built to be looked at (``research demo``):
+#: what it says it spent on models is part of its story, and no model was called.
+DEMONSTRATION_KEY = "demonstration"
 _HOW_TO_APPROVE = (
     "A run is approved with `paper-orchestra research approve`, or with Approve in the app: "
     "that records what may run, and nothing else moves an experiment to approved, queued or "
@@ -421,15 +424,17 @@ def _author_from_slug(slug: str) -> str:
 
 
 def _who(author: str) -> str:
+    """Who did something, as a sentence for the person begins: ``You``, ``The scout``,
+    and ``The engine`` for the code that runs the project (the app's word for it)."""
     if author == HUMAN:
         return "You"
-    return f"The {role_of(author)}" if is_agent(author) else "The pipeline"
+    return f"The {role_of(author)}" if is_agent(author) else "The engine"
 
 
 def _whose(author: str) -> str:
     if author == HUMAN:
         return "your"
-    return f"the {role_of(author)}'s" if is_agent(author) else "the pipeline's"
+    return f"the {role_of(author)}'s" if is_agent(author) else "the engine's"
 
 
 def _what(page: ResearchPage) -> str:
@@ -440,6 +445,32 @@ def _what(page: ResearchPage) -> str:
     """
     title = quotable(page.title, 80).rstrip(".")
     return f'{page.kind} {page.id} "{title}"' if page.id else f'{page.kind} "{title}"'
+
+
+def _noted(new: ResearchPage, fields: Mapping[str, Any] | None, text_changed: bool) -> str:
+    """What a change that code made to a page means, as the activity feed says it.
+
+    Code notes things on pages that the person never asked about by name: that a
+    result went to the analysis, what a check of an experiment found, the title the
+    project was given.  Each is said as what happened to the page; "the pipeline
+    updated ..." would name a part of the machinery and say nothing.
+    """
+    what = _what(new)
+    what = f"{what[0].upper()}{what[1:]}"
+    names = set(fields or {}) if not text_changed else set()
+    if names == {"analysed"}:
+        return f"{what} was handed to the analysis."
+    if names == {"problems"}:
+        found = new.meta.get("problems")
+        count = len(found) if isinstance(found, list) else int(bool(found))
+        if not count:
+            return f"{what} was checked again: no problem is left."
+        listed = "1 problem is" if count == 1 else f"{count} problems are"
+        return f"{what} was checked: {listed} listed on its page."
+    if names == {"title"} and new.path == IDEA_PATH:
+        title = quotable(new.title, 80).rstrip(".")
+        return f'The idea page was given the project\'s title, "{title}".'
+    return f"{what} was brought up to date."
 
 
 def _said(text: Any, limit: int = 200) -> str:
@@ -943,6 +974,7 @@ class Project:
         files: Iterable[str | Path] = (),
         settings: ProjectSettings | Mapping[str, Any] | None = None,
         clock: Callable[[], datetime] | None = None,
+        demonstration: bool = False,
     ) -> Project:
         """Start a project in ``root`` (a new or empty directory) from the person's idea.
 
@@ -951,7 +983,8 @@ class Project:
         ``inputs/manifest.json`` (name, size, media type and SHA-256 of each file),
         and creates ``wiki/idea.md`` from the brief as the person's own page.
         ``settings`` may be partial; what it leaves out gets the defaults.  An
-        empty ``title`` is taken from the first line of the brief.
+        empty ``title`` is taken from the first line of the brief.  ``demonstration``
+        marks a project that is built to be looked at (:attr:`demonstration`).
 
         Creating is all or nothing: ``root`` holds the whole project when this
         returns, and is as it was (absent, or the empty directory it was) when it
@@ -995,6 +1028,8 @@ class Project:
             project.settings = typed
             if not given:
                 project._extra[TITLE_FROM_BRIEF] = True
+            if demonstration:
+                project._extra[DEMONSTRATION_KEY] = True
             # The directory the project will be: a rename keeps the inode.
             project._extra[HOME_KEY] = {"inode": (root if existed else built).stat().st_ino}
             project._title_on_file = title
@@ -1129,6 +1164,19 @@ class Project:
                 SYSTEM,
                 restored=True,
             )
+
+    @property
+    def demonstration(self) -> bool:
+        """Whether the project was built as a demonstration (``research demo``): its
+        history, and the model cost on file with it, were written to be looked at.
+        Whoever shows what it spent says so beside the amount."""
+        return self._extra.get(DEMONSTRATION_KEY) is True
+
+    def now(self) -> str:
+        """The moment by the project's clock, as a stamp: what its pages and events are
+        stamped with.  Whoever records something beside a page (who wrote a code file,
+        and when) uses it, so that the two can be compared."""
+        return self._clock.now()
 
     def at_home(self) -> bool | None:
         """Whether this directory is the one the project was created as: ``False`` for a
@@ -1800,14 +1848,12 @@ class Project:
         if after.kind != "experiment" or after.state == before.state:
             return
         what = _what(after)
-        self._page_event(
-            "experiment.state",
-            f"{what[0].upper()}{what[1:]} is now {after.state}.",
-            after,
-            by,
-            previous=before.state,
-            reason=reason,
-        )
+        if by == HUMAN and before.state == "approved" and after.state == "planned":
+            # The person's own step back: "is now planned" would not say what they did.
+            said = f"The approval of {what} was taken back: it is a plan again."
+        else:
+            said = f"{what[0].upper()}{what[1:]} is now {after.state}."
+        self._page_event("experiment.state", said, after, by, previous=before.state, reason=reason)
 
     # -- pages -------------------------------------------------------------------
 
@@ -1960,8 +2006,12 @@ class Project:
                 meta[EDITED_BY_PERSON] = stamp
             new = self._write(page.path, meta, new_body, editor=author, stamp=stamp, previous=page)
             self._changed()
-            verb = "edited" if author == HUMAN else "revised" if is_agent(author) else "updated"
-            self._page_event("page.updated", f"{_who(author)} {verb} {_what(new)}.", new, author)
+            if author == SYSTEM:
+                said = _noted(new, fields, new_body != page.body or bool(relations))
+            else:
+                verb = "edited" if author == HUMAN else "revised"
+                said = f"{_who(author)} {verb} {_what(new)}."
+            self._page_event("page.updated", said, new, author)
             self._state_event(page, new, author)
         return new
 
@@ -2328,7 +2378,12 @@ class Project:
             )
         decided = {"decided_by": HUMAN, "decided_at": self._clock.now(), "decision_reason": reason}
         if choice == "reject":
-            return self._close_proposal(replace(proposal, review="rejected", **decided), None)
+            # The page it would have changed is named by what it is called, if it is there.
+            try:
+                target: ResearchPage | None = self._fresh(proposal.target)[0]
+            except ProjectError:
+                target = None
+            return self._close_proposal(replace(proposal, review="rejected", **decided), target)
         try:
             page, text = self._fresh(proposal.target)
         except NotFound:
@@ -2671,14 +2726,13 @@ class Project:
                 previous=previous[0] if previous else None,
             )
             self._changed()
+            # A record is what a run or a bibliographic service left: said as that.
+            what = _what(page)
+            what = f"{what[0].upper()}{what[1:]}"
             if previous is None:
-                self._page_event(
-                    "page.created", f"The pipeline recorded {_what(page)}.", page, SYSTEM
-                )
+                self._page_event("page.created", f"{what} was recorded.", page, SYSTEM)
             else:
-                self._page_event(
-                    "page.updated", f"The pipeline updated {_what(page)}.", page, SYSTEM
-                )
+                self._page_event("page.updated", f"{what} was recorded again.", page, SYSTEM)
         return page
 
     # -- requests ----------------------------------------------------------------

@@ -1430,6 +1430,10 @@ class _Story:
                 "phase": self.state["phase"],
                 "at": format_stamp(self.clock()),
                 "summary": summary,
+                # As the engine keeps it: what the phase did, without what waited then and
+                # without the heading ("Round 2, design:"), which whoever shows it says
+                # from the checkpoint's round and phase.
+                "did": lead.partition(": ")[2] if lead.startswith("Round ") else lead,
                 "pending": dict(counts["by_kind"]),
             },
         )
@@ -2071,6 +2075,8 @@ def build_demo_project(root: str | Path, *, pages: int | None = None) -> Project
             # Room for the GPU experiment the designer goes on to propose (30 minutes).
             settings={"limits": {"experiment_seconds": 1800}},
             clock=clock,
+            # What it "spent" on models is the story's: said wherever a cost is shown.
+            demonstration=True,
         )
     story = _Story(project, clock)
     backend = get_backend("local")

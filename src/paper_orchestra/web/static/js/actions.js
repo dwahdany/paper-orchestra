@@ -236,7 +236,7 @@ async function rejectAccepted(path, reason) {
     else {
       const deps = result.dependents;
       /* the page in front of the person now says that it is rejected, and lists what rests on it with links */
-      say(restCount(deps) ? restSentence(label(page), deps) : 'Rejected ' + label(page) + ' after all. It is kept with your reason.', { ms: 12000 });
+      say(restCount(deps) ? restSentence(label(page), deps) : 'Rejected ' + label(page) + ' after all. It is kept' + (reason ? ' with your reason.' : '; you gave no reason.'), { ms: 12000 });
     }
   } catch (error) { sayError(cap(label(page)) + ' was not rejected: ' + message(error)); }
   app.render('decided');
@@ -481,7 +481,9 @@ function startProject() {
     const renamed = (project.uploads || []).filter((u) => u && u.sent && u.stored && u.stored !== u.sent).map((u) => u.sent + ' is kept as ' + u.stored);
     const also = (skipped ? ' ' + plural(skipped, 'file') + ' could not be attached.' : '') + (renamed.length ? ' ' + renamed.slice(0, 3).join('; ') + (renamed.length > 3 ? '; and ' + (renamed.length - 3) + ' more were renamed' : '') + '.' : '');
     if (project.worker_error) sayError('The project is created, but the agents could not be started: ' + plain(project.worker_error.message) + ' Start them from here once the cause is put right.' + also);
-    else say('The project is created' + (project.worker ? ' and research has started.' : '.') + also);
+    /* (said briefly, and no more than is known: the agents were started, and the strip above
+       the map says from here on what they are doing, or what they need before they can) */
+    else say('The project is created' + (project.worker ? '; the agents are starting.' : '.') + also, { ms: also ? 9000 : 3200 });
   }, (error) => {
     s.uploading = false; s.request = null;
     s.error = error && error.name === 'AbortError' ? null : message(error);
@@ -623,6 +625,7 @@ const ACT = {
   },
   'feed-more': async () => { const s = store(); app.ui.feedLimit += 60; if (s.activity.length < app.ui.feedLimit && s.moreActivity) { try { await s.loadEarlierActivity(); } catch (error) { sayError(message(error)); } } app.render('ui'); },
   'new-page': () => openNewPage(),
+  'decided-more': () => { app.ui.decidedAll = true; app.render('ui'); },
   'show-lessons': () => { app.ui.showLessons = true; app.render('ui'); },
   'bulk-accept': () => bulk('accept'),
   'bulk-reject': () => { app.ui.rejecting = app.ui.rejecting === 'bulk' ? null : 'bulk'; app.render('ui'); },
@@ -906,13 +909,25 @@ export function installActions() {
 
   /* tooltips for anything with data-tip: on hover and on keyboard focus */
   const tipEl = $('#tip');
+  /* A key is shown as a key, after the words: the one the markup names (`data-tipkey`), or
+     the one a tip ends with in brackets ("Edit (E)"). Written beside a name like any other
+     text, "Inbox (3)" reads as a count of what is in the inbox. */
+  const KEY_AT_END = / \((Ctrl [A-Z]|Esc|[A-Z0-9?+−])\)$/;
   const showTip = (t) => {
     if (!t || !t.dataset.tip) { tipEl.classList.remove('on'); return; }
-    tipEl.textContent = t.dataset.tip;
+    const said = t.dataset.tip, ends = t.dataset.tipkey ? null : KEY_AT_END.exec(said);
+    const key = t.dataset.tipkey || (ends ? ends[1] : '');
+    tipEl.textContent = ends ? said.slice(0, ends.index) : said;
+    if (key) { const mark = document.createElement('kbd'); mark.textContent = key; tipEl.append(' ', mark); }
     tipEl.classList.add('on');
-    const r = t.getBoundingClientRect();
+    const r = t.getBoundingClientRect(), h = tipEl.offsetHeight;
     tipEl.style.left = Math.max(8, Math.min(window.innerWidth - tipEl.offsetWidth - 8, r.left + r.width / 2 - tipEl.offsetWidth / 2)) + 'px';
-    tipEl.style.top = (r.top - tipEl.offsetHeight - 6 < 4 ? r.bottom + 6 : r.top - tipEl.offsetHeight - 6) + 'px';
+    /* Above what it is about, unless it would then lie over the top bar (where the project
+       stands and what it spent are read) or leave the window: then below, if there is room. */
+    const bar = t.closest('#top') ? null : $('#top');
+    const roof = bar ? bar.getBoundingClientRect().bottom + 2 : 4;
+    const below = r.top - h - 6 < roof && r.bottom + 6 + h <= window.innerHeight - 4;
+    tipEl.style.top = (below ? r.bottom + 6 : Math.max(4, r.top - h - 6)) + 'px';
   };
   document.addEventListener('mouseover', (ev) => showTip(ev.target.closest && ev.target.closest('[data-tip]')));
   document.addEventListener('focusin', (ev) => { const t = ev.target.closest && ev.target.closest('[data-tip]'); if (t && t.matches(':focus-visible')) showTip(t); });

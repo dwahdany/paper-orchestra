@@ -27,10 +27,12 @@ from paper_orchestra.research.engine import (
     PHASES,
     Engine,
     EngineError,
+    ModelNeeded,
     WorkerBusy,
     as_worker,
     next_step,
     phase_in_words,
+    phase_name,
     read_state,
     worker_alive,
 )
@@ -388,6 +390,9 @@ def test_a_full_round_pauses_at_each_checkpoint_and_builds_on_what_was_accepted(
         "The theorist proposed 2 hypotheses. 2 hypotheses await your review. "
         "Next: designing experiments for the hypotheses you accepted."
     )
+    # What the phases did is kept by itself: the count of what waited and what was next
+    # were true at that moment, and whoever shows the checkpoint later says both live.
+    assert state["checkpoint"]["did"] == "The theorist proposed 2 hypotheses."
     # The feed has heard what the phase did; the checkpoint adds what is waiting and what is next.
     assert events(project, "checkpoint")[-1]["summary"] == (
         "2 hypotheses await your review. "
@@ -476,6 +481,7 @@ def test_state_json_has_exactly_the_documented_shape(project, team, backend):
         "phase",
         "at",
         "summary",
+        "did",
         "pending",
         "recommends",
         "recommends_page",
@@ -3287,19 +3293,178 @@ def test_models_that_cannot_use_the_wiki_are_refused_before_anything_is_spent(tm
         client_for=lambda name: plain if name == "gpt-5.5" else capable,
     )
 
-    with pytest.raises(EngineError) as refusal:
+    with pytest.raises(ModelNeeded) as refusal:
         engine.advance()
 
     message = str(refusal.value)
+    assert message.startswith("The intake phase needs a model, and the model set for research")
     assert "settings.models.research" in message and "gpt-5.5" in message
-    assert "the memory tool" in message and "Nothing was spent" in message
+    assert "no memory tool" in message and "\n" not in message
+    assert refusal.value.need["settings"] == ["research"]
     assert plain.requests == [] and capable.requests == []
     state = read_state(project)
     assert (state["status"], state["phases"], state["worker"]) == ("idle", [], None)
     assert state["spent"]["model_usd"] == 0
-    (error,) = events(project, "error")
-    assert "settings.models.research" in error["summary"]
+    # A refusal is no event of the project: nothing happened to it, and whoever asked is
+    # told once, by the one who refused.
+    assert events(project, "error") == []
     assert project.pages() == project.pages(kind="idea")
+
+
+#: What the Anthropic client says when it finds no credential.
+NO_CREDENTIALS = (
+    "No Anthropic credentials were found. Configure one of:\n"
+    "  1. API key: set ANTHROPIC_API_KEY (for example in a .env file).\n"
+    "  2. Workload Identity Federation (keyless): set ANTHROPIC_FEDERATION_RULE_ID."
+)
+NEEDS_A_MODEL = (
+    " needs a model, and the model set for research, reasoning and coding "
+    "(claude-fable-5-2) cannot be used because no Anthropic credentials were found: set "
+    "ANTHROPIC_API_KEY or the Workload Identity Federation variables (Setup in the app and "
+    "`paper-orchestra doctor` show what is configured)."
+)
+
+
+def no_credentials(model: str):
+    raise LLMConfigError(NO_CREDENTIALS)
+
+
+def without_a_model(project: Project, backend: FakeBackend) -> Engine:
+    """An engine as a worker has it where no credential is configured."""
+    return Engine(project, compute=backend, client_for=no_credentials, scholar=make_scholar())
+
+
+def test_what_needs_no_model_runs_without_one_and_the_analysis_waits(project, team, backend):
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    asked = len(team.calls)
+
+    # Known beforehand, without a lock and without contacting anything: the run happens,
+    # the analysis does not, and why.
+    said = next_step(project, client_for=no_credentials)
+    assert (said["will_run"], said["then"], said["experiments"]) == (["run"], "analyze", ["E1"])
+    assert said["blocked"] == {
+        "phase": "analyze",
+        "needs": "model",
+        "settings": ["research", "reasoning", "coding"],
+        "models": ["claude-fable-5-2"],
+        "message": "The analysis phase" + NEEDS_A_MODEL,
+    }
+
+    state = without_a_model(project, backend).advance()
+
+    # The approved experiment ran; the call paused where a model was needed, and says so
+    # once, as a checkpoint and not as a failure.
+    assert project.page("E1").state == "succeeded" and len(backend.jobs) == 1
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "run",
+        "analyze",
+    )
+    summary = state["checkpoint"]["summary"]
+    assert summary.startswith("1 experiment ran: E1 succeeded. The analysis phase needs a model")
+    assert summary.count("ANTHROPIC_API_KEY") == 1 and "Configure one of" not in summary
+    assert summary.endswith("Next: analysing the new results.")
+    # What the phases did is kept by itself.  That a model was missing was true at the
+    # pause: whoever shows the checkpoint later must not go on saying it once one is set up.
+    assert state["checkpoint"]["did"] == "1 experiment ran: E1 succeeded."
+    (paused,) = events(project, "checkpoint")[-1:]
+    assert paused["summary"].startswith("The analysis phase needs a model")
+    assert state["error"] is None and events(project, "error") == []
+    assert events(project, "phase.failed") == [] and len(team.calls) == asked
+
+    # Pressed again, nothing can be done without a model: refused in the one sentence,
+    # and the project is left exactly where it stood.
+    before = read_state(project)
+    said = next_step(project, client_for=no_credentials)
+    assert (said["will_run"], said["then"], said["results"]) == ([], "analyze", 1)
+    assert said["blocked"]["phase"] == "analyze"
+    with pytest.raises(ModelNeeded) as refusal:
+        without_a_model(project, backend).advance()
+    assert str(refusal.value) == "The analysis phase" + NEEDS_A_MODEL
+    assert refusal.value.need["needs"] == "model"
+    after = read_state(project)
+    assert (after["status"], after["phases"], after["checkpoint"]) == (
+        before["status"],
+        before["phases"],
+        before["checkpoint"],
+    )
+    assert events(project, "error") == []
+
+    # With a model the analysis is what comes first, and the round goes on from there.
+    assert next_step(project, client_for=lambda _: FakeLLM(team))["blocked"] is None
+    state = advance(project, team, backend)
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "analyze",
+        "hypothesize",
+    )
+    assert project.page("F1").relations["based_on"]
+
+
+def test_a_project_that_cannot_start_without_a_model_is_refused_once_and_stays_as_it_was(
+    project, backend
+):
+    said = next_step(project, client_for=no_credentials)
+    assert (said["will_run"], said["then"]) == ([], "intake")
+    assert said["blocked"]["message"] == "The intake phase" + NEEDS_A_MODEL
+
+    with pytest.raises(ModelNeeded, match="The intake phase needs a model"):
+        without_a_model(project, backend).advance()
+    # A phase asked for by name is refused the same way; the run phase is not.
+    with pytest.raises(ModelNeeded, match="The hypothesis phase needs a model"):
+        without_a_model(project, backend).advance(phase="hypothesize")
+
+    state = read_state(project)
+    assert (state["status"], state["phases"], state["next_phase"]) == ("idle", [], "intake")
+    assert [event["type"] for event in project.events()] == ["project.created"]
+    # A forecast that is not told how a client is found says nothing about models.
+    assert next_step(project)["blocked"] is None
+    assert next_step(project)["will_run"] == ["intake", "research"]
+
+
+def test_a_run_that_could_not_run_is_said_before_the_pause_for_a_model(
+    project, team, backend, monkeypatch
+):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    mine = own_experiment(project, backend)
+    refuse_changed(monkeypatch, mine, "its code changed after the approval.")
+
+    state = without_a_model(project, backend).advance()
+
+    # Nothing ran, so the phase that was next would follow at once; it needs a model, and
+    # what the run phase found is not lost with the refusal.
+    assert (state["status"], state["phase"], state["next_phase"]) == ("checkpoint", "run", "design")
+    summary = state["checkpoint"]["summary"]
+    assert f"{mine} was not run: its code changed after the approval." in summary
+    assert "The design phase needs a model" in summary and backend.jobs == []
+    # The account keeps what happened to the experiment, not what the next phase lacked.
+    did = state["checkpoint"]["did"]
+    assert f"{mine} was not run" in did and "needs a model" not in did
+
+
+def test_a_failed_run_is_not_repaired_without_a_model_and_its_notes_say_why(project, team, backend):
+    team.code = FAILING_CODE
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    asked = len(team.calls)
+
+    record = without_a_model(project, backend).run_experiment("E1")
+
+    assert record["status"] == "failed" and len(team.calls) == asked
+    assert [run["status"] for run in experiments.runs(project, "E1")] == ["failed"]
+    (note,) = [note for note in record["notes"] if "not repaired" in note]
+    assert note.startswith(
+        "The failure was not repaired: a repair needs a model, and the model set for coding "
+    )
+    assert "no Anthropic credentials were found" in note
+    assert experiments.runs(project, "E1")[0]["notes"] == record["notes"]
+    assert experiments.code_files(project, "E1")["main.py"] == FAILING_CODE
+    assert project.page("E1").state == "failed"
 
 
 def test_the_brief_is_the_persons_and_stays_as_it_was(project, team, backend):
@@ -3381,6 +3546,29 @@ def test_the_scripted_model_of_the_browser_test_carries_a_project_through_a_roun
 
     state = go()
     assert (state["round"], state["phase"]) == (2, "hypothesize")
+
+
+def test_the_scripted_model_can_be_switched_off_to_show_a_project_without_a_model(
+    tmp_path, scripted, monkeypatch
+):
+    """For the browser test of what the app shows where no model can be used: while the
+    file the environment names exists, the scripted model offers what no agent can work
+    with, to the server's forecast and to the workers alike."""
+    project = Project.create(tmp_path / "p", title="No model", brief=BRIEF)
+    switch = tmp_path / "no-model"
+    monkeypatch.setenv(scripted.NO_MODEL_ENV, str(switch))
+    client = scripted.client()
+
+    assert next_step(project, client_for=lambda _: client)["blocked"] is None
+    switch.write_text("")
+    said = next_step(project, client_for=lambda _: client)
+    assert said["blocked"]["needs"] == "model" and said["will_run"] == []
+    assert "offers no tools and no memory tool" in said["blocked"]["message"]
+    with pytest.raises(ModelNeeded):
+        Engine(project, client_for=lambda _: client, scholar=make_scholar()).advance()
+
+    switch.unlink()
+    assert next_step(project, client_for=lambda _: client)["blocked"] is None
 
 
 def test_the_scripted_analyst_recommends_research_and_suggests_an_edit_when_asked(
@@ -3507,9 +3695,11 @@ FORECAST = {
     "will_run": [],
     "then": None,
     "experiments": [],
+    "not_running": [],
     "results": 0,
     "checkpoint_of": None,
     "needs_phase": False,
+    "blocked": None,
 }
 
 
@@ -3712,6 +3902,98 @@ def test_the_forecast_writes_nothing_and_takes_no_lock(project, team, backend):
     assert project.page("E1").state == "approved"
 
 
+def test_an_approved_experiment_that_changed_is_not_counted_in_what_a_press_will_run(
+    project, team, backend
+):
+    to_analysis_checkpoint(project, team, backend)
+    approve(project, "E1", backend)
+    said = next_step(project)
+    assert (said["experiments"], said["not_running"]) == (["E1"], [])
+    assert said["will_run"] == ["run", "analyze"]
+
+    # The person changes its code after the approval: it is no longer what was approved.
+    experiments.write_code(project, "E1", {"main.py": GOOD_CODE + "# changed\n"}, author="human")
+    said = next_step(project)
+
+    # It will not run, and the press is not said to run or to analyse anything: the run
+    # phase puts it back to planned, and the phase that was next goes ahead.
+    assert said["experiments"] == [] and said["results"] == 0
+    (held,) = said["not_running"]
+    assert held["id"] == "E1"
+    assert held["reason"].startswith("it is not what was approved at ")
+    assert "main.py" in held["reason"] and "changed after the approval" in held["reason"]
+    assert (said["will_run"], said["then"]) == (["run", "hypothesize"], "design")
+    # A look changed nothing; the experiment's own word is the same.
+    assert project.page("E1").state == "approved"
+    assert experiments.will_not_run(project, "E1") == held["reason"]
+
+    # ``advance`` keeps its rule, and does what the forecast said.
+    jobs = len(backend.jobs)
+    said, started, state = press(project, team, backend)
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+    assert len(backend.jobs) == jobs and project.page("E1").state == "planned"
+    assert "E1 was not run: it is not what was approved" in state["checkpoint"]["summary"]
+    assert next_step(project)["not_running"] == []
+
+
+def test_an_approval_that_a_run_has_used_is_not_counted_either(project, team, backend):
+    to_analysis_checkpoint(project, team, backend)
+    approve(project, "E1", backend)
+    experiments.run(project, "E1", compute=backend)
+    # The page says approved again (saved from an editor that was open since), but the
+    # run that approval allowed is over: one approval is one run.
+    page = project.page("E1")
+    stale = {**page.meta, "state": "approved"}
+    (project.root / page.path).write_text(
+        "---\n"
+        + "".join(f"{key}: {json.dumps(value)}\n" for key, value in stale.items())
+        + "---\n"
+        + page.body
+    )
+    project = Project.open(project.root)
+    assert project.page("E1").state == "approved"
+
+    said = next_step(project)
+
+    assert said["experiments"] == []
+    assert said["not_running"] == [
+        {"id": "E1", "reason": "the run it was approved for is over (one approval is one run)"}
+    ]
+
+
+def test_a_run_the_person_cancelled_is_no_result_to_analyse(project, team, backend):
+    to_analysis_checkpoint(project, team, backend)
+    approve(project, "E1", backend)
+    # The person cancels the second run while it is in flight.
+    backend.before = lambda: experiments.request_cancel(project, "E1")
+    calls = len(team.calls)
+
+    said = next_step(project)
+    assert said["will_run"] == ["run", "analyze"]
+    state = advance(project, team, backend)
+
+    # The run is on record as cancelled, with its record; nobody is asked to analyse it,
+    # and the call pauses instead of going on with a phase the person did not ask for.
+    assert [run["status"] for run in experiments.runs(project, "E1")] == ["succeeded", "cancelled"]
+    assert project.page("E1").state == "cancelled"
+    assert project.page("E1-run2").state == "cancelled"
+    assert team.calls[calls:] == []
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "run",
+        "hypothesize",
+    )
+    assert "1 experiment ran: E1 cancelled." in state["checkpoint"]["summary"]
+
+    # Nor is it counted afterwards: the next press goes on with the round.
+    said = next_step(project)
+    assert (said["results"], said["will_run"], said["then"]) == (0, ["hypothesize"], "design")
+    backend.before = lambda: None
+    said, started, state = press(project, team, backend)
+    assert started == ["hypothesize"] and "analyze.analyst" not in team.calls[calls:]
+    assert "analysed" not in project.page("E1-run2").meta
+
+
 def test_a_phase_has_one_name_in_the_sentences_a_person_reads():
     assert [phase_in_words(name) for name in PHASES] == [
         "the intake phase",
@@ -3723,3 +4005,14 @@ def test_a_phase_has_one_name_in_the_sentences_a_person_reads():
     ]
     # What is no phase of the engine keeps the name it came with.
     assert phase_in_words("review") == "the review phase"
+    # Where a phase is named by itself ("checkpoint after ...", "next: ..."), the app and
+    # the command line use one set of names, kept where the phases are.
+    assert [phase_name(name) for name in PHASES] == [
+        "intake",
+        "research",
+        "hypotheses",
+        "experiment design",
+        "runs",
+        "analysis",
+    ]
+    assert phase_name("write") == "write"

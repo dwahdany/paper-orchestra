@@ -29,14 +29,28 @@ export const TONE = {
   testing: 'live', running: 'live',
   /* a run whose worker is gone: the page says "running", nothing runs it, and it waits for the person */
   interrupted: 'halt',
+  /* approved, and no longer what was approved: nothing runs it until the person has looked again */
+  'needs approval again': 'halt',
   supported: 'pos', succeeded: 'pos', answered: 'pos',
   refuted: 'neg', failed: 'neg',
   inconclusive: 'void', dropped: 'void', cancelled: 'void',
 };
+/** An experiment whose page reads approved (or queued) and that would not run as it stands:
+    its code or plan changed since the approval, or that approval was used by a run. The
+    server says so wherever it lists the experiment (`will_not_run`: the reason, as the rest
+    of a sentence). It waits for the person's approval again, and is shown as that. */
+export const lapsed = (page) => !!page && page.kind === 'experiment' && page.review === 'accepted' && (page.state === 'approved' || page.state === 'queued') && typeof page.will_not_run === 'string' && page.will_not_run !== '';
 /** The state a mark and a word show for a page: what the page says, except for an experiment
-    whose run was interrupted. The server marks such a page wherever it lists it
-    (`interrupted`); its file still says "running", and the mark must not. */
-export const shownState = (page) => (page && page.kind === 'experiment' && page.state === 'running' && page.interrupted ? 'interrupted' : (page && page.state) || '');
+    whose run was interrupted and one whose approval no longer holds. The server marks such
+    a page wherever it lists it (`interrupted`, `will_not_run`); its file still says
+    "running" or "approved", and the mark must not. */
+export const shownState = (page) => (page && page.kind === 'experiment' && page.state === 'running' && page.interrupted ? 'interrupted' : lapsed(page) ? 'needs approval again' : (page && page.state) || '');
+/** The run of an experiment that succeeded before the one its state is about: the server
+    names it (`last_success`: `{number, result_page}`) where the page reads cancelled or
+    failed, so that the state is not taken to mean that there is no result. */
+export const earlierSuccess = (page) => { const won = page && page.kind === 'experiment' && (page.state === 'cancelled' || page.state === 'failed') ? page.last_success : null; return won && typeof won === 'object' && won.number != null ? won : null; };
+/** "run 1 succeeded", for beside the state; '' where no earlier run did. */
+export const successWords = (page) => { const won = earlierSuccess(page); return won ? 'run ' + won.number + ' succeeded' : ''; };
 export const STATES = {
   question: ['open', 'answered', 'dropped'],
   hypothesis: ['open', 'testing', 'supported', 'refuted', 'inconclusive', 'dropped'],

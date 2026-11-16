@@ -443,7 +443,8 @@ def test_the_designer_supplies_the_code_of_an_accepted_plan_that_came_without_an
     with pytest.raises(NotAllowed, match="accepted"):
         experiments.write_code(project, page.id, {"main.py": QUICK}, author="agent:analyst")
     after = parse_stamp(page.meta["decided_at"]) + timedelta(minutes=5)
-    monkeypatch.setattr(experiments, "_now", lambda: format_stamp(after))
+    # Who wrote a code file, and when, is stamped by the project's clock, as its pages are.
+    monkeypatch.setattr(project, "now", lambda: format_stamp(after))
     assert (
         experiments.write_code(project, page.id, {"main.py": QUICK}, author="agent:designer") == []
     )

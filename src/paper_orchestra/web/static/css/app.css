@@ -1314,3 +1314,69 @@ a.choice { text-decoration: none; }
 
 /* the library: a row whose state was read from the project's events says so */
 .lib-st3 { display: flex; align-items: center; gap: 5px; margin-top: 2px; font-size: 11.5px; font-style: italic; color: var(--prop); } .lib-st3 .ic { flex: none; width: 12px; height: 12px; }
+
+/* ---------- what a first-time user met ---------- */
+
+/* beside the control that continues: an experiment that reads approved and will not run, and
+   a model that a phase needs and cannot use. Both wait for the person; neither is an accident. */
+.go-held, .go-need { flex-wrap: nowrap; align-items: flex-start; max-width: 118ch; }
+.go-held > .ic, .go-need > .ic { margin-top: 2px; }
+.go-rec.go-held > span, .go-rec.go-need > span { flex: 0 1 auto; min-width: 0; }
+.go-held b { font-weight: 600; color: var(--ink); }
+.go-held .btn, .go-need .btn { flex: none; }
+@media (max-width: 640px) { .go-held, .go-need { flex-wrap: wrap; } .go-held .btn, .go-need .btn { margin-left: 24px; } }
+
+/* an earlier run that succeeded, said beside a state that would read as "no result" */
+.st-also { font-size: 11.5px; color: var(--pos); white-space: nowrap; }
+a.st-also { text-decoration: underline; text-underline-offset: 2px; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); }
+a.st-also:hover { text-decoration-color: currentColor; }
+.ex-st .st-also { display: block; margin: 2px 0 0 19px; }
+
+/* what was decided: a suggested edit beside the pages, and the reason of a rejection under its row */
+.in-old { flex-wrap: wrap; row-gap: 0; }
+.in-why { flex: 1 1 100%; min-width: 0; margin: 0 0 3px 28px; font-size: 12px; line-height: 1.4; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.in-why q { font-family: var(--serif); font-style: italic; font-size: 13px; }
+.in-more { display: inline-flex; align-items: center; min-height: 24px; margin: 6px 10px 0; font-size: 11.5px; }
+
+/* on the page it was about: the suggested edits that were decided, and what became of them */
+.decided-edits { margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--rule); }
+.decided-edits .rail-h { margin: 0 0 8px; padding: 0; border: 0; } .decided-edits .rail-h .quiet { font-weight: 400; margin-left: 4px; }
+.rail-notes .decided-edits { margin-top: 0; padding-top: 0; border-top: 0; }
+.des { display: grid; gap: 9px; }
+.de { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 6px; font-size: 12.5px; line-height: 1.45; }
+.de-m { color: var(--ink-3); padding-top: 1px; } .de-m .ic { width: 14px; height: 14px; }
+.de-what { font-family: var(--serif); font-style: italic; font-size: 14px; color: var(--ink-2); }
+.de-how { color: var(--ink-3); font-size: 12px; } .de-how q { font-family: var(--serif); font-style: italic; font-size: 13px; color: var(--ink-2); }
+.de-more { margin-top: 8px; font-size: 12px; color: var(--ink-3); } .de-more > summary { cursor: pointer; min-height: 24px; display: inline-flex; align-items: center; } .de-more .des { margin-top: 8px; }
+
+/* a key in a tooltip is drawn as a key: beside a name, "(3)" reads as a count */
+#tip kbd { margin-left: 3px; color: inherit; border-color: color-mix(in srgb, currentColor 45%, transparent); opacity: .92; }
+
+/* the heading of a narrow column keeps to one line */
+.arg th { white-space: nowrap; }
+
+/* the trail keeps the names of its pages: on a narrow page it takes a second line instead of
+   squeezing every name to a letter */
+.trail { flex-wrap: wrap; row-gap: 2px; overflow: visible; }
+.trail-i { flex: 0 1 auto; max-width: 100%; }
+.trail-i span { min-width: 2.2em; }
+.panel .trail-i span { max-width: 112px; }
+
+/* the server is gone, or lets this page in no longer: said in a band of its own under the
+   top bar, which moves the page down instead of lying over its head */
+body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
+.top { grid-row: 1; } .view { grid-row: 3; } .statusbar { grid-row: 4; }
+.banner { position: static; grid-row: 2; padding: 6px 12px; border-bottom: 1px solid var(--rule); background: var(--surface); pointer-events: auto; min-width: 0; }
+.banner-in { margin-top: 0; box-shadow: none; max-width: min(860px, 100%); }
+
+/* a demonstration: what it says it spent on models is its story's, said where the cost is shown */
+.lib-num .lib-demo { font-size: 11px; font-style: italic; color: var(--ink-3); }
+.top-demo { font-style: italic; color: var(--ink-3); }
+.spend-demo { margin-top: 12px; font-size: 12px; font-style: italic; max-width: 62ch; }
+
+/* Setup: what works although the default model cannot be used */
+.doc-b .doc-note { margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--rule-2); color: var(--ink); } .doc-b .doc-note + .doc-note { margin-top: 4px; padding-top: 0; border-top: 0; color: var(--ink-2); }
+
+/* the table of experiments on a narrow sheet: the line under a title gives way, so that a
+   state said in three words ("needs approval again") does not push the table past its edge */
+@media (max-width: 960px) { .ex-sub { max-width: 50ch; } }

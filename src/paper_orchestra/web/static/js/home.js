@@ -2,9 +2,10 @@
 
 import { app, defaults } from './core.js';
 import { api } from './api.js';
-import { MONTH_NAMES, ago, bytes, checkpointDid, cutoffFrom, cutoffParts, cutoffWords, html, money, plain, plural, raw, setHTML, storage } from './util.js';
+import { MONTH_NAMES, ago, bytes, checkpointDid, codeSpans, cutoffFrom, cutoffParts, cutoffWords, html, money, plain, plural, raw, setHTML, storage } from './util.js';
 import { KIND, STAGES, computeName, effortName, icon, phaseName } from './vocab.js';
 import { stripMapSmall } from './overview.js';
+import { DEMO_COST } from './shell.js';
 
 /* ---------- start: one box for the idea ---------- */
 const EXAMPLE = 'Learning-rate warmup is assumed to matter most for large batches. I suspect that with adaptive optimisers it is small batches that need it, because early second-moment estimates are noisy.';
@@ -149,6 +150,12 @@ export function loadLibrary(force) {
   });
 }
 
+/** What a project holds, in a line under its small map: "14 sources · 5 hypotheses · 1
+    experiment · 2 findings"; "idea only" where nothing but the idea is there. */
+export function countsLine(by) {
+  if (!STAGES.slice(1).some((k) => (by || {})[k])) return 'idea only';
+  return ['source', 'hypothesis', 'experiment', 'finding'].map((k) => plural(by[k] || 0, KIND[k].one.toLowerCase(), KIND[k].many.toLowerCase())).join(' · ');
+}
 /** How many proposals wait in a project, in words: the live number the row carries. */
 function waitingWords(row) {
   const n = row.pending || 0;
@@ -199,7 +206,7 @@ export const libraryView = {
         const counts = row.counts || null, st = rowState(row);
         const by = counts ? counts.by_kind || {} : null, pending = counts ? counts.pending || {} : null;
         /* what the last phase did; how much waits now is said live in the next column */
-        const did = row.checkpoint && row.checkpoint.summary ? checkpointDid(row.checkpoint.summary) : '';
+        const did = row.checkpoint && (row.checkpoint.did || row.checkpoint.summary) ? checkpointDid(row.checkpoint) : '';
         const fresh = row.state_source ? row.state_source === 'not_started' : row.status === 'idle' && !row.round;
         const say = row.state_source === 'unknown' ? plain(row.state_problem || 'Nothing on file says where this project stands.')
           : row.status === 'failed' || (row.status === 'stopped' && row.error) ? plain(row.error) : did ? 'After ' + phaseName(row.checkpoint.phase) + ': ' + did : fresh ? 'The idea is in place; research has not started.' : '';
@@ -209,9 +216,9 @@ export const libraryView = {
         const twin = row.title && lib.projects.filter((x) => x.title === row.title).length > 1;
         const waits = pending && pending.total ? plural(pending.pages || 0, 'proposed page') + (pending.proposals ? ' and ' + plural(pending.proposals, 'suggested edit') : '') + ' wait for a decision' : '';
         return html`<a class="lib-row" href="#/p/${encodeURIComponent(row.id)}/map"><div class="lib-main"><h2>${row.title || row.dir}</h2>${twin && row.dir ? html`<code class="lib-dir">${row.dir}/</code>` : ''}<p>${say}</p></div>
-          <div class="lib-map">${stripMapSmall(by, pending ? pending.by_kind : null)}<span class="lib-counts">${by ? (STAGES.slice(1).some((k) => by[k]) ? (by.source || 0) + ' sources · ' + (by.hypothesis || 0) + ' hypotheses · ' + (by.experiment || 0) + ' experiments · ' + (by.finding || 0) + ' findings' : 'idea only') : ' '}</span></div>
+          <div class="lib-map">${stripMapSmall(by, pending ? pending.by_kind : null)}<span class="lib-counts">${by ? countsLine(by) : ' '}</span></div>
           <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2"${waits ? html` data-tip="${waits}"` : ''}>${st[2]}</span>${rebuilt ? html`<span class="lib-st3" data-state-problem data-tip="${rebuilt}">${icon('warn')}read from its events</span>` : ''}</div>
-          <div class="lib-num"><span>${money((row.spent || {}).model_usd || 0)}</span><span class="quiet">${ago(row.updated)}</span></div></a>`;
+          <div class="lib-num"${row.demonstration ? html` data-demonstration data-tip="${DEMO_COST}"` : ''}><span>${money((row.spent || {}).model_usd || 0)}</span>${row.demonstration ? html`<span class="lib-demo">in its story</span>` : ''}<span class="quiet">${ago(row.updated)}</span></div></a>`;
       })}</div>${broken}`;
     }
     setHTML(root, html`<div class="library"><div class="lib-wrap">${head}${body}</div></div>`);
@@ -227,9 +234,9 @@ export function loadDoctor(force) {
     .finally(() => { doc.loading = false; if (app.route.name === 'setup') app.render('setup', true); });
 }
 const MARKS = { ok: ['check', 'Usable'], warn: ['warn', 'Works, limited'], missing: ['x', 'Not set up'], optional: ['minus', 'Optional, not set up'] };
-const item = (status, name, note, detail, fix) => html`<div class="doc-i s-${status}"><span class="doc-m">${icon(MARKS[status][0])}</span><div class="doc-b"><h3>${name}${note ? html`<span class="quiet">${note}</span>` : ''}</h3>
+const item = (status, name, note, detail, fix, more) => html`<div class="doc-i s-${status}"><span class="doc-m">${icon(MARKS[status][0])}</span><div class="doc-b"><h3>${name}${note ? html`<span class="quiet">${note}</span>` : ''}</h3>
   ${String(detail || '').split('\n').filter((l) => l.trim()).map((l) => html`<p>${l}</p>`)}
-  ${fix ? html`<div class="doc-fix"><code>${fix}</code><button class="ibtn" data-act="copy" data-text="${fix}" data-tip="Copy" aria-label="Copy the command">${icon('copy')}</button></div>` : ''}</div><span class="doc-s">${MARKS[status][1]}</span></div>`;
+  ${fix ? html`<div class="doc-fix"><code>${fix}</code><button class="ibtn" data-act="copy" data-text="${fix}" data-tip="Copy" aria-label="Copy the command">${icon('copy')}</button></div>` : ''}${more || ''}</div><span class="doc-s">${MARKS[status][1]}</span></div>`;
 
 export const setupView = {
   render(root) {
@@ -242,8 +249,12 @@ export const setupView = {
       return;
     }
     const prov = d.provider || {}, local = (d.compute || {}).local || {}, modal = (d.compute || {}).modal || {};
+    /* Where the default model cannot be used, the server says in a line what works all the
+       same (`without_credentials`); the app adds what only it knows: the server read its
+       environment when it started, so a credential set now is seen after a restart. */
+    const without = d.ok === false && typeof d.without_credentials === 'string' && d.without_credentials ? html`<p class="doc-note" data-without-credentials>${codeSpans(d.without_credentials)}</p><p class="doc-note">After you set a credential, stop the app and start it again: credentials are read when it starts.</p>` : '';
     const models = html`<section class="doc-g"><h2>Models</h2>
-      ${item(prov.usable ? ((prov.warnings || []).length ? 'warn' : 'ok') : 'missing', cap(prov.provider || 'Provider') + ' · ' + (d.model || prov.model || ''), prov.credential_source ? 'credentials from ' + prov.credential_source : '', prov.usable ? ((prov.warnings || []).join('\n') || 'The research agents can use this model.') : prov.error || 'No credentials were found.', prov.usable ? '' : 'export ANTHROPIC_API_KEY=…')}
+      ${item(prov.usable ? ((prov.warnings || []).length ? 'warn' : 'ok') : 'missing', cap(prov.provider || 'Provider') + ' · ' + (d.model || prov.model || ''), prov.credential_source ? 'credentials from ' + prov.credential_source : '', prov.usable ? ((prov.warnings || []).join('\n') || 'The research agents can use this model.') : prov.error || 'No credentials were found.', prov.usable ? '' : 'export ANTHROPIC_API_KEY=…', without)}
       ${(d.other_providers || []).map((o) => item(o.credential_source ? 'ok' : 'optional', cap(o.provider) === 'Openai' ? 'OpenAI' : cap(o.provider), o.sdk_installed ? 'package installed' : 'package not installed', o.credential_source ? 'Credentials from ' + o.credential_source + '. Research agents need a Claude model; other providers serve the paper pipeline only.' : 'No credentials. Only needed if you write papers with this provider.', ''))}</section>`;
     const compute = html`<section class="doc-g"><h2>Where experiments run</h2>
       ${item(local.available ? ((local.jobs || {}).network_isolation === false ? 'warn' : 'ok') : 'missing', 'This machine', local.python ? local.python : '', ((local.jobs || {}).summary || '') + ((local.problems || []).length ? '\n' + local.problems.join('\n') : '') + (local.error ? '\n' + local.error : ''), '')}

@@ -36,6 +36,21 @@ export function acceptTip(item, key) {
   return 'Accept' + k;
 }
 
+/** What the person decided, the latest first: the pages an agent proposed, and the edits an
+    agent suggested to a page (the store asks the server for those when this list is shown).
+    `{page, edit, review, at, reason, summary}`: the page that was decided or that the edit
+    was about, whether it is an edit, the decision, when, the reason of a rejection, and for
+    an edit what it suggested. */
+export function decidedItems(store) {
+  const pages = store.pages.filter((pg) => pg.meta && pg.meta.decided_by === 'human' && pg.meta.decided_at && pg.author !== 'human')
+    .map((pg) => ({ page: pg, edit: false, review: pg.review === 'rejected' ? 'rejected' : 'accepted', at: pg.meta.decided_at, reason: pg.review === 'rejected' ? pg.meta.decision_reason || '' : '', summary: '' }));
+  const edits = (store.decidedEdits || []).map((p) => ({ page: store.byPath.get(p.target), edit: true, id: p.id, review: p.review, at: p.decided_at, reason: p.review === 'rejected' ? p.decision_reason || '' : '', summary: p.summary || '' })).filter((it) => it.page);
+  /* (decisions of one moment: an edit after the page it was about, as they were made) */
+  return pages.concat(edits).sort((a, b) => String(b.at).localeCompare(String(a.at)) || (b.edit ? 1 : 0) - (a.edit ? 1 : 0));
+}
+/** How many of them the list shows before "earlier" has to be asked for. */
+const DECIDED_SHOWN = 8;
+
 /** The item the inbox is on: the one about the selected page, or the first. */
 export function currentItem(store, route) {
   const items = store.pending();
@@ -65,11 +80,15 @@ export const inboxView = {
             <button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-tip="Reject, with a reason (R)" aria-label="Reject">${icon('x')}</button></span></div>`;
       })}</div>`;
     });
-    const decidedAll = store.pages.filter((pg) => pg.meta && pg.meta.decided_by === 'human' && pg.meta.decided_at && pg.author !== 'human');
-    const decided = decidedAll.slice().sort((a, b) => String(b.meta.decided_at).localeCompare(String(a.meta.decided_at))).slice(0, 8);
-    const done = decided.length ? html`<div class="in-group in-done"><h3>Decided<span>${decidedAll.length}</span></h3>${decided.map((pg) => html`
-      <a class="in-row in-old${route.sel === pg.path ? ' cur' : ''}" href="${link({ view: 'inbox', sel: pg.path, sub: '' })}"><span class="in-dec">${icon(pg.review === 'rejected' ? 'x' : 'check')}</span>
-        <span class="in-name">${pageName(pg)}</span><span class="in-when">${pg.review === 'rejected' ? 'rejected ' : 'accepted '}${ago(pg.meta.decided_at)}</span></a>`)}</div>` : '';
+    /* what was decided: pages, and suggested edits, each with the decision and the reason of a rejection */
+    store.loadDecided(false);
+    const decidedAll = decidedItems(store);
+    const decided = decidedAll.slice(0, app.ui.decidedAll ? 60 : DECIDED_SHOWN);
+    const done = decided.length ? html`<div class="in-group in-done"><h3>Decided<span>${decidedAll.length}</span></h3>${decided.map((it) => html`
+      <a class="in-row in-old${it.edit ? ' in-edit' : ''}${route.sel === it.page.path ? ' cur' : ''}" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}"${it.edit ? html` data-decided="${it.id}"` : ''}><span class="in-dec">${icon(it.review === 'rejected' ? 'x' : 'check')}</span>
+        <span class="in-name">${pageName(it.page)}</span><span class="in-when">${it.edit ? 'edit ' : ''}${it.review} ${ago(it.at)}</span>
+        ${it.edit && it.summary ? html`<span class="in-why in-sugg">${it.summary}</span>` : ''}${it.reason ? html`<span class="in-why"><q>${it.reason}</q></span>` : ''}</a>`)}
+      ${decidedAll.length > decided.length && !app.ui.decidedAll ? html`<button class="linkish in-more" data-act="decided-more">Show earlier decisions</button>` : ''}</div>` : '';
     const shown = cur ? cur.page : route.sel && store.byPath.has(route.sel) ? store.byPath.get(route.sel) : null;
     const e = engineView(store);
     const idle = !e.working && !e.unverified;

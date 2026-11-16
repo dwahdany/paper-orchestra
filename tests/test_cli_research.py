@@ -319,6 +319,9 @@ def test_new_takes_a_project_to_its_first_checkpoint_with_the_real_engine(worksp
     assert started.exit_code == 0, started.output
     assert "Checkpoint after research (round 1)" in started.stdout
     assert "Waiting for you: 2 topics" in started.stdout
+    # The checkpoint is said once, by the command: its event is not printed as well.
+    assert (started.stdout + started.stderr).count("await your review") == 1
+    assert "await your review" in started.stdout
     assert "paper-orchestra research review w" in flat(started.stdout)
     events = [line for line in started.stderr.splitlines() if line.strip()]
     assert any("intake" in line for line in events) and any("scout" in line for line in events)
@@ -328,6 +331,32 @@ def test_new_takes_a_project_to_its_first_checkpoint_with_the_real_engine(worksp
     assert data["state"]["status"] == "checkpoint" and data["state"]["phase"] == "research"
     assert data["counts"]["pending"]["total"] == 0
     assert data["counts"]["by_kind"]["topic"] == 2
+
+
+def test_without_a_model_the_command_says_once_what_to_set_up_and_exits_with_3(workspace):
+    """The real engine, and no credential (as in every test): nothing that needs a model
+    starts, the reason is one sentence said once, and the exit code says that this is
+    something to set up, not a failure of the project."""
+    pytest.importorskip("paper_orchestra.research.engine")
+    from paper_orchestra.llm.router import reset_clients
+
+    reset_clients()
+    started = invoke("new", "--brief", "Small batches need warmup under Adam.", "--dir", "w")
+    again = invoke("advance", "w")
+    named = invoke("advance", "w", "--phase", "hypothesize")
+
+    assert (started.exit_code, again.exit_code, named.exit_code) == (cli.NEEDS_A_MODEL, 3, 3)
+    assert "Created the research project" in started.stdout
+    for result, phase in ((started, "intake"), (again, "intake"), (named, "hypothesis")):
+        said = flat(result.stderr)
+        assert f"The {phase} phase needs a model, and the model set for research, reasoning" in said
+        assert said.count("ANTHROPIC_API_KEY") == 1 and said.count("needs a model") == 1
+        assert "Configure one of" not in said and "Error:" not in said
+        assert "paper-orchestra doctor" in said
+    # Nothing happened to the project: it has not started, and no error is on record.
+    project = Project.open("w")
+    assert [event["type"] for event in project.events()] == ["project.created"]
+    assert "Not started: no phase has run yet." in invoke("status", "w").stdout
 
 
 # -- finding the project -------------------------------------------------------------
@@ -381,7 +410,8 @@ def test_status_summarises_round_phase_what_is_waiting_experiments_and_cost(proj
     assert result.exit_code == 0, result.output
     out = flat(result.stdout)
     assert "Warmup for small batches" in out and project.id in out
-    assert "Round 2, checkpoint after design; next: run" in out
+    # A phase is named as the app names it, not by the word a file or an option uses.
+    assert "Round 2, checkpoint after experiment design; next: runs" in out
     assert "1 experiment is ready to approve." in out
     assert "Waiting for you: 1 question, 1 hypothesis" in out
     assert "Experiments: 1 approved" in out
@@ -392,6 +422,95 @@ def test_status_summarises_round_phase_what_is_waiting_experiments_and_cost(proj
     assert "(one run may take up to 900 s)" in out
     assert "120 s of 900 s" not in out
     assert f"paper-orchestra research review {project.root}" in out
+
+
+def test_status_says_what_the_phase_did_and_what_waits_now_not_what_waited_then(project):
+    summary = (
+        "The theorist proposed 2 hypotheses. E1 is planned again: Not run: it is not what "
+        "was approved at 2026-11-15T11:58:00Z (main.py: changed after the approval, written "
+        "by human at 2026-11-15T11:59:30Z). 2 hypotheses, 1 question and 1 experiment await "
+        "your review. Next: designing experiments for the hypotheses you accepted."
+    )
+    recorded = {
+        "round": 1,
+        "phase": "hypothesize",
+        "at": "2026-11-15T12:00:00Z",
+        "summary": summary,
+        "pending": {"hypothesis": 2, "question": 1, "experiment": 1},
+    }
+    write_json(
+        project.root / "state.json",
+        checkpoint_state(phase="hypothesize", next_phase="design", checkpoint=recorded),
+    )
+    before = flat(invoke("status", str(project.root)).stdout)
+    # While they wait, the count is said once, live; the checkpoint's own count and its
+    # "Next:" are left to the lines that are true now.
+    assert "The theorist proposed 2 hypotheses." in before
+    assert "await your review" not in before and "Next: designing" not in before
+    assert "Waiting for you: 1 question, 2 hypotheses, 1 experiment" in before
+
+    for ref in ("H1", "H2", "Q1", "E1"):
+        project.review(ref, "accept")
+    result = invoke("status", str(project.root))
+
+    out = flat(result.stdout)
+    assert "Round 1, checkpoint after hypotheses; next: experiment design" in out
+    assert "The theorist proposed 2 hypotheses." in out
+    assert "await your review" not in out and "Next: designing" not in out
+    assert "Nothing is waiting for you." in out
+    # A time is said as a person reads one, not as a file stores it; "human" is you.
+    assert "2026-11-15T" not in out and "by you" in out
+    assert "it is not what was approved on 15 Nov 2026 at " in out
+    # The machine-readable form keeps the checkpoint as it was recorded.
+    data = json.loads(invoke("status", str(project.root), "--json").stdout)
+    assert data["state"]["checkpoint"] == recorded
+
+
+def test_status_of_a_demonstration_says_that_its_cost_is_the_storys(workspace):
+    demo = Project.create(
+        workspace / "research" / "demo", title="Demonstration", brief="x", demonstration=True
+    )
+    write_json(demo.root / "state.json", checkpoint_state())
+    plain = Project.create(workspace / "research" / "plain", title="Plain", brief="x")
+    write_json(plain.root / "state.json", checkpoint_state())
+
+    out = flat(invoke("status", str(demo.root)).stdout)
+
+    assert "Spent: $3.21 of $25.00 on models (the cost of the story this demonstration" in out
+    assert "no model was called" in out
+    assert "no model was called" not in invoke("status", str(plain.root)).stdout
+
+
+def test_status_takes_the_account_of_a_checkpoint_from_where_the_engine_keeps_it(project):
+    recorded = {
+        "round": 2,
+        "phase": "design",
+        "at": "2026-11-15T12:00:00Z",
+        # A sentence that happens to end like a count is the account's own.
+        "did": "Round 2, design: 2 experiments are planned. Both are waiting for you.",
+        "summary": "Round 2, design: 2 experiments are planned. Both are waiting for you. "
+        "1 question, 2 hypotheses and 1 experiment are waiting for you.",
+        "pending": {"hypothesis": 2},
+    }
+    write_json(
+        project.root / "state.json",
+        checkpoint_state(round=2, phase="design", next_phase="run", checkpoint=recorded),
+    )
+
+    out = flat(invoke("status", str(project.root)).stdout)
+
+    assert "Round 2, design: 2 experiments are planned. Both are waiting for you." in out
+    assert "1 question, 2 hypotheses and 1 experiment are waiting for you" not in out
+    # Without the field (a project of an earlier version, the demonstration as it was
+    # built before), the stale end of the sentence is left out all the same.
+    del recorded["did"]
+    write_json(
+        project.root / "state.json",
+        checkpoint_state(round=2, phase="design", next_phase="run", checkpoint=recorded),
+    )
+    out = flat(invoke("status", str(project.root)).stdout)
+    assert "Round 2, design: 2 experiments are planned. Both are waiting for you." in out
+    assert "1 question, 2 hypotheses and 1 experiment are waiting for you" not in out
 
 
 @pytest.fixture
@@ -457,7 +576,7 @@ def test_status_tells_a_live_worker_from_one_that_died(project):
     )
     write_json(project.root / "state.json", alive)
     running = flat(invoke("status", str(project.root)).stdout)
-    assert f"Round 1, research is running (pid {os.getpid()})" in running
+    assert f"Round 1, at work on research (pid {os.getpid()})" in running
     assert json.loads(invoke("status", str(project.root), "--json").stdout)["worker_alive"] is True
 
     dead = checkpoint_state(status="running", checkpoint=None, worker=worker(2**22 - 3, long_ago))
@@ -710,6 +829,31 @@ def test_review_without_a_decision_lists_what_is_waiting(project):
         assert any(ref in line and text in line for line in out.splitlines()), ref
     assert "--accept" in out and "--reject" in out
     assert project.counts()["pending"]["total"] == 5  # listing decides nothing
+    # Who proposed each is said in words, as the app says it; "agent:scout" is how a file
+    # names an author.
+    assert "agent:" not in out
+    lines = out.splitlines()
+    assert next(line for line in lines if "Q1" in line).endswith("(proposed by the scout)")
+    assert next(line for line in lines if "E1" in line).endswith("(proposed by the designer)")
+    edit = next(line for line in lines if proposal.id in line)
+    assert edit.endswith("(suggested by the analyst)")
+    # The page an edit would change is named as pages are named: by its title (or its id).
+    assert 'edit of "Warmup for small batches": Sharpen the claim' in edit
+    assert "wiki/idea.md:" not in edit
+    # ... and so is the side of a diff that is the suggestion.
+    assert "(as the analyst suggests it)" in out and "(as it is)" in out
+
+
+def test_a_rejection_without_a_reason_says_what_the_agents_will_see(project):
+    without = invoke("review", str(project.root), "--reject", "H2")
+    given = invoke("review", str(project.root), "--reject", "Q1", "--reason", "Out of scope")
+
+    assert without.exit_code == given.exit_code == 0
+    assert "No reason was recorded: the agents see its title and that you turned it down" in flat(
+        without.stdout
+    )
+    assert "--reason" in without.stdout
+    assert "No reason was recorded" not in given.stdout
 
 
 def test_what_agents_and_runs_wrote_is_printed_without_control_characters(project, engine):
@@ -829,6 +973,8 @@ def test_review_decides_an_edit_proposal_by_its_id(project):
     assert result.exit_code == 0, result.output
     assert project.page("wiki/idea.md").body == "Sharper.\n"
     assert f"Accepted {proposal.id}: Sharpen the claim" in result.stdout
+    # ... an edit of the page named as pages are named, not of a file.
+    assert 'Sharpen the claim (an edit of "Warmup for small batches")' in result.stdout
 
 
 def test_review_shows_what_an_edit_changes_before_and_when_it_is_accepted(project):
@@ -1127,6 +1273,23 @@ def test_approve_reports_a_refusal_and_exits_with_1(project, monkeypatch):
     assert "Error: E1 is proposed, not accepted." in flat(result.stderr)
 
 
+def test_approve_of_a_page_that_is_not_accepted_names_the_command_that_accepts_it(project):
+    """The real approval: the README's order of commands leaves out accepting the page,
+    and the refusal has to say how that is done."""
+    result = invoke("approve", str(project.root), "E1")
+
+    assert result.exit_code == 1
+    said = flat(result.stderr)
+    assert "Error: E1 is proposed, not accepted." in said
+    assert f"`paper-orchestra research review {project.root} --accept E1`" in said
+    assert project.page("E1").state == "planned"
+
+    # A page the person turned down is named the same way: accepting it after all.
+    project.review("E1", "reject", reason="Not this one.")
+    said = flat(invoke("approve", str(project.root), "E1").stderr)
+    assert "Error: E1 is rejected, not accepted." in said and "--accept E1" in said
+
+
 # -- run -----------------------------------------------------------------------------
 
 
@@ -1204,6 +1367,51 @@ def test_run_says_nothing_about_new_results_when_nothing_ran(approved, engine):
 
     assert result.exit_code == 1
     assert result.stdout.strip() == ""
+
+
+def test_a_run_that_was_cancelled_is_not_announced_as_a_result_to_analyse(approved, engine):
+    engine.runs = {"E1": run_record("E1", 1, "cancelled", error="Cancelled by you.")}
+
+    result = invoke("run", str(approved.root))
+
+    assert result.exit_code == 1
+    out = flat(result.stdout)
+    assert "E1 run 1 was cancelled after 4.2 s" in out
+    assert "analyses the new results" not in out
+
+
+def test_status_says_which_approved_experiment_will_not_run_and_what_a_cancelled_one_has(
+    project,
+):
+    from paper_orchestra.research import experiments
+
+    project.review("E1", "accept")
+    experiments.write_code(project, "E1", {"main.py": "print('hello')\n"}, author="human")
+    experiments.approve(project, "E1")
+    write_json(project.root / "state.json", checkpoint_state())
+    assert "will not run" not in invoke("status", str(project.root)).stdout
+
+    # The code changes after the approval: the experiment still reads approved, and the
+    # summary says that it will not run as it is, why, and how to approve it again.
+    experiments.write_code(project, "E1", {"main.py": "print('changed')\n"}, author="human")
+    out = flat(invoke("status", str(project.root)).stdout)
+    assert "Experiments: 1 approved" in out
+    assert "E1 reads approved but will not run: it is not what was approved on " in out
+    assert "main.py" in out and "2026-" not in out.split("will not run", 1)[1].split("`")[0]
+    assert f"`paper-orchestra research approve {project.root} E1`" in out
+
+    # An experiment whose last run was cancelled, after one that succeeded.
+    experiments.withdraw(project, "E1")
+    run_dir = project.experiment_dir("E1") / "runs"
+    for number, status in ((1, "succeeded"), (2, "cancelled")):
+        (run_dir / str(number)).mkdir(parents=True)
+        write_json(run_dir / str(number) / "run.json", run_record("E1", number, status))
+    experiments.approve(project, "E1")
+    for state in ("queued", "running", "cancelled"):
+        project.set_state("E1", state, by="system")
+    out = flat(invoke("status", str(project.root)).stdout)
+    assert "Experiments: 1 cancelled" in out
+    assert "E1 is cancelled; its run 1 succeeded." in out
 
 
 def test_run_says_once_that_the_project_has_a_worker(approved, engine):

@@ -17,7 +17,8 @@
 Exit codes: 0 on success, 1 when the pipeline (or a check) failed, 2 for a
 usage or validation error, 130 when the command was interrupted (Ctrl-C or
 SIGTERM).  For ``research advance`` that reads: 0 at a checkpoint, 1 when the
-engine failed, 130 when it was stopped.
+engine failed, 3 when the phase that would run needs a model and none can be
+used (nothing was started; the project is as it was), 130 when it was stopped.
 
 The research commands and ``ui`` import what they drive (the project store, the
 engine, the web app) when they run, so that every other command starts without
@@ -93,6 +94,10 @@ LEGACY_OPTIONS = {
 LEGACY_USE_PLOTTING = "--use_plotting"
 #: Exit code of a command that was interrupted (Ctrl-C or SIGTERM).
 INTERRUPTED = 130
+#: Exit code of a research command that started nothing because the phase that would run
+#: needs a model and none can be used.  It is no failure of the project: the web server
+#: tells such an end of a worker from one that died by this number.
+NEEDS_A_MODEL = 3
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
@@ -158,7 +163,10 @@ class _Effort(StrEnum):
 
 app = typer.Typer(
     name="paper-orchestra",
-    help="Turn an idea and an experimental log into a LaTeX paper.",
+    help="From an idea to a research wiki: agents propose sources, hypotheses, experiments "
+    "and findings, you decide, and a paper can be written from it. `research` and `ui` are "
+    "the workspace; `write` and `batch` turn an idea and an experimental log into a LaTeX "
+    "paper directly.",
     no_args_is_help=True,
     add_completion=False,
     # A traceback with local variables could print credentials.
@@ -903,10 +911,14 @@ class _EventPrinter:
     shows everything that happened to the project in that time, whoever wrote it.
     """
 
-    def __init__(self, project: Project) -> None:
+    def __init__(self, project: Project, *, leave_out: Sequence[str] = ()) -> None:
+        """``leave_out`` are the types of event the command says itself when it ends (the
+        checkpoint, for ``advance``): printed here as well, a person would read the same
+        sentence twice."""
         from paper_orchestra.research.project import EVENTS_FILE
 
         self._project = project
+        self._leave_out = frozenset(leave_out)
         self._file = project.root / EVENTS_FILE
         earlier = project.events()
         self._seen = earlier[-1]["seq"] if earlier else 0
@@ -948,7 +960,8 @@ class _EventPrinter:
             self._size = size
             for event in self._project.events(after=self._seen):
                 self._seen = event["seq"]
-                _say(_event_line(event), err=True)
+                if event.get("type") not in self._leave_out:
+                    _say(_event_line(event), err=True)
 
 
 def _event_line(event: Mapping[str, Any]) -> str:
@@ -970,13 +983,28 @@ def _working(project: Project, command: str = "advance") -> Iterator[_EventPrint
 
     _restore_interrupt()
     _sweep(project)
+    # `advance` ends by saying its checkpoint in full; `run` reaches none.
+    said_at_the_end = ("checkpoint",) if command == "advance" else ()
     try:
-        with _EventPrinter(project) as events:
+        with _EventPrinter(project, leave_out=said_at_the_end) as events:
             yield events
     except KeyboardInterrupt:
         _stopped(project, command)
     except (ProjectError, ComputeError, LLMError) as exc:
+        if _needs_a_model(exc):
+            # Not an error of the project: said once, as the engine says it.
+            _say(str(exc), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(NEEDS_A_MODEL) from None
         _fail(str(exc), code=1)
+
+
+def _needs_a_model(exc: BaseException) -> bool:
+    """Whether the engine refused because the phase that would run needs a model and none
+    can be used (``engine.ModelNeeded``).  Only the engine raises it, so it is loaded by
+    the time one arrives."""
+    engine = sys.modules.get("paper_orchestra.research.engine")
+    refusal = getattr(engine, "ModelNeeded", None)
+    return isinstance(refusal, type) and isinstance(exc, refusal)
 
 
 def _sweep(project: Project) -> None:
@@ -1058,15 +1086,18 @@ def _where_it_stands(state: Mapping[str, Any]) -> str:
                 "(state.json is missing or cannot be read)."
             )
         return "Not started: no phase has run yet."
-    phase = state.get("phase") or "no phase"
+    from paper_orchestra.research.model import phase_name
+
+    # A phase is named as the app names it, not by the word a file or an option uses.
+    phase = phase_name(state["phase"]) if state.get("phase") else "no phase"
     line = f"Round {state.get('round', 0)}, "
-    following = f"; next: {state['next_phase']}" if state.get("next_phase") else ""
+    following = f"; next: {phase_name(state['next_phase'])}" if state.get("next_phase") else ""
     if status == "checkpoint":
         return line + f"checkpoint after {phase}{following}"
     if status == "running":
         worker = _mapping(state.get("worker"))
         return (
-            line + f"{phase} is running" + (f" (pid {worker['pid']})" if worker.get("pid") else "")
+            line + f"at work on {phase}" + (f" (pid {worker['pid']})" if worker.get("pid") else "")
         )
     if status == "failed":
         return line + f"failed in {phase}: {_sentence(state.get('error') or 'no error recorded')}"
@@ -1111,31 +1142,123 @@ def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str,
     return "Next: " + "; ".join(steps) + "."
 
 
+#: What a checkpoint's sentence ends in: what comes next, and before it the count of what
+#: waited (as the engine says it, and as the demonstration project does).
+_SAID_NEXT = re.compile(r"(?:^|(?<=[.!?…]\s))Next: [^.]*\.\s*$")
+_SAID_WAITING = re.compile(
+    r"(?:^|(?<=[.!?…]\s))[^.!?]*\b(?:(?:is|are) waiting for you|awaits? your review)\.\s*$"
+)
+_STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
+_AT_STAMP = re.compile(rf"\b(at )?({_STAMP})")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _account(checkpoint: Mapping[str, Any]) -> str:
+    """What the phases did, as their checkpoint tells it, without what was true at that
+    moment only: how many things waited for the person and what was next.  Both are said
+    from the project as it is now, on lines of their own.
+
+    The engine keeps that account by itself (``did``).  A checkpoint without it (written
+    by an earlier version) has it in its summary, before those two sentences.
+    """
+    did = checkpoint.get("did")
+    if isinstance(did, str) and did.strip():
+        return " ".join(did.split())
+    summary = checkpoint.get("summary")
+    told = " ".join(summary.split()) if isinstance(summary, str) else ""
+    return _SAID_WAITING.sub("", _SAID_NEXT.sub("", told).rstrip()).rstrip()
+
+
+def _readable(text: str) -> str:
+    """A sentence of the project as a person reads it at a terminal: a time is said in
+    local time (``on 16 Nov 2026 at 15:54``) where a record holds a stamp, and the
+    author ``human`` is ``you``, as in the app."""
+    from paper_orchestra.research.model import parse_stamp
+
+    def said(match: re.Match[str]) -> str:
+        moment = parse_stamp(match.group(2))
+        if moment is None:
+            return match.group(0)
+        local = moment.astimezone()
+        day = f"{local.day} {_MONTHS[local.month - 1]} {local.year}"
+        clock = f"{local.hour:02d}:{local.minute:02d}"
+        return f"on {day} at {clock}" if match.group(1) else f"{day}, {clock}"
+
+    return re.sub(r"\bby (?:the )?human\b(?!-)", "by you", _AT_STAMP.sub(said, text))
+
+
 def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
-    """The compact summary of a project: where it stands, what waits, what it cost."""
+    """The compact summary of a project: where it stands, what waits, what it cost.
+
+    Of a checkpoint it repeats what the phases did.  What waits is counted now: the
+    count the checkpoint took is not said again once the person has decided things.
+    """
     counts = project.counts()
     lines = [f"  {_where_it_stands(state)}"]
     checkpoint = _mapping(state.get("checkpoint"))
-    if state.get("status") == "checkpoint" and checkpoint.get("summary"):
-        lines.append(f"  {_sentence(checkpoint['summary'])}")
+    if state.get("status") == "checkpoint":
+        did = _account(checkpoint)
+        if did:
+            lines.append(f"  {_readable(_sentence(did))}")
     if counts["pending"]["total"]:
         lines.append(f"  Waiting for you: {_waiting(counts)}")
+    elif state.get("status") == "checkpoint":
+        lines.append("  Nothing is waiting for you.")
     board = [f"{count} {name}" for name, count in counts["experiments"].items() if count]
     if board:
         lines.append(f"  Experiments: {', '.join(board)}")
+        lines += _experiment_notes(project)
     if counts["requests"]["open"]:
         lines.append(f"  {_plural(counts['requests']['open'], 'open request')} for the agents")
     spent, limits = _mapping(state.get("spent")), project.settings.limits
     # The two budgets are totals; the time limit is per run, so the time used is only told.
+    # A demonstration's model cost is part of what was written for it, not a bill.
+    story = (
+        " (the cost of the story this demonstration tells: no model was called)"
+        if project.demonstration
+        else ""
+    )
     lines.append(
         f"  Spent: ${_amount(spent.get('model_usd')):.2f} of ${limits.model_usd:.2f} on "
-        f"models; ${_amount(spent.get('experiment_usd')):.2f} of "
+        f"models{story}; ${_amount(spent.get('experiment_usd')):.2f} of "
         f"${limits.experiment_usd:.2f} on experiments, which ran for "
         f"{_amount(spent.get('experiment_seconds')):.0f} s in all (one run may take up to "
         f"{limits.experiment_seconds:.0f} s)"
     )
     lines += _problem_lines(project)
     lines.append(_next_steps(project, state, counts))
+    return lines
+
+
+def _experiment_notes(project: Project) -> list[str]:
+    """What the count of experiments by state does not say, one line each: an experiment
+    that reads approved and will not run as it stands (it changed since the approval),
+    and one that reads cancelled or failed although an earlier run of it succeeded."""
+    from paper_orchestra.research.model import ProjectError
+
+    waits, over = ("approved", "queued", "running"), ("cancelled", "failed")
+    pages = [page for page in project.pages(kind="experiment") if page.state in waits + over]
+    if not pages:
+        return []
+    # (Loaded for these experiments only: it is the module that runs them.)
+    from paper_orchestra.research import experiments
+
+    root, lines = _quoted(project.root), []
+    for page in pages:
+        name = page.id or page.path
+        with contextlib.suppress(ProjectError, OSError):
+            if page.state in over:
+                found = experiments.last_success(project, page.path)
+                if found:
+                    lines.append(f"  {name} is {page.state}; its run {found['number']} succeeded.")
+            elif page.review == "accepted":
+                reason = experiments.will_not_run(project, page.path)
+                if reason:
+                    lines.append(
+                        f"  {name} reads {page.state} but will not run: {_readable(reason)}. "
+                        f"`paper-orchestra research approve {root} {name}` approves it as it "
+                        "is now."
+                    )
     return lines
 
 
@@ -1217,8 +1340,11 @@ def _advance(project: Project, *, phase: str | None, instruction: str | None) ->
     status = state.get("status")
     root = _quoted(project.root)
     if status == "failed":
+        from paper_orchestra.research.engine import phase_in_words
+
+        failed = phase_in_words(state["phase"]) if state.get("phase") else "the current phase"
         _fail(
-            f"The {state.get('phase') or 'current'} phase failed: "
+            f"{failed[0].upper()}{failed[1:]} failed: "
             f"{_sentence(state.get('error') or 'no error was recorded')} The activity above "
             f"and {project.root / 'state.json'} have the details. Once the cause is dealt "
             f"with, `paper-orchestra research advance {root}` tries the phase again.",
@@ -1228,10 +1354,14 @@ def _advance(project: Project, *, phase: str | None, instruction: str | None) ->
         _stopped(project)
     checkpoint = _mapping(state.get("checkpoint"))
     if status == "checkpoint" and checkpoint:
+        from paper_orchestra.research.model import phase_name
+
+        # Said at the moment of the pause, so the whole of it is true: what was done,
+        # what waits and what comes next.
         _say(
-            f"Checkpoint after {checkpoint.get('phase') or state.get('phase')} "
+            f"Checkpoint after {phase_name(checkpoint.get('phase') or state.get('phase'))} "
             f"(round {checkpoint.get('round', state.get('round', 0))}): "
-            f"{_sentence(checkpoint.get('summary') or 'the phase is complete')}"
+            f"{_readable(_sentence(checkpoint.get('summary') or 'the phase is complete'))}"
         )
     else:
         _say(_where_it_stands(state))
@@ -1434,7 +1564,10 @@ def research_advance(
 
     Prints one line per event to stderr as it goes.  Ctrl-C (or SIGTERM) stops at the
     next model call or ends the running job; the same command continues afterwards.
-    Exit codes: 0 at a checkpoint, 1 when the engine failed, 130 when it was stopped.
+    What you approved runs without a model; the agents need one.
+
+    Exit codes: 0 at a checkpoint, 1 when the engine failed, 3 when the next phase needs
+    a model and none can be used (nothing was started), 130 when it was stopped.
     """
     _advance(_open_project(project), phase=phase.value if phase else None, instruction=instruction)
 
@@ -1489,11 +1622,21 @@ def _edit_changes(project: Project, proposal: EditProposal) -> list[str]:
     diff = difflib.unified_diff(
         page.body.splitlines(),
         proposal.body.splitlines(),
-        fromfile=f"{page.path} (now)",
-        tofile=f"{page.path} (proposed by {proposal.author})",
+        fromfile=f"{page.path} (as it is)",
+        tofile=f"{page.path} (as {_author_in_words(proposal.author)} suggests it)",
         lineterm="",
     )
     return [*lines, "text:", *diff]
+
+
+def _author_in_words(author: str) -> str:
+    """``the scout`` for ``agent:scout``, ``you`` for the person, ``the engine`` for what
+    code wrote: an author as the app names them."""
+    from paper_orchestra.research.model import HUMAN, is_agent, role_of
+
+    if author == HUMAN:
+        return "you"
+    return f"the {role_of(author)}" if is_agent(author) else "the engine"
 
 
 def _say_changes(project: Project, proposal: EditProposal, indent: str) -> None:
@@ -1551,6 +1694,18 @@ def _checked_numbers(project: Project, item: ResearchPage | EditProposal) -> lis
     return []
 
 
+def _page_named(project: Project, path: str) -> str:
+    """A page as a line for the person names it: its id (``H2``) or its title in quotation
+    marks; the path only for a page that is gone."""
+    from paper_orchestra.research.model import ProjectError
+
+    try:
+        page = project.page(path)
+    except ProjectError:
+        return path
+    return page.id or f'"{page.title}"'
+
+
 def _list_pending(project: Project) -> None:
     from paper_orchestra.research.model import EditProposal
 
@@ -1563,8 +1718,14 @@ def _list_pending(project: Project) -> None:
     width = max(len(item["ref"]) for item in waiting)
     indent = " " * (width + 6)
     for item, source in zip(waiting, pending, strict=True):
-        what = f"edit of {item['target']}:" if item["kind"] == "edit" else item["kind"]
-        _say(f"  {item['ref'].ljust(width)}  {what} {item['title']}  [{item['author']}]")
+        what = (
+            f"edit of {_page_named(project, item['target'])}:"
+            if item["kind"] == "edit"
+            else item["kind"]
+        )
+        verb = "suggested" if item["kind"] == "edit" else "proposed"
+        who = f"({verb} by {_author_in_words(item['author'])})"
+        _say(f"  {item['ref'].ljust(width)}  {what} {item['title']}  {who}")
         if isinstance(source, EditProposal):
             # Shown here, before anything can be accepted: the summary is the agent's word.
             _say_changes(project, source, indent)
@@ -1596,7 +1757,8 @@ def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bo
         return False
     verb = "Accepted" if decision == "accept" else "Rejected"
     if isinstance(outcome, EditProposal):
-        _say(f"{verb} {outcome.id}: {outcome.summary} ({outcome.target})")
+        target = _page_named(project, outcome.target)
+        _say(f"{verb} {outcome.id}: {outcome.summary} (an edit of {target})")
         for line in changes:
             _say(f"    {line}")
         if decision == "accept":
@@ -1604,6 +1766,12 @@ def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bo
         return True
     name = outcome.id or outcome.path
     _say(f'{verb} {name}: {outcome.kind} "{outcome.title}"')
+    if decision == "reject" and not outcome.decision_reason:
+        # Said as it is: the agents are told why a page was turned down only if you say.
+        _say(
+            "  No reason was recorded: the agents see its title and that you turned it down, "
+            "not why. `--reason TEXT` with the rejection tells them."
+        )
     if decision == "accept" and outcome.kind == "experiment" and outcome.state == "planned":
         _say(
             f"  {name} is accepted as a plan; nothing runs until you approve it: "
@@ -1774,7 +1942,7 @@ def research_approve(
             network=network,
         )
     except (ProjectError, ComputeError) as exc:
-        _fail(str(exc), code=1)
+        _fail(str(exc) + _how_to_accept(opened, experiment), code=1)
     name, root = page.id or page.path, _quoted(opened.root)
     _say(
         f"{name} is approved to run{_approved_as(page)}. `paper-orchestra research run "
@@ -1783,6 +1951,22 @@ def research_approve(
     )
     for line in _what_was_approved(opened, page):
         _say(line)
+
+
+def _how_to_accept(project: Project, ref: str) -> str:
+    """For an approval that was refused: when the experiment's page is not accepted, the
+    command that accepts it (the refusal says that it has to be, not how); else nothing."""
+    from paper_orchestra.research.model import ProjectError
+
+    with contextlib.suppress(ProjectError, OSError):
+        page = project.page(ref)
+        if page.kind == "experiment" and page.review != "accepted":
+            name = page.id or page.path
+            return (
+                f" `paper-orchestra research review {_quoted(project.root)} --accept {name}` "
+                "accepts it."
+            )
+    return ""
 
 
 def _what_was_approved(project: Project, page: ResearchPage) -> list[str]:
@@ -1937,7 +2121,8 @@ def research_run(
             events.flush()
             _say(_run_line(opened, record))
             outcomes.append(str(record.get("status")))
-    if any(outcomes):
+    # A run the person cancelled left nothing to analyse.
+    if any(outcome in ("succeeded", "failed") for outcome in outcomes):
         _say(
             f"Next: `paper-orchestra research advance {root}` analyses the new results "
             "before anything else and stops at the checkpoint after the analysis "
@@ -2044,7 +2229,7 @@ def research_cancel(
         _fail(str(exc))
     again = f"`paper-orchestra research approve {root} {name}` approves a run of it again."
     if withdrawn:
-        _say(f"{name} is a plan again: its approval was withdrawn and nothing ran. {again}")
+        _say(f"{name} is a plan again: its approval was taken back and nothing ran. {again}")
     elif before not in ("approved", "queued", "running"):
         _say(f"{name} is {before}: there is nothing to cancel.")
     elif after == "cancelled":
@@ -2647,6 +2832,29 @@ def modal_batch(
     except modal.exception.Error as exc:
         _fail(f"Modal reported {type(exc).__name__}: {exc}", code=1)
     _report_batch(papers, log_path)
+
+
+def _unwrap_descriptions(*apps: typer.Typer) -> None:
+    """Give every command its description as paragraphs of one line each.
+
+    A description is its function's docstring, whose lines break where the source is
+    100 columns wide.  The help is wrapped to the terminal; kept as they are, those
+    breaks would be breaks on the screen too, and a paragraph would be wrapped twice,
+    with a word or two alone on every other line.  A help text that was given as such
+    is left as it was written.
+    """
+    import inspect
+
+    for group in apps:
+        for command in group.registered_commands:
+            if command.help:
+                continue  # written out for the help as it is (the options of `modal run`)
+            text = inspect.getdoc(command.callback) or ""
+            paragraphs = [" ".join(paragraph.split()) for paragraph in text.split("\n\n")]
+            command.help = "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
+
+
+_unwrap_descriptions(app, research_app, memory_app, modal_app)
 
 
 def _send_logs_to_stderr() -> None:

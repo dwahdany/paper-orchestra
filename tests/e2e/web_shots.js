@@ -109,6 +109,8 @@ const SIZES = [
      title) are told apart by how many pages they hold */
   let demo = null, large = null;
   for (const row of listing.projects) {
+    /* (a third copy in a folder named `nomodel` belongs to web_check.js, which changes it) */
+    if (row.dir === 'nomodel') continue;
     const view = await (await fetch(BASE + '/api/projects/' + row.id, { headers: AUTH })).json();
     if (/150 pages/.test(row.title) || ((view.counts || {}).pages || 0) >= 140) large = large || row;
     else if (/^Demonstration/.test(row.title) && !demo) demo = row;

@@ -3,8 +3,8 @@
 
 import { VIEWS, app, hrefOf, link } from './core.js';
 import { connection, RESTARTED } from './api.js';
-import { clock, dateTime, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, storage, tf } from './util.js';
-import { KIND, PHASE_DO, STAGES, icon, phaseName } from './vocab.js';
+import { clock, codeSpans, dateTime, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, storage, tf, whyNot } from './util.js';
+import { KIND, PHASE_DO, STAGES, icon, lapsed, phaseName } from './vocab.js';
 
 const MARK = raw('<svg class="brand-mark" width="18" height="18" viewBox="-10 -10 20 20" aria-hidden="true"><circle r="8"/><circle class="core" r="3"/></svg>');
 
@@ -55,7 +55,11 @@ export function engineView(store) {
      and never as a project that has not started. */
   const unknown = source === 'unknown' && !busy;
   const exit = worker.last_exit || null;
-  const crashed = !busy && exit && !exit.stopped && exit.code !== 0 && exit.code != null && (exit.kind === 'advance' || exit.code < 0) && mode !== 'failed' && !died;
+  /* A worker that started nothing because its phase needs a model, and none can be used, did
+     not die: the server tells the two ends apart by a field (`reason`), and this one is
+     something to set up, said beside the button, not an accident with a log to read. */
+  const neededModel = !busy && !!exit && exit.reason === 'needs_model';
+  const crashed = !busy && exit && !neededModel && !exit.stopped && exit.code !== 0 && exit.code != null && (exit.kind === 'advance' || exit.code < 0) && mode !== 'failed' && !died;
   return {
     mode, stopping, kind, budget, lifted, died, crashed, exit, unverified,
     /* agents, a run or the write-up are at work, and this server can stop them */
@@ -107,15 +111,18 @@ export function waitingSentence(store) {
     owed; `needs_phase`: a press would be refused until a phase is named). Nothing of that is
     worked out here: this only finds the words for it.
 
-    `{known, blocked, steps, back, label, says, tip, href, pick, waiting, results}`: whether
-    the server said what a press does; whether no press is offered at all (nothing says where
-    the project stands, and the server could not say what a press would do either: its
-    sentence says what to put right); the phases the press runs; the phase that was next and is
-    still next afterwards, when something else comes first; the words on the button; a sentence for beside it when
-    the button cannot say it all; the same with the fine print; where a press would do
-    nothing, the address the button leads to instead; whether the button opens the list of
-    phases, because one has to be named; the experiments that wait for a run, and how many
-    results wait for an analysis. */
+    `{known, blocked, steps, back, label, says, tip, href, pick, waiting, results, held,
+    need}`: whether the server said what a press does; whether no press is offered at all
+    (nothing says where the project stands, and the server could not say what a press would
+    do either: its sentence says what to put right); the phases the press runs; the phase
+    that was next and is still next afterwards, when something else comes first; the words on
+    the button; a sentence for beside it when the button cannot say it all; the same with the
+    fine print; where a press would do nothing, the address the button leads to instead;
+    whether the button opens the list of phases, because one has to be named; the experiments
+    that wait for a run, and how many results wait for an analysis; the experiments that read
+    approved and will not run, each with the server's reason (`not_running`); and, where the
+    press stops because a phase needs a model that cannot be used (`blocked` of the
+    forecast), that phase and the engine's one sentence about what is missing. */
 export function nextStep(store, e) {
   e = e || engineView(store);
   const p = store.project || {};
@@ -123,7 +130,7 @@ export function nextStep(store, e) {
   const list = (value) => (Array.isArray(value) ? value.filter((x) => typeof x === 'string' && x) : []);
   const ids = said ? list(said.experiments) : [], results = said ? +said.results || 0 : 0;
   const resume = e.mode === 'stopped' || e.died || e.lifted;
-  const out = { known: false, steps: [], back: null, label: 'Continue', says: '', tip: '', href: '', pick: false, waiting: ids, results };
+  const out = { known: false, steps: [], back: null, label: 'Continue', says: '', tip: '', href: '', pick: false, waiting: ids, results, held: [], need: null };
   /* The server did not say (it could not tell, or it is an older one), or the state has just
      moved (it came with the event stream) and the project view, which carries the forecast,
      has not been read since: the button then promises nothing about what comes first. A
@@ -136,6 +143,13 @@ export function nextStep(store, e) {
     return out;
   }
   out.known = true;
+  /* what reads approved and will not run as it stands: named, with the reason, wherever the button is */
+  out.held = (Array.isArray(said.not_running) ? said.not_running : []).filter((x) => x && typeof x.id === 'string' && x.id).map((x) => ({ id: x.id, reason: whyNot(typeof x.reason === 'string' && x.reason ? x.reason : 'it is no longer what was approved') }));
+  /* a phase that needs a model where none can be used: the press stops before it */
+  const stop = said.blocked && typeof said.blocked === 'object' && typeof said.blocked.message === 'string' && said.blocked.message ? said.blocked : null;
+  out.need = stop ? { phase: typeof stop.phase === 'string' ? stop.phase : '', message: plain(stop.message) } : null;
+  /* nothing a press could start needs no model: the button leads to where that is put right */
+  const setUp = () => { out.label = 'Set up a model'; out.href = '#/setup'; out.steps = []; out.tip = 'Nothing can go on without a model: Setup shows what is configured, and what is missing.'; };
   if (said.needs_phase) {
     /* nothing on file says where the project stands: a press without a phase would be refused */
     out.pick = true;
@@ -150,7 +164,7 @@ export function nextStep(store, e) {
       out.label = 'Continue to the checkpoint';
       out.says = 'The ' + phaseName(owed) + ' phase had finished when its worker ended, before it could pause. A press writes its checkpoint and runs nothing' + (then ? '; the next phase is then ' + phaseName(then) + '.' : '.');
       out.tip = out.says;
-    }
+    } else if (out.need) setUp();
     return out;
   }
   const next = e.next || (e.mode === 'stopped' || e.mode === 'failed' ? e.phase : null);
@@ -173,22 +187,32 @@ export function nextStep(store, e) {
     out.label = (again ? 'Run the interrupted experiment' + (one ? '' : 's') + ' again' : one ? 'Run the approved experiment' : 'Run the ' + ids.length + ' approved experiments') + (analysed ? (one ? ', then analyse it' : ', then analyse them') : '');
     if (out.back) {
       out.says = listOf(ids) + (one ? ' runs first' + (analysed ? ' and is analysed. ' : '. ') : ' run first' + (analysed ? ' and are analysed. ' : '. ')) + still(out.back);
-      out.tip = out.says + ' If ' + (one ? 'it cannot be run' : 'none of them can be run') + ', the ' + phaseName(out.back) + ' phase goes ahead instead, and its checkpoint says why.';
+      /* (where that phase needs a model that cannot be used, it does not go ahead in the run's place: the note about the model says so) */
+      out.tip = out.says + (out.need ? '' : ' If ' + (one ? 'it cannot be run' : 'none of them can be run') + ', the ' + phaseName(out.back) + ' phase goes ahead instead, and its checkpoint says why.');
+    } else if (out.need) {
+      /* the run needs no model; what comes after it does, and the press pauses there */
+      out.tip = listOf(ids) + (one ? ' runs' : ' run') + ', and the project pauses there: ' + (phaseName(out.need.phase) || 'what comes next') + ' needs a model that cannot be used yet.';
     }
   } else if (first === 'analyze' && results) {
     out.label = results === 1 ? 'Analyse the new result' : 'Analyse the ' + results + ' new results';
-    out.says = (noRun ? 'No experiment is approved to run. ' : '') + (results === 1 ? 'One result has' : results + ' results have') + ' not been analysed yet: that comes first.' + (out.back ? ' ' + still(out.back) : '');
+    out.says = (noRun && !out.held.length ? 'No experiment is approved to run. ' : '') + (results === 1 ? 'One result has' : results + ' results have') + ' not been analysed yet: that comes first.' + (out.back ? ' ' + still(out.back) : '');
     out.tip = out.says;
   } else if (noRun && run.length === 1) {
     /* nothing is approved and nothing waits to be analysed: the run phase would say so and pause again */
-    const could = store.experiments.some((x) => x.review === 'proposed' || (x.review === 'accepted' && (x.state === 'planned' || !x.state)));
-    out.says = could ? 'No experiment is approved to run. Approve one first, or choose another phase.' : 'There is no experiment to run. Choose another phase from the list beside the button.';
+    const could = store.experiments.some((x) => x.review === 'proposed' || (x.review === 'accepted' && (x.state === 'planned' || !x.state)) || lapsed(x));
+    /* (where no model can be used there is no other phase to choose: the note about the model says so) */
+    out.says = out.held.length ? 'Nothing is approved to run as it stands.' + (out.need ? '' : ' Approve an experiment, or choose another phase.')
+      : could ? 'No experiment is approved to run. Approve one first' + (out.need ? '.' : ', or choose another phase.') : 'There is no experiment to run. Choose another phase from the list beside the button.';
     out.tip = out.says;
-    if (could) { out.label = 'Approve an experiment to run'; out.href = link({ view: 'experiments', sel: '', sub: '' }); out.steps = []; } else out.label = 'Continue without a run';
+    if (could) { out.label = 'Approve an experiment to run'; out.href = link({ view: 'experiments', sel: '', sub: '' }); out.steps = []; }
+    else if (out.need) { out.says = ''; setUp(); }
+    else out.label = 'Continue without a run';
   } else {
     out.label = e.fresh && !e.crashed ? 'Start research' : e.mode === 'failed' ? 'Retry ' + phaseName(first) : resume ? 'Resume ' + phaseName(first) : e.crashed ? (e.fresh ? 'Start again' : 'Try again: ' + phaseName(first)) : 'Continue to ' + phaseName(first);
-    if (noRun) { out.says = 'No experiment is approved to run: the press goes straight on to ' + phaseName(first) + '.'; out.tip = out.says; }
+    if (noRun) { out.says = (out.held.length ? 'The press' : 'No experiment is approved to run: the press') + ' goes straight on to ' + phaseName(first) + '.'; out.tip = out.says; }
   }
+  /* what will not run is part of what the button's fine print says, where the page shows no line for it */
+  if (out.held.length) out.tip = out.held.map((h) => h.id + ' will not run: ' + h.reason + '.').join(' ') + (out.tip ? ' ' + out.tip : '');
   return out;
 }
 /** The phases the person can choose to run in place of what comes next, where choosing them
@@ -201,7 +225,8 @@ export function phaseChoices(store, e, step) {
   const accepted = (kind, test) => store.pages.some((p) => p.kind === kind && p.review === 'accepted' && (!test || test(p)));
   const only = step.steps.length === 1 && !step.href ? step.steps[0] : null;    // what the button does by itself
   const list = [];
-  const add = (phase, when) => { if (when && only !== phase) list.push({ phase, title: PHASE_DO[phase][0], sub: PHASE_DO[phase][1] }); };
+  /* (where no model can be used, a phase that needs one is not offered: only a run needs none) */
+  const add = (phase, when) => { if (when && only !== phase && (!step.need || phase === 'run')) list.push({ phase, title: PHASE_DO[phase][0], sub: PHASE_DO[phase][1] }); };
   const told = step.known || step.settling;
   add('research', true);
   add('hypothesize', accepted('topic') || accepted('question') || accepted('source'));
@@ -248,15 +273,33 @@ export function continueControl(store, e, where, large) {
   if (!choices.length) return main;
   return html`<span class="go${open ? ' open' : ''}" data-menu="${where}">${main}<button class="${cls} go-more" data-act="go-menu" data-where="${where}" aria-haspopup="menu" aria-expanded="${tf(open)}" aria-label="Choose another phase to run" data-tip="Choose another phase to run">${icon('down')}</button>${menu}</span>`;
 }
-/** What stands beside the control: what a press does when the button cannot say all of it,
-    and why the literature might be searched again, with that choice next to the reason.
-    `brief`: the checkpoint's own words stand right above (the overview shows them), so a
-    reason they give already is named in a few words, with its choice. */
+/** What the app adds to the engine's sentence about a model that cannot be used. The server
+    reads its credentials when it starts, so one that is set while it runs is not seen. */
+const RESTART = 'After you set a credential, start the app again: credentials are read when it starts.';
+/** The model a phase needs and cannot use, as something to set up: the engine's one
+    sentence (`need` of the step), where to put it right, and that the app has to be started
+    again. Nothing where the forecast says nothing of it. */
+function needHTML(step) {
+  if (!step.need) return '';
+  return html`<p class="go-rec go-need" data-needs="model">${icon('warn')}<span>${codeSpans(step.need.message)} ${RESTART}</span>${step.href === '#/setup' ? '' : html`<a class="btn btn-s" href="#/setup">Open Setup</a>`}</p>`;
+}
+/** An experiment that reads approved and will not run when the button is pressed: the
+    server's reason, and the way to its page, where it is looked at and approved again. */
+function heldHTML(store, held) {
+  const row = store.expById.get(held.id);
+  return html`<p class="go-rec go-held" data-held="${held.id}">${icon('warn')}<span><b>${held.id} will not run:</b> ${held.reason}. Approve it again if it should run.</span>${row ? html`<a class="btn btn-s" href="${link({ view: 'experiments', sel: row.path, sub: '' })}">Look and approve again</a>` : ''}</p>`;
+}
+/** What stands beside the control: what will not run although it reads approved, what a
+    press does when the button cannot say all of it, what is missing where a phase needs a
+    model, and why the literature might be searched again, with that choice next to the
+    reason. `brief`: the checkpoint's own words stand right above (the overview shows them),
+    so a reason they give already is named in a few words, with its choice. */
 export function continueNotes(store, e, brief) {
   const step = nextStep(store, e), offered = phaseChoices(store, e, step).some((c) => c.phase === 'research');
   const why = offered ? researchReasons(store, e) : [];
-  if (!step.says && !why.length) return '';
-  return html`${step.says ? html`<p class="go-says">${step.says}</p>` : ''}${why.map((w) => html`<p class="go-rec" data-reason="${w.kind}">${icon('again')}<span>${(brief && w.brief) || w.text}${w.page ? html` <a class="linkish" href="${link({ view: 'wiki', sel: w.page.path, sub: '' })}" data-sel="${w.page.path}">Read the journal</a>` : ''}</span>
+  const need = needHTML(step);
+  if (!step.says && !why.length && !step.held.length && !String(need)) return '';
+  return html`${step.held.map((held) => heldHTML(store, held))}${step.says ? html`<p class="go-says">${step.says}</p>` : ''}${need}${why.map((w) => html`<p class="go-rec" data-reason="${w.kind}">${icon('again')}<span>${(brief && w.brief) || w.text}${w.page ? html` <a class="linkish" href="${link({ view: 'wiki', sel: w.page.path, sub: '' })}" data-sel="${w.page.path}">Read the journal</a>` : ''}</span>
     <button class="btn btn-s" data-act="continue-phase" data-phase="research">${PHASE_DO.research[0]}</button></p>`)}`;
 }
 /** What the engine says when state.json did not tell where the project stands and it read
@@ -305,6 +348,11 @@ export function problemsHTML(store) {
   </div></div></section>`;
 }
 
+/** What is said where the model cost of a demonstration is shown (`demonstration` of the
+    project): `research demo` built it without calling a model, and the cost is its story's. */
+export const DEMO_COST = 'A demonstration: no model was called for it. What it says it spent on models is part of the story it tells.';
+const spentTip = (p) => (p && p.demonstration ? DEMO_COST : 'Spent on models, of the limit for this project');
+
 const PAUSE = raw('<svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5v9M10.5 3.5v9"/></svg>');
 const RING = raw('<svg class="ic" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.2"/></svg>');
 
@@ -340,10 +388,10 @@ export function topbar(route) {
   const spent = (p.state || {}).spent || {};
   return html`<a class="brand" href="#/library" data-tip="All projects">${MARK}<span>PaperOrchestra</span></a><span class="top-sep" aria-hidden="true">/</span>
     <a class="top-proj" href="${link({ view: 'overview', sel: '', sub: '' })}" data-tip="${p.title}">${p.title}</a>
-    <nav class="views" aria-label="Views of this project">${VIEWS.map((v, i) => html`<a href="${hrefOf({ name: 'project', pid: route.pid, view: v[0], sel: v[0] === 'paper' ? '' : route.sel })}"${route.view === v[0] ? raw(' aria-current="page"') : ''} data-tip="${v[1]} (${i + 1})">${v[1]}${v[0] === 'inbox' && n ? html`<span class="count" aria-label="${n} waiting">${n}</span>` : ''}</a>`)}</nav>
+    <nav class="views" aria-label="Views of this project">${VIEWS.map((v, i) => html`<a href="${hrefOf({ name: 'project', pid: route.pid, view: v[0], sel: v[0] === 'paper' ? '' : route.sel })}"${route.view === v[0] ? raw(' aria-current="page"') : ''} data-tip="${v[1]}" data-tipkey="${i + 1}">${v[1]}${v[0] === 'inbox' && n ? html`<span class="count" aria-label="${n} waiting">${n}</span>` : ''}</a>`)}</nav>
     <div class="top-r">${probs ? html`<a class="top-prob" href="${link({ view: 'overview', sel: '', sub: '' })}" data-act="show-problems" data-tip="${plural(probs, 'problem')} in the project's files: see the overview" aria-label="${plural(probs, 'problem')} in the project's files">${icon('warn')}<span>${probs}</span></a>` : ''}
       <a class="top-status st-${cls}" href="${link({ view: 'overview', sel: '', sub: '' })}" data-tip="Where things stand">${status}</a>
-      <span class="top-spend" data-tip="Spent on models, of the limit for this project">${money(spent.model_usd || 0)}<span> / ${money(limits.model_usd)}</span></span>${right}</div>`;
+      <span class="top-spend" data-tip="${spentTip(p)}"${p.demonstration ? raw(' data-demonstration') : ''}>${p.demonstration ? html`<i class="top-demo">story</i> ` : ''}${money(spent.model_usd || 0)}<span> / ${money(limits.model_usd)}</span></span>${right}</div>`;
 }
 const cap1 = (text) => (text ? text.charAt(0).toUpperCase() + text.slice(1) : '');
 
@@ -532,7 +580,7 @@ export function statusbar(store) {
     <a class="sb-i${n ? ' sb-wait' : ''}" href="${link({ view: 'inbox', sel: '', sub: '' })}"><b>${n}</b> waiting</a>
     ${running ? html`<a class="sb-i sb-run" href="${link({ view: 'experiments', sel: running.path, sub: '' })}"><span class="live-dot" aria-hidden="true"></span><b>${running.id}</b>${run ? html` run ${run.number} · <span data-since="${run.started}">${clock((Date.now() - (parseStamp(run.started) || Date.now())) / 1000)}</span>${running.meta && running.meta.est_minutes ? html` of about ${running.meta.est_minutes} min` : ''}` : ' running'}</a>` : ''}
     <span class="sb-gap"></span>
-    <span class="sb-i" data-tip="Spent on models, of the limit for this project">models <b>${money(spent.model_usd || 0)}</b> <span class="sb-of">/ ${money(limits.model_usd)}</span><progress class="sb-meter${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend"></progress></span>
+    <span class="sb-i" data-tip="${spentTip(p)}"${p.demonstration ? raw(' data-demonstration') : ''}>models${p.demonstration ? ', in the story' : ''} <b>${money(spent.model_usd || 0)}</b> <span class="sb-of">/ ${money(limits.model_usd)}</span><progress class="sb-meter${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend"></progress></span>
     <span class="sb-i" data-tip="Estimated compute spend of the runs, of the limit for this project">experiments <b>${money(spent.experiment_usd || 0)}</b> <span class="sb-of">/ ${money(limits.experiment_usd)}</span></span>
     <span class="sb-i sb-conn">${live}</span>`;
 }

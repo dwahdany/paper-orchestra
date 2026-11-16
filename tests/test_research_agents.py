@@ -18,7 +18,8 @@ import pytest
 from rapidfuzz import fuzz
 
 from paper_orchestra.compute.base import ComputeBackend, JobResult, JobSpec
-from paper_orchestra.llm.base import Capabilities, Image, Pdf, Text, ToolError
+from paper_orchestra.config import DEFAULT_MODEL
+from paper_orchestra.llm.base import Capabilities, Image, LLMConfigError, Pdf, Text, ToolError
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
 from paper_orchestra.memory.harness import ContextHarness
 from paper_orchestra.memory.transcript import TranscriptLog
@@ -383,14 +384,84 @@ def test_models_without_tools_or_the_memory_tool_are_named_with_the_setting_to_c
     plain = FakeLLM("x", capabilities=Capabilities(tools=False, memory_tool=False))
     capable = FakeLLM("x")
     project.settings.models.reasoning = "plain-model"
-    harness = ContextHarness(client_for=lambda name: plain if name == "plain-model" else capable)
 
-    problems = agents.model_problems(project, harness)
+    need = agents.model_need(project, lambda name: plain if name == "plain-model" else capable)
 
-    assert len(problems) == 1
-    assert "settings.models.reasoning" in problems[0] and "plain-model" in problems[0]
-    assert "tools" in problems[0] and "memory tool" in problems[0]
-    assert agents.model_problems(project, ContextHarness(client_for=lambda _: capable)) == []
+    assert (need["needs"], need["settings"], need["models"]) == (
+        "model",
+        ["reasoning"],
+        ["plain-model"],
+    )
+    sentence = agents.need_sentence(need, "The hypothesis phase")
+    assert sentence.startswith("The hypothesis phase needs a model, and the model set for ")
+    assert "reasoning (plain-model)" in sentence
+    assert "no tools and no memory tool" in sentence
+    assert "settings.models.reasoning" in sentence and DEFAULT_MODEL in sentence
+    assert agents.model_need(project, lambda _: capable) is None
+
+
+#: What the Anthropic client says when it finds no credential: five lines.
+NO_CREDENTIALS = (
+    "No Anthropic credentials were found. Configure one of:\n"
+    "  1. API key: set ANTHROPIC_API_KEY (for example in a .env file).\n"
+    "  2. Workload Identity Federation (keyless): set ANTHROPIC_FEDERATION_RULE_ID and "
+    "ANTHROPIC_ORGANIZATION_ID, plus ANTHROPIC_IDENTITY_TOKEN_FILE."
+)
+
+
+def no_credentials(model: str):
+    raise LLMConfigError(NO_CREDENTIALS)
+
+
+def test_missing_credentials_are_one_sentence_that_names_every_role_once(tmp_path):
+    project = make_project(tmp_path)
+
+    need = agents.model_need(project, no_credentials)
+
+    assert need["needs"] == "model"
+    assert need["settings"] == ["research", "reasoning", "coding"]
+    assert need["models"] == [DEFAULT_MODEL]
+    sentence = agents.need_sentence(need, "The analysis phase")
+    assert sentence == (
+        "The analysis phase needs a model, and the model set for research, reasoning and "
+        f"coding ({DEFAULT_MODEL}) cannot be used because no Anthropic credentials were "
+        "found: set ANTHROPIC_API_KEY or the Workload Identity Federation variables (Setup "
+        "in the app and `paper-orchestra doctor` show what is configured)."
+    )
+    # One sentence, on one line, with nothing of the provider's five lines of advice and
+    # nothing about a command: the app says it as it is.
+    assert "\n" not in sentence and "Configure one of" not in sentence
+    assert "run the command again" not in sentence
+    # Asked about one role alone (the runner's repair), it names that role's model only.
+    coding = agents.model_need(project, no_credentials, settings=("coding",))
+    assert coding["settings"] == ["coding"]
+    assert "the model set for coding" in agents.need_sentence(coding, "A repair")
+
+
+def test_models_that_differ_are_each_named_with_what_is_wrong_with_them(tmp_path):
+    project = make_project(
+        tmp_path, settings={"models": {"research": "gemini-9", "coding": "gpt-5.5"}}
+    )
+    plain = FakeLLM("x", capabilities=Capabilities(tools=True, memory_tool=False))
+
+    def client_for(model: str):
+        if model == "gemini-9":
+            # As the router says it when a provider's SDK is not installed.
+            raise LLMConfigError(
+                "The gemini provider needs a Python package. Install it."
+            ) from ImportError("No module named 'google'")
+        if model == "gpt-5.5":
+            return plain
+        return FakeLLM("x")
+
+    need = agents.model_need(project, client_for)
+
+    assert (need["settings"], need["models"]) == (["research", "coding"], ["gemini-9", "gpt-5.5"])
+    sentence = agents.need_sentence(need, "The research phase")
+    assert "the model set for research (gemini-9) cannot be used because" in sentence
+    assert "the gemini provider needs a Python package" in sentence
+    assert "the model set for coding (gpt-5.5) offers no memory tool" in sentence
+    assert "\n" not in sentence
 
 
 def test_tool_calls_become_plain_sentences_for_the_activity_feed():

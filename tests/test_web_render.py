@@ -626,6 +626,37 @@ def test_unified_diff_by_line_and_its_html():
     assert diff_html("") == '<pre class="diff"></pre>'
 
 
+def test_the_head_of_a_diff_is_said_in_words_where_a_person_reads_it():
+    old = "\n".join(f"line {number}" for number in range(1, 41)) + "\n"
+    new = old.replace("line 30\n", "line 30, changed\nand one more\n")
+    diff = unified_diff(
+        old, new, old_label="the page as it is", new_label="as the analyst suggests it"
+    )
+    # The text stays a unified diff, for whoever applies or copies it.
+    assert diff.splitlines()[:3] == [
+        "--- the page as it is",
+        "+++ as the analyst suggests it",
+        "@@ -27,7 +27,8 @@",
+    ]
+
+    rendered = diff_html(diff)
+
+    # What the person is shown says which side is which and where the change is, without
+    # the marks of a patch file.
+    assert '<span class="diff-line diff-file">− the page as it is</span>' in rendered
+    assert '<span class="diff-line diff-file">+ as the analyst suggests it</span>' in rendered
+    assert '<span class="diff-line diff-hunk">From line 27</span>' in rendered
+    assert "@@" not in rendered and "---" not in rendered and "+++" not in rendered
+    assert '<span class="diff-line diff-del">-line 30</span>' in rendered
+    # Text put before the first line has no line to start from.
+    top = diff_html(unified_diff("", "new\n"))
+    assert '<span class="diff-line diff-hunk">At the top</span>' in top
+    # A line of the text that merely looks like a mark of the format stays the text.
+    inner = diff_html(unified_diff("a\n", "a\n--- not a head\n@@ not a hunk @@\n"))
+    assert '<span class="diff-line diff-add">+--- not a head</span>' in inner
+    assert '<span class="diff-line diff-add">+@@ not a hunk @@</span>' in inner
+
+
 def _patched(old: str, diff: str) -> str:
     """``old`` with a unified diff applied, checking every line the diff says is there."""
     lines = old.splitlines()

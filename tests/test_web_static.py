@@ -515,3 +515,500 @@ def test_the_app_says_that_the_server_was_restarted_and_does_not_retry_for_ever(
     # again when the server lets it in.
     assert re.search(r"connection\.denied\) askHealth\(\)", main)
     assert "app.store.connect()" in main
+
+
+# ---------------------------------------------------------------------------
+# What a first-time user met (round 4): the client's own modules, given a project as
+# the server describes it.  No browser and no network: the views are functions that
+# return markup, and Node runs them.
+# ---------------------------------------------------------------------------
+
+#: A real ``Store`` filled as a fetch of the lists would fill it, and the route of a project.
+HARNESS = r"""
+import { app } from './js/core.js';
+import { Store } from './js/store.js';
+
+export const NOW = Date.now();
+/** A stamp `seconds` ago, as the server writes them. */
+export const ago = (seconds) => new Date(NOW - seconds * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+export function projectStore(lists) {
+  const store = new Store('p-1', () => {});
+  store.server = Object.assign({ project: {}, pages: [], edges: [], proposals: [], requests: [], experiments: [] }, lists);
+  store.server.project = Object.assign({ id: 'p-1', title: 'A project', settings: { limits: { model_usd: 25, experiment_usd: 5 } }, worker: { state: 'idle', last_exit: null } }, lists.project || {});
+  store.loaded = true;
+  store.derive();
+  app.store = store;
+  app.route = { name: 'project', pid: 'p-1', view: 'map', ref: '', sel: '', sub: '', q: {} };
+  return store;
+}
+export const page = (kind, id, more) => Object.assign({ path: 'wiki/' + kind + 's/' + id + '.md', kind, id, title: 'The page ' + id, summary: '', review: 'accepted', state: null, author: 'agent:designer', round: 1, created: ago(3600), updated: ago(3600), meta: {}, relations: {} }, more || {});
+export const checkpoint = (phase, next, more) => Object.assign({ status: 'checkpoint', round: 2, phase, next_phase: next, phases: [{ round: 2, phase, status: 'completed' }], spent: {} }, more || {});
+export const said = (more) => Object.assign({ will_run: [], then: null, experiments: [], not_running: [], results: 0, checkpoint_of: null, needs_phase: false, blocked: null }, more || {});
+/** How often `part` occurs in `text`. */
+export const times = (text, part) => String(text).split(part).length - 1;
+"""
+
+
+def _client(tmp_path: Path, script: str) -> dict:
+    """Run ``script`` beside a copy of the client's modules and the harness; what it
+    prints is one JSON object."""
+    (tmp_path / "js").mkdir()
+    for path in _files(".js"):
+        if path.parent.name == "js":
+            (tmp_path / "js" / path.name).write_text(_text(path), encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"type": "module"}', encoding="utf-8")
+    (tmp_path / "harness.js").write_text(HARNESS, encoding="utf-8")
+    (tmp_path / "check.js").write_text(script, encoding="utf-8")
+    done = subprocess.run(
+        ["node", str(tmp_path / "check.js")], capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
+    return __import__("json").loads(done.stdout)
+
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+
+#: The engine's one sentence about a model that cannot be used, as the server sends it.
+NEEDS = (
+    "The analysis phase needs a model, and the model set for research, reasoning and coding "
+    "(claude-fable-5-2) cannot be used because no Anthropic credentials were found: set "
+    "ANTHROPIC_API_KEY or the Workload Identity Federation variables (Setup in the app and "
+    "`paper-orchestra doctor` show what is configured)."
+)
+
+NO_MODEL_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, times, ago } from './harness.js';
+import { app } from './js/core.js';
+import { engineView, nextStep, phaseChoices, strip, statusbar, continueNotes } from './js/shell.js';
+import { overviewView } from './js/overview.js';
+
+const NEEDS = process.env.NEEDS;
+const blocked = { phase: 'analyze', needs: 'model', settings: ['research', 'reasoning', 'coding'], models: ['claude-fable-5-2'], message: NEEDS };
+const e4 = page('experiment', 'E4', { state: 'approved' });
+const look = (store) => {
+  const e = engineView(store), step = nextStep(store, e), bar = String(strip(store)), foot = String(statusbar(store));
+  return {
+    crashed: !!e.crashed, label: step.label, href: step.href, need: step.need ? step.need.message : null,
+    choices: phaseChoices(store, e, step).map((c) => c.phase),
+    saysIt: times(bar, NEEDS.slice(0, 60)), setup: bar.includes('#/setup'),
+    accident: /stopped unexpectedly|Show log|Try again|ended with exit code/.test(bar + foot),
+    promises: /analyse/i.test(step.label + ' ' + step.says + ' ' + step.tip),
+    restart: /start (the app|it) again/i.test(bar),
+    again: /run the command again/i.test(bar),
+  };
+};
+const out = {};
+/* an approved experiment runs without a model; its analysis cannot */
+out.run = look(projectStore({ pages: [e4], experiments: [Object.assign({ runs: 0 }, e4)],
+  project: { state: checkpoint('design', 'run'), next_step: said({ will_run: ['run'], then: 'analyze', experiments: ['E4'], blocked }) } }));
+/* a run that comes before an analysis that was next already (an earlier result waits for it):
+   the fine print must not say that the analysis goes ahead when the run cannot */
+out.before = (() => {
+  const store = projectStore({ pages: [e4], experiments: [Object.assign({ runs: 1 }, e4)],
+    project: { state: checkpoint('run', 'analyze'), next_step: said({ will_run: ['run'], then: 'analyze', experiments: ['E4'], results: 1, blocked }) } });
+  const step = nextStep(store, engineView(store));
+  return { label: step.label, says: step.says, tip: step.tip, notes: String(continueNotes(store, engineView(store))) };
+})();
+/* nothing can be done without a model, and a press that was made all the same ended for that reason */
+out.none = look(projectStore({ pages: [], experiments: [],
+  project: { state: checkpoint('run', 'analyze'), next_step: said({ then: 'analyze', results: 1, blocked }),
+    worker: { state: 'idle', last_exit: { kind: 'advance', code: 3, at: ago(5), stopped: false, interrupted_phase: null, reason: 'needs_model' } } } }));
+/* a project that has not started */
+out.fresh = look(projectStore({ pages: [], experiments: [],
+  project: { state: { status: 'idle', round: 0, phase: null, next_phase: 'intake', phases: [], spent: {} }, state_source: 'not_started', next_step: said({ then: 'intake', blocked: Object.assign({}, blocked, { phase: 'intake' }) }) } }));
+/* a worker that ended with the same code and no such reason did die */
+out.died = look(projectStore({ pages: [], experiments: [],
+  project: { state: checkpoint('run', 'analyze'), next_step: said({ will_run: ['analyze'], then: 'hypothesize', results: 1 }),
+    worker: { state: 'idle', last_exit: { kind: 'advance', code: 3, at: ago(5), stopped: false, interrupted_phase: null, reason: null } } } }));
+/* the overview: what the runs did, and the sentence about the model once (beside the button) or,
+   when a model can be used again, not at all: the checkpoint's own account still holds it */
+const paused = (next) => ({ state: checkpoint('run', 'analyze'), next_step: next,
+  checkpoint: { round: 2, phase: 'run', at: ago(60), summary: '1 experiment ran: E4 succeeded. ' + NEEDS + ' Next: analysing the new results.', did: '1 experiment ran: E4 succeeded. ' + NEEDS } });
+const head = (store) => {
+  /* (the view writes its markup into the element it is given, and then looks for nothing in it) */
+  const root = { innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
+  app.route = { name: 'project', pid: 'p-1', view: 'overview', ref: '', sel: '', sub: '', q: {} };
+  overviewView.render(root);
+  const text = root.innerHTML.slice(root.innerHTML.indexOf('class="ov-head"'), root.innerHTML.indexOf('class="ov-map"'));
+  return [times(text, 'needs a model'), text.includes('E4 succeeded')];
+};
+out.overview = {
+  blocked: head(projectStore({ pages: [], experiments: [], project: paused(said({ then: 'analyze', results: 1, blocked })) })),
+  usable: head(projectStore({ pages: [], experiments: [], project: paused(said({ will_run: ['analyze'], then: 'hypothesize', results: 1 })) })),
+};
+/* a server that says nothing about models (an older one) changes nothing */
+out.older = look(projectStore({ pages: [e4], experiments: [Object.assign({ runs: 0 }, e4)],
+  project: { state: checkpoint('design', 'run'), next_step: { will_run: ['run', 'analyze'], then: 'hypothesize', experiments: ['E4'], results: 0, checkpoint_of: null, needs_phase: false } } }));
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_a_project_without_a_usable_model_is_something_to_set_up_not_an_accident(
+    tmp_path, monkeypatch
+):
+    """Where no model can be used, the server's forecast says so (``next_step.blocked``)
+    and a worker that started nothing says why by a field (``last_exit.reason``).  The
+    main button promises what happens without a model and nothing else; the engine's
+    sentence stands beside it once; nothing is called an accident."""
+    monkeypatch.setenv("NEEDS", NEEDS)
+    out = _client(tmp_path, NO_MODEL_SCRIPT)
+    run = out["run"]
+    assert run["label"] == "Run the approved experiment" and not run["promises"], run
+    assert run["need"] == NEEDS and run["saysIt"] == 1 and run["setup"] and run["restart"], run
+    assert not run["accident"] and not run["again"] and run["choices"] == [], run
+    # A run before an analysis that was next already: the analysis is still next, and
+    # nothing says that it goes ahead in the run's place, which it cannot without a model.
+    before = out["before"]
+    assert before["label"] == "Run the approved experiment", before
+    assert "still analysis" in before["says"] and "goes ahead" not in before["tip"], before
+    assert "credentials are read when it starts" in before["notes"], before
+    none = out["none"]
+    assert none["crashed"] is False and not none["accident"], none
+    assert none["label"] == "Set up a model" and none["href"] == "#/setup", none
+    assert none["saysIt"] == 1 and none["restart"] and none["choices"] == [], none
+    fresh = out["fresh"]
+    assert fresh["label"] == "Set up a model" and fresh["href"] == "#/setup", fresh
+    assert fresh["saysIt"] == 1 and not fresh["accident"], fresh
+    # The overview says the sentence once, and not at all once a model can be used again.
+    assert out["overview"] == {"blocked": [1, True], "usable": [0, True]}, out["overview"]
+    # Only the server's field tells the two ends apart: without it, it is a crash as before.
+    assert out["died"]["crashed"] is True and out["died"]["accident"], out["died"]
+    older = out["older"]
+    assert older["label"] == "Run the approved experiment, then analyse it", older
+    assert older["need"] is None and older["saysIt"] == 0, older
+    store = _js("store.js")
+    assert "needs_model" in store, "the log of a worker that only needed a model is still read"
+
+
+CHANGED = (
+    "it is not what was approved at 2026-11-16T17:07:01Z (main.py: changed after the approval "
+    "(written by human at 2026-11-16T17:07:01Z))"
+)
+
+CHANGED_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, times, ago } from './harness.js';
+import { engineView, nextStep, continueNotes } from './js/shell.js';
+import { shownState } from './js/vocab.js';
+import { statusParts, statusLine } from './js/page.js';
+import * as experiments from './js/experiments.js';
+
+const CHANGED = process.env.CHANGED;
+const row = (p, more) => Object.assign({ runs: 1, last_run: null, interrupted: false, cancel_does: null, will_not_run: null, last_success: null }, p, more || {});
+const e1 = page('experiment', 'E1', { state: 'approved', will_not_run: CHANGED });
+const e2 = page('experiment', 'E2', { state: 'approved' });
+const h1 = page('hypothesis', 'H1', { state: 'open' });
+const store = projectStore({ pages: [h1, e1, e2], experiments: [row(e1, { cancel_does: 'withdraw' }), row(e2, { cancel_does: 'withdraw' })],
+  project: { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['run', 'hypothesize'], then: 'design', not_running: [{ id: 'E1', reason: CHANGED }] }) } });
+const e = engineView(store), step = nextStep(store, e), notes = String(continueNotes(store, e));
+const p1 = store.byPath.get(e1.path), p2 = store.byPath.get(e2.path);
+const group = typeof experiments.groupName === 'function' ? experiments.groupName : () => null;
+const out = {
+  label: step.label, held: (step.held || []).map((h) => h.id), notes,
+  shown: [shownState(p1), shownState(p2)],
+  parts: [statusParts(store, p1), statusParts(store, p2)],
+  line: statusLine(store, p1).full,
+  groups: [group(store.expById.get('E1')), group(store.expById.get('E2'))],
+};
+/* one of two still runs: the button counts that one only, and the other is named */
+const both = projectStore({ pages: [h1, e1, e2], experiments: [row(e1), row(e2)],
+  project: { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['run', 'analyze'], then: 'hypothesize', experiments: ['E2'], not_running: [{ id: 'E1', reason: CHANGED }] }) } });
+const step2 = nextStep(both, engineView(both));
+out.both = { label: step2.label, notes: String(continueNotes(both, engineView(both))) };
+/* a row that carries the reason where the page of the other list does not is still marked */
+const bare = Object.assign({}, e1); delete bare.will_not_run;
+const lists = projectStore({ pages: [bare], experiments: [row(e1)], project: { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
+out.fromRow = shownState(lists.byPath.get(e1.path));
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_an_approved_experiment_that_changed_is_shown_as_needing_approval_again(
+    tmp_path, monkeypatch
+):
+    """An experiment that reads approved and is no longer what was approved will not run
+    (``will_not_run`` of its rows, ``not_running`` of the forecast): every list shows it as
+    needing approval again, and the button's sentence says that it will not run, and why."""
+    monkeypatch.setenv("CHANGED", CHANGED)
+    out = _client(tmp_path, CHANGED_SCRIPT)
+    assert out["shown"] == ["needs approval again", "approved"], out["shown"]
+    assert out["parts"][0][0] == "needs approval again" and out["parts"][1][0] == "approved"
+    assert out["line"].startswith("needs approval again")
+    assert out["groups"] == ["Needs your approval", "Approved, queued and running"], out["groups"]
+    assert out["fromRow"] == "needs approval again"
+    assert out["label"] == "Continue to hypotheses" and out["held"] == ["E1"], out
+    notes = out["notes"]
+    assert "E1 will not run" in notes and "main.py: changed after the approval" in notes, notes
+    # The server's reason, as the app says things: no raw stamp, and the person is "you".
+    assert "2026-11-16T" not in notes and "human" not in notes and "written by you" in notes
+    assert "pprove it again" in notes and "/experiments/E1" in notes, notes
+    assert "No experiment is approved to run" not in notes, notes
+    assert "goes straight on to hypotheses" in notes, notes
+    assert out["both"]["label"] == "Run the approved experiment, then analyse it", out["both"]
+    assert "E1 will not run" in out["both"]["notes"], out["both"]
+
+
+CANCELLED_SCRIPT = r"""
+import { projectStore, page, checkpoint, said } from './harness.js';
+import { shownState } from './js/vocab.js';
+import { statusParts, statusLine } from './js/page.js';
+import * as experiments from './js/experiments.js';
+
+const won = { number: 1, result_page: 'wiki/results/E4-run1.md' };
+const row = (p, more) => Object.assign({ runs: 2, last_run: { number: 2, status: 'cancelled', finished: null }, interrupted: false, cancel_does: null, will_not_run: null, last_success: null }, p, more || {});
+const e4 = page('experiment', 'E4', { state: 'cancelled', last_success: won });
+const e5 = page('experiment', 'E5', { state: 'cancelled' });
+const e6 = page('experiment', 'E6', { state: 'failed', last_success: { number: 2, result_page: 'wiki/results/E6-run2.md' } });
+const result = page('result', '', { path: 'wiki/results/E4-run1.md', id: null, title: 'E4 run 1', state: 'succeeded', author: 'system' });
+const store = projectStore({ pages: [e4, e5, e6, result], experiments: [row(e4), row(e5), row(e6)], project: { state: checkpoint('design', 'run'), next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
+const get = (p) => store.byPath.get(p.path);
+const sub = typeof experiments.standingWords === 'function' ? experiments.standingWords : () => '';
+console.log(JSON.stringify({
+  parts: [statusParts(store, get(e4)), statusParts(store, get(e5)), statusParts(store, get(e6))],
+  line: statusLine(store, get(e4)).full,
+  shown: shownState(get(e4)),
+  words: [sub(store.expById.get('E4')), sub(store.expById.get('E5')), sub(store.expById.get('E6'))],
+}));
+"""
+
+
+@needs_node
+def test_a_cancelled_experiment_whose_earlier_run_succeeded_says_so(tmp_path):
+    """The state of an experiment is how its last approved run ended.  Where that reads
+    cancelled (or failed) and an earlier run succeeded, the server names that run
+    (``last_success``), and wherever the state is said the run is said with it."""
+    out = _client(tmp_path, CANCELLED_SCRIPT)
+    assert out["parts"][0] == ["cancelled", "run 1 succeeded"], out["parts"]
+    assert out["parts"][1] == ["cancelled"], out["parts"]
+    assert out["parts"][2] == ["failed", "run 2 succeeded"], out["parts"]
+    assert out["line"] == "cancelled · run 1 succeeded"
+    # The mark stays the one of the state the page has: only the words say more.
+    assert out["shown"] == "cancelled"
+    assert out["words"] == ["cancelled; run 1 succeeded", "cancelled", "failed; run 2 succeeded"]
+
+
+WORDS_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago, times } from './harness.js';
+import { checkpointDid } from './js/util.js';
+import { reviewBar } from './js/page.js';
+import * as overview from './js/overview.js';
+import * as home from './js/home.js';
+
+const out = {};
+/* a rejection with and without a reason */
+const noWhy = page('hypothesis', 'H2', { review: 'rejected', author: 'agent:theorist', meta: { decided_by: 'human', decided_at: ago(120) } });
+const why = page('hypothesis', 'H3', { review: 'rejected', author: 'agent:theorist', meta: { decided_by: 'human', decided_at: ago(120), decision_reason: 'Not what the sources say' } });
+/* a proposal the person edited: proposed 23 minutes ago, saved just now */
+const edited = page('hypothesis', 'H5', { review: 'proposed', author: 'agent:theorist', round: 2, created: ago(23 * 60), updated: ago(3), meta: { updated_by: 'human' } });
+const store = projectStore({ pages: [noWhy, why, edited], project: { state: checkpoint('hypothesize', 'design'), next_step: said({ will_run: ['design'], then: 'run' }) } });
+const bar = (p) => String(reviewBar(store, store.byPath.get(p.path), {}));
+out.noWhy = bar(noWhy); out.why = bar(why); out.edited = bar(edited);
+out.when = store.pending().map((it) => it.when === edited.created);
+/* what the phases did is the checkpoint's own field; an older checkpoint has only the sentence */
+out.did = checkpointDid({ did: 'Round 2, design: 2 experiments are planned.', summary: 'Round 2, design: 2 experiments are planned. 9 questions await your review. Next: running what you approved.' });
+out.didOld = checkpointDid({ summary: 'The theorist proposed 2 hypotheses. 2 hypotheses and 6 findings await your review. Next: designing experiments for the hypotheses you accepted.' });
+out.didText = checkpointDid('The theorist proposed 2 hypotheses. 2 hypotheses await your review.');
+/* the round as a line: a phase that ran twice is one mark, and one that comes again says so */
+const phases = ['intake', 'research', 'hypothesize', 'design', 'run', 'run', 'analyze'].map((phase) => ({ round: 1, phase, status: 'completed', produced: [], seconds: 1 }));
+const twice = projectStore({ pages: [], project: { state: { status: 'checkpoint', round: 1, phase: 'analyze', next_phase: 'hypothesize', phases, spent: {} }, next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
+const rounds = typeof overview.roundsLine === 'function' ? String(overview.roundsLine(twice)) : '';
+out.rounds = { runs: times(rounds, '</i>runs'), twice: rounds.includes('runs (twice)'), again: rounds.includes('hypotheses again') };
+/* the library: counts in the singular where there is one, and each number of the small map named */
+out.counts = typeof home.countsLine === 'function' ? home.countsLine({ idea: 1, source: 1, hypothesis: 1, experiment: 1, finding: 1 }) : '';
+out.many = typeof home.countsLine === 'function' ? home.countsLine({ idea: 1, source: 14, hypothesis: 5, experiment: 4, finding: 2 }) : '';
+const small = String(overview.stripMapSmall({ idea: 1, source: 14, topic: 4, question: 6 }, { question: 1 }));
+out.small = { sources: small.includes('14 sources'), waiting: /6 questions, 1 (of them )?waiting/.test(small) };
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_the_words_say_what_is_so(tmp_path):
+    """Sentences that said more than was so, or the wrong time: a rejection without a
+    reason, a proposal the person edited, the checkpoint's account, the round as a line,
+    the counts of the library."""
+    out = _client(tmp_path, WORDS_SCRIPT)
+    assert "Agents see its title, nothing else." in out["noWhy"], out["noWhy"]
+    assert "this reason" not in out["noWhy"]
+    assert "Agents see its title and this reason, nothing else." in out["why"]
+    # "Proposed by" is followed by when it was proposed; the edit is said where it belongs.
+    assert "in round 2, 23 min ago" in out["edited"], out["edited"]
+    assert out["when"] == [True]
+    assert out["did"] == "2 experiments are planned."
+    assert out["didOld"] == "The theorist proposed 2 hypotheses."
+    assert out["didText"] == "The theorist proposed 2 hypotheses."
+    assert out["rounds"] == {"runs": 1, "twice": True, "again": True}, out["rounds"]
+    assert out["counts"] == "1 source · 1 hypothesis · 1 experiment · 1 finding"
+    assert out["many"] == "14 sources · 5 hypotheses · 4 experiments · 2 findings"
+    assert out["small"] == {"sources": True, "waiting": True}, out["small"]
+
+
+DECIDED_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago } from './harness.js';
+import * as inbox from './js/inbox.js';
+import * as pages from './js/page.js';
+
+const topic = page('topic', 'why-warmup-helps', { id: null, title: 'Why warmup helps', author: 'agent:scout' });
+const h2 = page('hypothesis', 'H2', { state: 'supported', author: 'agent:theorist', meta: { decided_by: 'human', decided_at: ago(7200) } });
+const turned = { id: 'ep-1', target: topic.path, author: 'agent:analyst', round: 1, created: ago(3600), summary: 'Say what F1 adds', fields: {}, relations_add: {}, review: 'rejected', decided_by: 'human', decided_at: ago(60), decision_reason: 'Not what the sources say', changes_text: true };
+const taken = { id: 'ep-2', target: h2.path, author: 'agent:analyst', round: 1, created: ago(3600), summary: 'Mark H2 as supported', fields: { state: 'supported' }, relations_add: {}, review: 'accepted', decided_by: 'human', decided_at: ago(30), decision_reason: null, changes_text: false };
+const store = projectStore({ pages: [topic, h2], project: { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
+const out = { listed: null, page: '' };
+if (typeof store.takeDecided === 'function' && typeof inbox.decidedItems === 'function') {
+  store.takeDecided([Object.assign({ page: topic, body: 'x' }, turned), Object.assign({ page: h2 }, taken), { id: 'ep-3', target: topic.path, review: 'proposed' }]);
+  out.listed = inbox.decidedItems(store).map((it) => [it.edit ? 'edit' : 'page', it.page.path === topic.path ? 'topic' : 'H2', it.review, it.reason || '']);
+}
+if (typeof pages.decidedEditsHTML === 'function') out.page = String(pages.decidedEditsHTML(store, { page: topic, decided_proposals: [turned] }));
+out.none = typeof pages.decidedEditsHTML === 'function' ? String(pages.decidedEditsHTML(store, { page: topic })) : null;
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_a_decided_suggested_edit_can_be_found_again(tmp_path):
+    """A suggested edit that was decided is listed among what was decided, the latest
+    first, with the decision and the reason, and the page it was about says what was
+    suggested and what became of it (``decided_proposals`` of its view)."""
+    out = _client(tmp_path, DECIDED_SCRIPT)
+    assert out["listed"] == [
+        ["edit", "H2", "accepted", ""],
+        ["edit", "topic", "rejected", "Not what the sources say"],
+        ["page", "H2", "accepted", ""],
+    ], out["listed"]
+    assert "Say what F1 adds" in out["page"] and "Not what the sources say" in out["page"]
+    assert "rejected" in out["page"].lower() and "the analyst" in out["page"]
+    # A server that does not list them leaves the page as it was.
+    assert out["none"] == ""
+    assert "review=all" in _js("api.js") or "'all'" in _js("store.js")
+
+
+SHORT_WORKER_SCRIPT = r"""
+import { projectStore, checkpoint, said, ago } from './harness.js';
+
+/* the server as the page reaches it: what is asked for, and what the project view answers */
+const asked = [];
+let view = null;
+globalThis.fetch = async (url) => {
+  asked.push(String(url).replace(/^.*\/api\/projects\/p-1/, '') || '/');
+  const body = /\/api\/projects\/p-1$/.test(url) ? view
+    : { pages: [], edges: [], dangling: [], proposals: [], requests: [], experiments: [] };
+  return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+};
+const project = (worker) => ({ id: 'p-1', title: 'A project', settings: { limits: {} }, state: checkpoint('run', 'analyze'), next_step: said({ then: 'analyze' }), worker });
+const busy = { state: 'running', kind: 'advance', phase: null, verified: true, last_exit: null };
+const idle = { state: 'idle', kind: null, last_exit: { kind: 'advance', code: 3, at: ago(1), stopped: false, interrupted_phase: null, reason: 'needs_model' } };
+const reasons = [];
+const store = projectStore({ project: project(busy) });
+store.onChange = (reason) => reasons.push(reason);
+const out = { has: typeof store.checkWorker === 'function' };
+if (out.has) {
+  /* the page holds a worker as busy, and something was heard a moment ago: nothing is asked */
+  store.heardAt = Date.now();
+  await store.checkWorker();
+  out.heard = asked.length;
+  /* nothing was heard for a while, and the worker is still at work: one look, and no more */
+  store.heardAt = Date.now() - 60000;
+  view = project(busy);
+  await store.checkWorker();
+  out.still = asked.slice();
+  /* nothing was heard, and the worker is gone (it ended between two looks of the stream): the lists are read again */
+  asked.length = 0;
+  store.heardAt = Date.now() - 60000;
+  view = project(idle);
+  await store.checkWorker();
+  await store._waiting;
+  out.gone = { looked: asked[0], lists: asked.length > 1, worker: store.project.worker.state, reason: store.project.worker.last_exit.reason, refreshed: reasons.includes('refresh') };
+  /* a project nobody works on is never asked about */
+  asked.length = 0;
+  store.heardAt = Date.now() - 60000;
+  await store.checkWorker();
+  out.idle = asked.length;
+}
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_a_worker_that_ended_between_two_looks_of_the_stream_is_noticed(tmp_path):
+    """A worker that starts nothing ends within half a second and writes no event: the
+    event stream, which looks twice a second, may never report it.  A page that holds a
+    worker as busy and has heard nothing for a while asks the project view itself, and
+    reads the lists again when the worker is gone."""
+    out = _client(tmp_path, SHORT_WORKER_SCRIPT)
+    assert out["has"], "the store never asks whether a worker it holds as busy is still there"
+    assert out["heard"] == 0
+    assert out["still"] == ["/"], out["still"]
+    gone = out["gone"]
+    assert gone["looked"] == "/" and gone["lists"] and gone["refreshed"], gone
+    assert gone["worker"] == "idle" and gone["reason"] == "needs_model", gone
+    assert out["idle"] == 0
+    assert "checkWorker()" in _js("main.js"), "nothing calls the look at a silent worker"
+
+
+UNFILLED_SCRIPT = r"""
+import { projectStore, page, checkpoint, said } from './harness.js';
+import { engineView, nextStep, strip, continueNotes } from './js/shell.js';
+import { shownState, earlierSuccess } from './js/vocab.js';
+import { statusParts, decidedEditsHTML, reviewBar } from './js/page.js';
+import { decidedItems } from './js/inbox.js';
+import { checkpointDid } from './js/util.js';
+import { countsLine } from './js/home.js';
+
+const oops = { error: { code: 'internal', message: 'It could not be worked out.' } };
+const e1 = page('experiment', 'E1', { state: 'approved', will_not_run: oops, last_success: oops });
+const e2 = page('experiment', 'E2', { state: 'cancelled', will_not_run: 7, last_success: 'run 1' });
+const store = projectStore({ pages: [e1, e2], experiments: [Object.assign({ runs: 1 }, e1), Object.assign({ runs: 1 }, e2)],
+  project: { demonstration: oops, state: checkpoint('design', 'run'), checkpoint: { did: oops, summary: 'Two experiments are planned. 2 experiments await your review.' },
+    next_step: said({ will_run: ['run', 'analyze'], then: 'hypothesize', experiments: ['E1'], not_running: oops, blocked: oops }),
+    worker: { state: 'idle', last_exit: { kind: 'advance', code: 0, at: null, stopped: false, reason: oops } } } });
+store.takeDecided(oops);
+const e = engineView(store), step = nextStep(store, e);
+console.log(JSON.stringify({
+  label: step.label, held: step.held, need: step.need, crashed: !!e.crashed, notes: String(continueNotes(store, e)),
+  strip: String(strip(store)).length > 0,
+  shown: [shownState(store.byPath.get(e1.path)), shownState(store.byPath.get(e2.path))],
+  parts: [statusParts(store, store.byPath.get(e1.path)), statusParts(store, store.byPath.get(e2.path))],
+  won: earlierSuccess(store.byPath.get(e2.path)),
+  did: checkpointDid(store.project.checkpoint),
+  decided: [decidedItems(store).length, String(decidedEditsHTML(store, { page: e1, decided_proposals: oops }))],
+  counts: countsLine(oops),
+}));
+"""
+
+
+@needs_node
+def test_a_field_the_server_could_not_fill_changes_nothing(tmp_path):
+    """Each of the new fields may be missing (an older server) or hold something else than
+    it should (the server could not work it out): the app then shows what it showed before
+    the field existed, and nothing breaks."""
+    out = _client(tmp_path, UNFILLED_SCRIPT)
+    assert out["label"] == "Run the approved experiment, then analyse it", out
+    assert out["held"] == [] and out["need"] is None and out["crashed"] is False
+    assert out["notes"] == "" and out["strip"] is True
+    assert out["shown"] == ["approved", "cancelled"]
+    assert out["parts"] == [["approved", "runs next"], ["cancelled"]]
+    assert out["won"] is None
+    assert out["did"] == "Two experiments are planned."
+    assert out["decided"] == [0, ""]
+    assert out["counts"] == "idea only"
+
+
+def test_the_client_reads_what_the_server_now_says():
+    """Fields the server added for what a newcomer met: the kinds a person can write, the
+    mark of a demonstration, what works without credentials, the keys of the tooltips."""
+    overlays, home, shell = _js("overlays.js"), _js("home.js"), _js("shell.js")
+    # The New dialog offers the kinds the server lists (a lesson among them), not its own.
+    assert "creatable_kinds" in overlays, "the New dialog still carries its own list of kinds"
+    # What a demonstration says it spent is its story's: said where the cost is shown.
+    assert "demonstration" in home and "demonstration" in shell
+    assert "without_credentials" in home, "Setup does not say what works without credentials"
+    # The key of a view is drawn as a key, not written like a count beside the name.
+    assert "(${i + 1})" not in shell, "the tooltip of a view still reads like a count"
+    assert "data-tipkey" in shell and "tipkey" in _js("actions.js")
+    # The paper view asks again when the write-up's worker is gone, not at its next poll.
+    paper = _js("paper.js")
+    assert "paper.running && !busy" in paper or "stale" in paper
+    css = _text(STATIC_DIR / "css" / "app.css")
+    for selector in (".go-need", ".go-held", ".in-why", ".decided-edits", ".st-also", "#tip kbd"):
+        assert selector in css, f"the stylesheet has no rule for {selector}"

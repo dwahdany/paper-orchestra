@@ -47,6 +47,18 @@ What a client would otherwise guess or work out a second time, the API says:
 * what a press of Continue does is ``next_step`` of the project view, the
   engine's own answer; the analyst's recommendation of more research is
   ``recommends`` on the checkpoint, for as long as its journal page stands;
+* where no model can be used, ``next_step.blocked`` says so before anything is
+  pressed (which phase is not started, and the one sentence about what to set
+  up), and a worker that ended for that reason is told from one that died by
+  ``worker.last_exit.reason`` (``"needs_model"``), not by what it printed;
+* an experiment that reads approved and will not run as it stands (it changed
+  since the approval) carries ``will_not_run`` wherever it is listed and is
+  named in ``next_step.not_running``; one that reads cancelled or failed
+  although an earlier run of it succeeded carries ``last_success``;
+* what the phases did before a checkpoint is ``checkpoint.did``, apart from the
+  count of what waited then, from what was next and from a model the next phase
+  lacked (all three are in ``summary``, as the checkpoint said them, and are
+  shown live instead: the last one is ``next_step.blocked`` while it is true);
 * what cancelling an experiment does is ``cancel_does`` (take the approval back,
   or cancel the run), and the answer to the cancel says which happened;
 * an experiment whose run was interrupted is marked wherever its page is listed,
@@ -107,7 +119,11 @@ from paper_orchestra.research.model import (
     EFFORTS,
     FOR_ALL,
     HUMAN,
+    KINDS,
+    RECORD_KINDS,
     REQUEST_ROLES,
+    ROLE_MAY_CREATE,
+    ROLES,
     SCHEMA,
     SECTIONS,
     Conflict,
@@ -118,9 +134,13 @@ from paper_orchestra.research.model import (
     ProjectSettings,
     ResearchPage,
     format_stamp,
+    is_agent,
     normalize_author,
     page_from_parts,
     parse_id,
+    phase_name,
+    plain_links,
+    role_of,
 )
 from paper_orchestra.research.project import (
     BRIEF_FILE,
@@ -205,6 +225,9 @@ _MIN_URL_SECRET_CHARS = 4
 _COUNT_SECONDS = 0.3
 #: Seconds a Run waits for the runs a dead worker left to be settled before it decides.
 _SETTLE_SECONDS = 20.0
+#: Seconds for which the server remembers that no client could be made for a model (no
+#: credential) before it tries again: see ``Services.client_for``.
+_REFUSAL_SECONDS = 20.0
 #: Seconds one listing of the edit proposals spends on the number checks of suggested
 #: edits to findings; an edit it does not get to is listed without a report.
 _ROW_CHECK_SECONDS = 0.5
@@ -218,6 +241,13 @@ _USAGE_FILE = "usage.json"
 _READ_BY_THE_ENGINE = (STATE_FILE, EVENTS_FILE, _USAGE_FILE)
 #: A record of a project (usage, the paper's state, a manifest) is far smaller.
 _MAX_JSON_BYTES = 32 * 1024 * 1024
+#: The kinds of page a person writes: all but the idea (there is one, made with the
+#: project) and the records, which code writes from what a run or a service returned.
+_PERSON_KINDS: tuple[str, ...] = tuple(
+    kind for kind in KINDS if kind != "idea" and kind not in RECORD_KINDS
+)
+#: How many decided edit proposals a page's view lists, the latest first.
+_MAX_DECIDED_EDITS = 20
 #: Half of a surrogate pair: valid in a JSON file, impossible to send or store as UTF-8.
 _UNSENDABLE = re.compile("[\ud800-\udfff]")
 
@@ -533,6 +563,26 @@ class Services:
     def approve(self, project: Project, ref: str, **options: Any) -> ResearchPage:
         return self._experiments().approve(project, ref, **options)
 
+    def will_not_run(self, project: Project, experiment_id: str) -> str | None:
+        """Why a run of the experiment would not start although its page reads approved
+        (``experiments.will_not_run``): it is no longer what was approved, or the run it
+        was approved for is over.  The rest of a sentence about the experiment; ``None``
+        when a run would start, and where that cannot be told here (the run says it)."""
+        try:
+            reason = self._later("will_not_run")(project, experiment_id)
+        except (ApiError, ProjectError, OSError):
+            return None
+        return str(reason) if reason else None
+
+    def last_success(self, project: Project, experiment_id: str) -> dict[str, Any] | None:
+        """The latest run of the experiment that succeeded, ``{"number", "result_page"}``
+        (``experiments.last_success``); ``None`` when none did or it cannot be told."""
+        try:
+            found = self._later("last_success")(project, experiment_id)
+        except (ApiError, ProjectError, OSError):
+            return None
+        return dict(found) if found else None
+
     def secrets(
         self,
         project: Project | None = None,
@@ -600,8 +650,43 @@ class Services:
     def next_step(self, project: Project, state: Mapping[str, Any]) -> dict[str, Any]:
         """What an ``advance`` without a phase would do from ``state`` (the engine's
         reading), as ``engine.next_step`` says it: ``{"will_run", "then", "experiments",
-        "results", "checkpoint_of", "needs_phase"}``.  Reads only."""
-        return dict(self._engine().next_step(project, state))
+        "not_running", "results", "checkpoint_of", "needs_phase", "blocked"}``.  Reads
+        only.  Whether the models can be used is part of it (``blocked``): the engine
+        asks :meth:`client_for`, as a worker of this server would find its clients."""
+        return dict(self._engine().next_step(project, state, client_for=self.client_for))
+
+    def client_for(self, model: str) -> Any:
+        """The client of ``model`` as a worker this server starts would get it
+        (``llm.router.get_client``), for asking whether the model can be used.
+        ``LLMConfigError`` when none can be made: no credential, most of the time.
+
+        Nothing is contacted.  A client that can be made is kept by the router; one
+        that cannot is tried anew at every call, at the cost of making one, and a
+        project is looked at often.  So a refusal is remembered here for
+        ``_REFUSAL_SECONDS``, and what the server reads from its environment when it
+        starts (a credential set since needs a restart, as for the Setup check)
+        stays true for that long at least.
+        """
+        from paper_orchestra.llm.base import LLMConfigError
+        from paper_orchestra.llm.router import get_client
+
+        refused: dict[str, tuple[float, LLMConfigError]] = self.__dict__.setdefault(
+            "_refused_clients", {}
+        )
+        # One look at a time: whoever asks while another look is under way gets its answer.
+        with self.__dict__.setdefault("_client_lock", threading.Lock()):
+            known = refused.get(model)
+            if known is not None and time.monotonic() < known[0]:
+                # One exception for many looks: raised without the frames of the looks
+                # before, which it would otherwise gather, with all they held.
+                raise known[1].with_traceback(None)
+            try:
+                client = get_client(model)
+            except LLMConfigError as exc:
+                refused[model] = (time.monotonic() + _REFUSAL_SECONDS, exc)
+                raise
+            refused.pop(model, None)
+            return client
 
     def phase_words(self) -> dict[str, str]:
         """How a sentence for the person names each phase (``the hypothesis phase``), in
@@ -1423,7 +1508,13 @@ def defaults(context: Ctx) -> dict[str, Any]:
     ``efforts`` (``settings.models.effort``) and ``compute_backends``
     (``settings.compute``).  ``phase_words`` is how a sentence for the person names
     each phase (``{"hypothesize": "the hypothesis phase"}``), as the engine's own
-    sentences and the server's refusals name it."""
+    sentences and the server's refusals name it, and ``phase_names`` what a phase
+    is called by itself (``{"hypothesize": "hypotheses"}``: "checkpoint after
+    hypotheses"), as the command line says it too.
+
+    ``creatable_kinds`` are the kinds of page the person can write (``kind`` of
+    ``POST .../pages``), and ``kind_writers`` says for each kind which agents write
+    it as well: none for a lesson, which is the person's alone."""
     return {
         "settings": context.services.default_settings(),
         "phases": list(PHASES),
@@ -1431,6 +1522,12 @@ def defaults(context: Ctx) -> dict[str, Any]:
         "efforts": list(EFFORTS),
         "compute_backends": list(COMPUTE_BACKENDS),
         "phase_words": context.services.phase_words(),
+        "phase_names": {phase: phase_name(phase) for phase in PHASES},
+        "creatable_kinds": list(_PERSON_KINDS),
+        "kind_writers": {
+            kind: [role for role in ROLES if kind in ROLE_MAY_CREATE.get(role, ())]
+            for kind in _PERSON_KINDS
+        },
     }
 
 
@@ -1667,6 +1764,8 @@ def _summary(context: Context, key: str, project: Project) -> dict[str, Any]:
         "title": project.title,
         "created": project.created,
         "dir": project.root.name,
+        # Built to be looked at: what it "spent" on models is its story's, not a bill.
+        "demonstration": project.demonstration,
         "status": state["status"],
         "round": state["round"],
         "phase": state["phase"],
@@ -1795,6 +1894,7 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
         "created": project.created,
         "settings": _shown_settings(project),
         "dir": project.root.name,
+        "demonstration": project.demonstration,
         "state": state,
         "state_problem": standing.problem,
         "state_source": standing.source,
@@ -1813,9 +1913,12 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
 def list_projects(context: Ctx) -> dict[str, Any]:
     """Every project of the workspace, the most recently active first.
 
-    A row is ``{"id", "title", "created", "dir", "status", "round", "phase",
-    "next_phase", "checkpoint", "pending", "spent", "error", "state_problem",
-    "state_source", "updated", "worker", "worker_verified", "counts"}``.
+    A row is ``{"id", "title", "created", "dir", "demonstration", "status",
+    "round", "phase", "next_phase", "checkpoint", "pending", "spent", "error",
+    "state_problem", "state_source", "updated", "worker", "worker_verified",
+    "counts"}``.  ``demonstration`` is true for a project that ``research demo``
+    built: the model cost in ``spent`` is part of its story, and no model was
+    called for it.
     ``counts`` is ``Project.counts()`` as the project view gives it and
     ``pending`` its total (proposed pages and edit proposals as they are now).
     Counting is bounded per listing: where a project's pages changed and the
@@ -2066,7 +2169,8 @@ async def create_project(request: Request, context: Ctx) -> dict[str, Any]:
 @router.get("/projects/{pid}")
 def get_project(project: Proj, context: Ctx) -> dict[str, Any]:
     """``project.json``, the engine's ``state``, ``counts``, the ``checkpoint`` and the
-    ``worker``.
+    ``worker``.  ``demonstration`` is true for a project built by ``research demo``:
+    what it says it spent on models is its story's cost.
 
     ``state`` is where the project stands as the engine reads it: ``state.json``,
     or, when that file is lost or holds no phase, round, phases, checkpoint and
@@ -2078,11 +2182,37 @@ def get_project(project: Proj, context: Ctx) -> dict[str, Any]:
 
     ``next_step`` is what a press of Continue (``POST .../advance`` without a
     phase) would do, by the engine's own rule: ``{"will_run": [phases, in order],
-    "then": the phase its checkpoint names as next, "experiments": [ids the run
-    phase is owed], "results": how many result records have no analysis yet,
+    "then": the phase its checkpoint names as next, "experiments": [ids of the
+    experiments a run phase would start], "not_running": [{"id", "reason"} for
+    each experiment that reads approved and would not be started: it is no longer
+    what was approved, or that approval was used], "results": how many result
+    records have no analysis yet (a run the person cancelled is none),
     "checkpoint_of": a phase whose owed checkpoint is written first (or ``null``),
-    "needs_phase": the call would be refused until a phase is named}``.  It is
-    ``null`` while a worker has the project.
+    "needs_phase": the call would be refused until a phase is named, "blocked":
+    ``null`` or where the press stops for want of a model}``.  It is ``null`` while
+    a worker has the project.
+
+    ``next_step.blocked`` is ``{"phase", "needs": "model", "settings", "models",
+    "message"}`` where the project's models cannot be used by this server's
+    workers (no credential is configured, or a model offers no tools): ``phase``
+    is the first phase that is not started, ``settings`` the entries of
+    ``settings.models`` concerned, and ``message`` the one sentence that says what
+    is missing and what to set up.  ``will_run`` then lists only what happens
+    without a model (the run of what is approved) and ``then`` is that phase; with
+    ``will_run`` empty a press starts nothing.  The server finds this out from its
+    own environment, without contacting anything, and asks again after a short
+    while; a credential set since the server started needs a restart.
+
+    ``worker.last_exit.reason`` is ``"needs_model"`` when the last worker started
+    nothing for that reason (``POST .../advance`` still answers 202: the worker
+    finds it out for itself and ends).  It did not die, no error is among the
+    events, and ``state`` is as it was.
+
+    ``checkpoint.did`` is the account of what the phases did before the pause,
+    without the count of what waited, without what was next and without the
+    sentence about a model the next phase could not use; ``summary`` has all of
+    it as the checkpoint said it.  (A checkpoint of an earlier version has no
+    ``did``.)
 
     ``checkpoint`` (also ``state.checkpoint``) carries ``recommends`` and
     ``recommends_page``: ``"research"`` and the path of the journal page when the
@@ -2146,6 +2276,13 @@ def advance(project: Proj, context: Ctx, body: AdvanceBody | None = None) -> dic
 
     Returns at once; the worker reports through the event stream.  409 with the
     running ``worker`` and ``phase`` when the project already has one.
+
+    Where the phase that would run needs a model and none can be used, the worker
+    finds that out, starts nothing and ends: the answer here is 202 all the same.
+    The project view said so beforehand (``next_step.blocked``, with the sentence
+    to show) and says how that worker ended (``worker.last_exit.reason`` is
+    ``"needs_model"``); no error is written to the project's events.  What needs
+    no model, the run of an approved experiment, happens first.
 
     409 ``conflict`` as well, with nothing started, where the project view says that
     the state is not read because ``state.json``, the events or the usage ledger is not
@@ -2486,6 +2623,17 @@ def _node(node: Mapping[str, Any], relation: str) -> dict[str, Any]:
     }
 
 
+def _by(author: str) -> str:
+    """An author as a sentence names them: ``you``, ``the analyst``, ``the engine``."""
+    try:
+        author = normalize_author(author)
+    except ProjectError:
+        return "its author"  # a proposal file written by hand may name anybody
+    if author == HUMAN:
+        return "you"
+    return f"the {role_of(author)}" if is_agent(author) else "the engine"
+
+
 def _as_proposed(page: ResearchPage, proposal: EditProposal) -> ResearchPage:
     """``page`` as it would read with ``proposal`` accepted as it stands: its fields set,
     its relations added, its text in place of the page's.  Nothing is written."""
@@ -2541,8 +2689,12 @@ def _proposal_view(
     current = _blank(page.body, hidden)
     proposed = current if proposal.body is None else _blank(proposal.body, hidden)
     finding = page.kind == "finding"
+    # Headed as the app says everything else: whose suggestion it is, not "agent:analyst".
     diff = unified_diff(
-        current, proposed, old_label="current", new_label=f"proposed by {proposal.author}"
+        current,
+        proposed,
+        old_label="the page as it is",
+        new_label=f"as {_by(proposal.author)} {'suggest' if proposal.author == HUMAN else 'suggests'} it",
     )
     marked = render_marked(
         current,
@@ -2566,6 +2718,30 @@ def _proposal_view(
         "page_changed": bool(proposal.base_updated) and proposal.base_updated != page.updated,
         **(_numbers(context, project, _as_proposed(page, proposal)) if finding else {}),
     }
+
+
+def _decided_edits(project: Project, page: ResearchPage) -> list[dict[str, Any]]:
+    """The edit proposals for ``page`` that the person has decided, the latest decision
+    first (at most ``_MAX_DECIDED_EDITS``): each as the proposal is on file, with its
+    ``review``, ``decided_at`` and ``decision_reason``, but without the text it proposed
+    (``changes_text`` says whether it proposed one).  So that a suggestion that was
+    turned down, and why, can be found on the page it was about."""
+    decided = [
+        proposal
+        for proposal in project.proposals(review=None)
+        if proposal.target == page.path and proposal.review != "proposed"
+    ]
+    # Decisions of one second are told apart by when the edits were suggested.
+    decided.sort(
+        key=lambda proposal: (proposal.decided_at or "", proposal.created, proposal.id),
+        reverse=True,
+    )
+    rows = []
+    for proposal in decided[:_MAX_DECIDED_EDITS]:
+        row = proposal.to_dict()
+        text = row.pop("body")
+        rows.append({**row, "changes_text": text is not None})
+    return rows
 
 
 def _page_view(context: Context, project: Project, page: ResearchPage) -> dict[str, Any]:
@@ -2595,6 +2771,8 @@ def _page_view(context: Context, project: Project, page: ResearchPage) -> dict[s
             for proposal in project.proposals(review="proposed")
             if proposal.target == page.path
         ],
+        # What was suggested for this page before, and what the person decided.
+        "decided_proposals": _decided_edits(project, page),
         # A record (a result, a source) that no longer reads as code wrote it.
         "edited_record": context.services.edited_record(project, page),
     }
@@ -2625,7 +2803,10 @@ def list_pages(
     The row of an experiment also carries ``interrupted``, as the experiments'
     own listing does: true where the page says ``running`` and nothing is running
     it any more, so that whatever is drawn from this list (a glyph, a pill) can
-    say what the experiment's view says in words."""
+    say what the experiment's view says in words.  It carries ``will_not_run`` and
+    ``last_success`` as that listing does, too: an experiment that reads approved
+    and will not run as it stands, and one that reads cancelled or failed although
+    an earlier run of it succeeded, are told wherever experiments are drawn."""
     pages = project.pages(kind=_many(kind), review=_many(review), state=_many(state))
     interrupted = _interrupted(context, project, [p for p in pages if p.kind == "experiment"])
 
@@ -2633,13 +2814,14 @@ def list_pages(
         listed = page.to_dict(body=False)
         if page.kind == "experiment":
             listed["interrupted"] = page.id in interrupted
+            listed.update(_run_standing(context, project, page))
         return listed
 
     if q and q.strip():
         hits = {hit.path: hit for hit in project.search(q, k=len(pages) or 1, review=None)}
         order = {path: position for position, path in enumerate(hits)}
         pages = sorted((p for p in pages if p.path in hits), key=lambda p: order[p.path])
-        return {"pages": [{**row(p), "snippet": hits[p.path].snippet} for p in pages]}
+        return {"pages": [{**row(p), "snippet": _snippet(hits[p.path].snippet)} for p in pages]}
     return {"pages": [row(page) for page in pages]}
 
 
@@ -2679,7 +2861,9 @@ def get_version(path: str, stamp: str, project: Proj, context: Ctx) -> dict[str,
     current = _blank(project.page(target).body, hidden) if target else None
     body = _blank(body, hidden)
     diff = (
-        unified_diff(body, current, old_label=f"version of {stamp}", new_label="current")
+        unified_diff(
+            body, current, old_label=f"the version of {stamp}", new_label="the page as it is"
+        )
         if current is not None
         else ""
     )
@@ -2703,6 +2887,16 @@ def get_page(path: str, project: Proj, context: Ctx) -> dict[str, Any]:
     with the relation ``type``), ``history`` (earlier versions, newest first) and the
     pending edit ``proposals`` for it (each with ``diff``, ``diff_html`` and
     ``marked_html``).  ``path`` may also be an id (``H2``) or a link target.
+
+    ``decided_proposals`` are the edits suggested for the page that the person has
+    decided, the latest decision first: each with ``review`` (``accepted`` or
+    ``rejected``), ``decided_at``, ``decision_reason``, ``author``, ``summary``,
+    ``fields`` and ``changes_text`` (whether it proposed a new text), without that
+    text.  ``GET .../proposals?review=all`` lists the decided edits of every page.
+
+    ``page.created`` is when the page was first written (for a proposal: when it
+    was proposed) and stays so; ``page.updated`` and ``page.meta.updated_by`` say
+    when and by whom it was last changed, which an edit of the person's moves.
 
     For a finding, ``number_check`` lists where each of its numbers was found
     (``{"number", "found_in", "in_basis", "kinds"}``) and ``number_report`` is the
@@ -3021,9 +3215,29 @@ def delete_request(rid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     return {"deleted": rid}
 
 
+_MARKDOWN_LINK = re.compile(r"!?\[([^\]\n]*)\]\([^)\n]*\)")
+_EMPHASIS = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+_LINE_MARK = re.compile(r"^\s*(?:#{1,6}|>+|[-*+]|\d+[.)])\s+")
+
+
+def _snippet(line: Any) -> str:
+    """The line of a page a search matched, as text: without the marks a page is written
+    with.  A row of a table reads ``a · b``, a link is its label, and ``**``, backticks
+    and the mark that begins a heading, a quotation or a list item are left out.  (The
+    snippet is shown where nothing is rendered: a list of hits, the palette.)"""
+    text = " ".join(str(line or "").split())
+    if text.startswith("|"):
+        cells = [cell.strip() for cell in text.strip("|").split("|")]
+        text = " · ".join(cell for cell in cells if cell.strip("-: "))
+    text = _MARKDOWN_LINK.sub(r"\1", plain_links(_LINE_MARK.sub("", text)))
+    return _EMPHASIS.sub(r"\1", text.replace("**", "").replace("`", "")).strip()
+
+
 @router.get("/projects/{pid}/search")
 def search(project: Proj, context: Ctx, q: str = "", limit: int = 20) -> dict[str, Any]:
-    """Keyword search over every page, whatever its review; best first."""
+    """Keyword search over every page, whatever its review; best first.  The ``snippet``
+    of a hit is the matching line as plain text (no table pipes, link brackets or
+    emphasis marks)."""
     if not q.strip():
         return {"query": q, "hits": []}
     pages = {page.path: page for page in project.pages()}
@@ -3031,7 +3245,8 @@ def search(project: Proj, context: Ctx, q: str = "", limit: int = 20) -> dict[st
     for hit in project.search(q, k=max(1, min(limit, 100)), review=None):
         page = pages.get(hit.path)
         if page is not None:
-            hits.append({**page.to_dict(body=False), "score": hit.score, "snippet": hit.snippet})
+            snippet = _snippet(hit.snippet)
+            hits.append({**page.to_dict(body=False), "score": hit.score, "snippet": snippet})
     return {"query": q, "hits": hits}
 
 
@@ -3100,6 +3315,32 @@ def _cancel_does(context: Context, project: Project, page: ResearchPage) -> str 
     return "cancel" if context.services.run_held(project, str(page.id)) is True else "withdraw"
 
 
+def _run_standing(context: Context, project: Project, page: ResearchPage) -> dict[str, Any]:
+    """What a listing says of an experiment beyond the state on its page, so that the
+    state is not taken for more than it says:
+
+    ``will_not_run``: for an accepted experiment whose page reads ``approved`` (or
+    ``queued``, ``running``), why a run of it would not start as it stands: it is no
+    longer what was approved (its code or plan changed), or that approval was used.
+    The rest of a sentence (``it is not what was approved at ... (main.py: ...)``);
+    ``None`` when it would run.  Such an experiment needs the person's approval again,
+    and a press of Continue does not run it (``next_step.not_running`` names it too).
+
+    ``last_success``: for an experiment whose page reads ``cancelled`` or ``failed``,
+    the latest run of it that succeeded, ``{"number", "result_page"}``: its state is
+    how the last approved run ended, not that it has no result.  ``None`` otherwise.
+
+    Only the experiments in those states cost a look at their code or their runs.
+    """
+    waits = page.review == "accepted" and page.state in ("approved", "queued", "running")
+    over = page.state in ("cancelled", "failed")
+    name = str(page.id or "")
+    return {
+        "will_not_run": context.services.will_not_run(project, name) if waits and name else None,
+        "last_success": context.services.last_success(project, name) if over and name else None,
+    }
+
+
 def _dependents(context: Context, project: Project, page: ResearchPage) -> Any:
     """What rests on a rejected experiment, as the answer to its rejection said it;
     ``None`` for an experiment that is not rejected, and where it cannot be told."""
@@ -3117,7 +3358,12 @@ def list_experiments(project: Proj, context: Ctx) -> dict[str, Any]:
     """Every experiment page (without text) with a summary of its runs: how many, and
     the latest one's record.  ``interrupted`` is true where the page says ``running``
     and nothing is running it any more, and ``cancel_does`` says what a cancel would
-    do (see the experiment's own view for both)."""
+    do (see the experiment's own view for both).
+
+    ``will_not_run`` is ``null``, or why an experiment that reads approved would not
+    run as it stands (it changed since the approval: it needs approval again).
+    ``last_success`` is ``null``, or, for an experiment that reads ``cancelled`` or
+    ``failed``, its latest run that succeeded: ``{"number", "result_page"}``."""
     pages = project.pages(kind="experiment")
     interrupted = _interrupted(context, project, pages)
     rows = []
@@ -3131,6 +3377,7 @@ def list_experiments(project: Proj, context: Ctx) -> dict[str, Any]:
                 "last_run": _run_view(context, project, page.id, latest) if latest else None,
                 "interrupted": page.id in interrupted,
                 "cancel_does": _cancel_does(context, project, page),
+                **_run_standing(context, project, page),
             }
         )
     return {"experiments": rows}
@@ -3172,6 +3419,8 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
         "interrupted_note": _INTERRUPTED.format(id=experiment_id) if interrupted else None,
         # What the cancel endpoint would do now: "withdraw", "cancel" or nothing.
         "cancel_does": _cancel_does(context, project, page),
+        # Why it would not run although it reads approved; an earlier run that succeeded.
+        **_run_standing(context, project, page),
         # For a rejected experiment: the findings and verdicts that rest on its runs.
         "dependents": _dependents(context, project, page),
         "html": render_markdown(
@@ -3241,6 +3490,13 @@ def get_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     ``"withdraw"`` (the experiment is approved and has not started: its approval
     is taken back), ``"cancel"`` (it is queued or being run: the run ends as
     cancelled) or ``null`` (nothing to cancel).
+
+    ``will_not_run`` is ``null``, or, for an experiment whose page reads approved
+    (or queued, running), why a run would not start as it stands, as the rest of
+    a sentence: it is not what was approved any more, or the run it was approved
+    for is over.  ``last_success`` is ``null``, or, for an experiment that reads
+    ``cancelled`` or ``failed``, the latest run of it that succeeded
+    (``{"number", "result_page"}``).
 
     ``dependents`` is ``null`` unless the experiment is rejected; then it is what
     rests on it, in the shape the review answer gives with the rejection

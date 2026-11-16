@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import io
+import os
 import re
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -106,8 +107,9 @@ __all__ = [
     "gpu_has_price",
     "make_repair",
     "model_for",
-    "model_problems",
+    "model_need",
     "named",
+    "need_sentence",
     "priced_gpus",
     "read_inputs",
     "repo_tools",
@@ -353,42 +355,160 @@ def model_for(project: Project, role: str) -> str:
     return str(project.settings.models[MODEL_ROLES[role]])
 
 
-def model_problems(project: Project, harness: ContextHarness) -> list[str]:
-    """Why the research agents cannot work with the project's models; empty when they can.
+#: How each provider's credentials are set, for the one sentence that says what to do.
+_CREDENTIALS = {
+    "anthropic": (
+        "Anthropic",
+        "set ANTHROPIC_API_KEY or the Workload Identity Federation variables",
+    ),
+    "gemini": ("Gemini", "set GEMINI_API_KEY (or VERTEX_AI_PROJECT and VERTEX_AI_LOCATION)"),
+    "openai": ("OpenAI", "set OPENAI_API_KEY"),
+}
+#: Where the person finds out what is configured, said once at the end of that sentence.
+_WHERE_TO_LOOK = "Setup in the app and `paper-orchestra doctor` show what is configured"
 
-    The agents read and write the wiki through tools and the memory tool.  A model
-    without them is refused here, before anything is spent, with the setting to change.
+
+@dataclass(frozen=True)
+class _Fault:
+    """Why the model of one setting (``settings.models.<setting>``) cannot serve the agents."""
+
+    setting: str
+    model: str
+    #: What is wrong with it, as the rest of "the model set for ... (<model>) ...".
+    says: str
+    #: What the person does about it, as the rest of a sentence.
+    fix: str
+
+
+def _first_sentence(text: Any) -> str:
+    """The first sentence of a provider's error, as a clause: on one line, without its
+    full stop, and beginning in lower case unless it begins with a name."""
+    line = str(text).strip().split("\n", 1)[0].split(". ", 1)[0].rstrip(".: ")
+    line = _short(line, 200)
+    return line[:1].lower() + line[1:] if line[1:2].islower() else line
+
+
+def _unbuilt(project: Project, setting: str, model: str, exc: LLMConfigError) -> _Fault:
+    """The fault of a model whose client could not be made.
+
+    No credential is by far the most common reason, and the provider explains it
+    in several lines that suit a terminal.  Here it is one clause and one thing to
+    do; what else can be wrong (a package that is not installed, a model no
+    provider serves) is said in the first sentence of the provider's own error.
     """
-    problems: list[str] = []
-    for setting in dict.fromkeys(MODEL_ROLES.values()):
-        model = str(project.settings.models[setting])
-        fix = (
-            f"Set settings.models.{setting} to a model that has both (for example "
-            f"{DEFAULT_MODEL}) and run the command again. Nothing was spent."
+    from paper_orchestra import doctor
+    from paper_orchestra.llm.router import provider_for_model
+
+    change = f"put that right or change settings.models.{setting}"
+    try:
+        provider = provider_for_model(model)
+    except LLMConfigError:
+        provider = ""
+    missing_package = isinstance(exc.__cause__, ImportError)
+    no_credential = provider in _CREDENTIALS and not missing_package
+    if no_credential and doctor.environment_credential(provider, os.environ) is None:
+        name, fix = _CREDENTIALS[provider]
+        return _Fault(
+            setting, model, f"cannot be used because no {name} credentials were found", fix
         )
-        try:
-            capabilities: Capabilities = harness.client_for(model).capabilities
-        except LLMConfigError as exc:
-            problems.append(
-                f"The model set for `{setting}` ({model}) cannot be used: {exc} "
-                "Put this right, or change settings.models."
-                f"{setting}, and run the command again. Nothing was spent."
-            )
-            continue
-        missing = [
-            name
-            for name, has in (
-                ("tools", capabilities.tools),
-                ("the memory tool", capabilities.memory_tool),
-            )
-            if not has
-        ]
-        if missing:
-            problems.append(
-                f"The model set for `{setting}` ({model}) offers no {' and no '.join(missing)}, "
-                "which the research agents need to read and write the wiki. " + fix
-            )
-    return problems
+    # A library may quote what it was configured with: no credential gets into a sentence.
+    why = experiments.mask_credentials(project, _first_sentence(exc))
+    return _Fault(setting, model, f"cannot be used because {why}", change)
+
+
+def _fault(project: Project, setting: str, client_for: Callable[[str], Any]) -> _Fault | None:
+    model = str(project.settings.models[setting])
+    try:
+        capabilities: Capabilities = client_for(model).capabilities
+    except LLMConfigError as exc:
+        return _unbuilt(project, setting, model, exc)
+    missing = [
+        name
+        for name, has in (("tools", capabilities.tools), ("memory tool", capabilities.memory_tool))
+        if not has
+    ]
+    if not missing:
+        return None
+    # The agents read and write the wiki through tools and the memory tool.
+    return _Fault(
+        setting,
+        model,
+        f"offers no {' and no '.join(missing)}",
+        f"set settings.models.{setting} to a model that has "
+        f"{'both' if len(missing) > 1 else 'it'} (for example {DEFAULT_MODEL})",
+    )
+
+
+def model_need(
+    project: Project,
+    client_for: Callable[[str], Any],
+    *,
+    settings: Sequence[str] | None = None,
+) -> dict[str, Any] | None:
+    """What keeps the research agents from working with the project's models, for
+    whoever has to say so; ``None`` when they can work::
+
+        {"needs": "model", "settings": ["research", "reasoning", "coding"],
+         "models": ["claude-fable-5-2"],
+         "why": "the model set for research, reasoning and coding (claude-fable-5-2) "
+                "cannot be used because no Anthropic credentials were found",
+         "fix": "set ANTHROPIC_API_KEY or the Workload Identity Federation variables"}
+
+    ``client_for`` is how a model's client is found (``ContextHarness.client_for``,
+    ``llm.router.get_client``).  A model cannot be used when no client can be made
+    for it (no credential, most of the time) or when it offers no tools or no
+    memory tool, through which the agents read and write the wiki.  ``settings``
+    are the entries of ``settings.models`` that are asked about: all that an
+    agent works with, unless a caller needs one role's alone.
+
+    Finding this out contacts nothing and spends nothing: a client is made from
+    the environment and local files, and asked what it offers.
+    :func:`need_sentence` says the answer in one sentence.
+    """
+    asked = list(dict.fromkeys(settings or MODEL_ROLES.values()))
+    found: dict[str, Any] = {}
+
+    def once(model: str) -> Any:
+        """The client of ``model``, or the refusal, looked for once however many roles
+        share the model: a client that cannot be made costs as much at every try."""
+        if model not in found:
+            try:
+                found[model] = client_for(model)
+            except LLMConfigError as exc:
+                found[model] = exc
+        if isinstance(found[model], LLMConfigError):
+            raise found[model]
+        return found[model]
+
+    faults = [fault for name in asked if (fault := _fault(project, name, once)) is not None]
+    if not faults:
+        return None
+    groups: dict[tuple[str, str], list[str]] = {}
+    for fault in faults:
+        groups.setdefault((fault.model, fault.says), []).append(fault.setting)
+    why = [
+        f"the model set for {_listed(names)} ({model}) {says}"
+        for (model, says), names in groups.items()
+    ]
+    return {
+        "needs": "model",
+        "settings": [fault.setting for fault in faults],
+        "models": list(dict.fromkeys(fault.model for fault in faults)),
+        "why": ", and ".join(why),
+        "fix": ", and ".join(dict.fromkeys(fault.fix for fault in faults)),
+    }
+
+
+def need_sentence(need: Mapping[str, Any], what: str) -> str:
+    """The one sentence about models that cannot be used (``need``, from
+    :func:`model_need`): ``what`` (``The analysis phase``, ``A repair``) needs a model,
+    which model set for which roles cannot be used and why, and what to do.
+
+    It names every role concerned once and says nothing about a command or a
+    button: whoever shows it (the command line, the app, a checkpoint) adds how
+    to go on from where the person is.
+    """
+    return f"{what} needs a model, and {need['why']}: {need['fix']} ({_WHERE_TO_LOOK})."
 
 
 # ---------------------------------------------------------------------------
