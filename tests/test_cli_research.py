@@ -1425,6 +1425,32 @@ def test_ui_serves_the_workspace_on_loopback_by_default(workspace, monkeypatch):
     ]
 
 
+def test_ui_says_that_the_app_needs_its_access_token_and_where_the_link_is():
+    result = runner.invoke(cli.app, ["ui", "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    said = flat(result.output)
+    # On loopback too: every account and process of the machine reaches loopback.
+    assert "access token" in said and "loopback included" in said
+    assert "prints the link" in said and "once" in said and "in this terminal" in said
+    # How to keep one across restarts, and how a program that is no browser sends it.
+    assert "PAPER_ORCHESTRA_UI_TOKEN" in said and "16 characters" in said
+    assert "Authorization: Bearer" in said
+
+
+def test_ui_refuses_a_token_that_cannot_be_one_in_one_line(workspace, monkeypatch):
+    monkeypatch.setenv("PAPER_ORCHESTRA_UI_TOKEN", "short")
+
+    result = runner.invoke(cli.app, ["ui", "--no-browser"])
+
+    assert result.exit_code == 2
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert "PAPER_ORCHESTRA_UI_TOKEN" in lines[0] and "16 characters" in lines[0]
+    assert "short" not in lines[0].replace("shorter", "")
+    assert not (workspace / "research").exists()  # nothing was started, nothing was made
+
+
 class _MissingPackage(importlib.abc.MetaPathFinder):
     """Makes importing the web app fail the way it does without the ``ui`` extra."""
 

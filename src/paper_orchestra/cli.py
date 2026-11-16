@@ -2232,12 +2232,18 @@ def ui(
     host: Annotated[
         str,
         typer.Option(
-            "--host", help="Address to listen on. Anything but loopback needs the access token."
+            "--host",
+            help="Address to listen on. On every address, loopback included, the app is "
+            "opened with the link that carries the access token.",
         ),
     ] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", min=0, max=65535, help="Port.")] = 8600,
     browser: Annotated[
-        bool, typer.Option("--browser/--no-browser", help="Open the app in the browser.")
+        bool,
+        typer.Option(
+            "--browser/--no-browser",
+            help="Open the app in the browser. Without it, open the link the server prints.",
+        ),
     ] = True,
     stop_workers_on_exit: Annotated[
         bool,
@@ -2250,18 +2256,29 @@ def ui(
 ) -> None:
     """Open the web app: the wiki, its graph, the review inbox, experiments and activity.
 
+    The app asks for an access token, so that nobody else on this machine can use it
+    as you. The server prints the link that carries the token once, in this terminal,
+    when it starts, and opens it in your browser; a page opened without the token says
+    so. Every start makes a new token: set PAPER_ORCHESTRA_UI_TOKEN (16 characters or
+    more) to keep one across restarts. Other programs send it as
+    `Authorization: Bearer <token>`.
+
     Agents and experiments belong to their project, not to the server: when the server
     ends they keep running, and it prints which do and how to stop one.
     """
     try:
         from paper_orchestra.web.app import serve
+        from paper_orchestra.web.security import TokenError
     except ModuleNotFoundError as exc:
         missing = exc.name or "a package"
         if missing.split(".")[0] == "paper_orchestra":
             raise
         _fail(f"The web app needs {missing}, which is not installed: run `uv sync --extra ui`.")
     options: dict[str, Any] = {"stop_workers_on_exit": True} if stop_workers_on_exit else {}
-    serve(workspace, host=host, port=port, open_browser=browser, **options)
+    try:
+        serve(workspace, host=host, port=port, open_browser=browser, **options)
+    except TokenError as exc:
+        _fail(str(exc))
 
 
 # -- memory ------------------------------------------------------------------------

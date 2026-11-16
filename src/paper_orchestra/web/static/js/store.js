@@ -11,7 +11,7 @@
    derived state already shows it. It is sent after a short grace period (the only "undo"
    there is: the API has none), and rolled back with the server's message if it is refused. */
 
-import { api, Unreachable } from './api.js';
+import { api, connection, Unreachable } from './api.js';
 import { askHealth } from './core.js';
 import { STAGES, relOf } from './vocab.js';
 
@@ -338,7 +338,9 @@ export class Store {
 
   /* ---------- the event stream ---------- */
   connect() {
-    if (this.closed || this.source || typeof EventSource === 'undefined') return;
+    /* (a server that refuses this page refuses its stream: it is opened again when the
+       server lets the page in, not every few seconds until then) */
+    if (this.closed || this.source || connection.denied || typeof EventSource === 'undefined') return;
     const source = new EventSource(api.eventsUrl(this.pid, this.lastSeq));
     this.source = source;
     source.onopen = () => {

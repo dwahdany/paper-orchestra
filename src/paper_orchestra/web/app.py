@@ -3,18 +3,29 @@
 ``create_app`` builds the ASGI application for a workspace (a directory of
 project directories); ``serve`` runs it with uvicorn, which is what
 ``paper-orchestra ui`` calls.
+
+The server ``serve`` runs always asks for an access token, on loopback too:
+the link it prints once at start carries the token, and a browser it opens is
+handed that link through a file only the person can read (see
+``_BrowserOpener``), never as an argument of a process.
 """
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import errno
+import html
+import inspect
 import logging
 import os
 import re
 import shutil
 import signal
 import socket
+import stat
+import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -43,16 +54,20 @@ from paper_orchestra.web.security import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     MAX_BODY_BYTES,
+    MIN_TOKEN_CHARS,
+    TOKEN_ENV,
     TOKEN_PARAM,
     PathEscape,
     SecurityMiddleware,
     confined,
+    fixed_token,
     is_loopback,
     new_token,
+    offers_token,
 )
 from paper_orchestra.web.workers import GRACE_SECONDS, Launcher, Workers
 
-__all__ = ["STAGING_DIR", "STATIC_DIR", "create_app", "serve", "sweep_staging"]
+__all__ = ["OPENER_SECONDS", "STAGING_DIR", "STATIC_DIR", "create_app", "serve", "sweep_staging"]
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +81,26 @@ STAGING_DIR: str = getattr(api_module, "_STAGING_DIR", ".incoming")
 STAGING_STALE_SECONDS = 3600.0
 #: What the API calls the directory of one upload: sixteen hexadecimal digits.
 _STAGED_UPLOAD = re.compile(r"[0-9a-f]{16}")
+
+#: How long the file that hands the link to a browser exists, in seconds: long enough
+#: for a browser that is only just starting to read it, and no longer.
+OPENER_SECONDS = 30.0
+#: That file.  It sends the browser on to the link at once (and replaces itself in the
+#: history of the tab), and tells the app's address nothing about where it came from.
+_OPENER_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="refresh" content="0; url={link}">
+<title>Opening PaperOrchestra</title>
+</head>
+<body>
+<p>Opening PaperOrchestra. If nothing happens,
+<a rel="noreferrer" href="{link}">open it here</a>.</p>
+</body>
+</html>
+"""
 
 _FRONTEND_MISSING = (
     "PaperOrchestra is running, but the files of its web interface are not installed "
@@ -258,6 +293,203 @@ def _free_port(host: str) -> int:
         return int(probe.getsockname()[1])
 
 
+class _BrowserOpener:
+    """Opens the app in the person's browser, a moment after the server has started.
+
+    With an access token the browser is not given the link: an argument of a
+    process can be read by every account of the machine for as long as the
+    process lives.  It is given a file that leads to the link.  The file is the
+    person's alone (mode 0600, in a directory of its own with mode 0700) and is
+    removed ``OPENER_SECONDS`` after it was written or when the app ends,
+    whichever comes first.  If it cannot be written no browser is opened, and
+    ``say`` is told so; the link printed at start is then the way in.
+
+    Without a token (an app built for an in-process test) the plain address is
+    opened.
+    """
+
+    def __init__(self, address: str, link: str | None, say: Callable[[str], None]) -> None:
+        self._address = address
+        self._link = link
+        self._say = say
+        self._lock = threading.Lock()
+        self._timers: list[threading.Timer] = []
+        self._directory: Path | None = None
+        self._closed = False
+
+    def start(self) -> None:
+        # A moment later, so that the server answers when the page asks.
+        self._later(0.5, self._open)
+
+    def close(self) -> None:
+        """The app has ended: nothing more is opened, and the file is gone."""
+        with self._lock:
+            self._closed = True
+            timers, self._timers = self._timers, []
+        for timer in timers:
+            timer.cancel()
+        self._remove()
+
+    def _later(self, seconds: float, call: Callable[[], None]) -> None:
+        timer = threading.Timer(seconds, call)
+        timer.daemon = True
+        with self._lock:
+            if self._closed:
+                return
+            self._timers.append(timer)
+        timer.start()
+
+    def _open(self) -> None:
+        if self._link is None:
+            webbrowser.open(self._address)
+            return
+        try:
+            page = self._write()
+        except OSError as exc:
+            self._remove()
+            self._say(
+                "The browser was not opened: the file that hands it the link could not "
+                f"be written ({exc}). Open the link that was printed at start yourself."
+            )
+            return
+        if page is None:
+            return
+        # Counted from now, not from when the browser returns: a browser started by this
+        # call may only return when the person closes it.
+        self._later(OPENER_SECONDS, self._remove)
+        began = time.monotonic()
+        try:
+            opened = webbrowser.open(page.as_uri())
+        except Exception:  # whatever a browser's launcher may raise
+            log.debug("The browser could not be opened.", exc_info=True)
+            opened = False
+        if not opened and time.monotonic() - began < OPENER_SECONDS:
+            self._remove()
+            self._say(
+                "No browser could be started here. Open the link that was printed at "
+                "start yourself."
+            )
+
+    def _write(self) -> Path | None:
+        """Write the file and return where it is; ``None`` when the app has ended."""
+        directory = Path(tempfile.mkdtemp(prefix="paper-orchestra-ui-"))  # mode 0700
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._directory = directory
+        if closed:
+            shutil.rmtree(directory, ignore_errors=True)
+            return None
+        # Should the process end without the app's own ending (an error at start).
+        atexit.register(self._remove)
+        page = directory / "open.html"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(page, flags, 0o600), "w", encoding="utf-8") as handle:
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), 0o600)  # whatever the umask says
+            handle.write(_OPENER_PAGE.format(link=html.escape(str(self._link), quote=True)))
+        return page
+
+    def _remove(self) -> None:
+        with self._lock:
+            directory, self._directory = self._directory, None
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+            atexit.unregister(self._remove)
+
+
+def _output_is_shared() -> bool:
+    """Whether what the server prints goes to a file that other users of the machine can
+    read (`paper-orchestra ui > ui.log` under the usual umask).  A terminal, a pipe and a
+    file of the person's alone are not; where there are no such permissions, nothing is."""
+    if os.name != "posix":
+        return False
+    try:
+        status = os.fstat(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        return False
+    return stat.S_ISREG(status.st_mode) and bool(status.st_mode & 0o044)
+
+
+def _how_to_open(
+    address: str, link: str, *, opens: bool, fixed: bool, shared: bool, beyond: bool
+) -> str:
+    """What the server says at start about the way into the app.
+
+    ``link`` is the address with the access token.  It is said once, here, unless
+    the output is ``shared`` (other users can read it): then the token is left
+    out and the message says how to get in without it being written down.
+    ``opens``: a browser is being opened; ``fixed``: the token is the one the
+    person set in the environment; ``beyond``: the address is not loopback.
+    """
+    own = f"set {TOKEN_ENV} to a token of your own ({MIN_TOKEN_CHARS} characters or more)"
+    if shared:
+        lines = [
+            f"PaperOrchestra is running at {address}",
+            "The link that opens it carries the access token and is not written here: "
+            "this output goes to a file that other users of this machine can read.",
+        ]
+        if fixed:
+            lines.append(f"Open {address}?{TOKEN_PARAM}= followed by the token in {TOKEN_ENV}.")
+        else:
+            start = "It opens in your browser. For a link in writing" if opens else "To open it"
+            lines.append(
+                f"{start}, start the server in a terminal, or {own} and open "
+                f"{address}?{TOKEN_PARAM}=<that token>."
+            )
+    else:
+        first = (
+            "PaperOrchestra is running and opens in your browser. If it does not, open "
+            "this link, which carries the access token:"
+            if opens
+            else "PaperOrchestra is running. Open it with this link, which carries the "
+            "access token:"
+        )
+        kept = (
+            f"The token is the one in {TOKEN_ENV}, so the link stays good across restarts."
+            if fixed
+            else f"Every start makes a new token; {own} to keep one across restarts."
+        )
+        lines = [
+            first,
+            f"  {link}",
+            "The link is shown only here, once. Whoever has it uses the app as you, with "
+            "your API credentials: keep it to yourself. Nobody else can open the app "
+            f"without it, on this machine or from another. {kept}",
+        ]
+    if beyond:
+        lines.append(
+            "This address can be reached from other machines: the token is all that keeps them out."
+        )
+    return "\n".join(lines)
+
+
+def _not_started(address: str) -> str:
+    """What the server says when it ends before it could listen (the reason is in the
+    line the web server wrote before): no link is given, because none leads to this app."""
+    return (
+        f"PaperOrchestra did not start: it could not listen at {address} (the line above "
+        "says why). If that address is in use, another PaperOrchestra may be running "
+        "there: open that one with its own link, or stop it. Otherwise give this server "
+        "another port with --port."
+    )
+
+
+def _untraced_link() -> dict[str, Any]:
+    """The argument that keeps the link out of the framework's own tracing.
+
+    A FastAPI that traces requests by itself (where OpenTelemetry is set up for
+    the process) does so from outside the security layer and records the address
+    of each request in full, the access token of the link included; what it
+    records goes where the person's set-up sends it, by default to a port of
+    this machine.  Requests whose address names a token are kept from it.  A
+    FastAPI without such tracing does not know the argument and is not given it.
+    """
+    if "telemetry" not in inspect.signature(FastAPI.__init__).parameters:
+        return {}
+    return {"telemetry": {"exclude": offers_token}}
+
+
 def create_app(
     workspace: str | Path,
     *,
@@ -279,11 +511,17 @@ def create_app(
     """The web app for the projects in ``workspace``.
 
     ``launcher`` builds the command line of a worker process (see
-    :mod:`paper_orchestra.web.workers`); ``open_browser`` opens the app's address
-    when the server has started.  ``host`` and ``port`` are where the server will
-    listen: requests whose ``Host`` is not that address (or loopback) are
-    refused, and ``token`` is required when given (``serve`` generates one for
-    any address but loopback).
+    :mod:`paper_orchestra.web.workers`); ``open_browser`` opens the app in the
+    person's browser when the app starts (see ``_BrowserOpener``; ``serve`` does
+    that itself instead, once it listens at its address).
+    ``host`` and ``port`` are where the server will listen: requests whose
+    ``Host`` is not that address (or loopback) are refused.
+
+    ``token`` is the access token every request must then carry (see
+    :class:`~paper_orchestra.web.security.SecurityMiddleware`).  ``serve``
+    always gives one.  ``None`` means that no token is asked for: that is for
+    in-process tests, which reach the app without a network, and for nothing
+    else.
 
     **How the app ends.**  Its end never stops a worker: agents and experiments
     belong to their project, go on without the server, and are found again by
@@ -348,14 +586,16 @@ def create_app(
         threading.Thread(
             target=sweep_staging, args=(root,), name="sweep-staging", daemon=True
         ).start()
+        opener = None
         if open_browser:
-            # A moment later, so that the server answers when the page asks.
-            timer = threading.Timer(0.5, webbrowser.open, args=(_address(host, port, token),))
-            timer.daemon = True
-            timer.start()
+            link = _address(host, port, token) if token else None
+            opener = _BrowserOpener(_address(host, port), link, say)
+            opener.start()
         try:
             yield
         finally:
+            if opener is not None:
+                opener.close()
             context.live.closing.set()  # streams end at their next look
             await run_in_threadpool(end_workers)
 
@@ -366,6 +606,7 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url="/api/openapi.json",
+        **_untraced_link(),
     )
     app.state.context = context
     install_error_handlers(app)
@@ -401,8 +642,18 @@ def serve(
 ) -> None:
     """Run the web app until it is told to stop (``paper-orchestra ui``).
 
-    Listens on loopback unless ``host`` says otherwise.  On any other address an
-    access token is generated and the link that carries it is printed once.
+    Listens on loopback unless ``host`` says otherwise.  On every address,
+    loopback included, the app asks for an access token: a fresh random one per
+    start, or the value of ``PAPER_ORCHESTRA_UI_TOKEN`` when that is set (an
+    empty value is none; one that cannot serve as a token raises
+    :class:`~paper_orchestra.web.security.TokenError` before anything is
+    started).  The variable is taken out of this process's environment, so that
+    no worker, job or browser inherits it.  The link that carries the token is
+    printed once, and with ``open_browser`` the browser is handed it through a
+    file only the person can read.  Both happen only when the server listens at
+    its address: if it cannot (another program holds the port), it says so, gives
+    no link and ends.  Where the output goes to a file that other users can
+    read, the token is not printed and the message says what to do.
 
     However the server ends (Ctrl-C, a termination signal, the terminal or the
     SSH session going away), the agents and experiments that are running go on:
@@ -413,6 +664,8 @@ def serve(
     """
     import uvicorn
 
+    fixed = fixed_token()  # first: a token that cannot be one stops the start
+    token = fixed or new_token()
     workspace = Path(workspace).expanduser()
     try:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -421,7 +674,6 @@ def serve(
             f"The workspace {workspace} cannot be created ({exc}). Choose a directory you "
             "can write to with --workspace."
         ) from exc
-    token = None if is_loopback(host) else new_token()
     if port == 0:
         port = _free_port(host)  # chosen here, so that the address printed is the real one
 
@@ -434,13 +686,54 @@ def serve(
         host=host,
         port=port,
         token=token,
-        open_browser=open_browser,
+        open_browser=False,  # opened from here, once the server listens (see ``announce``)
         stop_workers_on_exit=stop_workers_on_exit,
         report=say,
     )
     closing = app.state.context.live.closing
+    opener = (
+        _BrowserOpener(_address(host, port), _address(host, port, token), say)
+        if open_browser
+        else None
+    )
+    if stop_workers_on_exit:
+        ending = "Press Ctrl-C to stop it, and with it the agents and experiments it runs."
+    else:
+        ending = (
+            "Press Ctrl-C to stop the server. Agents and experiments that are running "
+            "then go on without it, and the next start finds them."
+        )
+
+    def announce() -> None:
+        """Say how to get into the app, and send the browser there."""
+        say(
+            _how_to_open(
+                _address(host, port),
+                _address(host, port, token),
+                opens=open_browser,
+                fixed=fixed is not None,
+                shared=_output_is_shared(),
+                beyond=not is_loopback(host),
+            )
+        )
+        say(f"Projects are kept in {workspace.resolve()}. {ending}")
+        if opener is not None:
+            opener.start()
 
     class Server(uvicorn.Server):
+        async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+            # Nothing is said about the address, and no browser is sent to it, before the
+            # server listens there.  Where another program holds the port (on a shared
+            # machine: another account's), the link would hand that program the token.
+            await super().startup(sockets=sockets)
+            if self.started:
+                announce()
+
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+            if opener is not None:
+                opener.close()  # first: ending the workers may take a while
+            await super().shutdown(sockets=sockets)
+
         def handle_exit(self, sig: int, frame: FrameType | None) -> None:
             # uvicorn waits for open connections before it shuts the app down, and an
             # event stream never ends by itself: tell the streams first.
@@ -453,21 +746,6 @@ def serve(
             closing.set()
             self.should_exit = True
 
-    say(f"PaperOrchestra is running at {_address(host, port)}")
-    if stop_workers_on_exit:
-        ending = "Press Ctrl-C to stop it, and with it the agents and experiments it runs."
-    else:
-        ending = (
-            "Press Ctrl-C to stop the server. Agents and experiments that are running "
-            "then go on without it, and the next start finds them."
-        )
-    say(f"Projects are kept in {workspace.resolve()}. {ending}")
-    if token is not None:
-        say(
-            "This address can be reached from other machines, and whoever opens it uses "
-            "your API credentials through the app. Open it with this link, which carries "
-            f"the access token:\n  {_address(host, port, token)}"
-        )
     config = uvicorn.Config(
         app,
         host=host,
@@ -478,8 +756,16 @@ def serve(
         timeout_graceful_shutdown=5,
     )
     server = Server(config)
-    with _hang_up_handled(server.hang_up), contextlib.suppress(KeyboardInterrupt):
-        server.run()
+    try:
+        with _hang_up_handled(server.hang_up), contextlib.suppress(KeyboardInterrupt):
+            server.run()
+    except SystemExit:
+        if not server.started:
+            say(_not_started(_address(host, port)))
+        raise
+    finally:
+        if opener is not None:
+            opener.close()
 
 
 @contextlib.contextmanager

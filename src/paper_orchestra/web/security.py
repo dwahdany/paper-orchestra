@@ -8,8 +8,11 @@ things follow, all enforced here:
   whose ``Host`` header is not the server's own address is refused: that is how
   a web page on another site reaches a local server through DNS rebinding.  A
   request that changes something and comes from another origin is refused too.
-  When the server listens on anything but loopback it also wants a token, which
-  the browser gets once from the link printed at start and keeps as a cookie.
+  And every request has to prove that it is the person's, on loopback as well:
+  loopback is shared by every account and every process of the machine.  The
+  proof is an access token, which the browser gets once from the link printed
+  at start and keeps as a cookie, and which other clients send as
+  ``Authorization: Bearer``.
 * **What a response may do in the browser.**  Every response carries a
   Content-Security-Policy that allows the app's own scripts, styles and images
   and nothing else, and tells the browser not to guess content types.
@@ -27,6 +30,9 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
+import hmac
+import html
 import ipaddress
 import json
 import os
@@ -35,7 +41,6 @@ import secrets
 import stat
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
-from http.cookies import CookieError, SimpleCookie
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
@@ -47,14 +52,19 @@ __all__ = [
     "FILE_AREAS",
     "FILE_CONTENT_SECURITY_POLICY",
     "MAX_BODY_BYTES",
+    "MIN_TOKEN_CHARS",
     "PDF_CONTENT_SECURITY_POLICY",
     "TOKEN_COOKIE",
+    "TOKEN_ENV",
     "PathEscape",
     "SecurityMiddleware",
+    "TokenError",
     "confined",
+    "fixed_token",
     "is_loopback",
     "mask_secrets",
     "new_token",
+    "offers_token",
     "open_confined",
     "open_for_append",
     "safe_upload_path",
@@ -69,8 +79,16 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8600
+#: The cookie that holds the token; its full name also says the port (see ``_cookie_name``).
 TOKEN_COOKIE = "po_token"
 TOKEN_PARAM = "token"
+#: The environment variable that fixes the token's value, for a test harness or a
+#: bookmark that should survive restarts.
+TOKEN_ENV = "PAPER_ORCHESTRA_UI_TOKEN"
+#: A token the person chose must be at least this long to be worth the name.
+MIN_TOKEN_CHARS = 16
+#: What a token may consist of: it travels in a link, a cookie and a header, as it is.
+_TOKEN_CHARS = re.compile(r"[A-Za-z0-9._~-]+")
 #: The largest body a request may carry unless its endpoint is given a limit of its own
 #: (the upload of a new project is): room for the longest page, code file or preview the
 #: API accepts, written as JSON, and no more.
@@ -127,26 +145,91 @@ def is_loopback(host: str) -> bool:
 
 
 def new_token() -> str:
-    """An access token for a server that listens beyond loopback."""
+    """A fresh access token: 192 random bits, in characters a link can carry."""
     return secrets.token_urlsafe(24)
+
+
+class TokenError(ValueError):
+    """The access token named in the environment cannot be used; the message says why."""
+
+
+def fixed_token(environ: MutableMapping[str, str] | None = None) -> str | None:
+    """The access token the person fixed in ``PAPER_ORCHESTRA_UI_TOKEN``, or ``None``.
+
+    The variable is taken out of ``environ`` (the process's own by default)
+    whatever it held, so that nothing the server starts inherits the token:
+    workers, the jobs they run, a browser.  An empty value counts as none.  A
+    value shorter than ``MIN_TOKEN_CHARS`` characters, or one with characters
+    that a link, a cookie and a header cannot all carry, raises ``TokenError``
+    with a message that does not repeat the value.
+    """
+    environ = os.environ if environ is None else environ
+    value = str(environ.pop(TOKEN_ENV, "") or "").strip()
+    if not value:
+        return None
+    if len(value) < MIN_TOKEN_CHARS:
+        raise TokenError(
+            f"The access token in {TOKEN_ENV} is {len(value)} characters long; it must be "
+            f"at least {MIN_TOKEN_CHARS} characters to keep anybody out. Choose a longer "
+            f"one, or unset {TOKEN_ENV} and the server makes a token at every start."
+        )
+    if not _TOKEN_CHARS.fullmatch(value):
+        raise TokenError(
+            f"The access token in {TOKEN_ENV} must be at least {MIN_TOKEN_CHARS} characters "
+            "of letters, digits, '-', '.', '_' and '~' only, because it is carried by a "
+            f"link and a cookie. Choose another one, or unset {TOKEN_ENV} and the server "
+            "makes a token at every start."
+        )
+    return value
+
+
+def offers_token(scope: Mapping[str, Any]) -> bool:
+    """Whether the address of a request names an access token.
+
+    That is the link a person opens, or somebody's attempt at it.  Such an
+    address is not for anything that keeps the addresses of requests (a trace,
+    a log): ``create_app`` keeps it from the framework's own tracing.  Never
+    raises, whatever the query holds.
+    """
+    query = bytes(scope.get("query_string") or b"").decode("latin-1")
+    return any(key == TOKEN_PARAM for key, _ in parse_qsl(query, keep_blank_values=True))
 
 
 def _bare_host(value: str) -> str:
     return str(value or "").strip().lower().strip("[]").rstrip(".")
 
 
+def _port(digits: str) -> int | None:
+    """The port that ``digits`` name, or ``None`` when they name none.
+
+    ``str.isdigit`` is true of characters that ``int`` does not read (a superscript
+    two), and ``int`` refuses a number of thousands of digits: both arrive in a
+    header anybody can send, before the server has looked at who is asking.
+    """
+    if digits.isascii() and digits.isdigit() and len(digits) <= 5:
+        return int(digits)
+    return None
+
+
 def _split_host(value: str) -> tuple[str, int | None]:
-    """``host`` and ``port`` of a ``Host`` header or a URL's network location."""
+    """``host`` and ``port`` of a ``Host`` header or a URL's network location.
+
+    Never raises.  Where the port is written in digits that name no port, the
+    value is no address: the host comes back empty, which nothing accepts.
+    """
     value = str(value or "").strip().lower()
     port: int | None = None
     if value.startswith("["):
         name, _, rest = value[1:].partition("]")
         if rest.startswith(":") and rest[1:].isdigit():
-            port = int(rest[1:])
+            port = _port(rest[1:])
+            if port is None:
+                return "", None
         return name.rstrip("."), port
     name, colon, digits = value.rpartition(":")
     if colon and digits.isdigit() and ":" not in name:
-        return name.rstrip("."), int(digits)
+        port = _port(digits)
+        return (name.rstrip("."), port) if port is not None else ("", None)
     return value.rstrip("."), None
 
 
@@ -339,6 +422,71 @@ def _plain(status: int, code: str, message: str, *, api: bool) -> tuple[int, byt
     return status, b"text/plain; charset=utf-8", (message + "\n").encode()
 
 
+#: What a request without the token is told.  The same for a missing and a wrong token,
+#: and nothing in it depends on the request.
+_TOKEN_REQUIRED = (
+    "This app is opened with the link printed in the terminal where `paper-orchestra ui` "
+    "runs: the link carries the access token (it ends in ?token=...). It is shown once, "
+    "when the server starts; if it is gone, restart the server to get a new one."
+)
+#: Added for the API, whose callers are programs.
+_TOKEN_FOR_PROGRAMS = "A program sends the token as `Authorization: Bearer <token>`."
+#: The same for a person who opened an address of the app in a browser.  No style and no
+#: script: the policy allows neither inline, and every file of the app needs the token.
+_TOKEN_REQUIRED_PAGE = b"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex">
+<title>PaperOrchestra: open it with its link</title>
+</head>
+<body>
+<h1>This app is opened with its link</h1>
+<p>PaperOrchestra needs the link printed in the terminal where
+<code>paper-orchestra ui</code> runs: that link carries the access token
+(it ends in <code>?token=...</code>).</p>
+<p>The link is shown once, when the server starts. If it is gone, restart the
+server to get a new one.</p>
+</body>
+</html>
+"""
+#: What the link is answered with when a page of another site led to it (see
+#: ``SecurityMiddleware._accept_token``): the cookie is set, and this page goes on to the
+#: address without the token by itself.
+_ENTERING_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="refresh" content="0; url={location}">
+<title>Opening PaperOrchestra</title>
+</head>
+<body>
+<p>Opening PaperOrchestra. If nothing happens, <a href="{location}">continue</a>.</p>
+</body>
+</html>
+"""
+_NO_STORE = (b"cache-control", b"no-store")
+
+
+def _cookie_pairs(header: str) -> list[tuple[str, str]]:
+    """The ``name=value`` pairs of a ``Cookie`` header, whatever else is in it.
+
+    Read by hand: every app on this host name shares the cookie jar, whichever
+    port it listens on, and one pair that is not well formed must not hide the
+    others (the standard library's parser gives up on the whole header).
+    """
+    pairs = []
+    for part in header.split(";"):
+        name, equals, value = part.partition("=")
+        if equals and name.strip():
+            pairs.append((name.strip(), value.strip()))
+    return pairs
+
+
 class _BodyTooLarge(Exception):
     """A request body passed its limit while it arrived."""
 
@@ -422,9 +570,23 @@ class SecurityMiddleware:
     ``host`` is the address the server listens on.  For a loopback address the
     accepted ``Host`` names are the loopback ones; for a specific other address,
     that address as well; for a wildcard address any name is accepted, because the
-    machine's names cannot be listed, and the token (required off loopback) is
-    what stands between a stranger and the API.  ``allowed_hosts`` adds names, for
-    a reverse proxy or a test client.
+    machine's names cannot be listed, and the token is what stands between a
+    stranger and the API.  ``allowed_hosts`` adds names, for a reverse proxy or a
+    test client.
+
+    ``token`` is the access token (``serve()`` always gives one; ``None`` means
+    that none is asked for, which is for in-process tests only).  With it, every
+    request must carry the token: as the cookie that opening the link sets, or
+    as ``Authorization: Bearer <token>``.  ``GET /any/page?token=<token>`` is
+    that link: it sets the cookie (``HttpOnly``, ``SameSite=Strict``) and sends
+    the browser on to the same address without the token (a redirect; where a
+    page of another site led to the link, a page that goes on by itself, see
+    ``_accept_token``).  The token in the query of an API call, or of anything
+    but a ``GET``, counts for nothing.  A
+    request without a valid token is answered 401: the API in its JSON error
+    shape, a page a browser asked for with a small page that says where the
+    link is, anything else in a sentence.  A wrong token is answered exactly
+    like a missing one.
 
     ``max_body_bytes`` is the most a request body may hold; ``body_limits`` gives
     single endpoints another limit, as ``{(method, path): bytes}`` (the upload of
@@ -474,11 +636,13 @@ class SecurityMiddleware:
         """
         origin = headers.get("origin")
         if origin is not None:
-            parsed = urlsplit(origin.strip())
-            if parsed.scheme not in _DEFAULT_PORTS or not parsed.hostname:
-                return False  # "null" (a sandboxed or local page) and anything odd
-            default = _DEFAULT_PORTS[parsed.scheme]
             try:
+                # (Taking it apart fails on an address with half a bracket, reading its
+                # port on one that is no number.)
+                parsed = urlsplit(origin.strip())
+                if parsed.scheme not in _DEFAULT_PORTS or not parsed.hostname:
+                    return False  # "null" (a sandboxed or local page) and anything odd
+                default = _DEFAULT_PORTS[parsed.scheme]
                 theirs = (_bare_host(parsed.hostname), parsed.port or default)
             except ValueError:
                 return False
@@ -487,55 +651,146 @@ class SecurityMiddleware:
         site = headers.get("sec-fetch-site")
         return site is None or site.strip().lower() in ("same-origin", "none")
 
-    def _token_given(self, headers: dict[str, str]) -> str | None:
-        cookie = SimpleCookie()
-        try:
-            cookie.load(headers.get("cookie", ""))
-        except CookieError:
-            cookie = SimpleCookie()
-        if TOKEN_COOKIE in cookie:
-            return cookie[TOKEN_COOKIE].value
+    @staticmethod
+    def _cookie_name(scope: Scope, headers: dict[str, str]) -> str:
+        """The name of the token's cookie for the address this request was sent to.
+
+        A browser keeps cookies by host name and not by port, so the port is part
+        of the name: two servers on one machine (two workspaces, two forwarded
+        ports) each keep their own, and opening the one does not close the other.
+
+        The name keeps the servers apart, not the cookie in: a browser sends it
+        to every port of the host name.  A program that listens on another port
+        of the machine the browser runs on is given it when the browser opens
+        that program's address (``SameSite`` holds only for the first request
+        another site leads to, not for what the page then asks by itself).
+        That is a limit of cookies on a host name that programs share; a name
+        cannot lift it.
+        """
+        _, port = _split_host(headers.get("host", ""))
+        if port is None:
+            port = _DEFAULT_PORTS.get(str(scope.get("scheme", "http")), 80)
+        return f"port{port}_{TOKEN_COOKIE}"
+
+    def _tokens_given(self, scope: Scope, headers: dict[str, str]) -> list[str]:
+        """What the request offers as the token: its cookie for this address (a stale
+        one of that name may stand beside the current one) and the Bearer header."""
+        name = self._cookie_name(scope, headers)
+        # Every Cookie line: a client or a proxy may send the pairs on several.
+        lines = [
+            value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"cookie"
+        ]
+        given = [value for key, value in _cookie_pairs("; ".join(lines)) if key == name]
         scheme, _, value = headers.get("authorization", "").partition(" ")
-        return value.strip() if scheme.lower() == "bearer" and value.strip() else None
+        if scheme.lower() == "bearer":
+            given.append(value.strip())
+        return given
 
     def _token_ok(self, given: str | None) -> bool:
-        return bool(given) and secrets.compare_digest(str(given).encode(), self.token.encode())
+        """Whether ``given`` is the token, in time that does not depend on how much of
+        it is right, nor on its length (both sides are hashed first)."""
+        if not given or self.token is None:
+            return False
+        ours = hashlib.sha256(self.token.encode()).digest()
+        theirs = hashlib.sha256(str(given).encode("utf-8", "surrogatepass")).digest()
+        return hmac.compare_digest(ours, theirs)
+
+    def _authorised(self, scope: Scope, headers: dict[str, str]) -> bool:
+        # Every candidate is compared: no early exit that would tell which one matched.
+        results = [self._token_ok(given) for given in self._tokens_given(scope, headers)]
+        return any(results)
 
     # -- responses ---------------------------------------------------------------
 
     async def _refuse(self, send: Send, status: int, code: str, message: str, *, api: bool) -> None:
         status, media_type, body = _plain(status, code, message, api=api)
+        await self._answer(send, status, media_type, body)
+
+    @staticmethod
+    async def _answer(
+        send: Send,
+        status: int,
+        media_type: bytes,
+        body: bytes,
+        extra: Sequence[tuple[bytes, bytes]] = (),
+    ) -> None:
         headers = [
             (b"content-type", media_type),
             (b"content-length", str(len(body)).encode()),
+            *extra,
         ]
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
-    async def _accept_token(self, scope: Scope, send: Send, query: list[tuple[str, str]]) -> None:
-        """Keep the token as a cookie and send the browser on without it in the address."""
+    async def _ask_for_token(
+        self, scope: Scope, send: Send, headers: dict[str, str], *, api: bool
+    ) -> None:
+        """Answer 401 to a request without the token (or with a wrong one: the same).
+
+        A person who opened an address of the app in a browser gets a small page
+        that says where the link is; the API answers in its error shape; anything
+        else (a script, an image, a command-line client) gets the sentence.
+        """
+        page = (
+            not api
+            and str(scope.get("method", "GET")).upper() in ("GET", "HEAD")
+            and "text/html" in headers.get("accept", "").lower()
+        )
+        if page:
+            media_type, body = b"text/html; charset=utf-8", _TOKEN_REQUIRED_PAGE
+        else:
+            message = f"{_TOKEN_REQUIRED} {_TOKEN_FOR_PROGRAMS}" if api else _TOKEN_REQUIRED
+            _, media_type, body = _plain(401, "token_required", message, api=api)
+        await self._answer(send, 401, media_type, body, [_NO_STORE])
+
+    async def _accept_token(
+        self, scope: Scope, send: Send, headers: dict[str, str], query: list[tuple[str, str]]
+    ) -> None:
+        """Keep the token as a cookie and send the browser on without it in the address.
+
+        A redirect does that, except where a page of another site led to the link
+        (the file a browser is opened with, a terminal that runs in a browser, a
+        link in a mail): a browser does not send a ``SameSite=Strict`` cookie
+        along with a navigation another site started, the redirect included, so
+        the person would arrive without the cookie they were just given.  There
+        the answer is a page of this server that goes on to the address by
+        itself, which makes the next request the server's own.
+        """
         rest = [(key, value) for key, value in query if key != TOKEN_PARAM]
         # The path as it was asked for, but never more than a path of this server: a
         # browser reads "//host" and "/\\host" as another site, and the path arrives
         # percent-decoded, so it may hold a line break.
         path = "/" + str(scope.get("path") or "/").lstrip("/\\")
         location = quote(path) + (f"?{urlencode(rest)}" if rest else "")
-        cookie = f"{TOKEN_COOKIE}={self.token}; Path=/; HttpOnly; SameSite=Strict"
-        headers = [
-            (b"location", location.encode()),
-            (b"set-cookie", cookie.encode()),
-            (b"content-length", b"0"),
-        ]
-        await send({"type": "http.response.start", "status": 303, "headers": headers})
+        # For this session of the browser, to scripts invisible, and never sent along
+        # with a request that another site started.
+        name = self._cookie_name(scope, headers)
+        cookie = f"{name}={self.token}; Path=/; HttpOnly; SameSite=Strict"
+        kept = [(b"set-cookie", cookie.encode()), _NO_STORE]
+        if headers.get("sec-fetch-site", "").strip().lower() == "cross-site":
+            page = _ENTERING_PAGE.format(location=html.escape(location, quote=True))
+            await self._answer(send, 200, b"text/html; charset=utf-8", page.encode(), kept)
+            return
+        answer = [(b"location", location.encode()), (b"content-length", b"0"), *kept]
+        await send({"type": "http.response.start", "status": 303, "headers": answer})
         await send({"type": "http.response.body", "body": b""})
 
     # -- ASGI --------------------------------------------------------------------
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            await self.app(scope, receive, send)
+            return
         if scope["type"] != "http":
-            if scope["type"] == "lifespan":
-                await self.app(scope, receive, send)
-            return  # nothing here speaks WebSocket; such a connection is simply not accepted
+            # Nothing here speaks WebSocket.  The connection is refused in so many words:
+            # left unanswered, the server answers 500 and writes an error into the person's
+            # terminal, for anybody who asks and as often as they ask.
+            if scope["type"] == "websocket":
+                await receive()  # the request to connect
+                await send({"type": "websocket.close", "code": 1008})
+            return
         headers = {
             key.decode("latin-1").lower(): value.decode("latin-1")
             for key, value in scope.get("headers", [])
@@ -566,23 +821,25 @@ class SecurityMiddleware:
             )
             return
         if self.token is not None:
-            query = parse_qsl(scope.get("query_string", b"").decode("latin-1"))
-            offered = dict(query).get(TOKEN_PARAM)
-            if offered is not None and self._token_ok(offered) and not api:
-                await self._accept_token(scope, send, query)
-                return
-            if not self._token_ok(self._token_given(headers)):
-                await self._refuse(
-                    send,
-                    401,
-                    "token_required",
-                    "This server is reachable from other machines, so it asks for its "
-                    "access link: open the address with ?token=... that was printed in "
-                    "the terminal where it was started.",
-                    api=api,
+            if self._is_link(scope, api=api):
+                query = parse_qsl(
+                    scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True
                 )
+                offered = [value for key, value in query if key == TOKEN_PARAM]
+                if offered and all([self._token_ok(value) for value in offered]):
+                    await self._accept_token(scope, send, headers, query)
+                    return
+            if not self._authorised(scope, headers):
+                await self._ask_for_token(scope, send, headers, api=api)
                 return
         await self._bounded(_known_event_id(scope), receive, send, api=api)
+
+    @staticmethod
+    def _is_link(scope: Scope, *, api: bool) -> bool:
+        """Whether this is a request a person makes by opening a link: the only kind
+        whose address may carry the token.  Never an API call (such an address ends
+        up in logs and histories) and never anything that changes something."""
+        return not api and str(scope.get("method", "GET")).upper() == "GET"
 
     async def _bounded(self, scope: Scope, receive: Receive, send: Send, *, api: bool) -> None:
         """Hand the request to the application with a body that cannot pass its limit."""

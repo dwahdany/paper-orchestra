@@ -2,6 +2,9 @@
 
    node tests/e2e/web_shots.js --base http://127.0.0.1:8600 --out DIR [--only REGEX] [--themes light,dark] [--dsf 2]
 
+   The server asks for its access token: it is taken from PAPER_ORCHESTRA_UI_TOKEN, or from
+   --base when that is the link the server printed (http://127.0.0.1:8600/?token=...).
+
    Needs the demo project in the server's workspace (see README.md); with the project of 150
    pages beside it, its map is photographed too: with nothing selected, with a hypothesis, an
    experiment and a finding selected, and with every reference line drawn. Nothing is changed in
@@ -16,7 +19,12 @@ const os = require('os');
 const path = require('path');
 
 const arg = (name, fallback) => { const i = process.argv.indexOf('--' + name); return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback; };
-const BASE = String(arg('base', 'http://127.0.0.1:8600')).replace(/\/$/, '');
+/* where the server is, and the access token it asks for: the link it printed carries both */
+const GIVEN = new URL(String(arg('base', 'http://127.0.0.1:8600')));
+const BASE = GIVEN.origin;
+const TOKEN = GIVEN.searchParams.get('token') || process.env.PAPER_ORCHESTRA_UI_TOKEN || '';
+/* this process is no browser: it sends the token as a header */
+const AUTH = TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {};
 const OUT = path.resolve(arg('out', 'shots'));
 const DSF = +arg('dsf', '2');
 const ONLY = arg('only', '') ? new RegExp(arg('only', '')) : null;
@@ -94,12 +102,14 @@ const SIZES = [
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
-  const listing = await (await fetch(BASE + '/api/projects')).json();
+  const answer = await fetch(BASE + '/api/projects', { headers: AUTH });
+  if (answer.status === 401) { console.error('The server at ' + BASE + ' asks for its access token. Give the link it printed (--base \'' + BASE + '/?token=...\'), or set PAPER_ORCHESTRA_UI_TOKEN to the token the server was started with.'); fs.rmSync(tmp, { recursive: true, force: true }); process.exit(2); }
+  const listing = await answer.json();
   /* the demo project and the large one (`research demo --pages 150` gives both the same
      title) are told apart by how many pages they hold */
   let demo = null, large = null;
   for (const row of listing.projects) {
-    const view = await (await fetch(BASE + '/api/projects/' + row.id)).json();
+    const view = await (await fetch(BASE + '/api/projects/' + row.id, { headers: AUTH })).json();
     if (/150 pages/.test(row.title) || ((view.counts || {}).pages || 0) >= 140) large = large || row;
     else if (/^Demonstration/.test(row.title) && !demo) demo = row;
   }
@@ -109,6 +119,8 @@ const SIZES = [
   const shoot = async (name, hash, w, h, theme, pre, post) => {
     if (hash.includes('LARGE') && !large) return;
     const ctx = await browser.newContext({ viewport: { width: w, height: h }, deviceScaleFactor: DSF, colorScheme: theme, reducedMotion: 'reduce' });
+    /* the link with the token is opened once in every browser context, before anything else */
+    if (TOKEN) { const door = await ctx.newPage(); await door.goto(BASE + '/?token=' + encodeURIComponent(TOKEN)); await door.close(); }
     const page = await ctx.newPage();
     page.on('console', (m) => { if (m.type() === 'error' && !/status of 404/.test(m.text())) errors.push(name + ': ' + m.text()); });
     page.on('pageerror', (e) => errors.push(name + ': ' + e.message));

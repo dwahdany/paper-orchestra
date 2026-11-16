@@ -68,7 +68,15 @@ against what the server answers:
   middle included, is the server's account (`last` of `GET .../paper`), the same after a
   reload;
 - the composer offers the model efforts and compute backends `GET /api/defaults` lists;
-- `[redacted]` and `***` in a log are plain text, not an error.
+- `[redacted]` and `***` in a log are plain text, not an error;
+- a server that was restarted has a new access token and refuses the cookie the browser
+  holds: the app says "This server was restarted; open the new link printed in its
+  terminal.", in the banner, at the foot of the project and where a page could not be read;
+  it does not call the server unreachable, promises no retry and asks the server nothing
+  while it is refused; once the new link was opened in the same browser, the page works
+  again and the event stream is open again. (The check does not restart the server: it
+  takes the browser offline, puts another value into its cookie and brings it back, which
+  is what a restart is to a browser.)
 
 And a few things a reload, another window or the keyboard must not break:
 
@@ -86,6 +94,24 @@ And a few things a reload, another window or the keyboard must not break:
 `pytest tests/test_web_e2e.py` does everything below by itself, and skips with the reason
 when Node, Playwright or a browser is missing. It takes about five minutes.
 
+## The access token
+
+The server lets nobody in without its access token, on loopback too (the link it prints at
+start carries it). The checks reach it as a person and a script do:
+
+- every browser context opens `/?token=...` once, before anything else: the server sets its
+  cookie and sends the browser on to the address without the token;
+- the requests the checks make themselves (from Node, not from the browser) send
+  `Authorization: Bearer <token>`.
+
+The token comes from the environment variable `PAPER_ORCHESTRA_UI_TOKEN`, the same variable
+that fixes the token of a server. `pytest tests/test_web_e2e.py` makes a token, starts its
+server with it and hands it to the checks that way; nothing else has to be set. Against a
+server somebody else started, `--base` may be the link that server printed
+(`--base 'http://127.0.0.1:8600/?token=...'`); the token is then an argument of the `node`
+process, which other users of the machine can read while the checks run, so prefer the
+variable on a shared machine. Without the token the scripts stop at once and say so.
+
 ## By hand
 
 Node with Playwright (`require('playwright')` must resolve, a Chromium must be installed)
@@ -97,6 +123,9 @@ WS=$(mktemp -d)
 uv run paper-orchestra research demo --dir "$WS/demo"                # about 6 s: its runs are real
 uv run paper-orchestra research demo --dir "$WS/large" --pages 150   # for the `large` check
 
+# The server's access token, for the server and for the checks (16 characters or more).
+export PAPER_ORCHESTRA_UI_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+
 PYTHONPATH=tests/e2e \
 PAPER_ORCHESTRA_SCRIPTED_CLIENT=scripted_model:client \
 PAPER_ORCHESTRA_E2E_PAUSE=0.5 \
@@ -104,6 +133,8 @@ PAPER_ORCHESTRA_E2E_PAUSE=0.5 \
 
 node tests/e2e/web_check.js --base http://127.0.0.1:8600        # exit status 0 = all passed
 ```
+
+To look at the app yourself meanwhile, open the link the server printed.
 
 The flows change the project, so every run needs a fresh workspace. Options:
 
@@ -139,7 +170,8 @@ The flows change the project, so every run needs a fresh workspace. Options:
   at two widths, and removes them again.
 
 `web_shots.js --base URL --out DIR` photographs every static screen in light and dark at
-1440 px, and the main ones at 820, 1100 and 1900 px, without changing the project.
+1440 px, and the main ones at 820, 1100 and 1900 px, without changing the project. It gets
+the token as `web_check.js` does.
 
 ## The scripted model
 

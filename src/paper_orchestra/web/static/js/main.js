@@ -218,11 +218,21 @@ window.addEventListener('focus', lookAgain);
 document.addEventListener('visibilitychange', lookAgain);
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => render('theme'));
 connection.on((ok) => {
-  /* the server is back: what could not be read while it was gone is asked for again */
-  if (ok) { if (app.store && app.store.loaded) { app.store.retryFailed(); app.store.refreshNow(); } else if (app.store) app.store.load(); if (app.route.name === 'library') loadLibrary(true); }
+  /* the server is back: what could not be read while it was gone is asked for again, and the
+     stream is opened again if it was given up (a server that refused this page) */
+  if (ok) { if (app.store && app.store.loaded) { app.store.retryFailed(); app.store.refreshNow(); app.store.connect(); } else if (app.store) app.store.load(); if (app.route.name === 'library') loadLibrary(true); }
+  /* the server is back and refuses this page: what could not be read while it was away says
+     "not answering", which is no longer so. Asked for again, it says what is the matter now. */
+  else if (connection.denied && app.store && app.store.loaded) { app.store.retryFailed(); renderSoon('denied', true); }
 });
-/* while the server is gone, ask again every few seconds; fetches flip the state back */
-setInterval(() => { if (!connection.ok) askHealth().catch(() => {}); }, 3000);
+/* while the server is gone, ask again every few seconds; fetches flip the state back. A
+   server that answers and refuses this page (it was restarted and has a new access token)
+   is not asked at intervals: it goes on refusing until the person has opened its new link.
+   That happens in another tab as a rule, so it is asked once when they come back to this one. */
+setInterval(() => { if (!connection.ok && !connection.denied) askHealth().catch(() => {}); }, 3000);
+const askAgain = () => { if (document.visibilityState === 'visible' && connection.denied) askHealth().catch(() => {}); };
+window.addEventListener('focus', askAgain);
+document.addEventListener('visibilitychange', askAgain);
 setInterval(tick, 1000);
 /* "38 min ago" should not stay true for ever */
 setInterval(() => { if (document.visibilityState === 'visible') renderSoon('minute', true); }, 60000);

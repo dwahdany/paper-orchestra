@@ -2,6 +2,10 @@
 
    node tests/e2e/web_check.js --base http://127.0.0.1:8600 [--only a,b] [--skip a,b] [--shots DIR]
 
+   The server asks for its access token. The checks take it from the environment
+   (PAPER_ORCHESTRA_UI_TOKEN, the variable that also fixes the server's token), or from
+   --base when that is the link the server printed (http://127.0.0.1:8600/?token=...).
+
    The server must serve a workspace that holds the demo project
    (`paper-orchestra research demo --dir <workspace>/demo`; with the large one beside it,
    `research demo --dir <workspace>/large --pages 150`, the checks of a large project run
@@ -20,7 +24,12 @@ const os = require('os');
 const path = require('path');
 
 const arg = (name, fallback) => { const i = process.argv.indexOf('--' + name); return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback; };
-const BASE = String(arg('base', 'http://127.0.0.1:8600')).replace(/\/$/, '');
+/* where the server is, and the access token it asks for: the link it printed carries both */
+const GIVEN = new URL(String(arg('base', 'http://127.0.0.1:8600')));
+const BASE = GIVEN.origin;
+const TOKEN = GIVEN.searchParams.get('token') || process.env.PAPER_ORCHESTRA_UI_TOKEN || '';
+/* this process is no browser: it sends the token as a header */
+const AUTH = TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {};
 const ONLY = arg('only', '') ? arg('only', '').split(',') : null;
 const SKIP = arg('skip', '') ? arg('skip', '').split(',') : [];
 const SHOTS = arg('shots', '');
@@ -31,7 +40,7 @@ const ok = (condition, message) => { if (!condition) fails.push(message); return
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function api(method, url, body) {
-  const response = await fetch(BASE + url, { method, headers: body === undefined ? {} : { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const response = await fetch(BASE + url, { method, headers: Object.assign({}, AUTH, body === undefined ? {} : { 'Content-Type': 'application/json' }), body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await response.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
@@ -39,8 +48,21 @@ async function api(method, url, body) {
 }
 const pagePath = (p) => p.split('/').map(encodeURIComponent).join('/');
 
+/** A browser context the server lets in: the link with the token is opened once, before
+    anything else, as a person opens the link the server printed. The browser keeps the
+    cookie; the address it ends up at carries no token. */
+async function entered(context) {
+  if (!TOKEN) return context;
+  const page = await context.newPage();
+  const response = await page.goto(BASE + '/?token=' + encodeURIComponent(TOKEN));
+  if (!response || response.status() !== 200 || page.url().split('#')[0] !== BASE + '/') throw new Error('the link with the token did not open the app: status ' + (response && response.status()) + ' at ' + page.url().replace(TOKEN, '<token>'));
+  await page.close();
+  return context;
+}
+/* true while the check of a restarted server runs: there the server's 401 is what is looked at */
+let refusing = false;
 function watch(page, label) {
-  page.on('console', (m) => { if (m.type() === 'error') { const t = m.text(); if (!/Failed to load resource: (net::ERR_INTERNET_DISCONNECTED|net::ERR_FAILED|the server responded with a status of (409|422|404))/.test(t)) errors.push(label() + ': ' + t); } });
+  page.on('console', (m) => { if (m.type() === 'error') { const t = m.text(); if (!/Failed to load resource: (net::ERR_INTERNET_DISCONNECTED|net::ERR_FAILED|the server responded with a status of (409|422|404))/.test(t) && !(refusing && /status of 401|EventSource/.test(t))) errors.push(label() + ': ' + t); } });
   page.on('pageerror', (e) => errors.push(label() + ': ' + e.message + ' ' + String(e.stack || '').split('\n').slice(1, 3).join(' ')));
 }
 /** Wait until `fn` (run in the page) returns something truthy. */
@@ -135,7 +157,7 @@ CHECKS.screens = async ({ browser, pid }) => {
     '#/p/PID/experiments', '#/p/PID/experiments/E3', '#/p/PID/experiments/E4', '#/p/PID/experiments/E1', '#/p/PID/experiments/E2', '#/p/PID/paper', '#/p/PID/wiki/no-such-page', '#/p/p-000000000000/map'];
   /* the four widths side by side: the pages do not touch the project */
   await Promise.all([[1440, 'light'], [1100, 'dark'], [820, 'light'], [1900, 'dark']].map(async ([width, scheme]) => {
-    const ctx = await browser.newContext({ viewport: { width, height: 900 }, colorScheme: scheme, reducedMotion: 'reduce' });
+    const ctx = await entered(await browser.newContext({ viewport: { width, height: 900 }, colorScheme: scheme, reducedMotion: 'reduce' }));
     await ctx.addInitScript(() => { window.__csp = []; document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(e.violatedDirective + ' ' + (e.blockedURI || '') + ' ' + (e.sourceFile || '') + ':' + e.lineNumber)); });
     for (const r of routes) {
       const page = await ctx.newPage();
@@ -1175,6 +1197,57 @@ CHECKS.states = async ({ page, pid, context }) => {
   const note = await api('POST', '/api/projects/' + pid + '/pages', { kind: 'topic', title: 'Written elsewhere while this window was open', body: 'x' });
   ok(note.status === 201, 'a page is written elsewhere');
   await until(page, () => [...document.querySelectorAll('.wiki-index .idx')].some((a) => /Written elsewhere/.test(a.textContent)), null, 8000, 'it appears in the index by itself');
+
+  /* The server was restarted and has a new access token. To this browser that is: the
+     server goes away, comes back, and refuses the cookie the browser holds (401). The app
+     says so in plain words, promises no retry and asks nothing at intervals; once the new
+     link was opened in this browser, the page works again. */
+  if (TOKEN) {
+    const held = (await context.cookies(BASE)).filter((c) => /po_token$/.test(c.name));
+    ok(held.length === 1 && held[0].value === TOKEN && held[0].httpOnly && held[0].sameSite === 'Strict', 'the token is kept as one cookie that scripts cannot read and other sites cannot send: ' + JSON.stringify(held.map((c) => [c.name, c.httpOnly, c.sameSite])));
+    ok(!(await page.evaluate(() => document.cookie + ' ' + location.href)).includes(TOKEN), 'neither a script of the page nor its address holds the token');
+    await open(page, '#/p/' + pid + '/wiki/Q2', '.page-wiki .prose');
+    refusing = true;
+    try {
+      await context.setOffline(true);
+      await context.addCookies([Object.assign({}, held[0], { value: 'the-token-of-the-server-before-the-restart' })]);
+      await page.click('.wiki-index .idx:has-text("Written elsewhere")');      // a page this window has not read yet
+      await until(page, () => !document.querySelector('#banner').hidden, null, 8000, 'the server is away: the banner says that it is not answering');
+      await context.setOffline(false);
+      await until(page, () => !!document.querySelector('#banner [data-denied]'), null, 20000, 'the server is back and refuses this page: the banner says that it was restarted');
+      const said = (await text(page, '#banner')).replace(/\s+/g, ' ').trim();
+      ok(said.includes('This server was restarted; open the new link printed in its terminal.'), 'in plain words: ' + said);
+      ok(!/not answering|tried again|every few seconds/.test(said), 'and neither calls the server unreachable nor promises to try again: ' + said);
+      await until(page, () => /This server was restarted/.test((document.querySelector('.wiki-main .note-neg') || {}).textContent || ''), null, 6000, 'the page that could not be read says the same, not that the server is not answering');
+      ok(/new link needed/.test(await text(page, '.sb-conn')), 'the foot of the project says the same in two words: ' + (await text(page, '.sb-conn')).trim());
+      await shot(page, 'state-restarted');
+      /* nothing is asked at intervals: no health poll, no stream opened again and again */
+      await sleep(4000);
+      const sent = [];
+      const note = (r) => { if (r.url().startsWith(BASE)) sent.push(r.method() + ' ' + r.url().replace(BASE, '')); };
+      page.on('request', note);
+      await sleep(7000 * SLOW);
+      page.off('request', note);
+      ok(sent.length === 0, 'the app asks the server nothing while it is refused, got ' + sent.length + ': ' + sent.slice(0, 6).join(', '));
+      /* a look that is still refused changes nothing */
+      await page.click('#banner [data-act="retry-connection"]');
+      await sleep(800);
+      ok((await count(page, '#banner [data-denied]')) === 1, 'Try again, while the cookie is still the old one, leaves the banner');
+      /* the person opens the new link (in another tab of this browser) and comes back */
+      await entered(context);
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await until(page, () => document.querySelector('#banner').hidden, null, 12000, 'the banner goes once the new link was opened and the person is back');
+      await until(page, () => !!document.querySelector('.page-wiki .prose') && !document.querySelector('.wiki-main .note-neg') && /Written elsewhere/.test((document.querySelector('.page-wiki .page-title') || {}).textContent || ''), null, 15000, 'the page that could not be read is read by itself');
+      const elsewhere = await api('POST', '/api/projects/' + pid + '/pages', { kind: 'topic', title: 'Written after the restart', body: 'x' });
+      ok(elsewhere.status === 201, 'a page is written elsewhere');
+      await until(page, () => [...document.querySelectorAll('.wiki-index .idx')].some((a) => /Written after the restart/.test(a.textContent)), null, 12000, 'and the event stream is open again: it appears in the index by itself');
+    } finally {
+      /* whatever went wrong above, the checks that follow have a browser the server lets in */
+      await context.setOffline(false).catch(() => {});
+      await entered(context).catch(() => {});
+      refusing = false;
+    }
+  } else notes.push('states: the server asks for no access token; what the app says after a restart was not looked at');
 };
 
 /* The rules the engine and the store follow, as the interface shows them: more research is the
@@ -1388,7 +1461,7 @@ CHECKS.rules = async ({ browser, page, pid }) => {
     await reopen(page, '#/p/' + pid + '/experiments/E1', '.exp-page .note-rejected');
     await until(page, (n) => document.querySelectorAll('.note-rejected .rested a.chip').length === n, listed.length, 5000, 'after a reload the rejected experiment still lists what rests on it');
     ok((await page.evaluate(() => Object.keys(localStorage).filter((key) => /rested/.test(key)).length)) === 0, 'and this device keeps no copy of the list');
-    const elsewhere = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' });
+    const elsewhere = await entered(await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' }));
     const second = await elsewhere.newPage();
     watch(second, () => 'rules (a second browser)');
     await open(second, '#/p/' + pid + '/experiments/E1', '.exp-page .note-rejected');
@@ -1500,7 +1573,7 @@ CHECKS.rules = async ({ browser, page, pid }) => {
     const form = new FormData();
     form.append('title', 'A project the check breaks');
     form.append('brief', 'Made to be broken by hand.');
-    const made = await (await fetch(BASE + '/api/projects', { method: 'POST', body: form })).json();
+    const made = await (await fetch(BASE + '/api/projects', { method: 'POST', headers: AUTH, body: form })).json();
     const broken = path.join(path.dirname(dir), made.dir);
     ok(!!made.id && fs.existsSync(path.join(broken, 'project.json')), 'a second project is made: ' + made.id);
     fs.writeFileSync(path.join(broken, 'project.json'), '{ "schema": 1, "id": ');
@@ -2143,10 +2216,11 @@ CHECKS.hostile = async ({ page, pid }) => {
 /* ------------------------------------------------------------------------------------ */
 (async () => {
   let listing = { status: 0, data: null };
-  for (let i = 0; i < 80 && listing.status !== 200; i++) {   // the server may still be starting
+  for (let i = 0; i < 80 && listing.status !== 200 && listing.status !== 401; i++) {   // the server may still be starting
     listing = await api('GET', '/api/projects').catch((e) => ({ status: 0, data: String(e) }));
-    if (listing.status !== 200) await sleep(250);
+    if (listing.status !== 200 && listing.status !== 401) await sleep(250);
   }
+  if (listing.status === 401) { console.error('The server at ' + BASE + ' asks for its access token' + (TOKEN ? ', and the one given is not it' : '') + '. Give the checks the link the server printed (--base \'' + BASE + '/?token=...\'), or set PAPER_ORCHESTRA_UI_TOKEN to the token the server was started with.'); process.exit(2); }
   if (listing.status !== 200) { console.error('The server at ' + BASE + ' does not answer: ' + listing.status + ' ' + JSON.stringify(listing.data)); process.exit(2); }
   /* the demo project and, when it is there, the large one (`research demo --pages 150`
      gives both the same title): told apart by how many pages they hold */
@@ -2161,7 +2235,9 @@ CHECKS.hostile = async ({ page, pid }) => {
   let browser;
   try { browser = await chromium.launch(); }
   catch (error) { console.error('No browser could be started: ' + String(error.message).split('\n')[0]); process.exit(3); }
-  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' });
+  let context;
+  try { context = await entered(await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' })); }
+  catch (error) { console.error('The browser was not let into the app: ' + String(error.message).split('\n')[0]); await browser.close(); process.exit(2); }
   await context.addInitScript(() => { window.__csp = []; document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(e.violatedDirective + ' ' + (e.blockedURI || ''))); });
   let current = '';
   const page = await context.newPage();

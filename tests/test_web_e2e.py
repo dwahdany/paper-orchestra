@@ -7,6 +7,10 @@ port whose workers use the scripted model
 of ``tests/e2e/scripted_model.py``.  The server and the browser are child processes; this
 process opens no socket (it learns the server's address from what the server prints).
 
+The server asks for its access token, as every server does.  The fixture makes one, gives
+it to the server in ``PAPER_ORCHESTRA_UI_TOKEN`` and hands it to the check the same way, so
+nothing but this file is needed to run the test.
+
 The checks pass in both colour schemes; this test runs them in the light one, and with
 ``PAPER_ORCHESTRA_E2E_SCHEME=dark`` in the dark one.
 
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -34,7 +39,11 @@ E2E_DIR = Path(__file__).resolve().parent / "e2e"
 CHECK = E2E_DIR / "web_check.js"
 #: The exit status of ``web_check.js`` when no browser could be started.
 NO_BROWSER = 3
-ADDRESS = re.compile(r"running at (http://127\.0\.0\.1:\d+)/")
+#: The address in the link the server prints once it listens (a server that could not
+#: start names its address too, without the token: that is not a server to check).
+ADDRESS = re.compile(r"(http://127\.0\.0\.1:\d+)/\?token=")
+#: The variable that fixes the server's access token, and through which the check gets it.
+TOKEN_ENV = "PAPER_ORCHESTRA_UI_TOKEN"
 #: The option of ``paper-orchestra ui`` that ends the workers with the server.
 STOP_WORKERS = "--stop-workers-on-exit"
 #: ``dark`` runs the flows in the dark theme (``web_check.js --scheme dark``).
@@ -72,11 +81,12 @@ def _stop(process: subprocess.Popen) -> None:
 
 @pytest.fixture
 def server(tmp_path):
-    """A server on a temporary demo workspace; yields its address."""
+    """A server on a temporary demo workspace; yields its address and its access token."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    token = secrets.token_urlsafe(24)
     env = {
-        **os.environ,
+        **{name: value for name, value in os.environ.items() if name != TOKEN_ENV},
         "PYTHONPATH": os.pathsep.join(
             [str(E2E_DIR), *filter(None, [os.environ.get("PYTHONPATH")])]
         ),
@@ -132,7 +142,7 @@ def server(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=env,
+        env={**env, TOKEN_ENV: token},
     )
     lines: list[str] = []
     found = threading.Event()
@@ -151,7 +161,7 @@ def server(tmp_path):
             found.wait(0.2)
         assert found.is_set(), "the server did not say where it runs:\n" + "".join(lines)
         address = next(m.group(1) for m in map(ADDRESS.search, lines) if m)
-        yield address
+        yield address, token
     finally:
         _stop(process)
 
@@ -160,9 +170,13 @@ def test_the_app_works_in_a_real_browser(server):
     reason = _playwright_missing()
     if reason:
         pytest.skip(reason)
+    address, token = server
     scheme = ["--scheme", "dark"] if SCHEME == "dark" else []
+    # The token goes to the check in its environment, not as an argument.
     result = _run(
-        ["node", str(CHECK), "--base", server, *scheme], env=dict(os.environ), timeout=1200
+        ["node", str(CHECK), "--base", address, *scheme],
+        env={**os.environ, TOKEN_ENV: token},
+        timeout=1500,
     )
     if result.returncode == NO_BROWSER:
         pytest.skip("Playwright could not start a browser: " + result.stderr.strip()[-300:])

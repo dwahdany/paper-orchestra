@@ -402,3 +402,116 @@ def test_the_stylesheet_covers_what_the_seams_brought():
         ".paper-last",
     ):
         assert selector in css, f"the stylesheet has no rule for {selector}"
+
+
+# ---------------------------------------------------------------------------
+# A server that was restarted has a new access token: what the open app says and does
+# ---------------------------------------------------------------------------
+
+RESTARTED = "This server was restarted; open the new link printed in its terminal."
+
+# Drives the client's API module with a server that answers as given; no network, no browser.
+CONNECTION_SCRIPT = r"""
+import { api, connection, ApiError, Unreachable } from './js/api.js';
+
+const asked = [];
+let answer = { status: 200, body: { ok: true } };
+globalThis.fetch = async (url, init) => {
+  asked.push((init && init.method) + ' ' + url);
+  if (answer === null) throw new TypeError('fetch failed');
+  return { ok: answer.status >= 200 && answer.status < 300, status: answer.status, text: async () => JSON.stringify(answer.body) };
+};
+const flips = [];
+connection.on((ok) => flips.push(ok ? 'ok' : connection.denied ? 'denied' : 'gone'));
+const outcome = async (call) => {
+  try { await call(); return 'answered'; }
+  catch (error) { return error instanceof Unreachable ? 'unreachable' : error instanceof ApiError ? error.status + ' ' + error.code + ' ' + error.message : String(error); }
+};
+const out = {};
+const refused = { status: 401, body: { error: { code: 'token_required', message: 'This app is opened with the link printed in the terminal.' } } };
+
+out.before = [connection.ok, connection.denied];
+answer = refused;
+out.read = await outcome(() => api.project('p-1'));
+out.denied = [connection.ok, connection.denied];
+/* reading is not tried again by itself: a poll asks, and nothing goes to the server */
+let sent = asked.length;
+out.polled = [await outcome(() => api.projects()), await outcome(() => api.runLog('p-1', 'E1', 1, 0)), await outcome(() => api.paper('p-1'))];
+out.pollsSent = asked.length - sent;
+/* what the person asks to be done is tried, and so is the question whether it is over */
+sent = asked.length;
+out.write = await outcome(() => api.advance('p-1', {}));
+out.probe = await outcome(() => api.health());
+out.triedSent = asked.length - sent;
+out.stillDenied = connection.denied;
+/* the new link was opened in this browser: the server answers again */
+answer = { status: 200, body: { ok: true } };
+out.probeAfter = await outcome(() => api.health());
+out.after = [connection.ok, connection.denied];
+out.readAfter = await outcome(() => api.project('p-1'));
+/* a server that does not answer at all is another matter, and so is any other refusal */
+answer = null;
+out.gone = await outcome(() => api.project('p-1'));
+out.whenGone = [connection.ok, connection.denied];
+answer = { status: 404, body: { error: { code: 'not_found', message: 'There is no such project.' } } };
+out.other = await outcome(() => api.project('p-1'));
+out.afterOther = [connection.ok, connection.denied];
+/* a write that is refused the same way says the same, and marks the connection */
+answer = refused;
+out.writeRefused = await outcome(() => api.stop('p-1'));
+out.afterWrite = [connection.ok, connection.denied];
+out.flips = flips;
+console.log(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_an_answer_of_401_is_told_apart_from_a_server_that_is_gone(tmp_path):
+    """While the app is open, 401 means that the server was restarted and has a new access
+    token.  The client says that, in those words, and stops asking by itself: no poll
+    reaches the server until the person has opened the new link."""
+    (tmp_path / "js").mkdir()
+    for name in ("api.js", "util.js"):
+        (tmp_path / "js" / name).write_text(_js(name), encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"type": "module"}', encoding="utf-8")
+    (tmp_path / "check.js").write_text(CONNECTION_SCRIPT, encoding="utf-8")
+    done = subprocess.run(
+        ["node", str(tmp_path / "check.js")], capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
+    out = __import__("json").loads(done.stdout)
+    restarted = f"401 token_required {RESTARTED}"
+    assert out["before"] == [True, False]
+    assert out["read"] == restarted and out["denied"] == [False, True]
+    assert out["polled"] == [restarted] * 3 and out["pollsSent"] == 0
+    assert out["write"] == restarted and out["probe"] == restarted and out["triedSent"] == 2
+    assert out["stillDenied"] is True
+    assert out["probeAfter"] == "answered" and out["after"] == [True, False]
+    assert out["readAfter"] == "answered"
+    assert out["gone"] == "unreachable" and out["whenGone"] == [False, False]
+    assert out["other"] == "404 not_found There is no such project."
+    assert out["afterOther"] == [True, False]
+    assert out["writeRefused"] == restarted and out["afterWrite"] == [False, True]
+    assert out["flips"] == ["denied", "ok", "gone", "ok", "denied"]
+
+
+def test_the_app_says_that_the_server_was_restarted_and_does_not_retry_for_ever():
+    api, shell, main, store = _js("api.js"), _js("shell.js"), _js("main.js"), _js("store.js")
+    assert RESTARTED in api
+    # The banner says it in those words and does not promise that anything is tried again.
+    banner = shell[shell.index("export function banner()") :]
+    denied = banner[banner.index("connection.denied") : banner.index("stops_workers_on_exit")]
+    assert "RESTARTED" in denied and "tried again every few seconds" not in denied
+    assert "not answering" not in denied and "data-denied" in denied
+    # The quiet word at the foot of a project is not "offline" either.
+    assert "new link needed" in shell
+    # Nothing asks at intervals while the server refuses this page ...
+    assert "if (!connection.ok && !connection.denied) askHealth()" in main
+    assert "if (!connection.ok) askHealth()" not in main
+    # ... the event stream is not opened again and again ...
+    connect = store[store.index("  connect() {") : store.index("  takeState(")]
+    assert "connection.denied" in connect.split("new EventSource")[0]
+    # ... and the app asks once when the person comes back to it, and opens the stream
+    # again when the server lets it in.
+    assert re.search(r"connection\.denied\) askHealth\(\)", main)
+    assert "app.store.connect()" in main

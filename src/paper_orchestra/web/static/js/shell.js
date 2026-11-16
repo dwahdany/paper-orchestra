@@ -2,7 +2,7 @@
    the quiet status bar at the bottom of a project, and the banner for a server that is gone. */
 
 import { VIEWS, app, hrefOf, link } from './core.js';
-import { connection } from './api.js';
+import { connection, RESTARTED } from './api.js';
 import { clock, dateTime, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, storage, tf } from './util.js';
 import { KIND, PHASE_DO, STAGES, icon, phaseName } from './vocab.js';
 
@@ -526,7 +526,7 @@ export function statusbar(store) {
     : e.mode === 'stopped' ? html`<span>${PAUSE}<b>Stopped</b> during ${phaseName(e.next || e.phase)}</span>`
     : e.fresh ? html`<span>${RING}<b>Not started</b></span>`
     : html`<span class="sb-check">${PAUSE}<b>${e.budget ? 'Budget reached' : 'Checkpoint'}</b> round ${e.round || 1}${e.phase ? html` · ${phaseName(e.phase)}${to && to !== phaseName(e.phase) ? html` → ${to}` : ''}` : ''}</span>`;
-  const live = !connection.ok ? html`<span class="sb-neg" data-tip="The server is not answering">offline</span>` : store.live === 'reconnecting' ? html`<span class="sb-prop" data-tip="The live connection dropped; it is being opened again">reconnecting…</span>` : html`<span class="sb-ok" data-tip="Changes arrive as they happen">live</span>`;
+  const live = connection.denied ? html`<span class="sb-neg" data-tip="${RESTARTED}">new link needed</span>` : !connection.ok ? html`<span class="sb-neg" data-tip="The server is not answering">offline</span>` : store.live === 'reconnecting' ? html`<span class="sb-prop" data-tip="The live connection dropped; it is being opened again">reconnecting…</span>` : html`<span class="sb-ok" data-tip="Changes arrive as they happen">live</span>`;
   const frac = (a, b) => (b > 0 ? Math.max(0, Math.min(1, a / b)) : 0);
   return html`<a class="sb-i sb-state" href="${link({ view: 'overview', sel: '', sub: '' })}">${state}</a>
     <a class="sb-i${n ? ' sb-wait' : ''}" href="${link({ view: 'inbox', sel: '', sub: '' })}"><b>${n}</b> waiting</a>
@@ -540,6 +540,10 @@ export function statusbar(store) {
 /* ---------- the server is gone ---------- */
 export function banner() {
   if (connection.ok) return html``;
+  /* The server answers, and no longer lets this page in: it was restarted and has a new
+     access token. Nothing is tried again by itself; the way back in is the new link, and
+     once that was opened in this browser a look (or coming back to this window) is enough. */
+  if (connection.denied) return html`<div class="banner-in" data-denied>${icon('warn')}<span><b>${RESTARTED}</b> The link carries the server's new access token; once it was opened in this browser, this page works again. Nothing you typed is lost: drafts stay on this device.</span><button class="btn btn-s" data-act="retry-connection">Try again</button></div>`;
   /* what becomes of the agents and the runs when the server ends is the server's own word
      (`stops_workers_on_exit` of its last answer to /api/health); where it never said, both
      are named */

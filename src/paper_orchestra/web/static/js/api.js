@@ -3,7 +3,12 @@
    Two kinds of failure are told apart everywhere: the server answered with a refusal
    (`ApiError`, with its status, code and message, and the body for a 409), or it did not
    answer at all (`Unreachable`). The second one flips the connection state, which the
-   shell shows as a banner; nothing the person typed is thrown away in either case. */
+   shell shows as a banner; nothing the person typed is thrown away in either case.
+
+   One refusal changes the connection state as well: 401. The page was let in when it was
+   opened, so a 401 afterwards means that the server was restarted and has a new access
+   token, which this page's cookie is not (`connection.denied`). The shell says so, and
+   nothing is asked again by itself until the person has opened the server's new link. */
 
 import { pathOf, plain } from './util.js';
 
@@ -23,21 +28,35 @@ export class Unreachable extends Error {
   }
 }
 
+/** What a person is told when the server answers 401 while the app is open. */
+export const RESTARTED = 'This server was restarted; open the new link printed in its terminal.';
+
 const listeners = new Set();
-let reachable = true;
+let state = 'ok';            // ok | gone (no answer) | denied (401: the server has a new access token)
 export const connection = {
-  get ok() { return reachable; },
+  get ok() { return state === 'ok'; },
+  /** The server answers, and refuses this page: it was restarted and has a new access token. */
+  get denied() { return state === 'denied'; },
   on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-  set(ok) { if (ok !== reachable) { reachable = ok; listeners.forEach((fn) => fn(ok)); } },
+  set(ok) { connection.to(ok ? 'ok' : 'gone'); },
+  /** Listeners are told whether all is well, as before; `denied` says which trouble it is. */
+  to(next) { if (next !== state) { state = next; listeners.forEach((fn) => fn(next === 'ok')); } },
 };
 
 function refusal(status, data) {
   const error = (data && data.error) || {};
+  /* the server's own sentence is for somebody who opens the app without its link; a person
+     with the app open is told what happened and what to do */
+  if (status === 401) return new ApiError(401, error.code || 'token_required', RESTARTED, data);
   const message = error.message || (status === 413 ? 'The upload is too large.' : `The server answered with status ${status}.`);
   return new ApiError(status, error.code || 'error', plain(message), data);
 }
 
 async function request(method, url, body, options = {}) {
+  /* Refused once, a read is not sent again: every poll and every refetch would be refused
+     for as long as this page stays open. What the person asks to be done is still tried,
+     and `health` asks whether the server lets this page in again. */
+  if (state === 'denied' && method === 'GET' && !options.probe) throw refusal(401, null);
   let response;
   try {
     response = await fetch(url, {
@@ -52,7 +71,7 @@ async function request(method, url, body, options = {}) {
     connection.set(false);
     throw new Unreachable();
   }
-  connection.set(true);
+  connection.to(response.status === 401 ? 'denied' : 'ok');
   const text = await response.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
@@ -67,7 +86,7 @@ const query = (params) => {
 };
 
 export const api = {
-  health: () => request('GET', '/api/health'),
+  health: () => request('GET', '/api/health', undefined, { probe: true }),
   doctor: () => request('GET', '/api/doctor'),
   templates: () => request('GET', '/api/templates'),
   /** What a new project starts with (`settings`), the phases in order, whom a request can be
@@ -131,7 +150,7 @@ export const api = {
       xhr.onerror = () => { connection.set(false); reject(new Unreachable('The server did not answer, or the connection broke while the files were being sent.')); };
       xhr.onabort = () => reject(Object.assign(new Error('The upload was cancelled.'), { name: 'AbortError' }));
       xhr.onload = () => {
-        connection.set(true);
+        connection.to(xhr.status === 401 ? 'denied' : 'ok');
         let data = null;
         try { data = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch (e) { data = null; }
         if (xhr.status >= 200 && xhr.status < 300 && data) resolve(data);
