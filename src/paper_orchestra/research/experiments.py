@@ -79,6 +79,7 @@ from paper_orchestra.research.model import (
     moved_on,
     normalize_author,
     parse_id,
+    parse_stamp,
     stamp_after,
     with_article,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "run",
     "runs",
     "split_problems",
+    "supplies_missing_code",
     "unverified_numbers",
     "write_code",
 ]
@@ -162,6 +164,7 @@ MAX_WORKER_DEATHS = 3
 MAX_EVIDENCE_BYTES = 2_000_000
 
 _RUNNER = agent_author("runner")
+_DESIGNER = agent_author("designer")
 #: Failures a corrected file can cure: the code's own, as opposed to the backend's, the
 #: clock's or the person's.
 _REPAIRABLE = frozenset({"exit", "metrics", "code", "patch"})
@@ -715,13 +718,19 @@ def _code_text(name: str, text: Any) -> str:
     return text
 
 
-def _check_may_write(page: ResearchPage | None, author: str, experiment_id: str) -> None:
+def _check_may_write(
+    project: Project, page: ResearchPage | None, author: str, experiment_id: str
+) -> None:
     """Raise ``NotAllowed`` unless ``author`` may change the code of the experiment.
 
     The rule is the one for the page itself: an agent changes only what it
     proposed and nobody decided on.  Otherwise the plan would be locked once the
     person approved it while the code that runs was not.  The runner's repair
     is pipeline code, bounded and recorded in the run.
+
+    One case lies outside that rule: an accepted plan that has no code yet (the
+    person's own, or an analyst's next step they accepted).  The designer
+    supplies that code; see :func:`supplies_missing_code`.
     """
     if page is None or actor_class(author) != "agent":
         return
@@ -729,6 +738,8 @@ def _check_may_write(page: ResearchPage | None, author: str, experiment_id: str)
         reason = f"is {page.state}, so its code stays as it was when that was decided"
     elif page.review == "rejected":
         reason = "was rejected by the person and is kept as it was"
+    elif supplies_missing_code(project, page, author):
+        return
     elif page.decided_by:
         reason = "was accepted by the person, so its code stays as they read it"
     elif page.author != author:
@@ -739,6 +750,32 @@ def _check_may_write(page: ResearchPage | None, author: str, experiment_id: str)
         f"{experiment_id} {reason}. Say what should change in a proposal of your own, or "
         "leave the change to the person."
     )
+
+
+def supplies_missing_code(project: Project, page: ResearchPage, author: str) -> bool:
+    """Whether ``author`` is the designer writing code that nobody has decided on.
+
+    True for an accepted plan that still waits for approval when every code
+    file there was written by the designer after the plan became the person's
+    (their decision, or their writing it), so also when there is none yet.
+    Nothing the person read is changed by it: they read this code when they
+    approve the run, and that approval closes it like any other.
+    """
+    if author != _DESIGNER or page.kind != "experiment" or not page.id:
+        return False
+    if page.review != "accepted" or moved_on(page):
+        return False
+    since = parse_stamp(page.meta.get("decided_at")) or parse_stamp(page.meta.get("created"))
+    if since is None:
+        return False
+    directory = code_dir(project, str(page.id))
+    authors = _authors(directory)
+    for name, _path in _code_paths(directory):
+        entry = authors.get(name, {})
+        written = parse_stamp(entry.get("written"))
+        if entry.get("author") != author or written is None or written <= since:
+            return False
+    return True
 
 
 def _history_dir(directory: Path) -> Path:
@@ -779,12 +816,13 @@ def write_code(
     results to.  Every name and content is checked before the first file is
     written.  The version a file replaces is kept under
     ``code/.history/<name>/``.  An agent may write only the code of its own
-    proposal that nobody has decided on (``NotAllowed`` otherwise); the person
-    and the runner's repair may always.
+    proposal that nobody has decided on, and the designer the code of a plan
+    the person accepted without any (``NotAllowed`` otherwise); the person and
+    the runner's repair may always.
     """
     author = normalize_author(author)
     experiment_id = _experiment_id(project, experiment_id)
-    _check_may_write(_page_or_none(project, experiment_id), author, experiment_id)
+    _check_may_write(project, _page_or_none(project, experiment_id), author, experiment_id)
     if not isinstance(files, Mapping) or not files:
         raise ProjectError("No files were given: pass the files to write as {name: text}.")
     if len(files) > MAX_CODE_FILES:

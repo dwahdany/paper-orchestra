@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,14 @@ import pytest
 from paper_orchestra.compute import BackendUnusable, ComputeError, JobResult
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.research import experiments
-from paper_orchestra.research.model import Conflict, NotAllowed, NotFound, ProjectError
+from paper_orchestra.research.model import (
+    Conflict,
+    NotAllowed,
+    NotFound,
+    ProjectError,
+    format_stamp,
+    parse_stamp,
+)
 from paper_orchestra.research.project import Project
 
 BRIEF = "Does learning-rate warmup reduce the variance of early updates?"
@@ -400,6 +408,39 @@ def test_an_agent_cannot_change_the_code_of_a_plan_the_person_decided_on(project
         == []
     )
     assert experiments.write_code(project, page.id, {"main.py": QUICK}, author="human") == []
+
+
+def test_the_designer_supplies_the_code_of_an_accepted_plan_that_came_without_any(
+    project, backend, monkeypatch
+):
+    # The analyst proposes an experiment as a next step: a plan, no code.  Once the person
+    # accepts the plan the designer writes its code, which the person reads when approving
+    # the run.  Nothing the person read is changed by that.
+    page = project.create_page(
+        "experiment", "Follow-up sweep", BODY, author="agent:analyst", fields={"mode": "script"}
+    )
+    page = project.review(page.path, "accept")
+    with pytest.raises(NotAllowed, match="accepted"):
+        experiments.write_code(project, page.id, {"main.py": QUICK}, author="agent:analyst")
+    after = parse_stamp(page.meta["decided_at"]) + timedelta(minutes=5)
+    monkeypatch.setattr(experiments, "_now", lambda: format_stamp(after))
+    assert (
+        experiments.write_code(project, page.id, {"main.py": QUICK}, author="agent:designer") == []
+    )
+    # In several calls, and it may correct what it wrote there.
+    experiments.write_code(project, page.id, {"helper.py": "X = 1\n"}, author="agent:designer")
+    experiments.write_code(project, page.id, {"main.py": QUICK + "#\n"}, author="agent:designer")
+    assert sorted(experiments.code_files(project, page.id)) == ["helper.py", "main.py"]
+    # A file the person put there is theirs.
+    experiments.write_code(project, page.id, {"notes.py": "Y = 2\n"}, author="human")
+    with pytest.raises(NotAllowed, match="accepted"):
+        experiments.write_code(project, page.id, {"helper.py": "X = 3\n"}, author="agent:designer")
+    # And the approval of the run closes the code like any other.
+    (experiments.code_dir(project, page.id) / "notes.py").unlink()
+    experiments.write_code(project, page.id, {"helper.py": "X = 1\n"}, author="human")
+    experiments.approve(project, page.id, backends={"local": backend})
+    with pytest.raises(NotAllowed, match="approved"):
+        experiments.write_code(project, page.id, {"main.py": BROKEN}, author="agent:designer")
 
 
 def test_an_agent_writes_code_only_for_its_own_proposal(project):
