@@ -52,7 +52,7 @@ _TEX_UNIT = r"(?:pt|em|ex|cm|mm|in|bp|pc|sp|px|dpi)\b"
 #: without a leading zero, followed by a unit or a subscript (``2.3x``, ``110M``,
 #: ``87.3_{\pm 0.2}``).  Layout is not a result: a TeX length (``12.3pt``) and the factor
 #: of a length command (``0.48\textwidth``) are left out.
-_NUMBER = re.compile(
+NUMBER = re.compile(
     r"(?<![\w.])(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?!\d|\.\d)"
     rf"(?!{_TEX_UNIT})"
     r"(?!\s*\\(?:textwidth|linewidth|columnwidth|textheight|paperwidth|paperheight|hsize|vsize)\b)"
@@ -140,7 +140,7 @@ def _canonical(raw: str) -> str:
     return f"{whole}.{fraction}" if fraction else whole
 
 
-def _readings(raw: str) -> list[str]:
+def number_readings(raw: str) -> list[str]:
     """Canonical forms a matched number can stand for.
 
     ``12,345`` is either one number with a thousands separator or two list
@@ -159,8 +159,8 @@ def _readings(raw: str) -> list[str]:
 def numbers_in(text: str) -> set[str]:
     """Every number in ``text`` in canonical form, under each possible reading."""
     found: set[str] = set()
-    for raw in _NUMBER.findall(text):
-        found.update(_readings(raw))
+    for raw in NUMBER.findall(text):
+        found.update(number_readings(raw))
     return found
 
 
@@ -201,7 +201,7 @@ def _significant(number: str) -> bool:
     return len(whole) >= 4 and not _YEAR.fullmatch(whole)
 
 
-def _identifying(number: str) -> bool:
+def is_identifying(number: str) -> bool:
     """Numbers that could identify a result: at least two significant digits, and for
     integers at least three digits that are not a round figure or a calendar year."""
     whole, _, fraction = number.partition(".")
@@ -337,7 +337,7 @@ class LeakScanner:
         permitted = "\n".join(allowed)
         self.has_sources = bool(corpus.strip())
         venue_numbers = numbers_in(permitted)
-        self._numbers = {n for n in numbers_in(corpus) - venue_numbers if _identifying(n)}
+        self._numbers = {n for n in numbers_in(corpus) - venue_numbers if is_identifying(n)}
         #: The same results as percentages or fractions, and rounded: not in the materials
         #: in that spelling, but the paper's all the same.
         self._number_variants = (
@@ -403,7 +403,7 @@ class LeakScanner:
             return "it contains something that looks like a credential"
         if not self.has_sources:
             return None
-        spelled = [(raw, _readings(raw)) for raw in dict.fromkeys(_NUMBER.findall(text))]
+        spelled = [(raw, number_readings(raw)) for raw in dict.fromkeys(NUMBER.findall(text))]
         spelled += [
             (match.group(0), [_canonical(f"{match.group(1)}.{match.group(2)}")])
             for match in _DECIMAL_COMMA.finditer(text)

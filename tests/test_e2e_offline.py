@@ -332,7 +332,7 @@ class Model:
 
 @pytest.fixture
 def run(tmp_path, repo_root, monkeypatch):
-    example = json.loads((repo_root / "frontend/examples/cvpr_example.json").read_text())
+    example = json.loads((repo_root / "examples/cvpr_example.json").read_text())
     raw = tmp_path / "raw_materials"
     raw.mkdir()
     (raw / "idea_sparse.md").write_text(example["idea"], encoding="utf-8")

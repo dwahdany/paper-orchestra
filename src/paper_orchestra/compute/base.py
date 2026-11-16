@@ -1,22 +1,43 @@
 """Compute backend contract.
 
-Two kinds of work leave the orchestrator process:
+Three kinds of work leave the orchestrator process:
 
-* running model-written Python (figure code), which is untrusted, and
-* compiling model-written LaTeX, which needs a TeX distribution.
+* running model-written Python (figure code), which is untrusted,
+* compiling model-written LaTeX, which needs a TeX distribution, and
+* experiment jobs: a command run in a copy of a source directory, whose output a
+  person watches while it runs and whose result files are copied back.
 
-``LocalBackend`` runs both as subprocesses on this machine.  ``ModalBackend``
-runs them in Modal Sandboxes, so nothing model-written executes locally and no
-TeX install is needed.
+``LocalBackend`` runs all three as subprocesses on this machine.  ``ModalBackend``
+runs them in Modal Sandboxes, so nothing model-written executes locally, no TeX
+install is needed, and a job can have a GPU and packages of its own.
+
+The second half of this module is the plumbing of jobs that both backends share:
+the log, the supervision of a running job, and the rules for what goes into a
+working directory and what comes back out of it.
 """
 
 from __future__ import annotations
 
+import codecs
+import contextlib
+import fnmatch
+import inspect
+import json
+import math
+import os
+import queue
+import re
+import shutil
+import stat
+import threading
+import time
+import unicodedata
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, NamedTuple
 
 
 class ComputeError(RuntimeError):
@@ -31,6 +52,14 @@ class BackendUnusable(ComputeError):
     """The backend cannot work as configured; retrying will not change that."""
 
     unusable = True
+
+
+def safe_relative(name: str) -> Path:
+    """Reject absolute paths and ``..`` in caller-supplied file names."""
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ComputeError(f"unsafe file name: {name!r}")
+    return path
 
 
 @dataclass
@@ -101,6 +130,116 @@ def refuse_unsafe_document(workdir: str | Path, tex_name: str) -> CompileResult 
     )
 
 
+# -- experiment jobs: the contract -------------------------------------------------------
+
+#: Where a backend writes the combined output of a job, inside the run directory.
+LOG_NAME = "log.txt"
+#: Where a backend with remote jobs writes the job's handle as soon as it has one.
+HANDLE_NAME = "handle.txt"
+#: Where a backend whose jobs are billed keeps its estimate of what the job has cost so
+#: far: ``{"cost_usd": float | null, "seconds": float, "final": bool}``.  It is written
+#: when the job starts to cost and again whenever the job settles, so that a run whose
+#: result never reached its caller (a stop, an interrupt, a dead worker) still has a cost.
+COST_NAME = "cost.json"
+#: Where a backend whose jobs are processes of this machine records what a job started,
+#: for whoever has to clean up after a worker that died:
+#: ``{"session": int, "session_started": str, "scratch": str}``.  The working directory
+#: is on record from the moment it exists; the session is ``0`` (and its start ``""``)
+#: until the command has been started.  The record only says where to look: it is a file
+#: of a project directory, which anybody may have written, so what is ended and removed
+#: is decided by what the machine shows (see ``LocalBackend.end_job``), and the session
+#: is there for a person who wants to look for themselves.
+JOB_NAME = "job.json"
+#: Names in a run directory that the backend or the engine writes: the records above,
+#: the engine's ``run.json``, its snapshot of the code that ran (``code``) and its copy of
+#: the repository (``repo``).  A job's outputs may not replace them.
+RESERVED_RUN_FILES = frozenset(
+    {LOG_NAME, HANDLE_NAME, COST_NAME, JOB_NAME, "run.json", "code", "repo"}
+)
+#: Starts every line that a backend adds to a job's log itself, and no line of the job.
+NOTE_PREFIX = "[paper-orchestra] "
+#: Put before what a job printed where a line of its output begins like a line of the
+#: backend, so that no job can speak in the backend's name.
+JOB_MARK = "(printed by the job) "
+#: Stands where a string that must not be written down (a credential) was taken out of
+#: a text: in a job's log, and in everything else of a project that is kept or shown.
+#: One marker for all of it, so that a person and a program know it when they see it.
+MASK = "[redacted]"
+
+#: What ``describe()["jobs"]`` holds for a backend that runs no jobs.
+NO_JOB_FEATURES: Mapping[str, bool] = {
+    "supported": False,
+    "gpu": False,
+    "network_isolation": False,
+    "packages": False,
+    "reattach": False,
+}
+
+
+@dataclass
+class JobSpec:
+    """What to run.  ``command`` is an argv, run in a copy of the source directory."""
+
+    command: list[str]
+    #: Seconds of wall-clock time the command may take.
+    timeout: float = 900.0
+    #: A GPU type such as ``"T4"``, optionally with a count (``"A100:2"``); ``None`` = CPU.
+    gpu: str | None = None
+    #: Whether the job may use the network.
+    network: bool = False
+    #: pip requirements, each a name with optional extras and version (``"torch>=2.4"``).
+    packages: tuple[str, ...] = ()
+    #: Extra environment variables.  Non-secret values only: the job is untrusted.
+    env: dict[str, str] = field(default_factory=dict)
+    #: CPU cores and memory (MiB) the job may use; ``None`` leaves it to the backend.
+    cpu: float | None = None
+    memory_mb: int | None = None
+    #: Files and directories, relative to the working directory, copied to the run directory.
+    outputs: tuple[str, ...] = ("metrics.json", "artifacts")
+
+
+@dataclass
+class JobResult:
+    """How a job went.
+
+    Read ``error`` first (the backend failed: the job is not to blame, and repairing
+    its code will not help), then ``cancelled`` and ``timed_out``, then ``returncode``.
+    """
+
+    #: Exit status of the command; ``128 + n`` when signal ``n`` ended it, which is also
+    #: what a job that was stopped usually shows.  ``None`` when the backend has none:
+    #: it refused the job, lost it, or ended the sandbox it ran in.
+    returncode: int | None
+    timed_out: bool = False
+    cancelled: bool = False
+    #: Wall-clock seconds the command ran.
+    seconds: float = 0.0
+    #: Combined stdout and stderr as UTF-8 text (bytes that are not are replaced).
+    log_path: Path | None = None
+    #: The run directory, where the requested outputs that existed were copied.
+    outputs_dir: Path | None = None
+    backend: str = ""
+    #: Remote id of the job, for ``ComputeBackend.attach``.
+    handle: str | None = None
+    #: Estimated cost; ``None`` when unknown or when nothing is billed.
+    cost_usd: float | None = None
+    #: The backend's own failure, as a message for a person.  Not the job's.
+    error: str | None = None
+    #: What the person should know that is neither output nor a failure: outputs that
+    #: were not copied back, isolation the backend could not give, files left out.
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """The command ran to its end and exited with status 0."""
+        return (
+            self.returncode == 0
+            and not self.timed_out
+            and not self.cancelled
+            and self.error is None
+        )
+
+
 class ComputeBackend(ABC):
     name: str = ""
 
@@ -138,12 +277,91 @@ class ComputeBackend(ABC):
         listed, matching what a human author would get from ``nonstopmode``.
         """
 
+    def run_job(
+        self,
+        spec: JobSpec,
+        *,
+        source_dir: Path,
+        run_dir: Path,
+        on_log: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
+    ) -> JobResult:
+        """Run ``spec.command`` in a private copy of ``source_dir`` and report how it went.
+
+        ``source_dir`` is never run in place and never changed.  The combined
+        stdout and stderr of the job go to ``run_dir/log.txt`` as they are produced
+        and, line by line, to ``on_log`` (called on the caller's thread).  The job is
+        stopped when ``should_stop()`` turns true (asked at least once a second) or
+        when ``spec.timeout`` seconds have passed.  Afterwards the paths in
+        ``spec.outputs`` that exist are copied into ``run_dir``; outputs of an earlier
+        run that were there are removed first, so what is found there is this run's.
+
+        Only what the command wrote is an output: a path of ``spec.outputs`` that
+        came with ``source_dir`` is not in the working directory when the command
+        starts, and the result's notes say that it was removed.  The strings in
+        ``mask`` (credentials) never reach the log or ``on_log``: where the job
+        prints one, ``MASK`` (``[redacted]``) stands in its place.  A line of the job that begins like
+        a line of the backend (``[paper-orchestra]``) is marked as the job's.
+
+        Every outcome that follows from the job, or from the backend failing while it
+        worked, is a :class:`JobResult`; ``error`` is set when the backend refused the
+        job, could not run it or lost it.  Only three things raise:
+        :class:`BackendUnusable` (no credentials: trying again cannot help),
+        :class:`ComputeError` when ``run_dir`` cannot be written, and whatever
+        ``on_log`` or ``should_stop`` raise, including ``KeyboardInterrupt``.  In every
+        case the job has been stopped and its working directory is gone when this
+        returns.
+        """
+        raise ComputeError(f"The {self.name or 'compute'} backend does not run experiment jobs.")
+
+    def supports(self, spec: JobSpec) -> list[str]:
+        """Why this backend cannot run ``spec``, as sentences for a person; empty if it can.
+
+        Cheap and offline: it looks at the request and at this machine only.
+        ``run_job`` applies the same test and answers a refused job with a result
+        whose ``error`` holds these reasons.
+        """
+        return [f"The {self.name or 'compute'} backend does not run experiment jobs."]
+
+    def attach(
+        self,
+        handle: str,
+        *,
+        run_dir: Path,
+        spec: JobSpec | None = None,
+        started: str | float | None = None,
+        on_log: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
+    ) -> JobResult:
+        """Pick up the job ``handle`` (``JobResult.handle``) after the process that ran it died.
+
+        Only backends whose jobs outlive the orchestrator have something to pick up;
+        ``describe()["jobs"]["reattach"]`` says whether this one does.
+
+        A job is judged, fetched and billed by what this side knows about it, never
+        by what the job could have written where it ran: ``spec`` is the job as it
+        was approved (its outputs, time limit and resources) and ``started`` is when
+        its run began (an ISO 8601 stamp, or seconds since the epoch), from which it
+        is billed.  ``mask`` is as for :meth:`run_job`.
+        """
+        raise ComputeError(
+            f"Jobs of the {self.name or 'compute'} backend cannot be picked up again: they end "
+            "with the process that started them. Run the job again."
+        )
+
     def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
         """Why this backend cannot do the named kinds of work, as messages for the user.
 
         Called once before any model call is paid for; an empty list means it is
         ready.  Implementations keep this cheap: look for the tools or the
         credentials, without starting a job.
+
+        The paper pipeline asks with ``latex=True``.  A call with ``latex=False`` is
+        about running code alone, which is how it is asked before an experiment is
+        approved or run: the messages then speak of the experiment and of what a
+        person can do about it there, not of the paper.
         """
         return []
 
@@ -151,11 +369,1215 @@ class ComputeBackend(ABC):
         """Release remote resources.  Safe to call more than once."""
 
     def describe(self) -> dict[str, Any]:
-        """Non-secret diagnostics for ``paper-orchestra doctor``."""
-        return {"backend": self.name}
+        """Non-secret diagnostics for ``paper-orchestra doctor`` and the setup page.
+
+        ``jobs`` says what experiment jobs can ask of this backend: ``supported``,
+        ``gpu``, ``network_isolation`` (a job without network access really has
+        none), ``packages`` (it installs what a job asks for) and ``reattach``.
+        """
+        return {"backend": self.name, "jobs": dict(NO_JOB_FEATURES)}
 
     def __enter__(self) -> ComputeBackend:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+# -- experiment jobs: plumbing shared by the backends ------------------------------------
+
+#: Bytes and files copied back from one job.  Outputs are figures and tables for the wiki,
+#: not datasets or checkpoints, and the project directory is meant to stay small.
+MAX_OUTPUT_BYTES = 500 * 1024 * 1024
+MAX_OUTPUT_FILES = 2000
+#: Bytes of output a log keeps from the start of a job, and from its end once that is
+#: exceeded, so that a job printing in a loop can fill neither the disk nor the memory.
+MAX_LOG_BYTES = 64 * 1024 * 1024
+LOG_TAIL_BYTES = 256 * 1024
+#: Longest piece of output handed to ``on_log`` at once.
+MAX_LINE_CHARS = 4000
+#: Seconds a job has between being asked to stop and being killed.
+KILL_GRACE = 5.0
+#: Seconds without output after which a killed job's output is given up, and bytes of it
+#: that are read at most.  What was waiting to be read when the job was killed is less
+#: than that and ends by itself; only something that got away from the kill and still
+#: holds the output open stays silent for longer, or prints more.
+DRAIN_SECONDS = 5.0
+DRAIN_BYTES = 16 * 1024 * 1024
+#: How long supervision sleeps when no output arrives, and how often it asks ``should_stop``.
+TICK_SECONDS = 0.2
+CHECK_SECONDS = 0.5
+#: Chunks of output that may wait for the supervising thread; the reader blocks beyond it.
+QUEUE_CHUNKS = 64
+
+#: Names that never go into a job's working directory, matched against each file and
+#: directory name: version-control data and caches (large, and not what the job is about),
+#: environments (rebuilt from ``JobSpec.packages``) and ``.env`` files, which hold the
+#: credentials a job must not see.
+SOURCE_EXCLUDES = (
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".ipynb_checkpoints",
+    ".DS_Store",
+    ".env",
+    ".env.*",
+)
+
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_GPU = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*!?(?::[1-9][0-9]?)?")
+_VERSION = r"(?:===|==|~=|!=|<=|>=|<|>)\s*[A-Za-z0-9.*+!_-]+"
+# A name, optional extras, optional versions.  Nothing else pip accepts (options, URLs,
+# paths, markers): the strings are written by a model and end up in an image build.
+_REQUIREMENT = re.compile(
+    r"\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+    r"\s*(?:\[\s*[A-Za-z0-9._-]+(?:\s*,\s*[A-Za-z0-9._-]+)*\s*\])?"
+    rf"\s*(?:{_VERSION}(?:\s*,\s*{_VERSION})*)?\s*"
+)
+_LINE_END = re.compile(r"[\r\n]")
+
+
+def human_size(count: int) -> str:
+    if count < 10_000:
+        return f"{count} bytes"
+    if count < 1024 * 1024:
+        return f"{count / 1024:.0f} KB"
+    return f"{count / (1024 * 1024):.1f} MB"
+
+
+def _listed(names: Sequence[str], limit: int = 5) -> str:
+    more = len(names) - limit
+    return ", ".join(names[:limit]) + (f" and {more} more" if more > 0 else "")
+
+
+def requirement_name(requirement: str) -> str | None:
+    """The distribution a pip requirement names, or ``None`` if it is not a plain one."""
+    match = _REQUIREMENT.fullmatch(requirement) if isinstance(requirement, str) else None
+    return match.group("name") if match else None
+
+
+def _output_problem(name: object) -> str | None:
+    if isinstance(name, str) and "\0" not in name:
+        with contextlib.suppress(ComputeError):
+            if safe_relative(name).parts[0] not in RESERVED_RUN_FILES:
+                return None
+            return (
+                f"Output {name!r} would replace a record of the run "
+                f"({', '.join(sorted(RESERVED_RUN_FILES))}); give the output another name."
+            )
+    return f"Output {name!r} must be a relative path inside the working directory."
+
+
+def spec_problems(spec: JobSpec) -> list[str]:
+    """What is wrong with ``spec`` whatever the backend, as sentences for a person."""
+    problems: list[str] = []
+    command = spec.command
+    if not isinstance(command, list | tuple) or not command:
+        problems.append("The job has no command to run.")
+    elif not all(isinstance(arg, str) and "\0" not in arg for arg in command) or not command[0]:
+        problems.append("The command of the job must be a list of strings, the program first.")
+    timeout = spec.timeout
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int | float)
+        or not 0 < timeout < math.inf
+    ):
+        problems.append(
+            f"The time limit of the job must be a positive number of seconds, not {timeout!r}."
+        )
+    for field_name in ("outputs", "packages"):
+        if not isinstance(getattr(spec, field_name), list | tuple):
+            # A bare string would be taken apart into its characters.
+            problems.append(f"The {field_name} of the job must be a list, not a single string.")
+            return problems
+    problems.extend(filter(None, map(_output_problem, spec.outputs)))
+    for name, value in spec.env.items():
+        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
+            problems.append(
+                f"Environment variable name {name!r} is not valid: use letters, digits and "
+                "underscores, and do not start with a digit."
+            )
+        elif not isinstance(value, str) or "\0" in value:
+            problems.append(f"The value of environment variable {name!r} must be a string.")
+    if spec.cpu is not None and not 0 < spec.cpu < math.inf:
+        problems.append(f"The number of cpu cores must be positive, not {spec.cpu!r}.")
+    if spec.memory_mb is not None and not 16 <= spec.memory_mb < math.inf:
+        problems.append(f"The memory of the job must be at least 16 MB, not {spec.memory_mb!r}.")
+    if spec.gpu is not None and not (isinstance(spec.gpu, str) and _GPU.fullmatch(spec.gpu)):
+        problems.append(
+            f"The GPU request {spec.gpu!r} is not a GPU type. Give a type such as T4 or "
+            "A100-80GB, optionally with a count as in H100:2."
+        )
+    for requirement in spec.packages:
+        if requirement_name(requirement) is None:
+            problems.append(
+                f"Package {requirement!r} is not a plain requirement. Give a package name with "
+                "an optional version, such as numpy or torch>=2.4; options, URLs and paths are "
+                "not accepted."
+            )
+    return problems
+
+
+def open_run(run_dir: Path, outputs: Sequence[str]) -> Path:
+    """Make ``run_dir`` ready for a new run and return the path of its log.
+
+    The log is emptied, and the requested outputs and the backend's records (handle,
+    cost, job) that an earlier run left there are removed (links are removed, never
+    followed), so that what is found afterwards is this run's.  Outputs that
+    ``spec_problems`` objects to are left alone.  Raises :class:`ComputeError` when the
+    directory cannot be used.
+    """
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / LOG_NAME).write_bytes(b"")
+        stale = [run_dir / name for name in (HANDLE_NAME, COST_NAME, JOB_NAME)]
+        for name in () if isinstance(outputs, str) else outputs:
+            if _output_problem(name) is None:
+                stale.append(run_dir / safe_relative(name))
+        for path in stale:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+    except OSError as exc:
+        raise ComputeError(
+            f"The run directory {run_dir} cannot be used: {exc}. Check that it can be written."
+        ) from exc
+    return run_dir / LOG_NAME
+
+
+def write_record(path: Path, data: Mapping[str, Any]) -> None:
+    """Write ``data`` as the JSON file ``path``, whole or not at all.
+
+    The records a backend keeps next to a run are read by another process after this
+    one has died, at any moment: a reader finds the old file or the new one, never half
+    of one.  Raises ``OSError`` when the directory cannot be written.
+    """
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def read_record(path: Path) -> dict[str, Any] | None:
+    """The JSON object in ``path``; ``None`` when there is no such file or it holds none."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def output_of(relative: str, outputs: Sequence[str]) -> str | None:
+    """The one of ``outputs`` that the path ``relative`` is or lies in; ``None`` if none.
+
+    ``relative`` is a posix path inside a working directory.  ``outputs`` must have
+    passed :func:`spec_problems`.
+    """
+    parts = Path(relative).parts
+    for name in outputs:
+        wanted = safe_relative(name).parts
+        if parts[: len(wanted)] == wanted:
+            return name
+    return None
+
+
+def clear_outputs(work: Path, outputs: Sequence[str]) -> list[str]:
+    """Remove the requested ``outputs`` from the working directory ``work`` before the
+    job's command starts, and return the ones that were there.
+
+    A result is what the command wrote.  A ``metrics.json`` or an ``artifacts``
+    directory that came with the source would otherwise be collected as if this run
+    had produced it.  A link is removed, never followed; an output behind a linked
+    directory is left alone, because it is never collected either.
+    """
+    removed: list[str] = []
+    for name in outputs:
+        relative = safe_relative(name)
+        path = work / relative
+        behind_link = any(
+            (work / Path(*relative.parts[:depth])).is_symlink()
+            for depth in range(1, len(relative.parts))
+        )
+        if behind_link or not os.path.lexists(path):
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed.append(name)
+    return removed
+
+
+def leftover_notes(names: Iterable[str]) -> list[str]:
+    """The note for a result whose source held ``names`` of the requested outputs."""
+    found = sorted(set(names))
+    if not found:
+        return []
+    return [
+        f"The backend removed {_listed(found)} that was there before the run (it came with "
+        "the source): only what the command itself writes counts as a result."
+    ]
+
+
+class _Lines:
+    """Cuts text into the pieces that ``on_log`` receives.
+
+    A piece ends at a line feed or carriage return (so a progress bar that redraws
+    itself arrives as separate pieces) or after ``MAX_LINE_CHARS`` characters.  Empty
+    pieces are dropped.  The pieces depend only on the text, never on how it was cut
+    into chunks; replaying a log relies on that.  ``emit`` is told with each piece
+    whether it continues a line that an earlier piece began.
+    """
+
+    def __init__(self, emit: Callable[[str, bool], None]) -> None:
+        self._emit = emit
+        self._pending = ""
+        self._continues = False
+
+    def feed(self, text: str) -> None:
+        pending = self._pending + text
+        start = 0
+        for match in _LINE_END.finditer(pending):
+            self._pieces(pending[start : match.start()])
+            self._continues = False
+            start = match.end()
+        rest = pending[start:]
+        whole = len(rest) - len(rest) % MAX_LINE_CHARS
+        self._pieces(rest[:whole])
+        self._pending = rest[whole:]
+
+    def flush(self) -> None:
+        """Emit what is left of an unfinished line; what follows starts a new one."""
+        pending, self._pending = self._pending, ""
+        self._pieces(pending)
+        self._continues = False
+
+    def _pieces(self, line: str) -> None:
+        for start in range(0, len(line), MAX_LINE_CHARS):
+            self._emit(line[start : start + MAX_LINE_CHARS], self._continues)
+            self._continues = True
+
+
+def _utf8_decoder() -> codecs.IncrementalDecoder:
+    return codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+
+class _Mask:
+    """Replaces strings that must not be written down in a text that arrives in pieces.
+
+    A string cut in two by the pieces is still found: the end of a piece that may be
+    the beginning of one is held back until the next piece tells.  What comes out is
+    the same however the text was cut: it is what replacing in the whole text gives,
+    from left to right, the longest string first where several begin at one place.
+    """
+
+    def __init__(self, secrets: Iterable[str]) -> None:
+        # Longest first: where one secret contains another, the whole of it goes.
+        self._secrets = sorted(
+            {secret for secret in secrets if isinstance(secret, str) and secret},
+            key=len,
+            reverse=True,
+        )
+        self._pattern = (
+            re.compile("|".join(map(re.escape, self._secrets))) if self._secrets else None
+        )
+        self._pending = ""
+
+    def whole(self, text: str) -> str:
+        """``text`` without the secrets, for a text that is complete."""
+        return self._pattern.sub(MASK, text) if self._pattern is not None else text
+
+    def feed(self, text: str) -> str:
+        """What may be written once ``text`` has arrived."""
+        if self._pattern is None:
+            return text
+        text = self._pending + text
+        undecided = self._undecided(text)
+        pieces: list[str] = []
+        position = 0
+        while True:
+            # Where a secret may have begun whose end has not arrived.  A string found
+            # at or after that place has to wait: the longer one may yet take its place.
+            waits = next((index for index in undecided if index >= position), len(text))
+            match = self._pattern.search(text, position)
+            if match is None or match.start() >= waits:
+                break
+            pieces.append(text[position : match.start()])
+            pieces.append(MASK)
+            position = match.end()
+        pieces.append(text[position:waits])
+        self._pending = text[waits:]
+        return "".join(pieces)
+
+    def flush(self) -> str:
+        """What was held back, once nothing more can follow it."""
+        pending, self._pending = self._pending, ""
+        return self.whole(pending)
+
+    def _undecided(self, text: str) -> list[int]:
+        """The places near the end of ``text`` from which it reads as the beginning of a
+        secret that is longer than what is left of the text, in ascending order."""
+        places: set[int] = set()
+        for secret in self._secrets:
+            index = text.find(secret[0], max(0, len(text) - len(secret) + 1))
+            while index != -1:
+                if secret.startswith(text[index:]):
+                    places.add(index)
+                index = text.find(secret[0], index + 1)
+        return sorted(places)
+
+
+_TAG = NOTE_PREFIX.rstrip()
+_ESCAPE = "\x1b"
+# What a terminal or a page shows nothing of: blanks, control and zero-width characters.
+# The escape character is looked at by itself, because what follows it may go with it.
+_UNSEEN_SET = r"\s\x00-\x1a\x1c-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u2028-\u202f\u2060-\u2064\ufeff"
+# What most lines that have anything before their first word begin with: characters
+# of that kind, and colour or cursor sequences that can only be read as such.  (One
+# that could also be read as the escape character followed by the beginning of the
+# tag, such as ``ESC [ p``, is not among them, nor is one of a length no terminal
+# sends: those are read character by character, see :func:`_line_start`.)
+_LEAD = re.compile(rf"(?:[{_UNSEEN_SET}]+|\x1b\[(?:[0-?]{{1,256}}[ -/]{{0,16}}[@-~]|[@-oq-~]))*")
+# The kinds of character (Unicode general categories) that are drawn as nothing or as a
+# gap: controls, format characters, marks that sit on another character, separators,
+# and code points that are no character at all.  And letters that are drawn as nothing.
+_UNSEEN_KINDS = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Mn", "Me", "Zs", "Zl", "Zp"})
+_BLANK_LETTERS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
+#: Characters at the start of a line that are held back at most while it cannot be told
+#: whether the line begins like one of the backend's; a line that keeps it open for
+#: longer is taken for one.  No output of a real program comes near it.  The limit is
+#: counted in the text, not in what has arrived, so that it cuts every delivery alike.
+_HELD_CHARS = 1024
+#: Ways of reading the start of one line that are followed at once, at most.
+_MAX_READINGS = 64
+_CLEAN, _TAGGED, _OPEN = "clean", "tagged", "open"
+
+
+def _unseen(char: str) -> bool:
+    """Whether a reader sees nothing of ``char``, or no more than a gap."""
+    return char.isspace() or unicodedata.category(char) in _UNSEEN_KINDS or char in _BLANK_LETTERS
+
+
+def _in_sequence(char: str, phase: int) -> int | None:
+    """Where the reading of a colour or cursor sequence stands after ``char``.
+
+    A sequence is the escape character, ``[``, parameters (``0`` to ``?``),
+    intermediates (blank to ``/``) and one final character (``@`` to ``~``).  ``phase``
+    is 1 after the escape character, 2 among the parameters and 3 among the
+    intermediates; the result is the next phase, 0 when ``char`` ended the sequence,
+    and ``None`` when ``char`` cannot stand there, so that this is no sequence.
+    """
+    if phase == 1:
+        return 2 if char == "[" else None
+    if phase == 2 and "0" <= char <= "?":
+        return 2
+    if " " <= char <= "/":
+        return 3
+    return 0 if "@" <= char <= "~" else None
+
+
+#: One way of reading the start of a line: how many characters of the tag were read,
+#: where the tag began, where the sequence began that is being read (-1: none is), and
+#: how far that sequence is read (see :func:`_in_sequence`; 0: none is).
+_Reading = tuple[int, int, int, int]
+#: A line at whose start nothing has been read yet.
+_UNREAD: frozenset[_Reading] = frozenset({(0, -1, -1, 0)})
+
+
+def _held_from(readings: Iterable[_Reading], otherwise: int) -> int:
+    """The first place that one of ``readings`` still depends on: where the tag it has
+    begun to read starts, or the sequence it is in the middle of."""
+    places = [
+        began if began >= 0 else escape
+        for _, began, escape, _ in readings
+        if began >= 0 or escape >= 0
+    ]
+    return min(places, default=otherwise)
+
+
+def _line_start(
+    text: str, index: int, resume: tuple[Iterable[_Reading], int] | None = None
+) -> tuple[str, int, set[_Reading]]:
+    """How the line that starts at ``index`` of ``text`` begins for a reader.
+
+    Returns ``(_TAGGED, place, ...)`` when it reads as starting with the tag of the
+    backend's lines, whose first character is at ``place``; ``(_CLEAN, place, ...)``
+    when it does not, which is settled at ``place``; and ``(_OPEN, place, readings)``
+    when that depends on text that has not arrived: the text from ``place`` on has to
+    be kept, and ``(readings, len(text))`` is the ``resume`` to go on with once more
+    of it is there.
+
+    What counts is what is left once everything a reader does not see is taken out,
+    before the tag and *inside* it: the log is shown by programs that drop control
+    characters, colour sequences or both, and by pages on which a zero-width character
+    takes no room.  They do not agree on what goes with an escape character (it alone,
+    or the whole sequence it begins), so both readings are followed, and the line is
+    the backend's look-alike if either makes it one.  A carriage return is dropped by
+    some readers and starts a new line for others; it is taken both ways too.
+    """
+    size, last = len(text), len(_TAG) - 1
+    if resume is None:
+        lead = _LEAD.match(text, index)
+        position = lead.end() if lead else index
+        readings = set(_UNREAD)
+        # Nearly every line is settled by its first visible character or the one after
+        # it.  Told here, without the bookkeeping below: a job prints lines by the million.
+        if position < size and "!" <= (char := text[position]) <= "~":
+            if char != _TAG[0]:
+                return _CLEAN, position, readings
+            second = text[position + 1 : position + 2]
+            if "!" <= second <= "~" and second != _TAG[1]:
+                return _CLEAN, position + 1, readings
+    else:
+        readings, position = set(resume[0]), resume[1]
+    while position < size:
+        char = text[position]
+        if char == "\n":
+            return _CLEAN, position, readings
+        following: set[_Reading] = set()
+        if char == "\r":
+            following.update(_UNREAD)
+        for read, began, escape, phase in readings:
+            if phase:
+                step = _in_sequence(char, phase)
+                if step is not None:
+                    following.add((read, began, escape if step else -1, step))
+            elif char == _ESCAPE:
+                following.add((read, began, -1, 0))
+                following.add((read, began, position, 1))
+            elif char == _TAG[read]:
+                if read == last:
+                    # Before the first place any reading has a tag begin at: whichever
+                    # of them a reader follows, the mark then stands before its tag.
+                    first = min(began for _, began, _, _ in readings if began >= 0)
+                    return _TAGGED, first, readings
+                following.add((read + 1, began if read else position, -1, 0))
+            elif _unseen(char):
+                following.add((read, began, -1, 0))
+        if not following:
+            return _CLEAN, position, readings
+        held = _held_from(following, position)
+        if len(following) > _MAX_READINGS or position - held >= _HELD_CHARS:
+            # Nothing honest keeps the question open for so long, or in so many ways.
+            return _TAGGED, held, following
+        readings = following
+        position += 1
+    return _OPEN, _held_from(readings, size), readings
+
+
+class _Guard:
+    """Keeps a job from printing lines that read as the backend's own.
+
+    A line of the backend starts with ``NOTE_PREFIX``.  Where a line of the job reads
+    as starting with that tag (see :func:`_line_start`), ``JOB_MARK`` is put before
+    the tag.  The text arrives in pieces; the characters at the start of a line that
+    may be the beginning of the tag are held back until the next piece tells.
+    """
+
+    def __init__(self) -> None:
+        self._pending = ""
+        #: How the held-back text has been read so far, with places counted from its
+        #: start; ``None`` when it is to be read from its beginning.
+        self._readings: set[_Reading] | None = None
+        #: Nothing visible has been printed on the current line yet.
+        self._fresh = True
+
+    def feed(self, text: str) -> str:
+        resume = (self._readings, len(self._pending)) if self._readings else None
+        text = self._pending + text
+        self._pending, self._readings = "", None
+        pieces: list[str] = []
+        index = 0
+        while index < len(text):
+            if not self._fresh:
+                # The rest of the line is the job's to fill: copied, never looked at.
+                end = _LINE_END.search(text, index)
+                stop = len(text) if end is None else end.end()
+                pieces.append(text[index:stop])
+                index = stop
+                self._fresh = end is not None
+                continue
+            verdict, place, readings = _line_start(text, index, resume)
+            resume = None
+            pieces.append(text[index:place])
+            index = place
+            if verdict == _OPEN:
+                self._pending = text[place:]
+                if self._pending:  # else nothing was read that the next piece depends on
+                    self._readings = {
+                        (read, max(began - place, -1), max(escape - place, -1), phase)
+                        for read, began, escape, phase in readings
+                    }
+                break
+            if verdict == _TAGGED:
+                pieces.append(JOB_MARK)
+            self._fresh = False
+        return "".join(pieces)
+
+    def flush(self) -> str:
+        pending, self._pending, self._readings = self._pending, "", None
+        return pending
+
+    def new_line(self) -> None:
+        """What comes next starts a line, whatever came before (a note went in between):
+        what is held back is read again, as the beginning of that line."""
+        self._fresh = True
+        self._readings = None
+
+
+def _as_the_jobs(piece: str) -> str:
+    """``piece`` of a job's output with ``JOB_MARK`` if it begins like a backend's line."""
+    guard = _Guard()
+    return guard.feed(piece) + guard.flush()
+
+
+def _one_line(text: str) -> str:
+    """``text`` on one line: a note of the backend never spills into lines of its own
+    that lack the prefix, whatever name of a file it quotes."""
+    return " ".join(str(text).splitlines())
+
+
+class JobLog:
+    """The log of one job: a file that grows as output arrives, and lines for ``on_log``.
+
+    The file is UTF-8 text whatever the job printed (other bytes are replaced), and
+    holds everything received so far after every ``feed``, so a person can follow it
+    while the job runs.  Beyond ``MAX_LOG_BYTES`` only the end of the output is kept
+    (in memory, bounded) and written when the log is closed, and ``on_log`` is told
+    once and then left alone.  ``note`` adds a line of the backend's own.  A file that
+    cannot be written (a full disk) raises :class:`ComputeError`.
+
+    Two things are changed in what the job printed before it reaches the file or
+    ``on_log``.  The strings in ``mask`` (credentials) are replaced by ``MASK``,
+    also where one arrives in two pieces.  And a line that begins with the tag of
+    ``NOTE_PREFIX`` gets ``JOB_MARK`` in front of the tag, so that a line starting
+    with the prefix is always the backend's.  "Begins with" is meant as a reader
+    takes it: characters and colour sequences that are not seen, before the tag or
+    inside it, do not hide it (see :func:`_line_start`).  For both, a few characters
+    that may be the beginning of such a string are held back until more output, or
+    the end, tells.
+
+    ``skip_lines`` withholds that many lines from ``on_log``: a log that is rebuilt
+    from the start of a job reports only what was not reported before.  ``append``
+    keeps what the file holds.  Not thread-safe: one thread feeds it.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        on_log: Callable[[str], None] | None = None,
+        *,
+        skip_lines: int = 0,
+        append: bool = False,
+        mask: Iterable[str] = (),
+    ) -> None:
+        self.path = Path(path)
+        #: Bytes of job output received, before any replacement or truncation.
+        self.raw_bytes = 0
+        #: Whether output was left out of the file because the job printed too much.
+        self.truncated = False
+        self._on_log = on_log
+        self._skip = skip_lines
+        self._lines = _Lines(self._deliver)
+        self._decoder = _utf8_decoder()
+        self._mask = _Mask(mask)
+        self._guard = _Guard()
+        self._file: IO[bytes] = open(self.path, "ab" if append else "wb")  # noqa: SIM115
+        self._at_line_start = not append or _ends_with_newline(self.path)
+        self._written = 0
+        self._tail: deque[bytes] = deque()
+        self._tail_bytes = 0
+        self._beyond = 0
+        self._late_notes: list[str] = []
+        self._closed = False
+
+    def feed(self, data: bytes) -> None:
+        """Take the next bytes of the job's output."""
+        self.raw_bytes += len(data)
+        self._accept(self._screened(self._decoder.decode(data)))
+
+    def note(self, message: str) -> None:
+        """Add a line of the backend's own, on a line of its own."""
+        line = NOTE_PREFIX + self._mask.whole(_one_line(message))
+        if self.truncated:
+            self._late_notes.append(line)
+        else:
+            self._write(("" if self._at_line_start else "\n") + line + "\n")
+        # The job's output goes on below the note: on a new line, which is checked as one.
+        self._guard.new_line()
+        if self._on_log is not None:
+            self._lines.flush()
+            self._on_log(line)
+
+    def notes(self) -> list[str]:
+        """What the person should know about the log itself, for ``JobResult.notes``."""
+        if not self.truncated:
+            return []
+        return [
+            f"The job printed more than {human_size(MAX_LOG_BYTES)}; its log keeps the "
+            "beginning and the end of the output."
+        ]
+
+    def close(self) -> None:
+        """Write what is still held back and close the file.  Safe to call twice."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._accept(self._screened(self._decoder.decode(b"", final=True), last=True))
+            if self.truncated:
+                self._write_tail()
+            if self._on_log is not None:
+                self._lines.flush()
+        finally:
+            # Closing writes what an earlier write could not; that failure was reported.
+            with contextlib.suppress(OSError):
+                self._file.close()
+
+    def __enter__(self) -> JobLog:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _screened(self, text: str, *, last: bool = False) -> str:
+        """The job's output as it may be written: masked first, then guarded."""
+        text = self._mask.feed(text)
+        if last:
+            text += self._mask.flush()
+        text = self._guard.feed(text)
+        return text + self._guard.flush() if last else text
+
+    def _accept(self, text: str) -> None:
+        if not text:
+            return
+        data = text.encode("utf-8")
+        if not self.truncated and self._written + len(data) > MAX_LOG_BYTES:
+            self.truncated = True
+            if self._on_log is not None:
+                self._lines.flush()
+                self._on_log(
+                    f"{NOTE_PREFIX}The job has printed more than {human_size(MAX_LOG_BYTES)}; "
+                    "its output is no longer shown live. The end of it is kept in the log."
+                )
+        if self.truncated:
+            self._beyond += len(data)
+            self._tail.append(data)
+            self._tail_bytes += len(data)
+            while self._tail_bytes - len(self._tail[0]) >= LOG_TAIL_BYTES:
+                self._tail_bytes -= len(self._tail.popleft())
+            return
+        self._written += len(data)
+        self._write(text)
+        if self._on_log is not None:
+            self._lines.feed(text)
+
+    def _write(self, text: str) -> None:
+        try:
+            self._file.write(text.encode("utf-8"))
+            # Flushed every time: the file is what a person watching the job reads.
+            self._file.flush()
+        except OSError as exc:
+            raise ComputeError(
+                f"The log {self.path} cannot be written: {exc}. Check the disk that holds "
+                "the run directory."
+            ) from exc
+        self._at_line_start = text.endswith("\n")
+
+    def _write_tail(self) -> None:
+        tail = b"".join(self._tail)[-LOG_TAIL_BYTES:]
+        self._tail.clear()
+        marker = (
+            f"{NOTE_PREFIX}{human_size(self._beyond - len(tail))} of output are left out "
+            f"here: a log keeps the first {human_size(MAX_LOG_BYTES)} and the end."
+        )
+        # The cut may have gone through a character; what is left of it is dropped.  It
+        # may also have gone through a line, whose rest now starts one.
+        guard = _Guard()
+        end = guard.feed(tail.decode("utf-8", errors="ignore")) + guard.flush()
+        self._write(("" if self._at_line_start else "\n") + marker + "\n" + end)
+        for line in self._late_notes:
+            self._write(("" if self._at_line_start else "\n") + line + "\n")
+
+    def _deliver(self, piece: str, continues: bool) -> None:
+        if not piece:
+            return
+        if self._skip > 0:
+            self._skip -= 1
+            return
+        assert self._on_log is not None
+        # The start of a line was checked when it was written.  A long line reaches the
+        # callback in several pieces, and none of them may read as the backend's either.
+        self._on_log(_as_the_jobs(piece) if continues else piece)
+
+
+def _ends_with_newline(path: Path) -> bool:
+    try:
+        with open(path, "rb") as stream:
+            if stream.seek(0, os.SEEK_END) == 0:
+                return True
+            stream.seek(-1, os.SEEK_END)
+            return stream.read(1) == b"\n"
+    except OSError:
+        return True
+
+
+def delivered_lines(log_path: Path) -> int:
+    """How many lines of job output the log at ``log_path`` has handed to ``on_log``.
+
+    The backend's own notes and an unfinished last line do not count.  This is the
+    ``skip_lines`` of a :class:`JobLog` that rebuilds the same log from the start.
+    Only the backend starts a line with ``NOTE_PREFIX`` (see :class:`JobLog`), so a line
+    of the job is never taken for a note, and none is delivered twice.
+    """
+    count = 0
+
+    def emit(piece: str, continues: bool) -> None:
+        nonlocal count
+        if piece and (continues or not piece.startswith(NOTE_PREFIX)):
+            count += 1
+
+    lines = _Lines(emit)
+    decoder = _utf8_decoder()
+    try:
+        with open(log_path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(65536), b""):
+                lines.feed(decoder.decode(chunk))
+    except OSError:
+        return 0
+    return count
+
+
+_END = object()
+
+
+class _Failure(NamedTuple):
+    error: BaseException
+
+
+class _Pump(threading.Thread):
+    """Reads a job's output on a thread of its own.
+
+    Reading blocks while a job is silent, and the thread that supervises the job has
+    to stay free to look at the clock and at ``should_stop``.  The queue between the
+    two is bounded, so a job that prints faster than it is read is held back instead
+    of filling the memory.
+    """
+
+    def __init__(self, chunks: Iterable[bytes]) -> None:
+        super().__init__(name="paper-orchestra-job-output", daemon=True)
+        self._chunks = chunks
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=QUEUE_CHUNKS)
+        self._abandoned = threading.Event()
+
+    def run(self) -> None:
+        try:
+            for chunk in self._chunks:
+                # An empty chunk is the heartbeat of a stream that can be polled; it is
+                # what lets this thread notice that nobody is listening any more.
+                if self._abandoned.is_set() or (chunk and not self._offer(chunk)):
+                    return
+        except BaseException as exc:  # handed to the supervising thread
+            self._offer(_Failure(exc))
+        else:
+            self._offer(_END)
+
+    def _offer(self, item: Any) -> bool:
+        while not self._abandoned.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+            except queue.Full:
+                continue
+            return True
+        return False
+
+    def get(self, timeout: float) -> Any:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def waiting(self) -> bool:
+        """Whether output that was read is waiting to be taken with ``get``."""
+        return not self._queue.empty()
+
+    def abandon(self) -> None:
+        self._abandoned.set()
+
+
+@dataclass
+class Supervised:
+    """How supervision ended, unless the output simply came to its end."""
+
+    timed_out: bool = False
+    cancelled: bool = False
+    #: What reading the output raised.  The job may still be running.
+    failure: BaseException | None = None
+    #: The job was killed and its output stayed open all the same: something it started
+    #: got away and holds it.  What that prints from then on is not in the log.
+    abandoned: bool = False
+
+
+def supervise(
+    chunks: Iterable[bytes],
+    log: JobLog,
+    *,
+    timeout: float,
+    interrupt: Callable[[], None],
+    should_stop: Callable[[], bool] | None = None,
+    kill: Callable[[], None] | None = None,
+    exited: Callable[[], bool] | None = None,
+    grace: float | None = None,
+    drain: float | None = None,
+) -> Supervised:
+    """Feed a running job's output to ``log`` until the output ends, and stop the job
+    when it should not go on.
+
+    ``chunks`` is the job's output; iterating it may block.  After ``timeout``
+    seconds, or once ``should_stop()`` is true (asked every ``CHECK_SECONDS``, with
+    or without output arriving), ``interrupt()`` asks the job to end; ``kill()`` ends
+    it for certain ``grace`` seconds later, or as soon as ``exited()`` says the
+    command is gone.  ``exited()`` turning true by itself means the command has ended
+    while something it started still holds its output open: that is killed too.
+
+    After a kill, what the job had printed is still read to its end, however long
+    ``on_log`` takes over it.  Reading is only given up (``abandoned``) when the output
+    is still open ``drain`` seconds later with nothing left of it waiting to be read,
+    or when more than ``DRAIN_BYTES`` have come since the kill: something survived it
+    and holds the output.
+
+    Returns when the output has ended, was given up, or failed.  The caller still
+    owns the job: it makes sure that the job is dead, whatever this returns or raises.
+    """
+    grace = KILL_GRACE if grace is None else grace
+    drain = DRAIN_SECONDS if drain is None else drain
+    outcome = Supervised()
+    pump = _Pump(chunks)
+    pump.start()
+    deadline = time.monotonic() + timeout
+    next_check = 0.0
+    kill_at: float | None = None  # set once the job was asked to stop
+    give_up_at: float | None = None  # set once it was killed
+    drained = 0  # bytes of output read since then
+    last_look = False  # all that was waiting has been read; what comes next decides
+    try:
+        while True:
+            item = pump.get(TICK_SECONDS)
+            if item is _END:
+                break
+            if isinstance(item, _Failure):
+                outcome.failure = item.error
+                break
+            if item is not None:
+                log.feed(item)
+                if give_up_at is not None:
+                    drained += len(item)
+            now = time.monotonic()
+            if give_up_at is not None:
+                if last_look or drained > DRAIN_BYTES:
+                    outcome.abandoned = True
+                    break
+                # Not while output is waiting to be read: a slow `on_log` must not cost
+                # the end of the log, which is where the result and the traceback are.
+                # Once nothing is waiting, the end of the output is all that can still
+                # come from the job itself; the next look tells (it broke out above).
+                last_look = now >= give_up_at and not pump.waiting()
+            elif kill_at is not None:
+                if now >= kill_at or (exited is not None and exited()):
+                    if kill is not None:
+                        kill()
+                    give_up_at = now + drain
+            elif now >= next_check or now >= deadline:
+                next_check = now + CHECK_SECONDS
+                if exited is not None and exited():
+                    if kill is not None:
+                        kill()
+                    give_up_at = now + drain
+                elif should_stop is not None and should_stop():
+                    outcome.cancelled = True
+                elif now >= deadline:
+                    outcome.timed_out = True
+                if outcome.cancelled or outcome.timed_out:
+                    interrupt()
+                    kill_at = now + grace
+    finally:
+        pump.abandon()
+        pump.join(timeout=0.5)
+    return outcome
+
+
+class OutputEntry(NamedTuple):
+    """One thing found under a job's requested outputs."""
+
+    #: Relative to the working directory, with forward slashes.
+    path: str
+    #: ``"file"``, ``"link"`` or ``"other"`` (a pipe, a socket, a device).
+    kind: str
+    size: int
+
+
+def scan_outputs(
+    root: str, outputs: list[str], max_entries: int = 100_000, max_chars: int = 10_000_000
+) -> dict:
+    """List what exists under the requested ``outputs`` of a job, following no links.
+
+    Returns ``{"entries": [[path, kind, size], ...], "truncated": bool}`` with the
+    fields of :class:`OutputEntry`.  An output that lies behind a link (``results`` is
+    one, and ``results/metrics.json`` was asked for) is not looked at: the link is
+    listed in its place.  Listing stops, and ``truncated`` is set, after
+    ``max_entries`` entries or when the listing, written as JSON, would be longer
+    than ``max_chars`` characters.
+
+    Self-contained on purpose (its imports are inside, its annotations are builtins):
+    the Modal backend runs this function's source inside the sandbox, so that both
+    backends see a job's outputs in the same way.
+    """
+    import json
+    import os
+    import stat
+
+    entries: list[list] = []
+    seen: set[str] = set()
+    chars = 0
+    truncated = False
+
+    def add(path: str) -> bool:
+        nonlocal chars, truncated
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if relative in seen:
+            return True
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return True
+        cost = len(json.dumps(relative)) + 24  # what the entry takes in the listing
+        if len(entries) >= max_entries or chars + cost > max_chars:
+            truncated = True
+            return False
+        seen.add(relative)
+        chars += cost
+        if stat.S_ISREG(info.st_mode):
+            entries.append([relative, "file", info.st_size])
+        elif stat.S_ISLNK(info.st_mode):
+            entries.append([relative, "link", 0])
+        else:
+            entries.append([relative, "other", 0])
+        return True
+
+    def link_above(output: str) -> str | None:
+        current = root
+        parts = [part for part in output.replace(os.sep, "/").split("/") if part not in ("", ".")]
+        for part in parts[:-1]:
+            current = os.path.join(current, part)
+            if os.path.islink(current):
+                return current
+        return None
+
+    for output in outputs:
+        top = os.path.join(root, output)
+        # A link on the way to an output leads out of the working directory just as one
+        # at its end does.
+        above = link_above(output)
+        if above is not None:
+            if not add(above):
+                break
+            continue
+        if os.path.islink(top) or not os.path.isdir(top):
+            if os.path.lexists(top) and not add(top):
+                break
+            continue
+        for current, dirs, files in os.walk(top):
+            dirs.sort()
+            # os.walk does not descend into linked directories, but it names them here.
+            links = [name for name in dirs if os.path.islink(os.path.join(current, name))]
+            if not all(add(os.path.join(current, name)) for name in sorted(files + links)):
+                break
+        if truncated:
+            break
+    return {"entries": entries, "truncated": truncated}
+
+
+# Put together when this module is loaded, from the source it was loaded from.  Read
+# from the file only when a job has ended, it would be whatever the file holds by then:
+# a package that was upgraded while a job ran would cost that job its outputs.
+_SCAN_SCRIPT = (
+    "from __future__ import annotations\n\n\n"
+    + inspect.getsource(scan_outputs)
+    + "\n\nimport json\nimport sys\n\n"
+    "listing = scan_outputs('.', sys.argv[3:], int(sys.argv[1]), int(sys.argv[2]))\n"
+    "print(json.dumps(listing))\n"
+)
+
+
+def scan_outputs_script() -> str:
+    """A standalone script that prints :func:`scan_outputs` of its working directory as
+    JSON.  Its arguments are ``max_entries``, ``max_chars`` and then the outputs."""
+    return _SCAN_SCRIPT
+
+
+def choose_outputs(
+    entries: Iterable[Sequence[Any]],
+    *,
+    max_bytes: int | None = None,
+    max_files: int | None = None,
+    truncated: bool = False,
+) -> tuple[list[tuple[str, int]], list[str]]:
+    """Decide which of the scanned ``entries`` are copied to the run directory.
+
+    Returns the chosen ``(path, size)`` pairs, in the order they were found, and
+    notes for the person about everything that was left out: links (never followed,
+    so no output can lead out of the working directory), things that are not regular
+    files, files beyond ``max_files``, and files that no longer fit into ``max_bytes``
+    in total.  ``truncated`` says that the scan itself stopped early.
+    """
+    max_bytes = MAX_OUTPUT_BYTES if max_bytes is None else max_bytes
+    max_files = MAX_OUTPUT_FILES if max_files is None else max_files
+    chosen: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    remaining = max_bytes
+    too_large: list[str] = []
+    links: list[str] = []
+    others: list[str] = []
+    beyond = 0
+    for path, kind, size in entries:
+        if path in seen:
+            continue
+        seen.add(path)
+        if kind == "link":
+            links.append(path)
+        elif kind != "file":
+            others.append(path)
+        elif len(chosen) >= max_files:
+            beyond += 1
+        elif size > remaining:
+            too_large.append(f"{path} ({human_size(size)})")
+        else:
+            chosen.append((path, size))
+            remaining -= size
+    notes: list[str] = []
+    if too_large:
+        notes.append(
+            f"Not copied (the outputs of a job are limited to {human_size(max_bytes)} in "
+            f"total): {_listed(too_large)}."
+        )
+    if beyond:
+        notes.append(
+            f"Only the first {max_files} files of the outputs were copied; {beyond} more "
+            "were left out."
+        )
+    if links:
+        notes.append(f"Not copied (symbolic links are never followed): {_listed(links)}.")
+    if others:
+        notes.append(f"Not copied (not a regular file): {_listed(others)}.")
+    if truncated:
+        notes.append("The outputs hold too many entries to list; the rest was not looked at.")
+    return chosen, notes
+
+
+@dataclass
+class SourceReport:
+    """What :func:`walk_source` left out of a working directory."""
+
+    excluded: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+    def notes(self) -> list[str]:
+        notes: list[str] = []
+        if self.excluded:
+            notes.append(
+                "Left out of the working directory (version-control data, caches, "
+                f"environments and .env files are not copied): {_listed(self.excluded)}."
+            )
+        if self.skipped:
+            notes.append(
+                "Left out of the working directory (links that lead outside the source "
+                f"directory, and special files): {_listed(self.skipped)}."
+            )
+        return notes
+
+
+def _excluded(name: str) -> bool:
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in SOURCE_EXCLUDES)
+
+
+def _link_stays_inside(path: Path, relative: str) -> bool:
+    """Whether the link at ``path`` is relative and still valid in a copy of the tree."""
+    target = os.readlink(path)
+    if os.path.isabs(target):
+        return False
+    resolved = os.path.normpath(os.path.join(os.path.dirname(relative), target))
+    return resolved != ".." and not resolved.startswith(".." + os.sep)
+
+
+class JobStopped(Exception):
+    """``should_stop`` turned true before the job's command had been started."""
+
+
+def walk_source(
+    source: Path, report: SourceReport, should_stop: Callable[[], bool] | None = None
+) -> Iterator[tuple[str, Path, str]]:
+    """Yield what a job's working directory receives from ``source``.
+
+    Each item is ``(relative posix path, path, kind)`` with kind ``"dir"``,
+    ``"file"`` or ``"link"``, a directory before its contents.  Names matching
+    ``SOURCE_EXCLUDES`` are left out, at any depth.  A relative link that stays
+    inside the tree is kept as a link; any other link is left out, as are special
+    files, so that nothing in the working directory leads back to the person's files.
+    What was left out is recorded in ``report``.
+
+    A large tree takes a while to copy or pack, so ``should_stop`` is asked every
+    ``CHECK_SECONDS`` on the way, between files; :class:`JobStopped` is raised once it
+    is true.
+    """
+    next_check = 0.0
+
+    def hear_a_stop() -> None:
+        nonlocal next_check
+        if should_stop is not None and time.monotonic() >= next_check:
+            if should_stop():
+                raise JobStopped
+            next_check = time.monotonic() + CHECK_SECONDS
+
+    for current, dirs, files in os.walk(source):
+        hear_a_stop()
+        here = Path(current)
+        descend: list[str] = []
+        for name in sorted(dirs):
+            path = here / name
+            relative = path.relative_to(source).as_posix()
+            if _excluded(name):
+                report.excluded.append(relative)
+            elif path.is_symlink():
+                if _link_stays_inside(path, relative):
+                    yield relative, path, "link"
+                else:
+                    report.skipped.append(relative)
+            else:
+                descend.append(name)
+                yield relative, path, "dir"
+        dirs[:] = descend
+        for name in sorted(files):
+            path = here / name
+            relative = path.relative_to(source).as_posix()
+            if _excluded(name):
+                report.excluded.append(relative)
+                continue
+            try:
+                mode = path.lstat().st_mode
+            except OSError:  # removed while we were walking
+                continue
+            if stat.S_ISREG(mode):
+                # Asked here too: one directory can hold hours of files to copy.
+                hear_a_stop()
+                yield relative, path, "file"
+            elif stat.S_ISLNK(mode) and _link_stays_inside(path, relative):
+                yield relative, path, "link"
+            else:
+                report.skipped.append(relative)

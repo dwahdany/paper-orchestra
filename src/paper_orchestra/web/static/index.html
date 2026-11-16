@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>PaperOrchestra</title>
+<!-- The research workspace. Static files, no build step, no request to any other site.
+     The server's Content-Security-Policy allows scripts and styles from this origin only:
+     nothing here is inline. -->
+<link rel="icon" href="img/mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/app.css">
+<script src="js/theme.js"></script>
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+<a class="skip" href="#view">Skip to the content</a>
+<header id="top" class="top"></header>
+<main id="view" class="view" tabindex="-1">
+  <div class="boot" role="status">Loading PaperOrchestra…</div>
+</main>
+<footer id="status" class="statusbar" hidden></footer>
+<div id="banner" class="banner" role="alert" hidden></div>
+<div id="toast" aria-live="polite"></div>
+<div id="tip" role="tooltip"></div>
+<div id="overlay" hidden></div>
+<noscript><p class="noscript">PaperOrchestra needs JavaScript to show a project.</p></noscript>
+</body>
+</html>

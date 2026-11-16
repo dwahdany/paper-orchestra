@@ -34,10 +34,12 @@ WriteScope = Literal["none", "notes", "all"]
 LabWriteScope = Literal["none", "all"]
 
 
-_FRONT_MATTER_LINE = re.compile(r"^([A-Za-z_][\w\-]*[ \t]*:.*|[ \t]*-[ \t]+.*|[ \t]*#.*|[ \t]*)$")
+#: A line that may stand in a front matter block.  Shared with the research workspace's
+#: memory backend, so both vet an edit of a page's front matter by the same rule.
+FRONT_MATTER_LINE = re.compile(r"^([A-Za-z_][\w\-]*[ \t]*:.*|[ \t]*-[ \t]+.*|[ \t]*#.*|[ \t]*)$")
 
 
-def _front_matter_line_count(lines: list[str]) -> int:
+def front_matter_line_count(lines: list[str]) -> int:
     """Number of leading lines taken by a ``---`` front matter block (0 if there is none)."""
     if not lines or lines[0].strip() != "---":
         return 0
@@ -47,7 +49,8 @@ def _front_matter_line_count(lines: list[str]) -> int:
     return 0
 
 
-def _human_size(size: int) -> str:
+def human_size(size: int) -> str:
+    """A file size as the memory tool's directory listing shows it."""
     if size < 1024:
         return f"{size}B"
     if size < 1024 * 1024:
@@ -98,8 +101,12 @@ class WikiMemoryBackend:
 
     # -- path handling ---------------------------------------------------------
 
-    def _split(self, path: Any) -> tuple[Wiki, str, bool]:
-        """Virtual path -> (wiki, memory-relative path or "" for the root, is_lab)."""
+    def split(self, path: Any) -> tuple[Wiki, str, bool]:
+        """Virtual path -> (wiki, memory-relative path or "" for the root, is_lab).
+
+        Refuses every path that could leave the memory directory.  Other backends that
+        show a directory to a model through the memory tool vet their paths with this.
+        """
         if not isinstance(path, str) or not path.strip():
             raise ToolError("path must be a non-empty string starting with /memories")
         path = path.strip()
@@ -124,7 +131,7 @@ class WikiMemoryBackend:
 
     def _page(self, path: Any) -> tuple[Wiki, str, bool]:
         """Like ``_split`` but the path must name a file the wiki accepts."""
-        wiki, rel, is_lab = self._split(path)
+        wiki, rel, is_lab = self.split(path)
         if not rel:
             raise ToolError(f"{path} is a directory, not a file")
         try:
@@ -217,13 +224,13 @@ class WikiMemoryBackend:
             for level in range(1, min(len(below), depth) + 1):
                 entry = "/".join(base_parts + below[:level])
                 is_file = level == len(below)
-                entries.setdefault(entry, _human_size(size) if is_file else "4.0K")
+                entries.setdefault(entry, human_size(size) if is_file else "4.0K")
         return [
             f"{size}\t{virtual_path(entry, lab=is_lab)}" for entry, size in sorted(entries.items())
         ]
 
     def view(self, path: str, view_range: tuple[int, int] | None = None) -> str:
-        wiki, rel, is_lab = self._split(path)
+        wiki, rel, is_lab = self.split(path)
         target = wiki.root / rel if rel else wiki.root
         is_file = bool(rel) and rel.endswith(".md")
         if not is_file:
@@ -355,9 +362,9 @@ class WikiMemoryBackend:
                 f"range of lines of the file: [0, {len(lines)}]"
             )
         new_lines = insert_text.rstrip("\n").split("\n")
-        header = _front_matter_line_count(lines)
+        header = front_matter_line_count(lines)
         if 0 < insert_line < header and not all(
-            _FRONT_MATTER_LINE.match(line) for line in new_lines
+            FRONT_MATTER_LINE.match(line) for line in new_lines
         ):
             # Free text inside the front matter block would be dropped when the page is saved.
             raise ToolError(
@@ -374,7 +381,7 @@ class WikiMemoryBackend:
         return f"The file {path} has been edited."
 
     def delete(self, path: str) -> str:
-        wiki, rel, is_lab = self._split(path)
+        wiki, rel, is_lab = self.split(path)
         if not rel:
             raise ToolError(f"Cannot delete the {VIRTUAL_ROOT} directory itself")
         wiki, rel, is_lab = self._page(path)

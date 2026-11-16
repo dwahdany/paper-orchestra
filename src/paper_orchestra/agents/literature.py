@@ -14,6 +14,12 @@
 
 """The literature agent: search, verify, build the bibliography, write Intro + Related Work.
 
+0. *Known papers*: when the materials hold ``known_papers.json`` (a paper written
+   from a research project: the sources its researcher accepted and rejected), the
+   bibliography starts from the papers listed there, under the citation keys they
+   came with and without looking them up again, and a paper listed as excluded is
+   never cited, whatever a search proposes.  Without the file nothing is known and
+   the stage is the plain search below.
 1. *Discovery*: one small web-search call per search task of the outline
    proposes candidate papers (title, year, reason).
 2. *Verification*: every candidate has to be found in Semantic Scholar under
@@ -40,10 +46,10 @@ import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from paper_orchestra.agents.outline import write_outline_page
 from paper_orchestra.errors import stops_the_run
@@ -88,6 +94,27 @@ CACHE_NAMESPACE = "semantic-scholar"
 #: directory between attempts has to leave it in place for the search not to be repeated.
 CHECKPOINT_NAME = "collected_papers.json"
 _CHECKPOINT_VERSION = 1
+#: File in the materials directory that names the papers the bibliography starts from and
+#: the papers that must not be cited: ``{"version": 1, "papers": [<the fields of PaperData>],
+#: "excluded": [{"citation_key", "title", "reason"}]}``.  ``research/writeup.py`` writes it
+#: for a paper written from a research project (the sources the researcher accepted and
+#: rejected); a paper written from raw materials alone has none.
+KNOWN_PAPERS_NAME = "known_papers.json"
+_KNOWN_PAPERS_VERSION = 1
+#: Added to the reason of a known paper that has no abstract.  A search drops such a paper,
+#: because nothing says what it found; this one the person accepted, so it stays, and
+#: whoever cites it is told what is not on record.
+_NO_ABSTRACT_NOTE = (
+    "No abstract is on record for it: cite it for what its title says and nothing more."
+)
+#: What a citation key taken from that file may look like.  It becomes a BibTeX key, an
+#: argument of ``\cite`` and the name of a wiki page, and is used as it stands; the page is
+#: a file, so the key has to leave room in a file name for what is written around it.
+_MAX_KEY_CHARS = 200
+_CITABLE_KEY = re.compile(rf"[A-Za-z0-9][A-Za-z0-9._-]{{0,{_MAX_KEY_CHARS - 1}}}")
+#: How many of the problems with that file the note in the run's memory spells out.  The
+#: log and the stage's result have every one; a note is something a later session reads.
+_MAX_PROBLEMS_IN_NOTE = 5
 
 INTRO_SECTION = "Introduction"
 DEFAULT_VENUE = "arXiv"
@@ -192,7 +219,9 @@ class DiscoveryResult(BaseModel):
 
 
 class PaperData(BaseModel):
-    """A verified paper.  Bibliographic fields come from Semantic Scholar only."""
+    """A verified paper.  Bibliographic fields come from Semantic Scholar only: from this
+    stage's own lookup or, for a known paper (``known_papers.json``), from the record it
+    was put on when it was verified."""
 
     citation_key: str
     title: str
@@ -201,7 +230,8 @@ class PaperData(BaseModel):
     year: int | None
     abstract: str
     citation_count: int
-    #: The outline section whose search found the paper first.
+    #: The outline section whose search found the paper first (empty for a known paper
+    #: that no search returned).
     found_in_section: str
     #: Every outline section whose searches returned it, ``found_in_section`` first.
     sections: list[str]
@@ -235,9 +265,13 @@ class LiteratureStats:
     after_cutoff: int = 0
     no_abstract: int = 0
     verified: int = 0
+    #: Papers the collection started from (``known_papers.json``); not among ``verified``.
+    known: int = 0
+    #: Candidates left out because the materials say the paper must not be cited.
+    excluded: int = 0
 
     def describe(self) -> str:
-        return (
+        text = (
             f"{self.tasks} search task(s) ({self.failed_tasks} failed, {self.empty_tasks} "
             f"without candidates), {self.candidates} candidate(s), {self.verified} verified "
             f"paper(s); {self.duplicates} duplicate(s), {self.unmatched} not matched in "
@@ -246,6 +280,14 @@ class LiteratureStats:
             f"{self.skipped_lookups} skipped lookup(s), {self.lookups} live lookup(s), "
             f"{self.cache_hits} cache hit(s)"
         )
+        if self.known or self.excluded:
+            # Only where there is something to say: a paper written from raw materials
+            # alone is summed up in the words it always was.
+            text += (
+                f"; {self.known} paper(s) known before the search, {self.excluded} "
+                "candidate(s) left out because the researcher rejected the paper as a source"
+            )
+        return text
 
 
 @dataclass
@@ -255,6 +297,33 @@ class LiteratureResult:
     bibtex: str
     latex: str
     papers: int
+    #: How many of ``papers`` were known before the search (``known_papers.json``).
+    known: int = 0
+    #: Candidates of the search that were left out because the materials say the paper
+    #: must not be cited (a source the researcher rejected).
+    excluded: int = 0
+    #: What the person has to be told about the known papers: what in the file could not
+    #: be used, and which of its papers are not in the bibliography and why.
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class KnownPapers:
+    """What the materials say about the literature before any search.
+
+    ``papers`` are cited without a lookup (they were verified when they were put on
+    record), under the citation keys they came with.  A paper whose normalised title
+    is in ``excluded`` is never cited, and ``reserved_keys`` (case-folded) are the
+    citation keys of those papers (as far as they could be citation keys), which no
+    other paper is given: a key the person saw on a paper they rejected does not come
+    back on another one.  ``problems`` says, for the person, what in the file could
+    not be used and which of its papers were left out.
+    """
+
+    papers: tuple[PaperData, ...] = ()
+    excluded: frozenset[str] = frozenset()
+    reserved_keys: frozenset[str] = frozenset()
+    problems: tuple[str, ...] = ()
 
 
 @dataclass
@@ -268,6 +337,9 @@ class _Collection:
     resolved: dict[str, str | None] = field(default_factory=dict)
     #: Case-folded citation keys already handed out.
     keys: set[str] = field(default_factory=set)
+    #: Normalised titles of the papers that must not be collected (``KnownPapers.excluded``),
+    #: and the other wordings under which a search proposed one of them.
+    excluded: set[str] = field(default_factory=set)
     stats: LiteratureStats = field(default_factory=LiteratureStats)
     consecutive_lookup_failures: int = 0
     scholar_down: bool = False
@@ -286,6 +358,259 @@ class _Draft:
         when the repair turns run out, however many other problems it has.
         """
         return not _is_complete_document(self.latex), len(self.blocking), len(self.advisory)
+
+
+# ---------------------------------------------------------------------------
+# Known papers
+# ---------------------------------------------------------------------------
+
+
+def load_known_papers(materials_dir: Path, *, cutoff: str | None = None) -> KnownPapers:
+    """What ``known_papers.json`` in ``materials_dir`` says, as far as it can be used.
+
+    A missing file means that nothing is known.  Nothing the file holds makes this
+    raise: what cannot be read, or is not what the format says, becomes an entry of
+    ``problems`` and the rest is used, so that one bad entry costs neither the other
+    papers nor the paper run.  A listed paper is left out, with a problem that names
+    it, when it has no title, when its citation key cannot be used as it stands, when
+    it is also listed as excluded, when it repeats the title or the citation key of
+    an earlier one, or when it was not published before ``cutoff`` (the rule every
+    other paper is held to; ``cutoff`` must be one that ``parse_cutoff`` reads).
+    The papers that are kept come in the shape the papers of a search are kept in
+    (see :func:`_as_kept`), so that whatever the file holds can be written to the
+    files of the run.  A paper that is left out is not thereby kept out (only an
+    excluded one is): a search that proposes it has it verified like any other.
+    """
+    path = Path(materials_dir) / KNOWN_PAPERS_NAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return KnownPapers()
+    except (OSError, ValueError) as exc:  # a directory, no permission, not UTF-8
+        return KnownPapers(problems=(_unusable_file(path, f"it could not be read ({exc})"),))
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        return KnownPapers(problems=(_unusable_file(path, f"it is not valid JSON ({exc})"),))
+    if not isinstance(data, dict):
+        why = "it does not hold an object with 'papers' and 'excluded'"
+        return KnownPapers(problems=(_unusable_file(path, why),))
+    if data.get("version") != _KNOWN_PAPERS_VERSION:
+        why = (
+            f"its version is {_quoted(data.get('version'), 40)}, and this version of the "
+            f"program reads version {_KNOWN_PAPERS_VERSION}"
+        )
+        return KnownPapers(problems=(_unusable_file(path, why),))
+    problems: list[str] = []
+    excluded, reserved = _read_excluded(path, data.get("excluded"), problems)
+    papers = _read_known(path, data.get("papers"), excluded, cutoff, problems)
+    return KnownPapers(tuple(papers), frozenset(excluded), frozenset(reserved), tuple(problems))
+
+
+def _quoted(text: Any, limit: int = 120) -> str:
+    """Words from the file (a title, a key) as a quotation in a sentence this stage says.
+
+    On one line, cut to ``limit`` characters and with nothing inside that reads as the
+    end of the quotation: the sentence goes into the log, the stage's record and the
+    run's memory, where a title must not read as a further sentence of ours.
+    """
+    line = clean_text(text) or ""
+    line = "".join(
+        "'" if char == '"' or unicodedata.category(char) in ("Pi", "Pf") else char for char in line
+    )
+    if len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    return f'"{line}"'
+
+
+def _unusable_file(path: Path, why: str) -> str:
+    return (
+        f"The list of papers this paper starts from ({path}) cannot be used: {why}. The "
+        "literature is searched without it: the sources accepted in the research wiki are "
+        "cited only if the search finds them, and the rejected ones are not kept out. "
+        "Correct or remove the file (starting the write-up of a research project again "
+        "writes it anew), then run the same command again."
+    )
+
+
+def _read_excluded(path: Path, listed: Any, problems: list[str]) -> tuple[set[str], set[str]]:
+    """The papers not to cite: their normalised titles, and their citation keys
+    (case-folded) where those are keys a paper could be given."""
+    titles: set[str] = set()
+    keys: set[str] = set()
+    if listed is None:
+        return titles, keys
+    if not isinstance(listed, list):
+        problems.append(
+            f"{path}: 'excluded' is not a list, so it keeps no paper out: a source rejected "
+            "in the research wiki is cited if the search finds it. Correct the file, then "
+            "run the same command again."
+        )
+        return titles, keys
+    for index, entry in enumerate(listed):
+        title = entry.get("title") if isinstance(entry, Mapping) else entry
+        wanted = normalize_title(title) if isinstance(title, str) else ""
+        if not wanted:
+            problems.append(
+                f"{path}: excluded[{index}] names no title, so it keeps no paper out. "
+                "Correct the file, then run the same command again."
+            )
+            continue
+        titles.add(wanted)
+        key = entry.get("citation_key") if isinstance(entry, Mapping) else None
+        # Only a key that a paper could be given needs keeping free; any other text is not
+        # held on to (it would go into the record of the search, which is a file).
+        if isinstance(key, str) and _CITABLE_KEY.fullmatch(key.strip()):
+            keys.add(key.strip().casefold())
+    return titles, keys
+
+
+def _read_known(
+    path: Path, listed: Any, excluded: set[str], cutoff: str | None, problems: list[str]
+) -> list[PaperData]:
+    """The listed papers that can be cited, in the order of the list."""
+    if listed is None:
+        return []
+    if not isinstance(listed, list):
+        problems.append(
+            f"{path}: 'papers' is not a list, so no paper is taken from it: the sources "
+            "accepted in the research wiki are cited only if the search finds them. Correct "
+            "the file, then run the same command again."
+        )
+        return []
+    by_title: dict[str, PaperData] = {}
+    by_key: dict[str, PaperData] = {}
+    for index, entry in enumerate(listed):
+        try:
+            paper = _as_kept(PaperData.model_validate(entry))
+        except ValidationError as exc:
+            problems.append(
+                f"{path}: papers[{index}] is not a paper record ({_validation_text(exc)}), "
+                "so it is not in the bibliography. Correct the file, then run the same "
+                "command again."
+            )
+            continue
+        reason = _why_not_cited(paper, by_title, by_key, excluded, cutoff)
+        if reason is not None:
+            key = paper.citation_key
+            name = _quoted(paper.title) + (f" ({key})" if _CITABLE_KEY.fullmatch(key) else "")
+            # "Left out of the papers taken from the wiki", not "not cited": the search
+            # may still propose the paper, and then it is verified like any other.
+            problems.append(
+                f"The accepted source {name} is left out of the papers taken from the "
+                f"wiki: {reason}"
+            )
+            continue
+        if not paper.abstract:
+            said = f"{paper.reason} {_NO_ABSTRACT_NOTE}".strip()
+            paper = paper.model_copy(update={"reason": said})
+        by_title[normalize_title(paper.title)] = paper
+        by_key[paper.citation_key.casefold()] = paper
+    return list(by_title.values())
+
+
+def _as_kept(paper: PaperData) -> PaperData:
+    """``paper`` in the shape the papers of a search are kept in.
+
+    A search keeps what ``public_record`` made of a Semantic Scholar record: text
+    without control characters or unpaired surrogates (which no file of the run could
+    hold), on one line except for the abstract, a venue to print and an abstract of
+    bounded length.  The list is a file somebody wrote, so its papers are brought
+    into that shape here; nothing else about them is changed.  The citation key is
+    left as it is: it is checked (:func:`_why_not_cited`), not corrected.
+    """
+    return paper.model_copy(
+        update={
+            "title": clean_text(paper.title) or "",
+            "authors": [name for author in paper.authors if (name := clean_text(author))],
+            "venue": clean_text(paper.venue) or DEFAULT_VENUE,
+            "abstract": _clip_abstract(_strip_controls(paper.abstract).strip()),
+            "reason": clean_text(paper.reason) or "",
+            "found_in_section": clean_text(paper.found_in_section) or "",
+            "sections": [name for section in paper.sections if (name := clean_text(section))],
+            "journal": clean_text(paper.journal),
+            "volume": clean_text(paper.volume),
+            "pages": clean_text(paper.pages),
+            "publication_date": clean_text(paper.publication_date),
+        }
+    )
+
+
+def _why_not_cited(
+    paper: PaperData,
+    by_title: Mapping[str, PaperData],
+    by_key: Mapping[str, PaperData],
+    excluded: set[str],
+    cutoff: str | None,
+) -> str | None:
+    """Why a listed paper is not taken into the bibliography from the list, as the end of
+    a sentence; or ``None``."""
+    title, key = normalize_title(paper.title), paper.citation_key
+    if not title:
+        return "it has no title."
+    if not _CITABLE_KEY.fullmatch(key):
+        return (
+            f"its citation key {_quoted(key, 60)} cannot be used as one (letters, digits, "
+            f"'.', '_' and '-' only, starting with a letter or a digit, at most "
+            f"{_MAX_KEY_CHARS} characters)."
+        )
+    if title in excluded:
+        return (
+            "it is also among the papers not to be cited (the rejected sources), and the "
+            "rejection stands."
+        )
+    if title in by_title:
+        return f"it has the same title as {by_title[title].citation_key}, which is cited."
+    if key.casefold() in by_key:
+        other = by_key[key.casefold()]
+        return f"its citation key is also that of {_quoted(other.title)}, which is cited under it."
+    if not is_before_cutoff(paper.publication_date, paper.year, cutoff):
+        return _past_the_cutoff(paper, cutoff)
+    return None
+
+
+def _past_the_cutoff(paper: PaperData, cutoff: str | None) -> str:
+    if paper.publication_date:
+        said = (
+            f"its publication date, {paper.publication_date}, is not before the research "
+            f"cutoff {cutoff}"
+        )
+    elif paper.year:
+        said = (
+            f"only its year, {paper.year}, is on record, and a paper known by its year alone "
+            f"is cited only when that year is before the year of the research cutoff {cutoff}"
+        )
+    else:
+        said = (
+            "neither a publication date nor a year is on record for it, so it cannot be "
+            f"shown to precede the research cutoff {cutoff}"
+        )
+    return f"{said}. Move the cutoff (--research-cutoff) if the paper should be cited."
+
+
+def _in_short(problems: Sequence[str]) -> str:
+    """The first of ``problems`` and how many more there are, for the note in the run's memory.
+
+    A list of sources can leave out as many papers as it has (a cutoff before all of
+    them), and a note that repeats a sentence for each is no observation; one longer
+    than a page of the memory could not be written at all.
+    """
+    shown = " ".join(problems[:_MAX_PROBLEMS_IN_NOTE])
+    more = len(problems) - _MAX_PROBLEMS_IN_NOTE
+    if more <= 0:
+        return shown
+    return f"{shown} And {more} more of the kind: the log of the run names every one."
+
+
+def _validation_text(exc: ValidationError) -> str:
+    """The first complaints of a failed validation, on one line."""
+    errors = exc.errors(include_url=False, include_input=False)
+    said = [
+        f"{'.'.join(str(part) for part in error['loc']) or 'the entry'}: {error['msg']}"
+        for error in errors[:3]
+    ]
+    more = len(errors) - len(said)
+    return "; ".join(said) + (f"; and {more} more" if more > 0 else "")
 
 
 # ---------------------------------------------------------------------------
@@ -364,21 +689,35 @@ def _core_problem(outline: Mapping[str, Any]) -> str:
 
 
 def _search_fingerprint(
-    tasks: Sequence[SearchTask], core_problem: str, cutoff: str | None, model: str
+    tasks: Sequence[SearchTask],
+    core_problem: str,
+    cutoff: str | None,
+    model: str,
+    known: KnownPapers | None = None,
 ) -> str:
-    """Digest of what a literature search is asked: the tasks, the cutoff and who searches.
+    """Digest of what a literature search is asked: the tasks, the cutoff, who searches,
+    and the papers it starts from and must leave out.
 
     A saved collection answers exactly this question.  When the outline is regenerated, the
-    cutoff moves or another model is put in charge of discovery, the digest differs and
-    the search runs again.
+    cutoff moves, another model is put in charge of discovery or the known papers change
+    (the researcher accepted or rejected a source), the digest differs and the search
+    runs again.
     """
-    asked = {
+    asked: dict[str, Any] = {
         "version": _CHECKPOINT_VERSION,
         "tasks": [[task.search_type, task.section, task.focus, task.context] for task in tasks],
         "core_problem": core_problem,
         "cutoff": cutoff,
         "model": model,
     }
+    if known is not None and (known.papers or known.excluded or known.reserved_keys):
+        # Left out when nothing is known, so that a collection saved for a paper written
+        # from raw materials alone (also by an earlier version) still answers the question.
+        asked["known"] = {
+            "papers": [paper.model_dump() for paper in known.papers],
+            "excluded": sorted(known.excluded),
+            "reserved_keys": sorted(known.reserved_keys),
+        }
     text = json.dumps(asked, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -671,7 +1010,7 @@ def _strip_controls(text: str) -> str:
     return "".join(c for c in text if c.isspace() or unicodedata.category(c)[0] != "C")
 
 
-def _clean(value: Any) -> str | None:
+def clean_text(value: Any) -> str | None:
     """``value`` as one line of text, or ``None`` when nothing is left of it."""
     text = " ".join(_strip_controls(str(value)).split()) if value is not None else ""
     return text or None
@@ -684,7 +1023,7 @@ def _clip_abstract(abstract: str) -> str:
     return abstract[:ABSTRACT_LIMIT] + _ABSTRACT_MARK
 
 
-def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
+def public_record(record: Mapping[str, Any]) -> dict[str, Any]:
     """The bibliographic fields of a Semantic Scholar result that the pipeline uses.
 
     Total on purpose: the input is a service's answer or a cache page, and a field of an
@@ -694,13 +1033,13 @@ def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
     authors = record.get("authors") if isinstance(record.get("authors"), list) else []
     year, abstract, citations = (record.get(k) for k in ("year", "abstract", "citationCount"))
     return {
-        "title": _clean(record.get("title")) or "",
+        "title": clean_text(record.get("title")) or "",
         "authors": [
             {"name": name}
             for author in authors
-            if isinstance(author, Mapping) and (name := _clean(author.get("name")))
+            if isinstance(author, Mapping) and (name := clean_text(author.get("name")))
         ],
-        "venue": _clean(record.get("venue")),
+        "venue": clean_text(record.get("venue")),
         "year": year if isinstance(year, int) and not isinstance(year, bool) else None,
         "abstract": (
             _clip_abstract(_strip_controls(abstract).strip()) if isinstance(abstract, str) else ""
@@ -709,22 +1048,23 @@ def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
             citations if isinstance(citations, int) and not isinstance(citations, bool) else 0
         ),
         "journal": {
-            "name": _clean(journal.get("name")),
-            "volume": _clean(journal.get("volume")),
-            "pages": _clean(journal.get("pages")),
+            "name": clean_text(journal.get("name")),
+            "volume": clean_text(journal.get("volume")),
+            "pages": clean_text(journal.get("pages")),
         },
-        "publicationDate": _clean(record.get("publicationDate")),
+        "publicationDate": clean_text(record.get("publicationDate")),
     }
 
 
-def _record_year(record: Mapping[str, Any]) -> int | None:
+def record_year(record: Mapping[str, Any]) -> int | None:
+    """The year a record was published, from its year or its publication date."""
     if record.get("year"):
         return int(record["year"])
     match = re.match(r"\d{4}", record.get("publicationDate") or "")
     return int(match.group()) if match else None
 
 
-class _ScholarCache:
+class ScholarCache:
     """Semantic Scholar matches kept across runs, beside the lab memory.
 
     Only public bibliographic metadata is stored, and only for papers that
@@ -842,10 +1182,16 @@ class LiteratureAgent:
         self.ctx = ctx
         self._scholar = scholar or SemanticScholar()
         self._cutoff = ctx.cfg.research_cutoff.strip() or None
-        self._cache = _ScholarCache(ctx.harness, self._cutoff)
+        self._cache = ScholarCache(ctx.harness, self._cutoff)
 
     def run(self, outline: dict[str, Any]) -> LiteratureResult:
-        """Collect verified literature for ``outline`` and write Introduction + Related Work."""
+        """Collect verified literature for ``outline`` and write Introduction + Related Work.
+
+        The bibliography starts from the papers ``known_papers.json`` in the materials
+        lists, when there is such a file, and holds none of the papers it excludes;
+        what was wrong with the file, or kept one of its papers out, is in the result's
+        ``warnings`` (and in the log), and never fails the stage.
+        """
         cfg, paths, harness = self.ctx.cfg, self.ctx.paths, self.ctx.harness
         parse_cutoff(self._cutoff)  # a malformed cutoff should fail before any model call
         idea = read_text(paths.idea)
@@ -861,13 +1207,22 @@ class LiteratureAgent:
             self._cutoff or "none",
             cfg.literature_workers,
         )
+        known = load_known_papers(paths.materials_dir, cutoff=self._cutoff)
+        for problem in known.problems:
+            log.warning("%s", problem)
+        if known.papers or known.excluded:
+            log.info(
+                "The bibliography starts from %d known paper(s); %d paper(s) are not to be cited",
+                len(known.papers),
+                len(known.excluded),
+            )
         fingerprint = _search_fingerprint(
-            tasks, _core_problem(outline), self._cutoff, cfg.models.fast
+            tasks, _core_problem(outline), self._cutoff, cfg.models.fast, known
         )
         found = self._load_checkpoint(fingerprint)
         searched = found is None
         if found is None:
-            found = self._collect(tasks, outline)
+            found = self._collect(tasks, outline, known)
             log.info("Literature search finished: %s", found.stats.describe())
             # Saved before the writing turn: that turn can fail (a refusal, a truncated or
             # incomplete document, an API error), and the search is the expensive part.
@@ -899,6 +1254,14 @@ class LiteratureAgent:
                     agent=AGENT,
                     title="Empty bibliography",
                 )
+        if known.problems and searched:  # as above: said once, by the attempt that searched
+            harness.note(
+                "Not everything the materials say about the papers to start from and the "
+                f"papers not to cite could be used. {_in_short(known.problems)}",
+                stage=STAGE,
+                agent=AGENT,
+                title="Known papers not used in full",
+            )
 
         bibtex = generate_bibtex(papers)
         citation_map = generate_citation_map(papers)
@@ -938,6 +1301,9 @@ class LiteratureAgent:
             bibtex=bibtex,
             latex=latex,
             papers=len(papers),
+            known=stats.known,
+            excluded=stats.excluded,
+            warnings=list(known.problems),
         )
 
     # -- checkpoint ------------------------------------------------------------
@@ -988,7 +1354,7 @@ class LiteratureAgent:
         if saved.get("fingerprint") != fingerprint:
             log.info(
                 "The verified papers in %s were collected for other search tasks, another "
-                "cutoff or by another model; searching again",
+                "cutoff, other known papers or by another model; searching again",
                 path,
             )
             return None
@@ -1017,15 +1383,36 @@ class LiteratureAgent:
 
     # -- discovery and verification --------------------------------------------
 
-    def _collect(self, tasks: Sequence[SearchTask], outline: Mapping[str, Any]) -> _Collection:
-        """Run every search task and verify what the tasks propose.
+    @staticmethod
+    def _start_from(known: KnownPapers) -> _Collection:
+        """A collection that holds the known papers, before any search has added to it.
+
+        They keep their citation keys (a paper found later that would get the same key
+        gets a suffix), their titles count as resolved, so no search looks them up
+        again, and the keys of the excluded papers are taken, so nothing else gets one.
+        """
+        found = _Collection(excluded=set(known.excluded), keys=set(known.reserved_keys))
+        for paper in known.papers:
+            canonical = normalize_title(paper.title)
+            # A copy: the searches add the sections that return the paper.
+            found.papers[canonical] = paper.model_copy(deep=True)
+            found.resolved[canonical] = canonical
+            found.keys.add(paper.citation_key.casefold())
+        found.stats.known = len(found.papers)
+        return found
+
+    def _collect(
+        self, tasks: Sequence[SearchTask], outline: Mapping[str, Any], known: KnownPapers
+    ) -> _Collection:
+        """Start from the ``known`` papers, run every search task and verify what the
+        tasks propose.
 
         Discovery runs in a thread pool.  Results are consumed in outline
         order by this thread, which alone talks to Semantic Scholar and owns
         the registry, so attribution and citation keys do not depend on which
         call happens to finish first.
         """
-        found = _Collection()
+        found = self._start_from(known)
         found.stats.tasks = len(tasks)
         if not tasks:
             return found
@@ -1151,7 +1538,7 @@ class LiteratureAgent:
             return None
         # The same rule as for live results, so the cutoff is applied again on every hit.
         return select_match(
-            [_public_record(cached)], title, year_hint=year_hint, cutoff=self._cutoff
+            [public_record(cached)], title, year_hint=year_hint, cutoff=self._cutoff
         )
 
     def _from_scholar(self, title: str, year_hint: int | None) -> dict[str, Any] | None:
@@ -1159,19 +1546,23 @@ class LiteratureAgent:
         match = self._scholar.find_paper(title, year_hint=year_hint, cutoff=self._cutoff)
         if match is None:
             return None
-        record = _public_record(match)
+        record = public_record(match)
         if is_before_cutoff(record["publicationDate"], record["year"], self._cutoff):
             self._cache.put(title, record)
         return record
 
     def _verify(self, candidate: CandidatePaper, task: SearchTask, found: _Collection) -> None:
-        """Register ``candidate`` if Semantic Scholar confirms it and the cutoff allows it."""
+        """Register ``candidate`` if Semantic Scholar confirms it, the cutoff allows it and
+        it is not one of the papers that must not be cited."""
         stats = found.stats
         stats.candidates += 1
         title = " ".join(candidate.title.split())
         wanted = normalize_title(title)
         if not wanted:
             stats.unmatched += 1
+            return
+        if wanted in found.excluded:
+            self._leave_out(title, found)
             return
         if wanted in found.resolved:
             stats.duplicates += 1
@@ -1210,6 +1601,13 @@ class LiteratureAgent:
             stats.unmatched += 1
             log.debug("No Semantic Scholar match before the cutoff for '%s'", title)
             return
+        canonical = normalize_title(record["title"])
+        if canonical in found.excluded:
+            # Proposed under another wording of its title; the lookup tells which paper it
+            # is, and the wording is remembered so that it is not looked up a second time.
+            found.excluded.add(wanted)
+            self._leave_out(record["title"], found)
+            return
         if not is_before_cutoff(record.get("publicationDate"), record.get("year"), self._cutoff):
             stats.after_cutoff += 1
             log.info("Dropped '%s': published at or after the cutoff", record.get("title"))
@@ -1225,13 +1623,12 @@ class LiteratureAgent:
             )
             return
 
-        canonical = normalize_title(record["title"])
         if canonical in found.papers:
             stats.duplicates += 1
             self._add_section(found.papers[canonical], task.section)
         else:
             authors = [author["name"] for author in record["authors"]]
-            year = _record_year(record)
+            year = record_year(record)
             journal = record["journal"]
             found.papers[canonical] = PaperData(
                 citation_key=unique_citation_key(
@@ -1257,9 +1654,18 @@ class LiteratureAgent:
         found.resolved[canonical] = canonical
 
     @staticmethod
+    def _leave_out(title: str, found: _Collection) -> None:
+        """Count a candidate that is one of the papers not to cite."""
+        found.stats.excluded += 1
+        log.info("Left out '%s': the researcher rejected it as a source", title)
+
+    @staticmethod
     def _add_section(paper: PaperData, section: str) -> None:
         if section not in paper.sections:
             paper.sections.append(section)
+        if not paper.found_in_section:
+            # A known paper: this is the first search that returned it.
+            paper.found_in_section = section
 
     # -- writing -----------------------------------------------------------------
 
@@ -1422,7 +1828,10 @@ def _paper_meta(paper: PaperData) -> dict[str, Any]:
 
 def _paper_page(paper: PaperData) -> str:
     quoted = "\n".join(f"> {line}" for line in paper.abstract.splitlines())
-    sections = "\n".join(f"- {section}" for section in paper.sections)
+    sections = "\n".join(f"- {section}" for section in paper.sections) or (
+        "No search of the outline returned it: it was known before the search and is in "
+        "the bibliography for that reason."
+    )
     return (
         f"# {paper.title}\n\n"
         f"Cite as `\\cite{{{paper.citation_key}}}`. {_authors_line(paper.authors)}. "

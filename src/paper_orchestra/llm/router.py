@@ -7,6 +7,8 @@ imported inside the builders: importing this module imports no SDK.
 
 from __future__ import annotations
 
+import importlib
+import os
 import threading
 from collections.abc import Callable
 
@@ -85,8 +87,39 @@ def _build(provider: str) -> LLMClient:
         ) from exc
 
 
+#: Names a function ``package.module:function`` that returns the client to use for every
+#: model.  It exists so that the whole application (a server, its worker processes, a
+#: browser) can be exercised offline with a scripted model; it is not a way to configure a
+#: provider.
+SCRIPTED_CLIENT_ENV = "PAPER_ORCHESTRA_SCRIPTED_CLIENT"
+
+
+def _scripted_client() -> LLMClient | None:
+    target = os.environ.get(SCRIPTED_CLIENT_ENV, "").strip()
+    if not target:
+        return None
+    module_name, _, function_name = target.partition(":")
+    try:
+        client = getattr(importlib.import_module(module_name), function_name)()
+    except Exception as exc:
+        raise LLMConfigError(
+            f"{SCRIPTED_CLIENT_ENV}={target!r} does not name a function that returns a "
+            f"client ({type(exc).__name__}: {exc})."
+        ) from exc
+    if not isinstance(client, LLMClient):
+        raise LLMConfigError(f"{SCRIPTED_CLIENT_ENV}={target!r} did not return a client.")
+    return client
+
+
 def get_client(model: str) -> LLMClient:
     """Return the shared client of the provider that serves ``model``."""
+    with _lock:
+        if "scripted" not in _clients and os.environ.get(SCRIPTED_CLIENT_ENV):
+            scripted = _scripted_client()
+            if scripted is not None:
+                _clients["scripted"] = scripted
+        if "scripted" in _clients:
+            return _clients["scripted"]
     provider = provider_for_model(model)
     with _lock:
         client = _clients.get(provider)

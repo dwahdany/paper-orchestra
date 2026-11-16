@@ -1,4 +1,4 @@
-"""Compute backends: where model-written Python and LaTeX builds run.
+"""Compute backends: where model-written Python, LaTeX builds and experiment jobs run.
 
 ``LocalBackend`` and ``ModalBackend`` are loaded on first access, so importing
 this package never pulls in the Modal SDK.
@@ -14,6 +14,8 @@ from paper_orchestra.compute.base import (
     ComputeBackend,
     ComputeError,
     ExecResult,
+    JobResult,
+    JobSpec,
 )
 
 if TYPE_CHECKING:
@@ -27,6 +29,8 @@ __all__ = [
     "ComputeBackend",
     "ComputeError",
     "ExecResult",
+    "JobResult",
+    "JobSpec",
     "LocalBackend",
     "ModalBackend",
     "get_backend",

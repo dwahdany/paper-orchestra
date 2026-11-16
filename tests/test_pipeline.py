@@ -2052,3 +2052,433 @@ def test_an_interrupted_or_killed_run_resumes_where_it_stopped(cfg, stubs, monke
     result, _, _ = run(cfg)
     assert result.success and last.calls == ["refinement"]
     assert state_of(cfg)["status"] == "succeeded"
+
+
+# -- a paper written from a research project: the papers its wiki already knows ---------------
+
+#: The file ``research/writeup.py`` exports next to the idea and the experimental log.
+KNOWN_PAPERS = "known_papers.json"
+WARMUP = {
+    "citation_key": "Aaa2020Warmup",
+    "title": "Warmup, Measured",
+    "authors": ["A. Aaa", "B. Bbb"],
+    "venue": "ICML",
+    "year": 2020,
+    "abstract": "We measure warmup at small batch sizes.",
+    "citation_count": 12,
+    "found_in_section": "",
+    "sections": [],
+    "reason": "A source the researcher accepted in the project's research wiki.",
+    "journal": None,
+    "volume": None,
+    "pages": None,
+    "publication_date": None,
+    "link": "https://example.org/aaa2020",
+    "record": "wiki/sources/Aaa2020Warmup.md",
+}
+SHALLOW = WARMUP | {
+    "citation_key": "Jones2019Shallow",
+    "title": "Shallow Things",
+    "authors": ["Jo Jones"],
+    "year": 2019,
+    "record": "wiki/sources/Jones2019Shallow.md",
+}
+NOT_SHALLOW = {
+    "citation_key": "Jones2019Shallow",
+    "title": "Shallow Things",
+    "reason": "Not about attention.",
+}
+
+
+def give_known(cfg: PipelineConfig, papers=(), excluded=()) -> Path:
+    path = cfg.base_dir / "raw_materials" / KNOWN_PAPERS
+    write_json(path, {"version": 1, "papers": list(papers), "excluded": list(excluded)})
+    return path
+
+
+@pytest.mark.parametrize("change", ["accepted another", "rejected another", "gone", "appeared"])
+def test_a_changed_list_of_known_papers_starts_over(cfg, stubs, monkeypatch, change):
+    if change != "appeared":
+        give_known(cfg, [WARMUP])
+    run(cfg)
+    if change == "accepted another":
+        give_known(cfg, [WARMUP, SHALLOW])
+    elif change == "rejected another":
+        give_known(cfg, [WARMUP], [NOT_SHALLOW])
+    elif change == "gone":
+        (cfg.base_dir / "raw_materials" / KNOWN_PAPERS).unlink()
+    else:
+        give_known(cfg, [WARMUP])
+
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+
+    # The paper on disk was written from other sources: it is not this list's paper.
+    assert result.success
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert not any(record["reused"] for record in result.stages.values())
+
+
+def test_an_unchanged_list_of_known_papers_keeps_the_resume(cfg, stubs, monkeypatch):
+    give_known(cfg, [WARMUP], [NOT_SHALLOW])
+    run(cfg)
+    give_known(cfg, [WARMUP], [NOT_SHALLOW])  # exported again by the next write-up, the same
+
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+
+    assert result.success and again.calls == []
+    assert all(record["reused"] for record in result.stages.values())
+
+
+#: An accepted source of June 2021: too recent for a paper whose cutoff is January 2021.
+MIDYEAR = WARMUP | {"year": 2021, "publication_date": "2021-06-01"}
+
+
+def test_a_later_cutoff_that_lets_in_a_known_paper_starts_over(cfg, stubs, monkeypatch, caplog):
+    give_known(cfg, [SHALLOW, MIDYEAR])
+    cfg.research_cutoff = "2021-01"
+    run(cfg)
+
+    # Later, but not late enough for the paper that was left out: the paper stands.
+    cfg.research_cutoff = "2021-06"
+    same = StubAgents().install(monkeypatch)
+    assert run(cfg)[0].success and same.calls == []
+
+    # The person moves the cutoff as the warning about the source told them to.  What was
+    # collected is still valid, but the paper on disk is not the one this list gives now.
+    cfg.research_cutoff = "2022-01"
+    again = StubAgents().install(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="paper_orchestra"):
+        result, _, _ = run(cfg)
+    assert result.success
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert not any(record["reused"] for record in result.stages.values())
+    assert "research cutoff is now 2022-01" in caplog.text and "Aaa2020Warmup" in caplog.text
+
+    # And with no cutoff at all it is the same question.
+    cfg.research_cutoff = "2021-01"
+    run(cfg)
+    cfg.research_cutoff = ""
+    unbounded = StubAgents().install(monkeypatch)
+    assert run(cfg)[0].success
+    assert unbounded.calls == ["outline", "literature", "section_writing", "refinement"]
+
+
+def test_the_source_a_moved_cutoff_lets_in_is_cited(cfg, stubs, monkeypatch):
+    from paper_orchestra.agents.literature import LiteratureAgent
+    from paper_orchestra.utils.latex import bib_keys
+
+    scholar = _TinyScholar()
+    monkeypatch.setattr(pipeline, "_outline_agent", lambda ctx: _SearchingOutline(stubs, ctx))
+    monkeypatch.setattr(
+        pipeline, "_literature_agent", lambda ctx: LiteratureAgent(ctx, scholar=scholar)
+    )
+    client = FakeLLM(literature_responder)
+    give_known(cfg, [MIDYEAR])
+
+    cfg.research_cutoff = "2021-01"
+    first, _, _ = run(cfg, harness=make_harness(cfg, client))
+    assert first.success and "Aaa2020Warmup" not in bib_keys(stubs.seen["writer_bib"])
+    (warning,) = first.stages["literature"]["warnings"]
+    assert "2021-06-01" in warning and "Move the cutoff" in warning
+
+    cfg.research_cutoff = "2022-01"
+    moved, _, _ = run(cfg, harness=make_harness(cfg, client))
+    assert moved.success and "Aaa2020Warmup" in bib_keys(stubs.seen["writer_bib"])
+    # Nothing is said any more about a cutoff that is no longer the run's.
+    assert "warnings" not in moved.stages["literature"]
+    assert moved.stages["literature"]["known_papers"] == 1
+
+
+def test_a_list_of_known_papers_that_cannot_be_opened_does_not_stop_the_run(
+    cfg, stubs, monkeypatch
+):
+    listed = give_known(cfg, [WARMUP])
+    run(cfg)
+    readable = state_of(cfg)["inputs"]
+    read_bytes = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == listed:
+            raise PermissionError(13, "Permission denied", str(self))
+        return read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    again = StubAgents().install(monkeypatch)
+    result, _, _ = run(cfg)
+
+    # The run goes on (the literature stage says what it could not read), and it is not
+    # the run of the list that could be read: every stage runs, now and when it can again.
+    assert result.success
+    assert again.calls == ["outline", "literature", "section_writing", "refinement"]
+    assert state_of(cfg)["inputs"] != readable
+    listed.unlink()
+    removed = StubAgents().install(monkeypatch)
+    assert run(cfg)[0].success and removed.calls == again.calls
+
+
+def test_the_inputs_of_a_run_without_known_papers_are_fingerprinted_as_they_were(cfg, stubs):
+    import hashlib
+
+    run(cfg)
+    materials = cfg.base_dir / "raw_materials"
+    files = [
+        ("idea", materials / "idea_sparse.md"),
+        ("experimental_log", materials / "experimental_log.md"),
+    ]
+    files += [
+        (f"template/{path.relative_to(cfg.template_dir).as_posix()}", path)
+        for path in sorted(p for p in cfg.template_dir.rglob("*") if p.is_file())
+    ]
+    digest = hashlib.sha256()
+    for label, path in files:
+        digest.update(label.encode("utf-8") + b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    # A run that is under way when the package is upgraded resumes where it stopped.
+    assert state_of(cfg)["inputs"] == digest.hexdigest()
+
+
+def test_the_literature_record_says_what_the_agent_reported(cfg, stubs, monkeypatch):
+    from types import SimpleNamespace
+
+    problem = f"{KNOWN_PAPERS} is not valid JSON; the paper's literature is searched without it"
+    reports = [SimpleNamespace(warnings=[problem], known=2, excluded=1)]
+
+    class Reporting(_Literature):
+        def run(self, outline: dict[str, Any]) -> Any:
+            super().run(outline)
+            return reports.pop(0)
+
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Reporting(stubs, ctx))
+    result, _, _ = run(cfg)
+
+    record = result.stages["literature"]
+    assert record["warnings"] == [problem]
+    assert (record["known_papers"], record["excluded_candidates"]) == (2, 1)
+    assert state_of(cfg)["stages"]["literature"] == record
+    # Nothing of the kind is said about a stage that had nothing to report.
+    assert set(result.stages["outline"]) == set(pipeline._blank_record())
+
+    # A resumed run still says it: the stage's result is the earlier one's.
+    again = StubAgents().install(monkeypatch)
+    resumed, _, _ = run(cfg)
+    assert again.calls == []
+    assert resumed.stages["literature"] == record | {"reused": True}
+
+    # And a stage that runs again says what it found this time, not what it found before.
+    cfg.resume = False
+    reports.append(SimpleNamespace(warnings=[], known=0, excluded=0))
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Reporting(again, ctx))
+    fresh, _, _ = run(cfg)
+    assert fresh.success
+    assert set(fresh.stages["literature"]) == set(pipeline._blank_record()) | {"after_done"}
+
+
+def test_what_a_failed_attempt_reported_is_not_said_of_the_attempt_that_succeeded(
+    cfg, stubs, monkeypatch
+):
+    from types import SimpleNamespace
+
+    reports = [SimpleNamespace(warnings=["only true of the first attempt"], known=5, excluded=5)]
+
+    class Reporting(_Literature):
+        def run(self, outline: dict[str, Any]) -> Any:
+            super().run(outline)
+            return reports.pop(0) if reports else None
+
+    monkeypatch.setattr(pipeline, "_literature_agent", lambda ctx: Reporting(stubs, ctx))
+    # The first attempt gets as far as reporting, then turns out to lack one of its files.
+    real_copy, copies = pipeline._atomic_copy, []
+
+    def copy(source: Path, target: Path) -> None:
+        copies.append(source.name)
+        if source.name == "references.bib" and copies.count("references.bib") == 1:
+            source.unlink()
+            raise FileNotFoundError(str(source))
+        real_copy(source, target)
+
+    monkeypatch.setattr(pipeline, "_atomic_copy", copy)
+    result, _, _ = run(cfg)
+
+    record = result.stages["literature"]
+    assert result.success and record["attempts"] == 2
+    assert not {"warnings", "known_papers", "excluded_candidates"} & set(record)
+
+
+class _SearchingOutline(_Outline):
+    """An outline that asks for one literature search."""
+
+    def run(self) -> dict[str, Any]:
+        outline = super().run()
+        outline["intro_related_work_plan"]["introduction_strategy"] = {
+            "problem_gap_hypothesis": "Attention is dense.",
+            "search_directions": ["sparse attention"],
+        }
+        write_json(self.ctx.paths.outline, outline)
+        return outline
+
+
+#: Title -> first author and year of the papers :class:`_TinyScholar` knows.
+TINY_LIBRARY = {"Deep Things": ("Sam Smith", 2020), "Shallow Things": ("Jo Jones", 2019)}
+
+
+class _TinyScholar:
+    """Semantic Scholar with two papers, found under exactly their titles."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def find_paper(self, title: str, *, year_hint: int | None = None, cutoff: str | None = None):
+        self.asked.append(title)
+        if title not in TINY_LIBRARY:
+            return None
+        author, year = TINY_LIBRARY[title]
+        return {
+            "title": title,
+            "authors": [{"name": author}],
+            "venue": "NeurIPS",
+            "year": year,
+            "abstract": f"On {title.lower()}.",
+            "citationCount": 3,
+            "journal": None,
+            "publicationDate": f"{year}-05-01",
+        }
+
+
+def literature_responder(request: FakeRequest) -> str:
+    """The models of the real literature agent; every other call as :func:`responder`."""
+    if request.label == "literature.discovery":
+        titles = ["Deep Things", "Shallow Things", "Warmup, Measured"]
+        return json.dumps(
+            {"candidates": [{"title": title, "year": None, "reason": "r"} for title in titles]}
+        )
+    if request.label == "literature.LiteratureAgent":
+        block = re.search(r"<citation_checklist>\n(.*?)\n</citation_checklist>", request.text, re.S)
+        keys = ", ".join(block.group(1).split())
+        return "```latex\n" + TEMPLATE.replace("% INTRO", f"Prior work \\cite{{{keys}}}.") + "```\n"
+    return responder(request)
+
+
+def test_a_paper_written_from_a_project_starts_from_its_sources_and_follows_them(
+    cfg, stubs, monkeypatch
+):
+    from paper_orchestra.agents.literature import LiteratureAgent
+    from paper_orchestra.utils.latex import bib_keys
+
+    scholar = _TinyScholar()
+    monkeypatch.setattr(pipeline, "_outline_agent", lambda ctx: _SearchingOutline(stubs, ctx))
+    monkeypatch.setattr(
+        pipeline, "_literature_agent", lambda ctx: LiteratureAgent(ctx, scholar=scholar)
+    )
+    client = FakeLLM(literature_responder)
+
+    def write_up() -> PaperResult:
+        return run(cfg, harness=make_harness(cfg, client))[0]
+
+    def searches() -> int:
+        return sum(request.label == "literature.discovery" for request in client.requests)
+
+    # The person accepted one source and rejected another; the search proposes both.
+    give_known(cfg, [WARMUP], [NOT_SHALLOW])
+    first = write_up()
+    assert first.success and searches() == 1
+    assert bib_keys(stubs.seen["writer_bib"]) == {"Aaa2020Warmup", "Smith2020DeepThings"}
+    assert scholar.asked == ["Deep Things"]  # neither the known nor the rejected paper
+    record = first.stages["literature"]
+    assert (record["known_papers"], record["excluded_candidates"]) == (1, 1)
+    assert "warnings" not in record
+
+    # Nothing changed in the wiki: the paper stands, and so does what was said about it.
+    again = write_up()
+    assert again.success and searches() == 1
+    assert again.stages["literature"] == record | {"reused": True}
+
+    # The person accepts the rejected paper after all: the literature is searched and the
+    # paper written again, now citing it under the key the wiki has for it.
+    give_known(cfg, [WARMUP, SHALLOW])
+    changed = write_up()
+    assert changed.success and searches() == 2
+    assert bib_keys(stubs.seen["writer_bib"]) == {
+        "Aaa2020Warmup",
+        "Jones2019Shallow",
+        "Smith2020DeepThings",
+    }
+    assert changed.stages["literature"]["known_papers"] == 2
+    assert "excluded_candidates" not in changed.stages["literature"]
+    assert not any(stage["reused"] for stage in changed.stages.values())
+
+    # A list that cannot be read does not cost the paper; the stage's record says so.
+    (cfg.base_dir / "raw_materials" / KNOWN_PAPERS).write_text("{ cut off")
+    broken = write_up()
+    assert broken.success and searches() == 3
+    assert bib_keys(stubs.seen["writer_bib"]) == {"Jones2019ShallowThings", "Smith2020DeepThings"}
+    (warning,) = broken.stages["literature"]["warnings"]
+    assert KNOWN_PAPERS in warning and "is not valid JSON" in warning
+    assert state_of(cfg)["stages"]["literature"]["warnings"] == [warning]
+
+
+def test_the_write_up_of_a_research_project_cites_its_sources_as_the_person_decided(
+    tmp_path, template_dir, stubs, monkeypatch
+):
+    """The seam with ``research/writeup.py``: what it exports is what the literature stage
+    reads, from the wiki's decisions to the bibliography the section writer is given."""
+    from paper_orchestra.agents.literature import LiteratureAgent
+    from paper_orchestra.research import Project, writeup
+    from paper_orchestra.research.demo import build_demo_project
+    from paper_orchestra.utils.latex import bib_keys
+
+    build_demo_project(tmp_path / "project")
+    project = Project.open(tmp_path / "project")
+    accepted = project.pages(kind="source", review="accepted")
+    turned_down = accepted.pop()
+    project.review(turned_down.path, "reject", reason="Not about warmup at all.")
+    proposed = [turned_down.title, accepted[0].title, "Deep Things"]
+
+    def models(request: FakeRequest) -> str:
+        if request.label == "literature.discovery":
+            found = [{"title": title, "year": None, "reason": "r"} for title in proposed]
+            return json.dumps({"candidates": found})
+        return literature_responder(request)
+
+    client, scholar = FakeLLM(models), _TinyScholar()
+    monkeypatch.setattr(pipeline, "_build_harness", lambda cfg: make_harness(cfg, client))
+    monkeypatch.setattr(pipeline, "_build_compute", lambda cfg: FakeCompute())
+    monkeypatch.setattr(pipeline, "_outline_agent", lambda ctx: _SearchingOutline(stubs, ctx))
+    monkeypatch.setattr(
+        pipeline, "_literature_agent", lambda ctx: LiteratureAgent(ctx, scholar=scholar)
+    )
+
+    result = writeup.write_paper(project, template=str(template_dir))
+
+    assert result.success, result.error
+    # Every source the person accepted, under the key the wiki has for it; what the search
+    # added; and not the one they rejected, although the search proposed it.
+    assert bib_keys(stubs.seen["writer_bib"]) == {page.id for page in accepted} | {
+        "Smith2020DeepThings"
+    }
+    assert turned_down.id not in stubs.seen["writer_bib"]
+    assert scholar.asked == ["Deep Things"]  # nothing the wiki decided on is looked up again
+    record = result.stages["literature"]
+    assert (record["known_papers"], record["excluded_candidates"]) == (len(accepted), 1)
+    assert "warnings" not in record
+
+    # The person turns another source down: the next write-up searches and writes again,
+    # and that paper is gone from the bibliography.
+    project.review(accepted[0].path, "reject", reason="Superseded.")
+    again = writeup.write_paper(project, template=str(template_dir))
+
+    assert again.success and not again.stages["literature"]["reused"]
+    assert accepted[0].id not in stubs.seen["writer_bib"]
+    assert bib_keys(stubs.seen["writer_bib"]) == {page.id for page in accepted[1:]} | {
+        "Smith2020DeepThings"
+    }
+    record = again.stages["literature"]
+    assert (record["known_papers"], record["excluded_candidates"]) == (len(accepted) - 1, 2)
+
+    # Started once more with nothing decided in between, the write-up exports the same list
+    # and keeps the paper it has: no search is paid for twice.
+    searches = sum(request.label == "literature.discovery" for request in client.requests)
+    resumed = writeup.write_paper(project, template=str(template_dir))
+    assert resumed.success and resumed.stages["literature"] == record | {"reused": True}
+    assert searches == 2 == sum(r.label == "literature.discovery" for r in client.requests)

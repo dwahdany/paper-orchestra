@@ -29,7 +29,7 @@ jobs:
       - name: Check the environment
         run: >-
           uv run --no-sync python -c
-          "import sys, modal, openai, streamlit, google.genai;
+          "import sys, modal, openai, fastapi, uvicorn, markdown_it, google.genai;
           assert '%d.%d' % sys.version_info[:2] == '${{ matrix.python-version }}', sys.version"
       - name: Lint
         run: |
@@ -50,3 +50,50 @@ jobs:
         env:
           PAPER_ORCHESTRA_REQUIRE_TEX: "1"
         run: uv run --no-sync pytest
+
+  # The web app in a real browser. The matrix above skips this test (no browser there);
+  # here a skip is a failure, so that the app is never merged unlooked at.
+  browser:
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    defaults:
+      run:
+        # Named explicitly so that the steps run with pipefail: a failing test must fail
+        # its step although its output goes through tee.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: uv sync --extra ui
+      # The check starts a write-up and ends its worker in the middle. Without pdflatex and
+      # bibtex a write-up stops at its first look at the machine, before there is a middle.
+      - name: Install TeX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends texlive-latex-base
+      # The tests give every process a home directory of its own, so the browser is kept
+      # where a variable says and not under ~/.cache, where the test would not find it.
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" playwright@1.63.0
+          export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/playwright-browsers"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
+          echo "NODE_PATH=$RUNNER_TEMP/playwright/node_modules" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Browser test, light theme
+        run: |
+          uv run --no-sync pytest tests/test_web_e2e.py -rs | tee light.txt
+          ! grep -q skipped light.txt
+      - name: Browser test, dark theme
+        env:
+          PAPER_ORCHESTRA_E2E_SCHEME: dark
+        run: |
+          uv run --no-sync pytest tests/test_web_e2e.py -rs | tee dark.txt
+          ! grep -q skipped dark.txt

@@ -24,6 +24,12 @@ if TYPE_CHECKING:
 
 S2_KEY_ENV = "SEMANTIC_SCHOLAR_API_KEY"
 REDACTED = "[redacted]"
+#: What works with no credential at all, said where a first look finds none.
+WITHOUT_CREDENTIALS = (
+    "The demonstration and the app work without credentials: `paper-orchestra research "
+    "demo` builds a project to look at and `paper-orchestra ui` opens it. Running "
+    "approved experiments needs none either; the agents need a model."
+)
 
 _PACKAGES = (
     "anthropic",
@@ -34,7 +40,10 @@ _PACKAGES = (
     "typer",
     "rich",
     "pymupdf",
-    "streamlit",
+    "fastapi",
+    "uvicorn",
+    "markdown-it-py",
+    "python-multipart",
 )
 #: Optional providers: the SDK module that must be importable, per provider.
 _PROVIDER_SDKS = {"anthropic": "anthropic", "gemini": "google.genai", "openai": "openai"}
@@ -44,7 +53,7 @@ _NOT_A_SECRET_SUFFIX = ("_FILE", "_PATH", "_DIR", "_ID")
 _MIN_SECRET_LENGTH = 12
 
 
-def _secret_values(environ: Mapping[str, str]) -> list[str]:
+def secret_values(environ: Mapping[str, str]) -> list[str]:
     """Values of environment variables that hold credentials, longest first."""
     values = {
         value
@@ -56,16 +65,16 @@ def _secret_values(environ: Mapping[str, str]) -> list[str]:
     return sorted(values, key=len, reverse=True)
 
 
-def _scrub(value: Any, secrets: Sequence[str]) -> Any:
+def scrub(value: Any, secrets: Sequence[str]) -> Any:
     """Blank out any credential value that found its way into the report."""
     if isinstance(value, str):
         for secret in secrets:
             value = value.replace(secret, REDACTED)
         return value
     if isinstance(value, Mapping):
-        return {str(key): _scrub(item, secrets) for key, item in value.items()}
+        return {str(key): scrub(item, secrets) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [_scrub(item, secrets) for item in value]
+        return [scrub(item, secrets) for item in value]
     return value
 
 
@@ -116,8 +125,10 @@ def _provider_report(model: str) -> dict[str, Any]:
     return row
 
 
-def _environment_credential(provider: str, environ: Mapping[str, str]) -> str | None:
-    """A cheap hint for providers other than the default one (no client is built)."""
+def environment_credential(provider: str, environ: Mapping[str, str]) -> str | None:
+    """Which credential of ``provider`` the environment holds (``api_key``, ``auth_token``,
+    ``workload_identity``, ``vertex_ai``), or ``None`` when it holds none.  A cheap look:
+    no client is built, and a profile on disk is not seen."""
     if provider == "anthropic":
         if environ.get("ANTHROPIC_API_KEY"):
             return "api_key"
@@ -140,7 +151,7 @@ def _other_providers(default: str | None, environ: Mapping[str, str]) -> list[di
         {
             "provider": provider,
             "sdk_installed": _sdk_installed(module),
-            "credential_source": _environment_credential(provider, environ),
+            "credential_source": environment_credential(provider, environ),
         }
         for provider, module in _PROVIDER_SDKS.items()
         if provider != default
@@ -197,6 +208,8 @@ def collect(model: str | None = None) -> dict[str, Any]:
 
     ``ok`` is false when the provider of ``model`` (default: the default model)
     has no usable credentials; the other sections are informational.
+    ``without_credentials`` is one line on what works all the same, for whoever
+    shows a report that is not ``ok``.
     """
     environ = os.environ
     model = model or DEFAULT_MODEL
@@ -212,8 +225,9 @@ def collect(model: str | None = None) -> dict[str, Any]:
         "memory": _memory_report(environ),
         "packages": _package_versions(),
         "ok": bool(provider["usable"]),
+        "without_credentials": WITHOUT_CREDENTIALS,
     }
-    return _scrub(report, _secret_values(environ))
+    return scrub(report, secret_values(environ))
 
 
 def _details(info: Mapping[str, Any], skip: Sequence[str] = ()) -> str:
@@ -305,3 +319,5 @@ def render(report: Mapping[str, Any], console: Console) -> None:
         console.print(Text(f"Warning: {warning}", style="yellow"))
     if not provider["usable"]:
         console.print(Text(f"{name} cannot be used: {provider['error']}", style="red"))
+        # The newcomer runs this first: nothing here stops them from looking around.
+        console.print(Text(str(report.get("without_credentials") or WITHOUT_CREDENTIALS)))

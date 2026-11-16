@@ -403,6 +403,44 @@ def test_help_shows_the_new_flags_only():
     assert "_" not in "".join(w for w in result.output.split() if w.startswith("--"))
 
 
+def test_the_top_of_the_help_says_what_the_tool_is_now():
+    result = runner.invoke(cli.app, ["--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    said = " ".join(result.output.split())
+    assert (
+        "From an idea to a research wiki: agents propose sources, hypotheses, experiments "
+        "and findings, you decide, and a paper can be written from it."
+    ) in said
+    assert "Turn an idea and an experimental log into a LaTeX paper." not in said
+    # The paper pipeline is still a command of its own, and says what it does.
+    assert "write" in said and "research" in said and "ui" in said
+
+
+@pytest.mark.parametrize("command", [["ui"], ["research", "approve"], ["research", "advance"]])
+def test_a_long_description_is_wrapped_once_whatever_the_width(command):
+    """A description is written in paragraphs; where its lines break in the source is not
+    where they break on the screen."""
+    narrow = runner.invoke(cli.app, [*command, "--help"], env={"COLUMNS": "80"})
+    wide = runner.invoke(cli.app, [*command, "--help"], env={"COLUMNS": "200"})
+
+    assert narrow.exit_code == wide.exit_code == 0
+    for output in (narrow.output, wide.output):
+        described = output.split("Usage:", 1)[1].split("╭", 1)[0].splitlines()[1:]
+        paragraphs = "\n".join(line.strip() for line in described).strip().split("\n\n")
+        assert len(paragraphs) >= 2
+        for paragraph in paragraphs:
+            lines = paragraph.splitlines()
+            # Every line but the last of a paragraph is filled: none ends after a word
+            # or two because the source broke there.
+            width = max(len(line) for line in lines)
+            assert all(len(line) > width - 30 for line in lines[:-1]), paragraph
+    # The same words either way.
+    assert " ".join(narrow.output.split("╭", 1)[0].split()) == " ".join(
+        wide.output.split("╭", 1)[0].split()
+    )
+
+
 def test_verbose_and_version(recorder):
     assert runner.invoke(cli.app, ["--version"]).output == f"paper-orchestra {__version__}\n"
 
@@ -579,6 +617,22 @@ def test_doctor_exits_with_1_when_the_default_provider_is_unusable(monkeypatch):
     assert result.exit_code == 1
     assert "no usable credentials" in result.output
     assert "No credentials are configured for this provider." in result.output
+    # Whoever runs this first, as the README has it, is told what works all the same.
+    said = " ".join(result.output.split())
+    assert (
+        "The demonstration and the app work without credentials: `paper-orchestra research "
+        "demo` builds a project to look at and `paper-orchestra ui` opens it."
+    ) in said
+    report = json.loads(runner.invoke(cli.app, ["doctor", "--json"]).output)
+    assert report["ok"] is False
+    assert report["without_credentials"].startswith("The demonstration and the app work")
+
+
+def test_doctor_does_not_talk_about_missing_credentials_when_there_are_some(monkeypatch):
+    register_client("anthropic", DescribedClient({"credential_source": "api_key"}))
+    result = runner.invoke(cli.app, ["doctor"], env={"COLUMNS": "240"})
+    assert result.exit_code == 0
+    assert "work without credentials" not in result.output
 
     # A provider that cannot even be constructed is a row of the report, not a traceback.
     reset_clients()
@@ -1315,7 +1369,17 @@ def test_python_dash_m_runs_the_cli(tmp_path):
 
 
 def test_importing_the_cli_loads_no_agent_and_no_provider_sdk(tmp_path):
-    heavy = ("paper_orchestra.agents.", "anthropic", "modal", "openai", "google.genai", "streamlit")
+    heavy = (
+        "paper_orchestra.agents.",
+        "paper_orchestra.research",
+        "paper_orchestra.web",
+        "anthropic",
+        "modal",
+        "openai",
+        "google.genai",
+        "fastapi",
+        "uvicorn",
+    )
     code = (
         "import sys, paper_orchestra.cli\n"
         f"print(sorted(m for m in sys.modules if m.startswith({heavy!r})))"

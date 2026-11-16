@@ -63,7 +63,9 @@ _NO_STANDING = "_None yet._"
 _FRONT_MATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 _KEY_VALUE = re.compile(r"^([A-Za-z_][\w\-]*)[ \t]*:[ \t]*(.*)$")
 _LIST_ITEM = re.compile(r"^[ \t]*-[ \t]+(.*)$")
-_WIKILINK = re.compile(r"\[\[([^\[\]|#\n]+)(#[^\[\]|\n]*)?(\|[^\[\]\n]*)?\]\]")
+#: A wiki link: ``[[target]]``, ``[[target#anchor]]`` or ``[[target|label]]``.  Public so that
+#: what renders pages and what reads their links agree on what a link is.
+WIKILINK = re.compile(r"\[\[([^\[\]|#\n]+)(#[^\[\]|\n]*)?(\|[^\[\]\n]*)?\]\]")
 _TOKEN = re.compile(r"[a-z0-9]+")
 _NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
 _PLAIN_SCALAR = re.compile(r"^[A-Za-z0-9_./()+\- ]*$")
@@ -227,7 +229,7 @@ class Page:
 
     def links(self) -> list[str]:
         """Wikilink targets in the body, in order, without anchors or labels."""
-        return [m.group(1).strip() for m in _WIKILINK.finditer(self.body)]
+        return [m.group(1).strip() for m in WIKILINK.finditer(self.body)]
 
     def render(self) -> str:
         return join_front_matter(self.meta, self.body)
@@ -697,7 +699,7 @@ class Wiki:
                     repairs.append((rel, target, new_target))
                     return f"[[{new_target}{match.group(2) or ''}{match.group(3) or ''}]]"
 
-                body = _WIKILINK.sub(fix, page.body)
+                body = WIKILINK.sub(fix, page.body)
                 if changed:
                     self.write(rel, body, page.meta, author=str(page.meta.get("author") or ""))
 
@@ -718,7 +720,7 @@ class Wiki:
                 repairs.append((INDEX_FILE, target, new_target))
                 return f"[[{new_target}{match.group(2) or ''}{match.group(3) or ''}]]"
 
-            repaired_standing = _WIKILINK.sub(fix_standing, standing)
+            repaired_standing = WIKILINK.sub(fix_standing, standing)
             if fixed_standing:
                 self._write_index(repaired_standing)
         return repairs
@@ -979,7 +981,7 @@ class Wiki:
             report.index_lines = len(text.splitlines())
             report.index_bytes = len(text.encode("utf-8"))
             standing = self.standing_notes()
-            for match in _WIKILINK.finditer(standing):
+            for match in WIKILINK.finditer(standing):
                 target = match.group(1).strip()
                 if self.resolve_link(target) is None:
                     report.broken_links.append((INDEX_FILE, target))
