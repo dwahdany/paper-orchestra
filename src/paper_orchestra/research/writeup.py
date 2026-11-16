@@ -31,6 +31,7 @@ from paper_orchestra.compute.base import ComputeError, safe_relative
 from paper_orchestra.pipeline import FIGURE_SUFFIXES, PaperResult, prepare_run_dir, run_paper
 from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import IDEA_PATH, ProjectError, ResearchPage, parse_id
+from paper_orchestra.research.sources import normalize_cutoff
 from paper_orchestra.utils.common import write_json, write_text
 
 if TYPE_CHECKING:
@@ -990,7 +991,7 @@ def _paper_config(project: Project, template: str, options: Mapping[str, Any]) -
         "plotting_model": everywhere or models.coding,
         "fast_model": everywhere or models.fast,
         "effort": models.effort,
-        "research_cutoff": settings.research_cutoff,
+        "research_cutoff": None if unreadable else settings.research_cutoff,
         "compute": settings.compute,
         "lab_memory": settings.lab_memory,
         # The figures here are what the runs produced; generating more must not drop them.
@@ -998,6 +999,7 @@ def _paper_config(project: Project, template: str, options: Mapping[str, Any]) -
     }
     chosen.update({name: value for name, value in options.items() if value is not None})
     chosen.pop("model", None)
+    chosen["research_cutoff"] = _cutoff_for_the_paper(chosen["research_cutoff"])
     return build_config(
         base_dir=project.paper_dir,
         template=template,
@@ -1005,6 +1007,22 @@ def _paper_config(project: Project, template: str, options: Mapping[str, Any]) -
         experimental_log_filename=LOG_FILE,
         **chosen,
     )
+
+
+def _cutoff_for_the_paper(cutoff: Any) -> str | None:
+    """The research cutoff in the form the paper pipeline takes, read as the wiki reads it.
+
+    The wiki admitted its sources by this cutoff, and there a year alone means "before
+    that year" (``2024`` is ``2024-01``).  The pipeline takes a month only and would
+    stop at a year, so the write-up hands it what the wiki applied.
+    """
+    try:
+        return normalize_cutoff(cutoff)
+    except ValueError:
+        raise ProjectError(
+            f"The research cutoff of the write-up is {cutoff!r}; it must be a date such as "
+            "2024-06 (YYYY, YYYY-MM or YYYY-MM-DD)."
+        ) from None
 
 
 @contextlib.contextmanager

@@ -1031,6 +1031,32 @@ def test_a_cutoff_that_cannot_be_read_stops_the_write_up(project, pipeline):
     assert pipeline.configs == []
 
 
+@pytest.mark.parametrize(
+    ("written", "applied"),
+    [(2024, "2024-01"), ("2024", "2024-01"), ("2024-6", "2024-06"), ("2024-06-15", "2024-06-15")],
+)
+def test_the_paper_gets_the_cutoff_as_the_wiki_read_it(project, pipeline, written, applied):
+    """The wiki reads a year alone as "before that year".  The paper pipeline only takes
+    a month, so the write-up hands it the cutoff the sources were admitted by."""
+    data = read_json(project.root / "project.json")
+    data["settings"]["research_cutoff"] = written
+    write_json(project.root / "project.json", data)
+
+    writeup.write_paper(Project.open(project.root), template="cvpr2025")
+
+    (cfg,) = pipeline.configs
+    assert cfg.research_cutoff == applied
+
+
+def test_a_cutoff_given_for_the_write_up_is_read_the_same_way(project, pipeline):
+    writeup.write_paper(project, template="cvpr2025", research_cutoff="2023")
+    with pytest.raises(ProjectError, match=r"research cutoff .* 'last June'"):
+        writeup.write_paper(project, template="cvpr2025", research_cutoff="last June")
+
+    (cfg,) = pipeline.configs
+    assert cfg.research_cutoff == "2023-01"
+
+
 def test_a_verdict_that_came_through_a_finding_that_is_left_out_is_said_to_be_open(
     project, tmp_path
 ):
