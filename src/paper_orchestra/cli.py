@@ -1458,6 +1458,18 @@ def research_approve(
         f"{root} {name}` runs it now; `paper-orchestra research advance {root}` runs "
         "everything approved and analyses the results."
     )
+    # What was approved is this code; saying so lets the person see that it is the code
+    # they read, and find it.
+    files = experiments.code_files(opened, str(name))
+    if files:
+        listed = ", ".join(
+            f"{file} ({len(text.splitlines())} lines)" for file, text in files.items()
+        )
+        digest = experiments.code_digest(opened, str(name))[:12]
+        _say(
+            f"Its code, in {_quoted(experiments.code_dir(opened, str(name)))}: {listed}; "
+            f"digest {digest}."
+        )
 
 
 def _asks_for_network(page: ResearchPage) -> bool:

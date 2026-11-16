@@ -948,6 +948,25 @@ def test_approve_says_what_was_approved(project, monkeypatch):
         "E1 is approved to run on modal with a T4 GPU, for up to 1800 s, and it may reach "
         "the network." in flat(result.stdout)
     )
+    assert "Its code" not in result.stdout  # this plan has none to name
+
+
+def test_approve_names_the_code_it_approved(project, monkeypatch):
+    from paper_orchestra.research import experiments
+
+    code = "import json\n\njson.dump({'loss': 0.5}, open('metrics.json', 'w'))\n"
+    experiments.write_code(
+        project, "E1", {"main.py": code, "lib/util.py": "X = 1\n"}, author="human"
+    )
+    project.review("E1", "accept")
+
+    result = invoke("approve", str(project.root), "E1", "--backend", "local")
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout)
+    digest = experiments.code_digest(project, "E1")[:12]
+    assert f"Its code, in {project.root / 'experiments' / 'E1' / 'code'}:" in out
+    assert f"lib/util.py (1 lines), main.py (3 lines); digest {digest}." in out
 
 
 def test_approve_reports_a_refusal_and_exits_with_1(project, monkeypatch):
