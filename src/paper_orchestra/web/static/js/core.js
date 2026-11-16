@@ -1,0 +1,90 @@
+/* What every module shares: the open route, the interface state that is not in the address,
+   the open project's store, and the way to ask for a render. `main.js` fills in `render`. */
+
+import { storage } from './util.js';
+
+export const VIEWS = [['map', 'Map'], ['wiki', 'Wiki'], ['inbox', 'Inbox'], ['experiments', 'Experiments'], ['overview', 'Overview'], ['paper', 'Paper']];
+const VIEW_NAMES = VIEWS.map((v) => v[0]);
+
+export const app = {
+  /** `{name: 'library' | 'start' | 'setup'}` or `{name: 'project', pid, view, ref, sel, sub, q}`;
+      `ref` is what the address says, `sel` the path of the page it names (once loaded). */
+  route: { name: 'library', q: {} },
+  /** The store of the open project, or null. */
+  store: null,
+  views: {},
+  /** Interface state kept across renders (never the project's data). */
+  ui: {
+    start: null,            // the composer: text, files, options, upload state
+    wikiFilter: '',
+    checked: {},            // inbox: refs selected for a bulk decision
+    rejecting: null,        // the ref whose reject form is open
+    reasons: {},            // ref -> the reason being typed
+    activityOpen: false,
+    logOpen: false,
+    showRejected: storage.get('po-show-rejected', true) !== false,
+    map: { fold: null, round: null, lineageOnly: false, deep: false, open: {} },
+    approve: {},            // experiment id -> the options chosen in the approval form
+    codeTab: {},            // experiment id -> the file shown
+    codeEdit: {},           // experiment id + file -> the text being edited
+    runOpen: {},            // experiment id + run -> whether its details are unfolded
+    asDiff: {},             // proposal id -> show the unified diff instead of the marked text
+    histVersion: {},        // page path -> the stamp of the version looked at
+    confirmDelete: null,    // the path of the page about to be deleted
+    trail: {},              // project id -> the pages opened on the way
+    request: { text: '', about: true },
+    feedLimit: 40,
+    newPage: null,          // the "new page" dialog
+    limitEdit: null,        // raising a limit from the strip
+    paper: {},
+    drafts: {},             // editor drafts in memory (they are also kept in localStorage)
+    editProposal: {},       // page path -> the edit proposal being edited before it is accepted
+    reapprove: null,        // the experiment whose approval form is open again
+    showLessons: false,
+    toast: null,
+    flash: null,
+    health: null,
+    library: null,          // the list of projects, as last fetched
+    doctor: null,
+  },
+  render() {},
+  /** Views that draw outside the main render (the live log) register here. */
+  hooks: {},
+};
+
+const decode = (text) => { try { return decodeURIComponent(text); } catch (e) { return text; } };
+
+/** `#/p/<pid>/<view>/<selection>/<sub>`, `#/library`, `#/start`, `#/setup`. */
+export function parseHash(hash) {
+  const [path, qs] = String(hash || '').replace(/^#\/?/, '').split('?');
+  const seg = path.split('/').filter(Boolean).map(decode);
+  const q = {};
+  (qs || '').split('&').filter(Boolean).forEach((kv) => { const i = kv.indexOf('='); if (i < 0) q[decode(kv)] = '1'; else q[decode(kv.slice(0, i))] = decode(kv.slice(i + 1)); });
+  if (seg[0] === 'p' && seg[1]) return { name: 'project', pid: seg[1], view: VIEW_NAMES.includes(seg[2]) ? seg[2] : 'map', ref: seg[3] || '', sel: '', sub: seg[4] || '', q };
+  if (seg[0] === 'start' || seg[0] === 'setup' || seg[0] === 'library') return { name: seg[0], q };
+  return { name: 'library', q };
+}
+
+/** The shortest name of a page that an address can carry: its id, or its place in the wiki. */
+export function shortRef(path) {
+  if (!path) return '';
+  const page = app.store && app.store.byPath.get(path);
+  if (page && page.id) return page.id;
+  return String(path).replace(/^wiki\//, '').replace(/\.md$/, '');
+}
+
+export function hrefOf(route) {
+  if (route.name !== 'project') return '#/' + route.name;
+  const ref = route.sel ? shortRef(route.sel) : route.ref || '';
+  return '#/p/' + encodeURIComponent(route.pid) + '/' + route.view + (ref ? '/' + encodeURIComponent(ref) + (route.sub ? '/' + encodeURIComponent(route.sub) : '') : '');
+}
+/** The address of another view or selection of the open project. */
+export const link = (patch) => hrefOf(Object.assign({}, app.route, { ref: '' }, patch));
+
+export function go(patch, replace) {
+  const next = typeof patch === 'string' ? patch : link(patch);
+  if (location.hash === next) { app.render('route'); return; }
+  if (replace) history.replaceState(null, '', next); else location.hash = next;
+  window.dispatchEvent(new HashChangeEvent('hashchange'));
+}
+export const select = (path, sub) => go({ sel: path || '', sub: sub || '' });

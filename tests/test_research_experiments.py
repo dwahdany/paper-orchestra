@@ -431,6 +431,12 @@ def test_the_designer_supplies_the_code_of_an_accepted_plan_that_came_without_an
     experiments.write_code(project, page.id, {"helper.py": "X = 1\n"}, author="agent:designer")
     experiments.write_code(project, page.id, {"main.py": QUICK + "#\n"}, author="agent:designer")
     assert sorted(experiments.code_files(project, page.id)) == ["helper.py", "main.py"]
+    assert {
+        name: entry["author"] for name, entry in experiments.code_authors(project, page.id).items()
+    } == {
+        "helper.py": "agent:designer",
+        "main.py": "agent:designer",
+    }
     # A file the person put there is theirs.
     experiments.write_code(project, page.id, {"notes.py": "Y = 2\n"}, author="human")
     with pytest.raises(NotAllowed, match="accepted"):

@@ -90,6 +90,7 @@ __all__ = [
     "ExperimentPlan",
     "approve",
     "check_code",
+    "code_authors",
     "code_digest",
     "code_dir",
     "code_files",
@@ -679,6 +680,13 @@ def code_files(project: Project, experiment_id: str) -> dict[str, str]:
 def code_digest(project: Project, experiment_id: str) -> str:
     """SHA-256 over the names and contents of the experiment's code files."""
     return _current_digest(project, experiment_id)
+
+
+def code_authors(project: Project, experiment_id: str) -> dict[str, dict[str, str]]:
+    """Who wrote the current version of each code file, and when:
+    ``{name: {"author", "written"}}``, as :func:`write_code` records it.  A file that
+    was put into the directory by hand has no entry."""
+    return _authors(code_dir(project, _experiment_id(project, experiment_id)))
 
 
 def _current_digest(project: Project, experiment_id: str) -> str:

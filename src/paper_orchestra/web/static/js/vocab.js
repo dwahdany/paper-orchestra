@@ -1,0 +1,149 @@
+/* The vocabulary of the interface: kinds, states, relations, and the marks that stand for
+   them. Kind is the silhouette of a glyph, review its outline, state its interior, so that
+   no status is told by colour alone. */
+
+import { html, raw } from './util.js';
+
+/** The stages of the map, left to right: the way research flows. */
+export const STAGES = ['idea', 'source', 'topic', 'question', 'hypothesis', 'experiment', 'result', 'finding'];
+/** Kinds listed in the wiki index after the stages. */
+export const EXTRA_KINDS = ['journal', 'lesson'];
+export const KIND = {
+  idea: { one: 'Idea', many: 'Idea', hint: 'what you asked' },
+  source: { one: 'Source', many: 'Sources', hint: 'verified papers' },
+  topic: { one: 'Topic', many: 'Topics', hint: 'what is known' },
+  question: { one: 'Question', many: 'Questions', hint: 'what is open' },
+  hypothesis: { one: 'Hypothesis', many: 'Hypotheses', hint: 'claims to test' },
+  experiment: { one: 'Experiment', many: 'Experiments', hint: 'plans and code' },
+  result: { one: 'Result', many: 'Results', hint: 'run records' },
+  finding: { one: 'Finding', many: 'Findings', hint: 'what it means' },
+  journal: { one: 'Journal', many: 'Journal', hint: 'round summaries' },
+  lesson: { one: 'Lesson', many: 'Lessons', hint: 'process notes for the agents' },
+  bundle: { one: 'Sources', many: 'Sources', hint: 'folded sources' },
+};
+export const kindName = (kind, many) => (KIND[kind] ? (many ? KIND[kind].many : KIND[kind].one) : kind || 'Page');
+
+/** Tone of a lifecycle state: how the mark inside the glyph is drawn. */
+export const TONE = {
+  open: 'open', planned: 'open', approved: 'ready', queued: 'ready',
+  testing: 'live', running: 'live',
+  supported: 'pos', succeeded: 'pos', answered: 'pos',
+  refuted: 'neg', failed: 'neg',
+  inconclusive: 'void', dropped: 'void', cancelled: 'void',
+};
+export const STATES = {
+  question: ['open', 'answered', 'dropped'],
+  hypothesis: ['open', 'testing', 'supported', 'refuted', 'inconclusive', 'dropped'],
+};
+/** Relation -> family (line weight on the map) and the two ways of reading it. */
+export const REL = {
+  mentions: { fam: 'read', out: 'mentions', inn: 'mentioned by' },
+  cites: { fam: 'read', out: 'cites', inn: 'cited by' },
+  about: { fam: 'read', out: 'about', inn: 'asked about by' },
+  motivated_by: { fam: 'reason', out: 'motivated by', inn: 'motivates' },
+  follows: { fam: 'reason', out: 'follows from', inn: 'led to' },
+  answers: { fam: 'reason', out: 'answers', inn: 'answered by' },
+  tests: { fam: 'test', out: 'tests', inn: 'tested by' },
+  run_of: { fam: 'test', out: 'run of', inn: 'has run' },
+  based_on: { fam: 'test', out: 'based on', inn: 'interpreted by' },
+  supports: { fam: 'pos', out: 'supports', inn: 'supported by' },
+  refutes: { fam: 'neg', out: 'refutes', inn: 'refuted by' },
+};
+export const relOf = (type) => REL[type] || { fam: 'read', out: String(type || 'links to').replace(/_/g, ' '), inn: 'linked from' };
+
+export const PHASES = ['intake', 'research', 'hypothesize', 'design', 'run', 'analyze'];
+export const PHASE_NAME = { intake: 'intake', research: 'research', hypothesize: 'hypotheses', design: 'experiment design', run: 'runs', analyze: 'analysis', write: 'the write-up' };
+export const phaseName = (phase) => PHASE_NAME[phase] || phase || '';
+/** The phases after which the engine pauses for the person. */
+export const CHECKPOINT_AFTER = { research: 1, hypothesize: 1, design: 1, analyze: 1 };
+
+export const agentName = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : String(author || '').replace(/^agent:/, '') || 'engine');
+
+/* ---------- glyphs ---------- */
+const SHAPE = {
+  idea: '<circle class="g-s" r="8"/><circle class="g-core" r="3"/>',
+  source: '<rect class="g-s" x="-3.6" y="-3.6" width="7.2" height="7.2"/>',
+  topic: '<rect class="g-s" x="-8" y="-4.6" width="16" height="9.2" rx="4.6"/>',
+  question: '<path class="g-s" d="M0-7.6 7.6 0 0 7.6-7.6 0Z"/>',
+  hypothesis: '<circle class="g-s" r="7"/>',
+  experiment: '<path class="g-s" d="M-8.2 0-4.1-7h8.2L8.2 0 4.1 7h-8.2Z"/>',
+  result: '<rect class="g-s" x="-4.6" y="-4.6" width="9.2" height="9.2" rx="1"/>',
+  finding: '<path class="g-s" d="M0-7.6 8 6.2H-8Z"/>',
+  journal: '<path class="g-s" d="M-5.5-7h11v14h-11Z"/><path class="g-m" d="M-2.5-3h5M-2.5 0h5M-2.5 3h3"/>',
+  lesson: '<path class="g-s" d="M-6.5-6h13v9.5h-6L-3 7V3.5h-3.5Z"/>',
+  bundle: '<rect class="g-s g-back" x="-1.2" y="-6" width="7.2" height="7.2"/><rect class="g-s" x="-6" y="-1.2" width="7.2" height="7.2"/>',
+};
+const HALF = {
+  hypothesis: 'M0-7A7 7 0 0 0 0 7Z',
+  experiment: 'M0-7h-4.1L-8.2 0-4.1 7H0Z',
+  question: 'M0-7.6-7.6 0 0 7.6Z',
+};
+/** Inner SVG of a glyph, centred on 0,0, about 18 units across. */
+export function glyphInner(kind, review, state, options) {
+  const tone = TONE[state] || 'none';
+  const small = kind === 'result' || kind === 'source';
+  const dy = kind === 'finding' ? 1.4 : 0;
+  let shape = SHAPE[kind] || SHAPE.topic;
+  let mark = '';
+  if (review !== 'rejected') {
+    if (tone === 'live' && HALF[kind]) mark = `<path class="g-fill" d="${HALF[kind]}"/>`;
+    else if (tone === 'live') mark = '<circle class="g-dot" r="1.8"/>';
+    else if (tone === 'pos') {
+      shape = shape.replace('class="g-s"', 'class="g-s g-solid"');
+      if (!small) mark = `<path class="g-tick" d="M-3.3 ${0.2 + dy} -1 ${2.5 + dy} 3.5 ${-2.5 + dy}"/>`;
+    } else if (tone === 'neg') {
+      const k = small ? 2.1 : 2.7;
+      mark = `<path class="g-m" d="M${-k} ${-k + dy} ${k} ${k + dy}M${k} ${-k + dy} ${-k} ${k + dy}"/>`;
+    } else if (tone === 'ready') mark = '<circle class="g-dot" r="2"/>';
+    else if (tone === 'void') mark = '<path class="g-m" d="M-3 0h6"/>';
+  }
+  if (review === 'rejected') mark += '<path class="g-strike" d="M-9.5 8 9.5-8"/>';
+  if (options && options.change) mark += '<circle class="g-change" r="11.2"/>';
+  const k = SHAPE[kind] ? kind : 'topic';
+  const r = review === 'proposed' || review === 'rejected' ? review : 'accepted';
+  return raw(`<g class="gl k-${k} r-${r} t-${tone}">${shape}${mark}</g>`);
+}
+export function glyph(kind, review, state, size) {
+  const z = +size || 18;
+  return raw(`<svg class="glyph" width="${z}" height="${z}" viewBox="-10 -10 20 20" aria-hidden="true">${glyphInner(kind, review, state)}</svg>`);
+}
+export const pageGlyph = (page, size) => glyph(page.kind, page.review, page.state, size);
+
+/* ---------- icons (16px, 1.5 stroke) ---------- */
+const ICONS = {
+  check: 'M3.5 8.5l3 3 6-7',
+  x: 'M4 4l8 8M12 4l-8 8',
+  pencil: 'M10.8 2.7l2.5 2.5L6 12.5l-3.2.7.7-3.2zM9.4 4.1l2.5 2.5',
+  clock: 'M8 4.5V8l2.3 1.6M14 8A6 6 0 1 1 2 8a6 6 0 0 1 12 0z',
+  search: 'M11 11l3 3M12 7.3A4.7 4.7 0 1 1 2.6 7.3a4.7 4.7 0 0 1 9.4 0z',
+  sun: 'M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1M10.8 8a2.8 2.8 0 1 1-5.6 0 2.8 2.8 0 0 1 5.6 0z',
+  moon: 'M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z',
+  right: 'M6 3.5L10.5 8 6 12.5',
+  down: 'M3.5 6L8 10.5 12.5 6',
+  plus: 'M8 3v10M3 8h10',
+  minus: 'M3 8h10',
+  fit: 'M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10',
+  open: 'M9 2.5h4.5V7M13.5 2.5L7.5 8.5M6 4H2.5v9.5H12V10',
+  file: 'M4 1.8h5l3 3v9.4H4zM9 1.8v3h3',
+  stop: 'M4.5 4.5h7v7h-7z',
+  play: 'M5 3.2l7.5 4.8L5 12.8z',
+  copy: 'M5.5 5.5v-3h8v8h-3M2.5 5.5h8v8h-8z',
+  map: 'M2 4l4-1.5 4 1.5 4-1.5v10L10 14l-4-1.5L2 14zM6 2.5v10M10 4v10',
+  undo: 'M5.5 3L2.5 6l3 3M2.5 6h6.7a4.3 4.3 0 0 1 0 8.6H6',
+  warn: 'M8 2l6.3 11.5H1.7zM8 6.5v3.2M8 11.6v.2',
+  help: 'M6.2 6.2a1.9 1.9 0 1 1 2.7 1.7c-.6.3-.9.8-.9 1.5M8 11.6v.2M14 8A6 6 0 1 1 2 8a6 6 0 0 1 12 0z',
+  link: 'M6.8 9.2a2.6 2.6 0 0 0 3.7 0l2-2a2.6 2.6 0 0 0-3.7-3.7l-.6.6M9.2 6.8a2.6 2.6 0 0 0-3.7 0l-2 2a2.6 2.6 0 0 0 3.7 3.7l.6-.6',
+  trash: 'M3 4.5h10M6.2 4.5V2.8h3.6v1.7M4.3 4.5l.6 8.7h6.2l.6-8.7M6.7 7v4M9.3 7v4',
+  pause: 'M5.5 3.5v9M10.5 3.5v9',
+  dot: 'M8 8h.01',
+  ring: 'M13.2 8A5.2 5.2 0 1 1 2.8 8a5.2 5.2 0 0 1 10.4 0z',
+  upload: 'M8 10.5V3M5 5.8L8 2.8l3 3M3 10.5v3h10v-3',
+  diff: 'M4.5 2.5v5M2 5h5M9.5 5H14M2.5 11.5h5M9.5 11.5H14M11.7 9.2v4.6',
+  cloud: 'M4.6 12.5h6.9a2.9 2.9 0 0 0 .5-5.76A4.1 4.1 0 0 0 4.1 7.6a2.5 2.5 0 0 0 .5 4.9z',
+  flask: 'M6.2 2.5h3.6M6.8 2.5v4L3.3 12.4a.9.9 0 0 0 .8 1.3h7.8a.9.9 0 0 0 .8-1.3L9.2 6.5v-4M5 10h6',
+  layers: 'M8 2.5l6 3-6 3-6-3zM2.6 8.5L8 11.2l5.4-2.7M2.6 11L8 13.7l5.4-2.7',
+  book: 'M3 3h4.2A1.8 1.8 0 0 1 9 4.8V13a1.5 1.5 0 0 0-1.5-1.5H3zM13 3H9.8A1.8 1.8 0 0 0 8 4.8',
+};
+export const icon = (name, cls) => raw(`<svg class="ic ${cls || ''}" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="${ICONS[name] || ICONS.dot}"/></svg>`);
+
+export const kbd = (...keys) => html`${keys.map((k) => html`<kbd>${k}</kbd>`)}`;

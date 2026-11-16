@@ -595,6 +595,22 @@ def test_results_the_person_brought_are_what_a_paper_reports_when_nothing_was_ru
     assert started["data"]["provided"] == ["loss curve.png", "notes.md", "results.csv"]
 
 
+def test_missing_says_what_a_paper_still_lacks_by_the_rule_of_the_write_up(tmp_path, pipeline):
+    fresh = Project.create(tmp_path / "fresh", title="A fresh idea", brief="Nothing yet.")
+    assert writeup.missing(fresh) == "results"
+    refused(fresh, pipeline, "no accepted experiment has a run that succeeded")
+
+    mine = tmp_path / "results.csv"
+    mine.write_text("a,b\n1,2\n")
+    own = Project.create(tmp_path / "own", title="Own results", brief="b", files=[mine])
+    assert writeup.missing(own) == "finding"
+    refused(own, pipeline, "no finding is accepted")
+
+    own.create_page("finding", "It holds", "Seen it.\n", author="human")
+    assert writeup.missing(own) is None
+    assert writeup.write_paper(own, template="cvpr2025").success
+
+
 def test_attached_text_is_given_whole_up_to_a_limit_and_says_where_it_was_cut(
     tmp_path, monkeypatch
 ):

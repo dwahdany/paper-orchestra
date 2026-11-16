@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from paper_orchestra.config import PipelineConfig
     from paper_orchestra.research.project import Project
 
-__all__ = ["export_materials", "write_paper"]
+__all__ = ["export_materials", "missing", "write_paper"]
 
 IDEA_FILE = "idea.md"
 LOG_FILE = "experimental_log.md"
@@ -559,6 +559,20 @@ def _export(
     write_text(dest / LOG_FILE, _log_text(project, runs, findings, figures, provided))
     names = [name for listed in figures.values() for name in listed]
     return _Materials(dest, runs, findings, names, [item.name for item in provided])
+
+
+def missing(project: Project) -> str | None:
+    """What the project still lacks for a paper: ``"results"`` (no accepted experiment
+    has a run that succeeded, and nothing the person attached can be reported),
+    ``"finding"`` (no finding is accepted), or ``None`` when a paper can be written.
+
+    The rule :func:`write_paper` applies, for a caller that wants to say so before
+    the person starts a write-up.
+    """
+    runs, findings = _reportable(project)
+    if not runs and not _provided(project):
+        return "results"
+    return None if findings else "finding"
 
 
 def _check_ready(project: Project, runs: list[_Run], findings: list[ResearchPage]) -> None:

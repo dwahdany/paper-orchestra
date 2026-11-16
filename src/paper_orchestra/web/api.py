@@ -273,6 +273,12 @@ class Services:
         ``code_digest`` and refuses when the code changed in between."""
         return str(self._experiments().code_digest(project, experiment_id))
 
+    def code_authors(self, project: Project, experiment_id: str) -> dict[str, dict[str, Any]]:
+        """Who wrote the current version of each code file, and when:
+        ``{name: {"author", "written"}}``, as ``write_code`` records it.  A file that
+        was put there by hand has no entry."""
+        return dict(self._experiments().code_authors(project, experiment_id))
+
     def approve(self, project: Project, ref: str, **options: Any) -> ResearchPage:
         return self._experiments().approve(project, ref, **options)
 
@@ -305,6 +311,18 @@ class Services:
         from paper_orchestra.config import bundled_templates
 
         return sorted(bundled_templates())
+
+    def paper_missing(self, project: Project) -> str | None:
+        """What the project still lacks for a paper, by the write-up's own rule:
+        ``"results"`` (no accepted experiment has a run that succeeded, and nothing the
+        person attached can be reported), ``"finding"`` (no finding is accepted), or
+        ``None`` when a paper can be written.  The write-up decides; this only asks it
+        without starting it, so that the page and a refused start never disagree."""
+        try:
+            writeup = importlib.import_module("paper_orchestra.research.writeup")
+        except ImportError:
+            return None  # Starting the write-up says what is wrong with the installation.
+        return writeup.missing(project)
 
 
 # ---------------------------------------------------------------------------
@@ -1596,6 +1614,7 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
     experiment_id = str(page.id)
     plan, plan_error = _plan(context, project, page)
     files = context.services.code_files(project, experiment_id)
+    authors = context.services.code_authors(project, experiment_id)
     try:
         options, options_error = context.services.options(project, page.path), None
     except ProjectError as exc:
@@ -1609,7 +1628,15 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
         "plan_error": plan_error,
         "code": {
             "files": [
-                {"name": name, "text": text, "size": len(text.encode("utf-8"))}
+                {
+                    "name": name,
+                    "text": text,
+                    "size": len(text.encode("utf-8")),
+                    # Who wrote this version and when (``None``: nobody recorded it), so
+                    # that code which arrived after the plan was accepted can be told.
+                    "author": authors.get(name, {}).get("author"),
+                    "written": authors.get(name, {}).get("written"),
+                }
                 for name, text in sorted(files.items())
             ],
             "problems": context.services.check_code(project, experiment_id),
@@ -1628,7 +1655,8 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
 @router.get("/projects/{pid}/experiments/{eid}")
 def get_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     """The experiment's ``page`` and ``html``, its ``plan`` as the runner reads it (or
-    ``plan_error``), its ``code`` (``files``, the ``problems`` a check finds, and
+    ``plan_error``), its ``code`` (``files``, each with the ``author`` of its current
+    version and when it was ``written``; the ``problems`` a check finds; and
     the ``digest`` an approval sends back as ``code_digest``), its ``runs``, and
     ``options``: for each backend ``{"backend", "can_run",
     "reasons", "est_minutes", "est_usd", "notes"}``, so the approval form offers
@@ -1873,6 +1901,8 @@ def _paper_view(context: Context, project: Project) -> dict[str, Any]:
         "state": state if isinstance(state, dict) else None,
         "running": worker["state"] != "idle" and worker["kind"] == "write",
         "final_pdf": f"{PAPER_DIR}/final_paper.pdf" if final.is_file() else None,
+        # What a write-up would refuse for ("results", "finding"), or None: it can start.
+        "missing": context.services.paper_missing(project),
         "worker": worker,
     }
 
@@ -1898,5 +1928,6 @@ def start_paper(body: PaperBody, project: Proj, context: Ctx) -> dict[str, Any]:
 def get_paper(project: Proj, context: Ctx) -> dict[str, Any]:
     """The paper run: ``state`` is ``paper/state.json`` (``null`` before the first run),
     ``final_pdf`` the project-relative path of the finished paper for the files
-    endpoint."""
+    endpoint, ``missing`` what the project lacks for a paper (``"results"``,
+    ``"finding"``) or ``null`` when it can be written."""
     return _paper_view(context, project)

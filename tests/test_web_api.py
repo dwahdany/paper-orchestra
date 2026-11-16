@@ -81,6 +81,8 @@ class FakeServices(Services):
     def __init__(self) -> None:
         self.approvals: list[tuple[str, dict[str, Any]]] = []
         self.refuse_approval: str | None = None
+        self.authors: dict[tuple[str, str], dict[str, str]] = {}
+        self.paper_gap: str | None = None
 
     def load_plan(self, project, ref):
         page = project.page(ref)
@@ -104,7 +106,14 @@ class FakeServices(Services):
             assert target.resolve().is_relative_to(folder.resolve()), name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text)
+            self.authors[experiment_id, name] = {
+                "author": author,
+                "written": "2026-11-15T12:30:00Z",
+            }
         return self.check_code(project, experiment_id)
+
+    def code_authors(self, project, experiment_id):
+        return {name: entry for (eid, name), entry in self.authors.items() if eid == experiment_id}
 
     def check_code(self, project, experiment_id):
         files = self.code_files(project, experiment_id)
@@ -155,6 +164,9 @@ class FakeServices(Services):
 
     def templates(self):
         return ["cvpr2025", "iclr2025"]
+
+    def paper_missing(self, project):
+        return self.paper_gap
 
 
 @pytest.fixture
@@ -1232,7 +1244,16 @@ def test_an_experiment_comes_with_plan_code_runs_and_options(client, project):
     assert view["page"]["id"] == "E1" and "<h2" in view["html"]
     assert view["plan"]["mode"] == "script" and view["plan_error"] is None
     assert view["code"] == {
-        "files": [{"name": "main.py", "text": "print('hello')\n", "size": 15}],
+        # The file was put there by hand: nobody is on record as its author.
+        "files": [
+            {
+                "name": "main.py",
+                "text": "print('hello')\n",
+                "size": 15,
+                "author": None,
+                "written": None,
+            }
+        ],
         "problems": [],
         "digest": "digest-of-main.py:15",
     }
@@ -1253,6 +1274,41 @@ def test_an_experiment_comes_with_plan_code_runs_and_options(client, project):
     for missing in ("E9", "H1", "nonsense", "..%2fE1"):
         response = client.get(url(project, f"/experiments/{missing}"))
         assert response.status_code == 404, missing
+
+
+def test_the_code_listing_says_who_wrote_each_file_and_when(client, project):
+    client.put(url(project, "/experiments/E1/code/lib/util.py"), json={"text": "X = 1\n"})
+    listed = client.get(url(project, "/experiments/E1")).json()["code"]["files"]
+    files = {entry["name"]: entry for entry in listed}
+    assert files["lib/util.py"]["author"] == "human"
+    assert files["lib/util.py"]["written"] == "2026-11-15T12:30:00Z"
+    assert files["main.py"]["author"] is None and files["main.py"]["written"] is None
+
+
+def test_the_real_services_say_who_wrote_the_code_and_what_a_paper_lacks(project):
+    real = Services()
+    assert real.code_authors(project, "E1") == {}  # main.py was put there by hand
+    real.write_code(project, "E1", {"main.py": "print(1)\n"}, author="human")
+    entry = real.code_authors(project, "E1")["main.py"]
+    assert entry["author"] == "human" and entry["written"].endswith("Z")
+
+    # The write-up's own rule, asked without starting it: results first, then a finding.
+    from paper_orchestra.research import writeup
+
+    assert real.paper_missing(project) == "results"
+    with pytest.raises(ProjectError, match="no accepted experiment has a run"):
+        writeup._check_ready(project, *writeup._reportable(project))
+    project.inputs_dir.mkdir(parents=True, exist_ok=True)
+    (project.inputs_dir / "prior_run.csv").write_text("step,loss\n1,0.7\n", encoding="utf-8")
+    (project.inputs_dir / "manifest.json").write_text(
+        json.dumps({"files": [{"name": "prior_run.csv", "size": 18}]}), encoding="utf-8"
+    )
+    assert real.paper_missing(project) == "finding"
+    with pytest.raises(ProjectError, match="no finding is accepted"):
+        writeup._check_ready(project, *writeup._reportable(project))
+    project.create_page("finding", "Warmup helps", "It does.\n", author="human")
+    assert real.paper_missing(project) is None
+    writeup._check_ready(project, *writeup._reportable(project))
 
 
 def test_the_person_edits_code_and_gets_the_check_back(client, project):
@@ -1694,6 +1750,7 @@ def test_the_paper_step_starts_a_worker_and_reports_its_state(client, project, l
         "state": None,
         "running": False,
         "final_pdf": None,
+        "missing": None,
         "worker": client.get(url(project)).json()["worker"],
     }
     unknown = client.post(url(project, "/paper"), json={"template": "../../etc"})
