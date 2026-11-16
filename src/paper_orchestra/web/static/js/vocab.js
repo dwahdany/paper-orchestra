@@ -57,6 +57,26 @@ export const phaseName = (phase) => PHASE_NAME[phase] || phase || '';
 /** The phases after which the engine pauses for the person. */
 export const CHECKPOINT_AFTER = { research: 1, hypothesize: 1, design: 1, analyze: 1 };
 
+/** What choosing a phase by name does, as the list beside Continue says it. */
+export const PHASE_DO = {
+  research: ['Search the literature again', 'The scout looks for more prior work. What it finds arrives as proposals.'],
+  hypothesize: ['Propose hypotheses', 'The theorist proposes hypotheses from what you accepted.'],
+  design: ['Design experiments', 'The designer plans experiments, with their code, for the hypotheses you accepted.'],
+  run: ['Run what is approved', 'The experiments whose run you approved, and nothing else.'],
+  analyze: ['Analyse the results', 'The analyst reads the result records and proposes findings.'],
+};
+/** Whom an instruction can be for. The roles come from the server (`request_for` of
+    /api/defaults); these are the words for them: `pick` in the list of choices, `name` in a
+    sentence, `phase` the phase in which that agent works. */
+export const ROLE = {
+  all: { pick: 'Everyone', name: 'everyone' },
+  scout: { pick: 'The agent that searches the literature (scout)', name: 'the scout', phase: 'research' },
+  theorist: { pick: 'The agent that proposes hypotheses (theorist)', name: 'the theorist', phase: 'hypothesize' },
+  designer: { pick: 'The agent that designs experiments (designer)', name: 'the designer', phase: 'design' },
+  analyst: { pick: 'The agent that analyses the results (analyst)', name: 'the analyst', phase: 'analyze' },
+};
+export const roleName = (role) => (ROLE[role] ? ROLE[role].name : role ? 'the ' + role : 'everyone');
+
 export const agentName = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : String(author || '').replace(/^agent:/, '') || 'engine');
 
 /* ---------- glyphs ---------- */
@@ -143,6 +163,7 @@ const ICONS = {
   flask: 'M6.2 2.5h3.6M6.8 2.5v4L3.3 12.4a.9.9 0 0 0 .8 1.3h7.8a.9.9 0 0 0 .8-1.3L9.2 6.5v-4M5 10h6',
   layers: 'M8 2.5l6 3-6 3-6-3zM2.6 8.5L8 11.2l5.4-2.7M2.6 11L8 13.7l5.4-2.7',
   book: 'M3 3h4.2A1.8 1.8 0 0 1 9 4.8V13a1.5 1.5 0 0 0-1.5-1.5H3zM13 3H9.8A1.8 1.8 0 0 0 8 4.8',
+  again: 'M13 8a5 5 0 1 1-1.6-3.7M13 2.6v2.9h-2.9',
 };
 export const icon = (name, cls) => raw(`<svg class="ic ${cls || ''}" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="${ICONS[name] || ICONS.dot}"/></svg>`);
 

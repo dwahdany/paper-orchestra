@@ -32,6 +32,7 @@ const type = (selector, text) => async (page) => { await page.fill(selector, tex
 const allLines = async (page) => { await page.click('.map-tools [data-act="map-refs"]'); await page.waitForSelector('.map-svg .edges .edge.t-cites'); await page.mouse.move(4, 4); await page.waitForTimeout(400); };
 const SHOTS = [
   ['01-start-empty', '#/start'],
+  ['01b-start-options', '#/start', async (page) => { await page.click('.adv summary'); await page.selectOption('#opt-cutoff-month', '6'); await page.fill('#opt-cutoff-year', '2024'); await page.waitForTimeout(300); }, async (page) => { await page.evaluate(() => { localStorage.removeItem('po-composer'); }); }],
   ['02-start-filled', '#/start', async (page) => {
     await page.fill('#idea-text', 'Learning-rate warmup is assumed to matter most for large batches. I suspect that with adaptive optimisers it is small batches that need it, because early second-moment estimates are noisy.');
     await page.setInputFiles('#file-input', [notes, runs]);
@@ -46,9 +47,13 @@ const SHOTS = [
   ['08-map-reject-on-node', '#/p/PID/map', async (page) => { await page.click('.node.k-question.r-proposed .n-no'); await page.waitForTimeout(400); }],
   ['09-overview', '#/p/PID/overview'],
   ['09b-overview-lower', '#/p/PID/overview', async (page) => { await page.evaluate(() => { document.querySelector('.overview').scrollTop = 760; }); await page.waitForTimeout(200); }],
+  ['09c-overview-other-phases', '#/p/PID/overview', async (page) => { await page.click('.ov-actions [data-act="go-menu"]'); await page.waitForSelector('.go-menu'); }],
+  ['09d-overview-instruction-for', '#/p/PID/overview', async (page) => { await page.evaluate(() => { document.querySelector('.rq-form').scrollIntoView({ block: 'center' }); }); await page.selectOption('#rq-for', 'scout'); await page.waitForTimeout(200); }],
+  ['05b-map-other-phases', '#/p/PID/map', async (page) => { await page.click('.strip [data-act="go-menu"]'); await page.waitForSelector('.go-menu'); }],
   ['10-wiki-page-h2', '#/p/PID/wiki/H2'],
   ['11-wiki-proposed-h5', '#/p/PID/wiki/H5'],
   ['12-wiki-editor', '#/p/PID/wiki/H2/edit', async (page) => { await page.waitForSelector('.ed-prev h2'); }],
+  ['12b-wiki-editor-proposal', '#/p/PID/wiki/H5/edit', async (page) => { await page.waitForSelector('.ed-bar [data-act="save-accept"]'); await page.waitForSelector('.ed-prev h2'); }],
   ['13-wiki-history', '#/p/PID/wiki/topics%2Fwhy-warmup-helps/history', async (page) => { await page.click('.hist-i [data-act="version"] >> nth=-1'); await page.waitForSelector('.hist-body pre.diff'); }],
   ['14-wiki-finding-f1', '#/p/PID/wiki/F1'],
   ['14f-wiki-finding-f2-flagged', '#/p/PID/wiki/F2', async (page) => { await page.waitForSelector('.numcheck'); await page.waitForTimeout(300); }],

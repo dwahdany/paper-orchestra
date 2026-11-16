@@ -14,6 +14,52 @@ away and coming back, the keyboard keeping its place, the command palette, a pro
 150 pages, a new project from the composer with two uploaded files, and titles and text
 with markup, scripts, odd Unicode and words longer than any column.
 
+It also checks that the interface follows the rules of the engine and the store, each
+against what the server answers:
+
+- an instruction has an addressee (everyone, or one agent, from `GET /api/defaults`), an
+  open one lists the phases that were given it so far, and it can be withdrawn;
+- more research is the person's choice: the list beside the main button offers "Search
+  the literature again" (an `advance` that names the phase), and the analyst's
+  recommendation from the checkpoint of the analysis stands next to that choice;
+- editing is not deciding: Save keeps a proposal proposed and a rejected page rejected,
+  "Save and accept" sends `accept: true`, and the app says which it did;
+- the number check is shown in the server's summary sentence with the numbers it counts
+  (not found, found only outside the finding's records, not checked), on a finding, on a
+  suggested edit to a finding (inbox and page) and in the paper view;
+- rejecting an experiment that has run lists, with links, the findings and verdicts the
+  server says rest on it, and the paper view names the accepted findings a paper would
+  then leave out, each with the server's reason;
+- a result record that was edited by hand says so;
+- a worker the server cannot verify is shown with the server's note, without Stop, and
+  can be forgotten; a run whose worker is gone is shown as interrupted and Run starts it
+  again; the banner for a server that is gone says that agents and experiments go on;
+- the library lists a project that cannot be opened with the reason, and its rows count
+  what waits, suggested edits included;
+- the composer's numbers are those of `GET /api/defaults`, and it takes a research cutoff
+  as a month and a year;
+- a project's problems are listed on the overview and counted by a quiet mark in the top
+  bar, in the server's words; a research cutoff that cannot be read is corrected there;
+- the main button and the strip say what a press does from the server's state ("Run the
+  approved experiment, then analyse it"), the phase that was next is offered again
+  afterwards, and in the moment between the state arriving and the lists of pages the
+  button promises neither a run nor an analysis that has just been done;
+- `[redacted]` and `***` in a log are plain text, not an error.
+
+And a few things a reload, another window or the keyboard must not break:
+
+- whom an instruction is for is kept with the text that is being typed, across a reload; an
+  instruction that was withdrawn in another window leaves the list at the next press of
+  Withdraw, which says that it was withdrawn already;
+- E opens the editor with the keyboard in the text and nothing typed into it;
+- the list beside the main button closes when Tab leaves it, and Escape from the question
+  of a rejection gives the keyboard back to what asked it;
+- what rests on a rejected experiment is still listed after a reload, for as long as that
+  rejection stands, and not for a later one;
+- with a phase to resume and a run approved meanwhile, the line of the round draws the run,
+  its analysis and then the resumed phase;
+- the run of a result record that was edited by hand says that the record was edited since.
+
 `pytest tests/test_web_e2e.py` does everything below by itself, and skips with the reason
 when Node, Playwright or a browser is missing. It takes about five minutes.
 
@@ -39,11 +85,13 @@ node tests/e2e/web_check.js --base http://127.0.0.1:8600        # exit status 0 
 The flows change the project, so every run needs a fresh workspace. Options:
 
 - `--only map,inbox` / `--skip composer`: the checks are `screens`, `map`, `inbox`, `wiki`,
-  `experiments`, `agents`, `states`, `keys`, `paper`, `large`, `composer`, `hostile`. They
-  are written to run in that order on one fresh demo project; a single one also runs alone.
+  `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`, `composer`,
+  `hostile`. They are written to run in that order on one fresh demo project; a single one
+  also runs alone.
 - `--shots DIR`: photographs of the moving states (a running phase, a live log, a failure)
   as the checks pass them.
-- `--scheme dark`: the flows in the dark theme (for the photographs).
+- `--scheme dark`: the flows in the dark theme. The checks are meant to pass in both
+  themes: run them once without the option and once with it, each on a fresh workspace.
 - `--slow 2`: doubles every wait, for a slow machine.
 - `large` also checks the keyboard on the map (Tab reaches the selected page, the arrow
   keys move from there with the map following, Tab leaves a map of 150 pages within a few
@@ -54,6 +102,12 @@ The flows change the project, so every run needs a fresh workspace. Options:
   projects have the same title; they are told apart by the number of their pages);
   otherwise it says that it was skipped. It also checks that what is being typed in one
   project (an instruction, an edit of a code file) does not turn up in the other.
+- A few states cannot be reached by using the app: a suggested edit to a finding (only an
+  agent proposes one), a worker on another machine, a run whose worker is gone, a
+  `project.json` with a cutoff nobody can read, a project that cannot be opened. For those
+  the checks write the project's files the way a person with an editor would, and take the
+  workspace's path from `GET /api/health`. With a server on another machine these parts
+  are skipped, and the checks say so in a `note` line.
 - `hostile` writes pages, an instruction and a project title full of markup, script tags,
   right-to-left overrides, combining marks and a word of 225 letters, looks at every view
   at two widths, and removes them again.

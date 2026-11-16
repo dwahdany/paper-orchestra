@@ -1,26 +1,40 @@
 /* The screens outside a project: the composer that starts one, the library, the setup check. */
 
-import { app } from './core.js';
+import { app, defaults } from './core.js';
 import { api } from './api.js';
-import { ago, bytes, checkpointDid, html, money, plural, raw, setHTML, storage } from './util.js';
-import { STAGES, icon, phaseName } from './vocab.js';
+import { MONTH_NAMES, ago, bytes, checkpointDid, cutoffFrom, cutoffParts, cutoffWords, html, money, plain, plural, raw, setHTML, storage } from './util.js';
+import { KIND, STAGES, icon, phaseName } from './vocab.js';
 import { stripMapSmall } from './overview.js';
 
 /* ---------- start: one box for the idea ---------- */
 const EXAMPLE = 'Learning-rate warmup is assumed to matter most for large batches. I suspect that with adaptive optimisers it is small batches that need it, because early second-moment estimates are noisy.';
 const FILE_NOTE = { md: 'notes · read as text', txt: 'text', csv: 'table · read as text', tsv: 'table · read as text', json: 'data · read as text', png: 'image · shown to the model', jpg: 'image · shown to the model', jpeg: 'image · shown to the model', gif: 'image · shown to the model', webp: 'image · shown to the model', pdf: 'paper · read as a PDF', ipynb: 'notebook · read as text', py: 'code · read as text', tex: 'LaTeX · read as text', bib: 'references · read as text' };
-const REVIEW_KINDS = [['topic', 'Topics'], ['question', 'Questions'], ['hypothesis', 'Hypotheses'], ['experiment', 'Experiments'], ['finding', 'Findings']];
 const COMPOSER_KEY = 'po-composer';
+/** How a kind is reviewed when nothing else is said: the server's default (`settings.review`
+    of /api/defaults), "review" or "auto"; `null` until the defaults are known. */
+const reviewDefault = (kind) => { const d = defaults(); const policy = d && d.settings && d.settings.review; return policy && typeof policy[kind] === 'string' ? policy[kind] : null; };
+/** The kinds the review options offer, in the order research flows: those the server's
+    defaults name, without the records and notes whose review is not the person's business. */
+function reviewKinds() {
+  const d = defaults(), policy = (d && d.settings && d.settings.review) || {};
+  return STAGES.filter((kind) => kind !== 'idea' && kind !== 'source' && kind !== 'result' && policy[kind] != null);
+}
+/** The limits a new project gets when the composer says nothing: the server's, or `null`. */
+const limitDefaults = () => { const d = defaults(); return (d && d.settings && d.settings.limits) || null; };
 
 /** The composer's state. The text and the options survive a reload; files cannot (the
     browser does not let a page keep them), and the composer says so when that happens. */
 export function composer() {
   if (!app.ui.start) {
     const saved = storage.get(COMPOSER_KEY, {}) || {};
+    /* a cutoff kept from before it had a field for the year and one for the month */
+    const old = cutoffParts(saved.cutoff);
     app.ui.start = {
       text: saved.text || '', files: [], adv: !!saved.adv, lostFiles: saved.fileCount || 0,
-      title: saved.title || '', effort: saved.effort || '', cutoff: saved.cutoff || '', compute: saved.compute || '',
+      title: saved.title || '', effort: saved.effort || '', compute: saved.compute || '',
+      cutoffYear: saved.cutoffYear || (old && old.raw == null ? old.year : ''), cutoffMonth: +saved.cutoffMonth || (old && old.raw == null ? old.month : 0),
       model_usd: saved.model_usd || '', exp_minutes: saved.exp_minutes || '', exp_usd: saved.exp_usd || '',
+      /* kind -> true: accepted as it is written; false: waits for the person. Only what the person changed. */
       auto: saved.auto || {}, uploading: false, progress: 0, error: null, request: null,
     };
   }
@@ -28,7 +42,7 @@ export function composer() {
 }
 export function keepComposer() {
   const s = composer();
-  storage.set(COMPOSER_KEY, { text: s.text, adv: s.adv, title: s.title, effort: s.effort, cutoff: s.cutoff, compute: s.compute, model_usd: s.model_usd, exp_minutes: s.exp_minutes, exp_usd: s.exp_usd, auto: s.auto, fileCount: s.files.length });
+  storage.set(COMPOSER_KEY, { text: s.text, adv: s.adv, title: s.title, effort: s.effort, cutoffYear: s.cutoffYear, cutoffMonth: s.cutoffMonth, compute: s.compute, model_usd: s.model_usd, exp_minutes: s.exp_minutes, exp_usd: s.exp_usd, auto: s.auto, fileCount: s.files.length });
 }
 export function clearComposer() { app.ui.start = null; storage.remove(COMPOSER_KEY); }
 export const composerReady = (s) => (s.text.trim().length > 0 || s.files.length > 0) && !s.uploading;
@@ -37,15 +51,17 @@ export const totalSize = (s) => s.files.reduce((a, f) => a + f.size, 0);
 export function composerSettings(s) {
   const settings = {};
   if (s.effort) settings.models = { effort: s.effort };
-  if (s.cutoff.trim()) settings.research_cutoff = s.cutoff.trim();
+  const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth);
+  if (cutoff.value) settings.research_cutoff = cutoff.value;
   if (s.compute) settings.compute = s.compute;
   const limits = {};
   if (String(s.model_usd).trim() !== '') limits.model_usd = Number(String(s.model_usd).replace(/[$,\s]/g, ''));
   if (String(s.exp_minutes).trim() !== '') limits.experiment_seconds = Math.round(Number(String(s.exp_minutes).replace(/[^\d.]/g, '')) * 60);
   if (String(s.exp_usd).trim() !== '') limits.experiment_usd = Number(String(s.exp_usd).replace(/[$,\s]/g, ''));
   if (Object.keys(limits).length) settings.limits = limits;
+  /* only where the person's choice differs from what the project would do anyway */
   const review = {};
-  Object.keys(s.auto || {}).forEach((kind) => { if (s.auto[kind]) review[kind] = 'auto'; });
+  Object.keys(s.auto || {}).forEach((kind) => { const wanted = s.auto[kind] ? 'auto' : 'review'; if (wanted !== (reviewDefault(kind) || 'review')) review[kind] = wanted; });
   if (Object.keys(review).length) settings.review = review;
   return settings;
 }
@@ -58,8 +74,16 @@ export const startView = {
     if (route.q && route.q.adv) s.adv = true;
     const ready = composerReady(s);
     const n = s.files.length;
+    /* every number the composer shows before the person types one is the server's default */
+    const limits = limitDefaults();
+    const d = defaults(), models = (d && d.settings && d.settings.models) || {};
     const typed = Number(String(s.model_usd).replace(/[$,\s]/g, ''));
-    const limit = String(s.model_usd).trim() !== '' && typed > 0 ? '$' + typed.toFixed(2) : '$25.00';
+    const limit = String(s.model_usd).trim() !== '' && typed > 0 ? money(typed) : limits && limits.model_usd != null ? money(limits.model_usd) : '';
+    const hint = (value, unit) => (value == null ? 'the default' : value + ' ' + unit);
+    const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth), cutoffNow = cutoff.value ? cutoffParts(cutoff.value) : null;
+    const kinds = reviewKinds();
+    const waits = (kind) => (s.auto[kind] != null ? !s.auto[kind] : reviewDefault(kind) !== 'auto');
+    const backendName = { local: 'this machine', modal: 'Modal sandboxes' };
     setHTML(root, html`<div class="start"><div class="start-col">
       <h1>What do you want to find out?</h1>
       <p class="start-lede">Describe the idea in a few sentences and add anything you already have. Agents research it and fill a wiki with sources, questions, hypotheses and experiments. They only suggest: nothing is accepted, and nothing runs, without you.</p>
@@ -75,17 +99,20 @@ export const startView = {
           <span class="composer-go">${s.text || n ? '' : html`<button class="btn btn-quiet" type="button" data-act="start-example">Use an example</button>`}
             <button class="btn btn-primary btn-l" type="submit"${ready ? '' : raw(' disabled')}>Start research ${icon('right')}</button></span></div>
         <div class="drop-veil" aria-hidden="true">Drop to attach</div></form>
-      <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint. It stops when ' + limit + ' has been spent on models.' : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
-      <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, limits, what needs your review</span></summary><div class="adv-grid">
+      <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
+      <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, a research cutoff, limits, what needs your review</span></summary><div class="adv-grid">
         <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea" autocomplete="off"></label>
-        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', 'As the project default'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['xhigh', 'extra high'], ['max', 'max']].map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
-        <label><span>Only literature before</span><input id="opt-cutoff" data-input="opt" data-name="cutoff" value="${s.cutoff}" placeholder="No cutoff (or 2024-06)" autocomplete="off"></label>
-        <label><span>Experiments run on</span><select id="opt-compute" data-input="opt" data-name="compute">${[['', 'As the project default'], ['local', 'This machine (local CPU)'], ['modal', 'Modal sandboxes']].map(([v, t]) => html`<option value="${v}"${s.compute === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
-        <label><span>Model spend limit</span><input id="opt-model-usd" data-input="opt" data-name="model_usd" value="${s.model_usd}" placeholder="25.00 dollars" inputmode="decimal" autocomplete="off"></label>
-        <label><span>Time limit per run</span><input id="opt-exp-min" data-input="opt" data-name="exp_minutes" value="${s.exp_minutes}" placeholder="15 minutes" inputmode="decimal" autocomplete="off"></label>
-        <label><span>Experiment spend limit</span><input id="opt-exp-usd" data-input="opt" data-name="exp_usd" value="${s.exp_usd}" placeholder="5.00 dollars" inputmode="decimal" autocomplete="off"></label>
-        <fieldset class="adv-review"><legend>Needs your review before it counts</legend>${REVIEW_KINDS.map(([kind, name]) => html`<label class="tick"><input type="checkbox" data-input="opt-review" data-kind="${kind}"${s.auto[kind] ? '' : raw(' checked')}> ${name}</label>`)}
-          <label class="tick"><input type="checkbox" disabled> Sources <span class="quiet">verified by code, accepted on creation</span></label></fieldset></div></details>
+        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + models.effort + ')' : 'As the project default'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['xhigh', 'extra high'], ['max', 'max']].map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
+        <div class="adv-cutoff" role="group" aria-labelledby="opt-cutoff-l"><span id="opt-cutoff-l">Only literature before</span><span class="cutoff-fields">
+          <label class="sr" for="opt-cutoff-month">Month of the research cutoff</label><select id="opt-cutoff-month" data-input="opt" data-name="cutoffMonth"><option value="0"${+s.cutoffMonth ? '' : raw(' selected')}>any month</option>${MONTH_NAMES.map((name, i) => html`<option value="${i + 1}"${+s.cutoffMonth === i + 1 ? raw(' selected') : ''}>${name}</option>`)}</select>
+          <label class="sr" for="opt-cutoff-year">Year of the research cutoff</label><input id="opt-cutoff-year" data-input="opt" data-name="cutoffYear" value="${s.cutoffYear}" placeholder="year" inputmode="numeric" maxlength="4" autocomplete="off"></span>
+          <span class="quiet cutoff-hint" data-cutoff>${cutoff.error ? cutoff.error : cutoffNow ? 'Papers published in ' + cutoffWords(cutoffNow) + ' or later are left out.' : 'Optional. Without a year, literature of any date is in scope.'}</span></div>
+        <label><span>Experiments run on</span><select id="opt-compute" data-input="opt" data-name="compute">${[['', d && d.settings && backendName[d.settings.compute] ? 'Default (' + backendName[d.settings.compute] + ')' : 'As the project default'], ['local', 'This machine (local CPU)'], ['modal', 'Modal sandboxes']].map(([v, t]) => html`<option value="${v}"${s.compute === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
+        <label><span>Model spend limit</span><input id="opt-model-usd" data-input="opt" data-name="model_usd" value="${s.model_usd}" placeholder="${limits && limits.model_usd != null ? Number(limits.model_usd).toFixed(2) + ' dollars' : 'the default'}" inputmode="decimal" autocomplete="off"></label>
+        <label><span>Time limit per run</span><input id="opt-exp-min" data-input="opt" data-name="exp_minutes" value="${s.exp_minutes}" placeholder="${limits && limits.experiment_seconds != null ? hint(Math.round(limits.experiment_seconds / 6) / 10, 'minutes') : 'the default'}" inputmode="decimal" autocomplete="off"></label>
+        <label><span>Experiment spend limit</span><input id="opt-exp-usd" data-input="opt" data-name="exp_usd" value="${s.exp_usd}" placeholder="${limits && limits.experiment_usd != null ? Number(limits.experiment_usd).toFixed(2) + ' dollars' : 'the default'}" inputmode="decimal" autocomplete="off"></label>
+        <fieldset class="adv-review"><legend>Needs your review before it counts</legend>${kinds.length ? kinds.map((kind) => html`<label class="tick"><input type="checkbox" data-input="opt-review" data-kind="${kind}"${waits(kind) ? raw(' checked') : ''}> ${KIND[kind].many}</label>`) : html`<span class="quiet">As the project default.</span>`}
+          ${reviewDefault('source') === 'auto' ? html`<label class="tick"><input type="checkbox" disabled> Sources <span class="quiet">verified by code, accepted on creation</span></label>` : ''}</fieldset></div></details>
       <div class="start-route" aria-label="What happens next"><div class="smap smap-route">
         ${[['Idea', 'yours'], ['Sources', 'verified papers'], ['Topics', 'what is known'], ['Questions', 'what is open'], ['Hypotheses', 'you accept or reject'], ['Experiments', 'you approve each run'], ['Results', 'written by code'], ['Findings', 'traced to results']].map((x, i) => html`<div class="smap-st${i ? ' none' : ' here'}"><div class="smap-dot"></div><div class="smap-name">${x[0]}</div><div class="smap-hint">${x[1]}</div></div>`)}</div></div>
     </div></div>`);
@@ -94,35 +121,44 @@ export const startView = {
 export { EXAMPLE };
 
 /* ---------- library ---------- */
-const details = new Map();   // project id -> counts, fetched for the rows on screen
+/** The projects of the workspace as the server lists them: each row with its live counts
+    (what waits for the person, edit proposals included), and beside them the directories
+    that hold a project which cannot be opened, each with the server's reason. */
 export function loadLibrary(force) {
-  const lib = app.ui.library || (app.ui.library = { projects: null, error: null, loading: false, at: 0 });
+  const lib = app.ui.library || (app.ui.library = { projects: null, unreadable: [], error: null, loading: false, at: 0 });
   if (lib.loading || (!force && lib.projects && Date.now() - lib.at < 4000)) return;
   lib.loading = true;
   api.projects().then((data) => {
     lib.projects = data.projects || [];
+    lib.unreadable = data.unreadable || [];
     lib.error = null;
     lib.at = Date.now();
-    lib.projects.slice(0, 16).forEach((row) => {
-      const known = details.get(row.id);
-      if (known && known.updated === row.updated) return;
-      details.set(row.id, { updated: row.updated, counts: known ? known.counts : null });
-      api.project(row.id).then((p) => { details.set(row.id, { updated: row.updated, counts: p.counts }); if (app.route.name === 'library') app.render('library', true); }, () => {});
-    });
   }, (error) => { lib.error = error; }).finally(() => {
     lib.loading = false;
-    const now = JSON.stringify([lib.projects, lib.error && lib.error.message]);   // looked at again every few seconds: drawn again only when it changed
+    const now = JSON.stringify([lib.projects, lib.unreadable, lib.error && lib.error.message]);   // looked at again every few seconds: drawn again only when it changed
     if (now !== lib.drawn && app.route.name === 'library') { lib.drawn = now; app.render('library', true); }
   });
 }
 
-function rowState(row, waiting) {
+/** How many proposals wait in a project, in words: the live number the row carries. */
+function waitingWords(row) {
+  const n = row.pending || 0;
+  if (!n) return '';
+  const pending = (row.counts || {}).pending;
+  /* while the pages of a project that changed are still to be counted, the number is the last checkpoint's */
+  return n + ' waiting for you' + (pending ? '' : ' at the last checkpoint');
+}
+function rowState(row) {
   const running = row.worker && row.worker !== 'idle';
-  if (running || row.status === 'running') return ['live', 'Round ' + (row.round || 1) + ' · ' + phaseName(row.phase), 'running now'];
-  if (row.status === 'failed') return ['neg', 'Round ' + (row.round || 1) + ' · ' + phaseName(row.next_phase || row.phase) + ' failed', 'needs you'];
-  if (row.status === 'stopped') return [row.error ? 'neg' : 'pause', 'Round ' + (row.round || 1) + ' · stopped', row.error ? 'the agents stopped unexpectedly' : 'stopped by you'];
-  if (row.status === 'checkpoint') { const n = waiting == null ? row.pending : waiting; return ['pause', 'Round ' + (row.round || 1) + ' · checkpoint', n ? n + ' waiting for you' : 'ready to continue']; }
-  return ['idle', 'Not started', 'ready'];
+  const waiting = waitingWords(row);
+  const and = (text) => (waiting ? text + ' · ' + waiting : text);
+  /* the project's files name a worker this server cannot verify: said as that, not as "running" */
+  if (running && row.worker_verified === false) return ['pause', 'Worker not verified', and('named in its files; see the project')];
+  if (running || row.status === 'running') return ['live', 'Round ' + (row.round || 1) + ' · ' + phaseName(row.phase), and('running now')];
+  if (row.status === 'failed') return ['neg', 'Round ' + (row.round || 1) + ' · ' + phaseName(row.next_phase || row.phase) + ' failed', and('needs you')];
+  if (row.status === 'stopped') return [row.error ? 'neg' : 'pause', 'Round ' + (row.round || 1) + ' · stopped', and(row.error ? 'the agents stopped unexpectedly' : 'stopped by you')];
+  if (row.status === 'checkpoint') return ['pause', 'Round ' + (row.round || 1) + ' · checkpoint', waiting || 'ready to continue'];
+  return ['idle', 'Not started', waiting || 'ready'];
 }
 
 export const libraryView = {
@@ -131,24 +167,30 @@ export const libraryView = {
     const lib = app.ui.library;
     const head = html`<header class="view-head lib-head"><div><h1>Projects</h1><p>Each project is a folder of plain files${app.ui.health && app.ui.health.workspace ? html` in <code>${app.ui.health.workspace}</code>` : ''}. Open one to see its map.</p></div>
       <a class="btn btn-primary" href="#/start">${icon('plus')}New project</a></header>`;
+    const unreadable = (lib.unreadable || []);
+    /* a folder that holds a project which cannot be opened is listed all the same, with why */
+    const broken = unreadable.length ? html`<section class="lib-unreadable" aria-label="Projects that cannot be opened"><h2>${unreadable.length === 1 ? 'A project that cannot be opened' : unreadable.length + ' projects that cannot be opened'}</h2>
+      ${unreadable.map((x) => html`<div class="lib-bad" data-dir="${x.dir || ''}">${icon('warn')}<div><code class="lib-dir">${x.dir || '?'}/</code><p>${plain(x.message || 'It cannot be opened.')}</p></div></div>`)}
+      <p class="quiet">Nothing in these folders was changed. Put right what the message names, and the project is listed again.</p></section>` : '';
     let body;
     if (!lib.projects && lib.error) body = html`<div class="note note-neg" role="alert">${icon('warn')}<span>The projects could not be listed: ${lib.error.message} <button class="linkish" data-act="reload-library">Try again</button></span></div>`;
     else if (!lib.projects) body = html`<div class="skeleton" aria-busy="true" aria-label="Loading the projects"><i></i><i></i><i class="short"></i></div>`;
-    else if (!lib.projects.length) body = html`<div class="blank lib-blank"><h2>No project yet</h2><p>A project starts from an idea: a few sentences, and whatever notes, data or papers you already have.</p><p><a class="btn btn-primary btn-l" href="#/start">Start the first one ${icon('right')}</a></p></div>`;
+    else if (!lib.projects.length) body = unreadable.length ? broken : html`<div class="blank lib-blank"><h2>No project yet</h2><p>A project starts from an idea: a few sentences, and whatever notes, data or papers you already have.</p><p><a class="btn btn-primary btn-l" href="#/start">Start the first one ${icon('right')}</a></p></div>`;
     else {
       body = html`<div class="lib-list">${lib.projects.map((row) => {
-        const d = details.get(row.id), counts = d && d.counts, st = rowState(row, counts ? (counts.pending || {}).total : null);
-        const by = counts ? counts.by_kind || {} : null;
+        const counts = row.counts || null, st = rowState(row);
+        const by = counts ? counts.by_kind || {} : null, pending = counts ? counts.pending || {} : null;
         /* what the last phase did; how much waits now is said live in the next column */
         const did = row.checkpoint && row.checkpoint.summary ? checkpointDid(row.checkpoint.summary) : '';
-        const say = row.status === 'failed' || (row.status === 'stopped' && row.error) ? row.error : did ? 'After ' + phaseName(row.checkpoint.phase) + ': ' + did : row.checkpoint && row.checkpoint.summary ? row.checkpoint.summary : row.status === 'idle' ? 'The idea is in place; research has not started.' : '';
+        const say = row.status === 'failed' || (row.status === 'stopped' && row.error) ? plain(row.error) : did ? 'After ' + phaseName(row.checkpoint.phase) + ': ' + did : row.status === 'idle' ? 'The idea is in place; research has not started.' : '';
         /* two projects of one title are told apart by their folders */
         const twin = row.title && lib.projects.filter((x) => x.title === row.title).length > 1;
+        const waits = pending && pending.total ? plural(pending.pages || 0, 'proposed page') + (pending.proposals ? ' and ' + plural(pending.proposals, 'suggested edit') : '') + ' wait for a decision' : '';
         return html`<a class="lib-row" href="#/p/${encodeURIComponent(row.id)}/map"><div class="lib-main"><h2>${row.title || row.dir}</h2>${twin && row.dir ? html`<code class="lib-dir">${row.dir}/</code>` : ''}<p>${say}</p></div>
-          <div class="lib-map">${stripMapSmall(by, counts ? (counts.pending || {}).by_kind : null)}<span class="lib-counts">${by ? (STAGES.slice(1).some((k) => by[k]) ? (by.source || 0) + ' sources · ' + (by.hypothesis || 0) + ' hypotheses · ' + (by.experiment || 0) + ' experiments · ' + (by.finding || 0) + ' findings' : 'idea only') : ' '}</span></div>
-          <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2">${st[2]}</span></div>
+          <div class="lib-map">${stripMapSmall(by, pending ? pending.by_kind : null)}<span class="lib-counts">${by ? (STAGES.slice(1).some((k) => by[k]) ? (by.source || 0) + ' sources · ' + (by.hypothesis || 0) + ' hypotheses · ' + (by.experiment || 0) + ' experiments · ' + (by.finding || 0) + ' findings' : 'idea only') : ' '}</span></div>
+          <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2"${waits ? html` data-tip="${waits}"` : ''}>${st[2]}</span></div>
           <div class="lib-num"><span>${money((row.spent || {}).model_usd || 0)}</span><span class="quiet">${ago(row.updated)}</span></div></a>`;
-      })}</div>`;
+      })}</div>${broken}`;
     }
     setHTML(root, html`<div class="library"><div class="lib-wrap">${head}${body}</div></div>`);
   },

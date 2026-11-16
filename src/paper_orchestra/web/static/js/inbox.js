@@ -4,7 +4,7 @@ import { app, link } from './core.js';
 import { ago, html, raw, setHTML, tf } from './util.js';
 import { KIND, STAGES, agentName, glyph, icon, kindName } from './vocab.js';
 import { afterRender, pageName, panelHTML, proposalWhat } from './page.js';
-import { continueLabel, engineView } from './shell.js';
+import { continueControl, engineView } from './shell.js';
 
 export const whatOf = (item) => (item.type === 'page' ? 'New ' + kindName(item.kind).toLowerCase() : proposalWhat(item.prop, item.page));
 export const summaryOf = (item) => (item.type === 'edit' ? item.prop.summary : item.page.summary && item.page.summary !== item.page.title ? item.page.summary : '');
@@ -45,15 +45,15 @@ export const inboxView = {
         <span class="in-name">${pageName(pg)}</span><span class="in-when">${pg.review === 'rejected' ? 'rejected ' : 'accepted '}${ago(pg.meta.decided_at)}</span></a>`)}</div>` : '';
     const shown = cur ? cur.page : route.sel && store.byPath.has(route.sel) ? store.byPath.get(route.sel) : null;
     const e = engineView(store);
-    const idle = e.mode !== 'running' && e.mode !== 'experiment' && e.mode !== 'writing';
+    const idle = !e.working && !e.unverified;
     setHTML(root, html`<div class="inbox">
       <section class="in-list" aria-label="Waiting for a decision"><header class="in-head"><h1>${items.length ? items.length + ' waiting for you' : 'Nothing is waiting'}</h1>
         ${items.length ? html`<div class="in-bulk"><label class="in-all"><input type="checkbox" data-check="all"${nChecked && nChecked === items.length ? raw(' checked') : ''}> Select all</label>
           <button class="btn btn-s" data-act="bulk-accept"${nChecked ? '' : raw(' disabled')}>Accept ${nChecked || ''} selected <kbd>⇧A</kbd></button>
           <button class="btn btn-s btn-neg-quiet" data-act="bulk-reject"${nChecked ? '' : raw(' disabled')} aria-expanded="${tf(app.ui.rejecting === 'bulk')}">Reject selected…</button></div>
           ${app.ui.rejecting === 'bulk' ? html`<form class="reject-form" data-form="bulk-reject"><label class="sr" for="why-bulk">Reason</label><input id="why-bulk" name="reason" data-input="reason" data-ref="bulk" value="${app.ui.reasons.bulk || ''}" placeholder="Why? One reason for all ${nChecked}; the agents read it." autocomplete="off"><button class="btn btn-neg" type="submit">Reject ${nChecked}</button><button class="btn btn-quiet" type="button" data-act="reject-cancel">Cancel</button></form>` : ''}` : ''}</header>
-        <div class="in-scroll">${items.length ? list : html`<div class="in-clear"><p>Every proposal has a decision.${idle && e.mode === 'checkpoint' ? ' The checkpoint can go on.' : ''}</p>${idle && !e.fresh ? html`<button class="btn btn-primary" data-act="continue">${continueLabel(e.next, store)} ${icon('right')}</button>` : ''}</div>`}${done}</div>
-        <footer class="in-keys"><span><kbd>J</kbd><kbd>K</kbd> move</span><span><kbd>X</kbd> select</span><span><kbd>A</kbd> accept</span><span><kbd>E</kbd> edit, then accept</span><span><kbd>R</kbd> reject</span><span data-tip="A decision is sent after five seconds; until then Z takes it back"><kbd>Z</kbd> undo, within 5 s</span></footer></section>
+        <div class="in-scroll">${items.length ? list : html`<div class="in-clear"><p>Every proposal has a decision.${idle && e.mode === 'checkpoint' ? ' The checkpoint can go on.' : ''}</p>${idle && !e.fresh ? continueControl(store, e, 'inbox') : ''}</div>`}${done}</div>
+        <footer class="in-keys"><span><kbd>J</kbd><kbd>K</kbd> move</span><span><kbd>X</kbd> select</span><span><kbd>A</kbd> accept</span><span data-tip="Saving an edit does not decide the proposal: “Save and accept” does"><kbd>E</kbd> edit</span><span><kbd>R</kbd> reject</span><span data-tip="A decision is sent after five seconds; until then Z takes it back"><kbd>Z</kbd> undo, within 5 s</span></footer></section>
       <section class="in-detail" aria-label="The proposal">${shown ? panelHTML(store, shown, { mode: 'inbox', sub: route.sub }) : html`<div class="in-none"><p>${items.length ? 'Select a proposal to read it.' : 'Proposals appear here when the agents have something for you to decide.'}</p></div>`}</section></div>`);
     afterRender(root);
   },

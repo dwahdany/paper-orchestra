@@ -246,3 +246,64 @@ def test_the_stylesheet_covers_what_the_server_renders():
         assert selector in css, f"the stylesheet has no rule for {selector}"
     assert "prefers-reduced-motion" in css and ":focus-visible" in css
     assert '[data-theme="dark"]' in css and "prefers-color-scheme: dark" in css
+
+
+def test_no_default_of_the_server_is_written_into_the_client():
+    """What a new project starts with (its limits, what needs a review, whom a request can
+    be for) is asked of the server, ``GET /api/defaults``: a number or a list copied into the
+    frontend would go on saying the old value after the server's changed."""
+    api = _text(STATIC_DIR / "js" / "api.js")
+    assert "'/api/defaults'" in api
+    home = _text(STATIC_DIR / "js" / "home.js")
+    assert "defaults()" in home, "the composer does not read the server's defaults"
+    for path in _files(".js"):
+        source = _text(path)
+        name = path.relative_to(STATIC_DIR)
+        for copied in ("25.00", "5.00 dollars", "15 minutes", "|| 900", "|| 25)"):
+            assert copied not in source, f"{name} carries a default of its own: {copied!r}"
+    overview = _text(STATIC_DIR / "js" / "overview.js")
+    assert "request_for" in overview, "the addressees of an instruction are not the server's"
+
+
+def test_the_frontend_speaks_the_api_as_it_is_now():
+    """The requests the repairs of the server added or changed: forgetting a worker that
+    cannot be verified, a phase the person names, an instruction with an addressee, and a
+    save that accepts only when it says so."""
+    api = _text(STATIC_DIR / "js" / "api.js")
+    assert "/worker/forget" in api
+    assert "for: role" in api, "an instruction is sent without its addressee"
+    actions = _text(STATIC_DIR / "js" / "actions.js")
+    # One place sets it, and only for "Save and accept": editing is not deciding.
+    assert actions.count("body.accept = true") == 1
+    assert re.search(r"if \(accept\) body\.accept = true", actions)
+    assert "api.advance(s.pid, phase ? { phase } : {})" in actions
+    page = _text(STATIC_DIR / "js" / "page.js")
+    assert "number_report" in page and "edited_record" in page
+    # The findings a paper would leave out are the server's list, with its reasons.
+    assert "left_out" in _text(STATIC_DIR / "js" / "paper.js")
+    for gone in ("meta.unverified", "(r.handled_in || {})"):
+        assert not any(gone in _text(path) for path in _files(".js")), (
+            f"the frontend still reads {gone}, which the server no longer writes that way"
+        )
+
+
+def test_the_stylesheet_covers_what_the_repairs_brought():
+    css = _text(STATIC_DIR / "css" / "app.css")
+    for selector in (
+        ".go-menu",
+        ".strip-sub",
+        ".strip.s-unverified",
+        ".top-prob",
+        ".ov-problems",
+        ".rq-for",
+        ".num-far",
+        ".numcheck-far",
+        ".review-num",
+        ".note-edited",
+        ".rested",
+        ".callout-interrupted",
+        ".lib-unreadable",
+        ".paper-numbers",
+        ".paper-left",
+    ):
+        assert selector in css, f"the stylesheet has no rule for {selector}"

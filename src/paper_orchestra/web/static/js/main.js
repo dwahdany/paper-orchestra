@@ -38,7 +38,7 @@ function focusKey(el) {
   let sel = '';
   if (el.id) sel = '#' + CSS.escape(el.id);
   else if (el.dataset.check) sel = 'input[data-check="' + CSS.escape(el.dataset.check) + '"]';
-  else if (el.dataset.act) sel = tag + '[data-act="' + CSS.escape(el.dataset.act) + '"]' + data(el, ['ref', 'eid', 'run', 'name', 'stamp', 'key', 'i', 'path', 'start', 'backend', 'minutes']);
+  else if (el.dataset.act) sel = tag + '[data-act="' + CSS.escape(el.dataset.act) + '"]' + data(el, ['ref', 'eid', 'run', 'name', 'stamp', 'key', 'i', 'path', 'start', 'backend', 'minutes', 'where', 'phase']);
   else if (el.dataset.input) sel = tag + '[data-input="' + CSS.escape(el.dataset.input) + '"]' + data(el, ['eid', 'name', 'kind', 'ref', 'key']) + (el.type === 'radio' ? '[value="' + CSS.escape(el.value) + '"]' : '');
   else if (tag === 'a' && el.getAttribute('href')) sel = 'a[href="' + CSS.escape(el.getAttribute('href')) + '"]';
   else if (el.classList.contains('node') && el.dataset.key) sel = '.node[data-key="' + CSS.escape(el.dataset.key) + '"]';
@@ -102,6 +102,8 @@ function openProject(pid) {
 function projectShell(route, store) {
   const error = store.loadError;
   if (!error) return html`<div class="blank loading" role="status"><div class="skeleton" aria-hidden="true"><i></i><i></i><i class="short"></i></div><p>Opening the project…</p></div>`;
+  /* the project is there and cannot be opened: the server's reason, which says what to repair */
+  if (error.code === 'project_unreadable') return html`<div class="blank blank-unreadable" role="alert"><h1>This project cannot be opened</h1><p>${error.message}</p><p class="quiet">Its files are untouched. Put right what the message names, in the project's folder, and try again.</p><p><button class="btn btn-primary" data-act="reload-project">Try again</button> <a class="btn" href="#/library">All projects</a></p></div>`;
   if (error.status === 404) return html`<div class="blank"><h1>There is no project “${route.pid}” here</h1><p>It may have been moved or deleted, or this address is from another workspace.</p><p><a class="btn btn-primary" href="#/library">All projects</a></p></div>`;
   return html`<div class="blank" role="alert"><h1>${error instanceof Unreachable ? 'The server is not answering' : 'The project could not be opened'}</h1><p>${error.message}</p><p><button class="btn btn-primary" data-act="reload-project">Try again</button> <a class="btn" href="#/library">All projects</a></p></div>`;
 }
@@ -203,9 +205,17 @@ window.addEventListener('hashchange', () => {
   handledHash = location.hash;
   if (app.ui.keepReject) app.ui.keepReject = false; else app.ui.rejecting = null;
   app.ui.confirmDelete = null;
+  app.ui.goMenu = null;       // a list of choices does not follow the person to another view
   render('route');
 });
 window.addEventListener('resize', () => renderSoon('resize', true));
+/* A project is plain files, and a person may have changed them in an editor meanwhile: that
+   writes no event. When they come back to this window the lists are read again, so that what
+   the server now reports (a problem in a file, a page changed by hand) is what is shown. */
+let lookedAt = 0;
+const lookAgain = () => { if (document.visibilityState === 'visible' && app.store && app.store.loaded && Date.now() - lookedAt > 3000) { lookedAt = Date.now(); app.store.refresh(); } };
+window.addEventListener('focus', lookAgain);
+document.addEventListener('visibilitychange', lookAgain);
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => render('theme'));
 connection.on((ok) => {
   /* the server is back: what could not be read while it was gone is asked for again */
@@ -220,6 +230,6 @@ api.health().then((health) => { app.ui.health = health; if (app.route.name !== '
 if (!location.hash || location.hash === '#' || location.hash === '#/') {
   /* straight to the composer when there is no project yet, to the library otherwise */
   history.replaceState(null, '', '#/library');
-  api.projects().then((data) => { app.ui.library = { projects: data.projects || [], error: null, loading: false, at: Date.now() }; if (!(data.projects || []).length && location.hash === '#/library') { history.replaceState(null, '', '#/start'); } render('boot'); }, () => render('boot'));
+  api.projects().then((data) => { app.ui.library = { projects: data.projects || [], unreadable: data.unreadable || [], error: null, loading: false, at: Date.now() }; if (!(data.projects || []).length && !(data.unreadable || []).length && location.hash === '#/library') { history.replaceState(null, '', '#/start'); } render('boot'); }, () => render('boot'));
 }
 render('boot');

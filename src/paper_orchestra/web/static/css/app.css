@@ -1187,3 +1187,106 @@ a.choice { text-decoration: none; }
 .details .linkish { justify-content: flex-start; }
 .details dt, .details dd { line-height: 24px; } .details dd code { line-height: 1.5; display: inline-block; vertical-align: middle; }
 .review-count { align-items: center; }
+
+/* ---------- what the repairs of the engine and the store brought to the interface ---------- */
+
+/* the control that continues a project: the main button, and beside it the phases the person can choose instead */
+.go { position: relative; display: inline-flex; flex: none; }
+.go > .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.go-more { padding: 0 7px; border-top-left-radius: 0; border-bottom-left-radius: 0; border-left-color: color-mix(in srgb, var(--on-btn) 34%, var(--btn)); }
+.go-more .ic { margin: 0; }
+.go-menu { position: absolute; z-index: 20; right: 0; top: calc(100% + 6px); width: min(360px, 86vw); padding: 6px; border: 1px solid var(--rule-2); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); text-align: left; white-space: normal; }
+.go-h, .go-f { padding: 6px 8px; font-size: 11.5px; color: var(--ink-3); }
+.go-h { font-weight: 600; letter-spacing: .07em; text-transform: uppercase; font-size: 10.5px; color: var(--ink-2); }
+.go-f { margin-top: 4px; border-top: 1px solid var(--rule); }
+.go-i { display: grid; gap: 2px; width: 100%; padding: 8px; border-radius: 5px; text-align: left; }
+.go-i:hover, .go-i:focus-visible { background: var(--hover); }
+.go-i:focus-visible { outline-offset: -2px; }
+.go-i b { font-size: 13px; font-weight: 600; } .go-i > span { font-size: 12px; line-height: 1.45; color: var(--ink-2); }
+.go-i .go-why { display: flex; gap: 6px; align-items: flex-start; margin-top: 3px; color: var(--prop); } .go-why .ic { flex: none; width: 13px; height: 13px; margin-top: 2px; }
+.in-clear .go-menu, .empty-card .go-menu { left: 50%; right: auto; transform: translateX(-50%); }
+/* what a press does where the button cannot say all of it; why the literature might be searched again */
+.go-says { font-size: 12.5px; line-height: 1.5; color: var(--ink-2); }
+.go-rec { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); }
+.go-rec > .ic { flex: none; color: var(--prop); } .go-rec > span { flex: 1 1 260px; min-width: 0; }
+.strip-sub { display: grid; gap: 4px; padding: 7px 14px 8px 38px; border-bottom: 1px solid var(--rule); background: var(--surface); }
+.strip-sub .go-rec > span { flex: 0 1 auto; }
+.ov-next { display: grid; gap: 6px; margin-top: 12px; max-width: 86ch; }
+.ov-actions .go-menu { left: 0; right: auto; }
+.strip.s-unverified { background: var(--prop-wash); } .s-unverified .strip-kicker, .s-unverified .strip-mark { color: var(--prop); }
+.strip.s-unverified .strip-text { white-space: normal; font-size: 13px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+.ov-unv { flex: 1 1 320px; font-size: 12.5px; max-width: 60ch; }
+
+/* a quiet mark in the top bar for a project whose files had to be read around */
+.top-prob { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 7px; margin-right: 2px; border-radius: 13px; font-size: 12px; color: var(--ink-3); }
+.top-prob:hover { color: var(--prop); background: var(--hover); } .top-prob .ic { width: 14px; height: 14px; }
+.ov-problems { margin-top: 22px; } .ov-problems .note { margin: 0; } .prob-body { min-width: 0; flex: 1; display: grid; gap: 6px; }
+.prob-note { max-width: 96ch; } .prob-act { font-size: 12px; }
+.ov-problems .problems { margin-top: 0; display: grid; gap: 3px; } .prob-path { font-size: 11.5px; color: var(--ink-2); } a.prob-path { text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--rule-2); }
+.prob-more summary { cursor: pointer; font-size: 12px; color: var(--ink-2); padding: 3px 0; min-height: 24px; } .prob-more .problems { margin-top: 4px; }
+
+/* instructions: who they are for, and which phases were given them */
+.rq-bar { flex-wrap: wrap; }
+.rq-for { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-3); margin-right: auto; min-width: 0; } .rq-for select { height: 28px; max-width: 100%; color: var(--ink); font-size: 12.5px; }
+.rq-send { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-top: 8px; } .rq-send .btn { flex: none; }
+.rq-when { font-size: 12px; line-height: 1.5; }
+.rq-m { line-height: 1.5; } .rq-for-who { color: var(--ink-2); } .rq-had { display: block; }
+.rq .rq-x { grid-row: 1 / 3; grid-column: 2; align-self: start; }
+
+/* the research cutoff: a month and a year */
+.cutoff-says { display: flex; gap: 7px; align-items: flex-start; margin-top: 6px; color: var(--ink-2); max-width: 60ch; } .cutoff-says .ic { flex: none; color: var(--prop); margin-top: 1px; }
+.cutoff-bad > summary .quiet { color: var(--prop); font-style: italic; }
+.cutoff-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 9px; } .cutoff-form select, .cutoff-form input { height: 28px; } .cutoff-form input { width: 64px; } .cutoff-form .note { flex: 1 1 100%; margin: 4px 0 0; }
+.adv-cutoff { grid-column: 1 / -1; display: grid; grid-template-columns: 148px auto minmax(0, 1fr); align-items: center; gap: 8px 12px; font-size: 12px; color: var(--ink-3); }
+.cutoff-fields { display: inline-flex; gap: 6px; } .cutoff-fields select { height: 30px; } .cutoff-fields input { width: 72px; height: 30px; }
+.cutoff-hint { line-height: 1.45; }
+
+/* the number check as the server reports it */
+.numcheck-far, .numcheck-skip, .numcheck-where, .numcheck-what { margin-top: 8px; font-size: 12px; line-height: 1.5; color: var(--ink-2); }
+.numcheck-far b, .numcheck-skip b, .numcheck-where b { font-weight: 600; color: var(--ink); } .numcheck-skip, .numcheck-what { color: var(--ink-3); } .numcheck-skip b { color: var(--ink-2); }
+.numcheck-n { font-variant-numeric: tabular-nums lining-nums; } .numcheck-far .numplace, .numcheck-where .numplace { text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--rule-2); }
+.prose .num-far, .num-far { border-bottom: 1.5px dotted var(--ink-3); } .num-far:hover { background: var(--hover); }
+.review-num { margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--prop-line); font-size: 12.5px; line-height: 1.5; } .review-num .numcheck-flag { background: var(--surface); }
+
+/* a record that was edited by hand */
+.note-edited > .ic { color: var(--prop); }
+
+/* what rests on an experiment that was rejected */
+.rested { display: grid; gap: 6px; } .note-rejected .rested { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--rule); }
+.rested-l { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 4px; font-size: 12.5px; }
+.rested-h { margin-right: 6px; font-size: 12px; color: var(--ink-3); } .rested-only { margin: 0 8px 0 0; font-size: 11.5px; font-style: italic; color: var(--prop); }
+.rested-say { font-size: 12px; line-height: 1.5; color: var(--ink-3); }
+
+/* a run whose worker is gone */
+.callout-interrupted h2 .ic { color: var(--prop); flex: none; }
+.st-word > .ic { width: 14px; height: 14px; }
+.log-mask { font-size: 11px; white-space: nowrap; }
+
+/* a project that cannot be opened */
+.lib-unreadable { margin-top: 34px; } .lib-unreadable h2 { font: 600 10.5px/1.3 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); padding-bottom: 8px; border-bottom: 1px solid var(--rule-2); }
+.lib-bad { display: flex; gap: 10px; align-items: flex-start; padding: 12px 0; border-bottom: 1px solid var(--rule); } .lib-bad > .ic { flex: none; margin-top: 2px; color: var(--prop); }
+.lib-bad .lib-dir { margin: 0; font-size: 12.5px; color: var(--ink); } .lib-bad p { margin-top: 3px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-width: 96ch; }
+.lib-unreadable > .quiet { margin-top: 10px; font-size: 12px; }
+.blank-unreadable { max-width: 640px; } .blank-unreadable .quiet { font-size: 12.5px; }
+
+/* the paper: what the number check says about the findings it would be written from */
+.paper-numbers { margin-top: 30px; } .pn-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; align-items: start; padding: 9px 0; border-bottom: 1px solid var(--rule); font-size: 12.5px; line-height: 1.5; }
+.pn-row .chip { margin-top: 1px; } .pn-row p + p { margin-top: 4px; }
+.pn-flag { display: flex; gap: 7px; align-items: flex-start; } .pn-flag .ic { flex: none; margin-top: 2px; color: var(--prop); }
+.pn-clean, .paper-numbers > .quiet, .paper-left > .quiet { margin-top: 9px; font-size: 12.5px; }
+.paper-left { margin-top: 30px; } .paper-left .pl-why { color: var(--ink-2); } .paper-from .pf-how b { display: inline; font: inherit; font-weight: 600; color: var(--ink-2); }
+.paper-started { margin-bottom: 12px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-width: 96ch; }
+
+@media (max-width: 960px) {
+  .strip-sub { padding-left: 14px; }
+  .adv-cutoff { grid-template-columns: 148px minmax(0, 1fr); gap: 6px 8px; } .cutoff-hint { grid-column: 2; }
+  .go-menu { right: auto; left: 0; } .strip .go-menu { left: auto; right: 0; }
+}
+
+/* a page that was accepted can still be rejected */
+.page-unaccept { font-size: 12px; margin-left: 4px; color: var(--ink-3); }
+.note-unaccept { display: grid; gap: 8px; border-style: dashed; } .note-unaccept .reject-form { margin: 0; }
+.numcheck-of { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.ev-given { cursor: help; }
+.plan-problems { margin-top: 14px; }
+.paper-ended { margin-top: 14px; }

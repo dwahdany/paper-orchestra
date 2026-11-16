@@ -6,11 +6,13 @@ import { app, link } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf } from './util.js';
 import { TONE, agentName, glyph, icon, pageGlyph } from './vocab.js';
-import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, reviewBar, reviewTag, stateTag, who } from './page.js';
+import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, planProblemsHTML, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
 
 const GROUPS = [
   ['Needs your approval', (x) => x.review !== 'rejected' && (x.review === 'proposed' || x.state === 'planned' || !x.state)],
-  ['Approved, queued and running', (x) => x.review === 'accepted' && (x.state === 'approved' || x.state === 'queued' || x.state === 'running')],
+  /* the page says "running" and nothing is running it: its worker is gone, and it waits for the person */
+  ['Interrupted', (x) => x.review === 'accepted' && x.state === 'running' && !!x.interrupted],
+  ['Approved, queued and running', (x) => x.review === 'accepted' && (x.state === 'approved' || x.state === 'queued' || (x.state === 'running' && !x.interrupted))],
   ['Failed', (x) => x.review === 'accepted' && x.state === 'failed'],
   ['Finished', (x) => x.review === 'accepted' && (x.state === 'succeeded' || x.state === 'cancelled')],
   ['Rejected', (x) => x.review === 'rejected'],
@@ -26,8 +28,9 @@ function subline(store, x) {
   if (x.review === 'rejected') return html`rejected${(x.meta || {}).decision_reason ? ': ' + x.meta.decision_reason : ''}`;
   if (x.review === 'proposed') return html`waiting for you · proposed ${ago(x.updated)}`;
   if (x.state === 'planned' || !x.state) return (x.meta || {}).state_reason ? html`<span class="t-prop">back to planned · ${plain(x.meta.state_reason)}</span>` : html`accepted · runs only after you approve it`;
-  if (x.state === 'approved') return html`approved · runs with the next run phase, or now`;
-  if (x.state === 'queued') return html`queued · starts when a worker takes it`;
+  if (x.state === 'approved') return html`approved · runs first when you continue, or now`;
+  if (x.state === 'queued') return html`queued · runs first when you continue, or now`;
+  if (x.state === 'running' && x.interrupted) return html`<span class="t-prop">interrupted · the worker that ran it is gone · run it again, or cancel it</span>`;
   if (x.state === 'running') return html`<span class="ex-tail" data-tail="${x.id}">${store.tails[x.id] || 'run ' + (run.number || '') + ' started ' + ago(run.started)}</span>`;
   if (x.state === 'succeeded') return html`${metricLine(run) || 'succeeded'}`;
   if (x.state === 'failed') return html`<span class="t-neg">${(x.meta && x.meta.state_reason) || run.error || 'failed'}</span>`;
@@ -37,12 +40,13 @@ function subline(store, x) {
 function stateCell(x) {
   if (x.review === 'rejected') return html`<span class="tag tag-rejected">rejected</span>`;
   if (x.review === 'proposed') return html`<span class="tag tag-proposed">proposed</span>`;
+  if (x.state === 'running' && x.interrupted) return html`<span class="st-word t-prop">${icon('warn')}interrupted</span>`;
   const tone = TONE[x.state] || 'open';
   return html`<span class="st-word t-${tone}">${glyph('experiment', 'accepted', x.state, 14)}${x.state || 'planned'}</span>`;
 }
 function timeCell(x) {
   const run = x.last_run || {}, m = x.meta || {};
-  if (x.state === 'running' && run.started) return sinceClock(run.started);
+  if (x.state === 'running' && run.started && !x.interrupted) return sinceClock(run.started);
   if (run.seconds != null && (x.state === 'succeeded' || x.state === 'failed' || x.state === 'cancelled')) return duration(run.seconds);
   return m.est_minutes != null ? 'est. ' + minutes(m.est_minutes) : '';
 }
@@ -61,6 +65,9 @@ function budgetLine(store) {
 }
 
 /* ---------- the log of a run: fetched in pieces, followed while the run is live ---------- */
+/* What stands in a log where a job printed a credential (the server and the job backends put
+   it there). It is a mark, not an error, and is shown as the plain text it is. */
+const MASK = '[redacted]';
 const logs = new Map();
 let following = null, pollTimer = 0;
 const MAX_LOG = 400000;
@@ -71,6 +78,8 @@ async function fetchLog(store, eid, number, entry) {
   try {
     const piece = await api.runLog(store.pid, eid, number, entry.next == null ? -65536 : entry.next);
     const text = piece.text || '';
+    /* a log that is a link out of the project, or not a file, is not read: the server says so */
+    entry.problem = piece.problem || '';
     if (piece.reset || entry.next == null) entry.text = text; else entry.text += text;
     if (entry.text.length > MAX_LOG) entry.text = entry.text.slice(-MAX_LOG);
     entry.cut = entry.next == null && piece.offset > 0 ? piece.offset : entry.cut || 0;
@@ -80,8 +89,10 @@ async function fetchLog(store, eid, number, entry) {
     entry.error = null;
     $$('[data-log="' + CSS.escape(eid + '/' + number) + '"]').forEach((el) => {
       const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-      if (piece.reset || el.dataset.empty) { el.textContent = entry.text; delete el.dataset.empty; } else if (text) el.append(text);
+      if (piece.reset || el.dataset.empty) { el.textContent = entry.problem ? plain(entry.problem) : entry.text; delete el.dataset.empty; } else if (text) el.append(text);
       if (stick) el.scrollTop = el.scrollHeight;
+      const mask = el.closest('.log') && el.closest('.log').querySelector('.log-mask');
+      if (mask) mask.hidden = entry.text.indexOf(MASK) < 0;
     });
     /* the log of a run that has ended is also where its failure quotes from: drawn again,
        after the text is in place (a render before it would be given the same text twice) */
@@ -122,9 +133,10 @@ app.hooks.runLog = (event) => {
 function logHTML(store, eid, run) {
   const entry = logOf(store, eid, run), live = run.status === 'running', open = app.ui.logOpen;
   return html`<div class="log${open ? ' open' : ''}${live ? ' live' : ''}"><div class="log-bar"><span>${live ? 'Live log' : 'log.txt'} · run ${run.number}</span>${live ? html`<span class="log-follow">following</span>` : ''}
+    <span class="log-mask quiet" data-tip="Where the job printed a credential, the log shows [redacted] in its place. The value is never sent to this page."${entry.text.indexOf(MASK) < 0 ? raw(' hidden') : ''}>credentials are masked as [redacted]</span>
     <a class="linkish log-open" href="${api.fileUrl(store.pid, 'experiments/' + eid + '/runs/' + run.number + '/log.txt')}" target="_blank" rel="noopener">Open the whole log</a>
     <button class="btn btn-quiet btn-s" data-act="toggle-log" aria-expanded="${tf(open)}">${open ? 'Collapse' : 'Expand'} <kbd>L</kbd></button></div>
-    <pre class="log-body" tabindex="0" aria-label="Log of run ${run.number}" data-log="${eid}/${run.number}"${entry.loaded ? '' : raw(' data-empty="1"')} data-follow>${entry.loaded ? entry.text || (live ? '' : 'The run wrote nothing to its log.') : entry.error ? 'The log could not be read: ' + entry.error.message : 'Reading the log…'}</pre></div>`;
+    <pre class="log-body" tabindex="0" aria-label="Log of run ${run.number}" data-log="${eid}/${run.number}"${entry.loaded ? '' : raw(' data-empty="1"')} data-follow>${entry.loaded ? (entry.problem ? plain(entry.problem) : entry.text || (live ? '' : 'The run wrote nothing to its log.')) : entry.error ? 'The log could not be read: ' + entry.error.message : 'Reading the log…'}</pre></div>`;
 }
 
 /* ---------- pieces of one experiment ---------- */
@@ -137,8 +149,10 @@ function approveHTML(store, page, data) {
   const limits = (store.project.settings || {}).limits || {};
   const chosen = approvalChoice(eid, data);
   const runnable = options.filter((o) => o.can_run);
-  const capMin = Math.max(1, Math.floor((limits.experiment_seconds || 900) / 60));
-  const planMin = Math.max(1, Math.round((plan.timeout_seconds || 900) / 60));
+  /* the longest one run may take is the project's limit; a plan that names no time gets that */
+  const capSeconds = limits.experiment_seconds || plan.timeout_seconds || 60;
+  const capMin = Math.max(1, Math.floor(capSeconds / 60));
+  const planMin = Math.max(1, Math.round((plan.timeout_seconds || capSeconds) / 60));
   const limitMin = chosen.minutes != null && chosen.minutes !== '' ? chosen.minutes : Math.min(planMin, capMin);
   /* network access is never taken from the plan: off until the person turns it on, and a
      plan that asks for it is answered explicitly (`networkAsk`) */
@@ -177,7 +191,7 @@ function approveHTML(store, page, data) {
               <button class="btn" data-act="edit" data-ref="${page.path}">Edit <kbd>E</kbd></button>
               <button class="btn btn-neg-quiet" data-act="reject-ask" data-ref="${page.path}">Reject… <kbd>R</kbd></button>`
           : html`<button class="btn btn-primary" data-act="approve" data-eid="${eid}" data-start="1"${runnable.length ? '' : raw(' disabled')}>${icon('play')}Approve and run now</button>
-              <button class="btn" data-act="approve" data-eid="${eid}"${runnable.length ? '' : raw(' disabled')}>Approve, run with the next run phase</button>
+              <button class="btn" data-act="approve" data-eid="${eid}"${runnable.length ? '' : raw(' disabled')} data-tip="It runs first, and is analysed, when you next continue the project">Approve, run when I continue</button>
               <button class="btn" data-act="edit" data-ref="${page.path}">Edit the plan <kbd>E</kbd></button>
               ${app.ui.reapprove === eid ? html`<button class="btn btn-quiet" data-act="reapprove" data-eid="">Cancel</button>` : ''}`}</div></div>`}
   </section>`;
@@ -227,13 +241,13 @@ function failureHTML(store, page, data, run) {
     /* stopped together with the agents: the experiment is queued again, the page offers "Run now" above */
     title = run.requeued ? 'Stopped when you stopped the agents' : 'Cancelled by you';
     say = run.requeued
-      ? html`<p>This run was under way${run.seconds != null ? ' for ' + duration(run.seconds) : ''} when you pressed Stop. The experiment is queued again: it runs with the next run phase, or now. What the run had written is kept below.</p>`
+      ? html`<p>This run was under way${run.seconds != null ? ' for ' + duration(run.seconds) : ''} when you pressed Stop. The experiment is queued again: it runs first when you continue, or now. What the run had written is kept below.</p>`
       : html`<p>The run was stopped at your request${run.seconds != null ? ' after ' + duration(run.seconds) : ''}. Nothing was repaired or retried, and what it had written is kept below.</p>`;
     actions = run.requeued ? '' : html`${again}${elsewhere}`;
   } else {
     const repairs = run.repairs || [];
     title = 'Failed with a programming error';
-    say = html`<p>${repairs.length ? html`The runner repaired the code ${repairs.length === 1 ? 'once' : repairs.length + ' times'} before this run (${repairs.length} of ${limits.repair_rounds != null ? limits.repair_rounds : 3} repairs used), and it failed again.` : 'The code ended with an error. The runner has not repaired it.'}</p>`;
+    say = html`<p>${repairs.length ? html`The runner repaired the code ${repairs.length === 1 ? 'once' : repairs.length + ' times'} before this run (${repairs.length}${limits.repair_rounds != null ? ' of ' + limits.repair_rounds : ''} repairs used), and it failed again.` : 'The code ended with an error. The runner has not repaired it.'}</p>`;
     actions = html`${edit}${again}${elsewhere}`;
   }
   /* a run the person cancelled is their own doing: it is said plainly, not as an alarm */
@@ -311,7 +325,7 @@ function runBlock(store, page, data, run, open) {
     ${failed && Object.keys(run.metrics || {}).length ? html`<h3 class="sec-h">Metrics <span class="quiet">what the run had written when it ended</span></h3>${metricsHTML(run, data)}` : ''}
     ${(run.notes || []).length ? html`<ul class="run-notes">${run.notes.map((n) => html`<li>${n}</li>`)}</ul>` : ''}
     ${logHTML(store, eid, run)}
-    <p class="run-rec">${result ? html`Result record <a class="chip" href="${link({ view: 'wiki', sel: result.path, sub: '' })}" data-sel="${result.path}">${pageGlyph(result, 12)}${label(result)}</a> was written by code from this run.` : run.status === 'running' ? 'The result record is written by code when the run ends.' : ''}
+    <p class="run-rec">${result ? html`Result record <a class="chip" href="${link({ view: 'wiki', sel: result.path, sub: '' })}" data-sel="${result.path}">${pageGlyph(result, 12)}${label(result)}</a> was written by code from this run${(result.meta || {}).edited_by_person ? html`, and <b class="rec-edited">edited by hand since</b>: it no longer reads as code wrote it` : ''}.` : run.status === 'running' ? 'The result record is written by code when the run ends.' : ''}
       ${run.code_digest ? html`<span class="quiet">Code digest ${String(run.code_digest).slice(0, 12)}…</span>` : ''}</p></div></div>`;
 }
 
@@ -366,7 +380,7 @@ function detailHTML(store, page, route) {
   const head = html`<header class="page-head"><div class="page-kicker"><span class="kicker-kind">${pageGlyph(page, 18)}<span>Experiment <b>${eid}</b></span></span>
       <span class="page-tools"><a class="ibtn" href="${link({ view: 'map', sel: page.path, sub: '' })}" data-tip="Show on the map (1)" aria-label="Show on the map">${icon('map')}</a><a class="ibtn" href="${link({ view: 'wiki', sel: page.path, sub: '' })}" data-tip="Open in the wiki (2)" aria-label="Open in the wiki">${icon('open')}</a></span></div>
     <h1 class="page-title">${page.title}</h1>${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
-    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span></div>
+    <div class="page-status">${reviewTag(page)}${page.state === 'running' && row.interrupted ? html`<span class="tag tag-proposed tag-interrupted">interrupted</span>` : stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span>${unacceptLink(page)}</div>
     ${tests.length ? html`<div class="ex-testsline"><span class="quiet">Tests</span>${tests.map((h) => html`<a class="chip" href="${link({ view: 'wiki', sel: h.path, sub: '' })}" data-sel="${h.path}" data-tip="${pageTip(h)}">${pageGlyph(h, 12)}<b>${h.id}</b> ${h.title}</a>`)}</div>` : ''}</header>`;
   if (!data) {
     return html`${head}${entry && entry.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The experiment could not be loaded: ${entry.error.message} <button class="linkish" data-act="reload-experiment" data-eid="${eid}">Try again</button></span></div>`
@@ -374,9 +388,22 @@ function detailHTML(store, page, route) {
   }
   const runs = (data.runs || []).slice().sort((a, b) => (b.number || 0) - (a.number || 0));
   const latest = runs[0];
-  const busy = store.project.worker && store.project.worker.state !== 'idle';
+  const worker = store.project.worker || {};
+  const busy = !!worker.state && worker.state !== 'idle';
+  /* why a run cannot start right now, where one is offered */
+  const held = worker.verified === false ? 'The project\'s files name a worker this server cannot verify: nothing can be started until it has ended or is forgotten (see the overview).' : 'The agents are at work; it runs when they reach it, or when they have stopped.';
+  const starting = !!app.ui.starting[eid];
+  const interrupted = page.state === 'running' && (data.interrupted || row.interrupted);
   let top = '';
   if (page.review === 'rejected') top = reviewBar(store, page, { part: 'page' });
+  else if (interrupted && app.ui.reapprove !== eid) {
+    /* the page says "running" and nothing runs it: the server's own sentence, Run to start it
+       again (what is left of the unfinished run is settled first), or Cancel */
+    top = html`<section class="callout callout-changed callout-interrupted" data-interrupted="${eid}"><h2>${icon('warn')}The run was interrupted</h2>
+      <p>${plain(data.interrupted_note) || 'The worker that ran ' + eid + ' is gone and nothing is running it now. Run it again to go on, or cancel it.'}</p>
+      <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Settling the unfinished run…' : 'Run it again'}</button>
+        <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="The unfinished run is settled and the experiment recorded as cancelled; it can be approved again">Cancel it</button></div></section>`;
+  }
   else if (page.review === 'proposed' || page.state === 'planned' || !page.state || app.ui.reapprove === eid) top = approveHTML(store, page, data);
   else if ((page.state === 'approved' || page.state === 'queued') && data.approval && data.approval.digest && data.approval.matches === false) {
     /* approved, and then the plan or the code changed: a run would be refused, so the page
@@ -389,8 +416,8 @@ function detailHTML(store, page, route) {
         <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="Take the approval back: it is recorded as cancelled and can be approved again">Do not run it</button></div></section>`;
   } else if (page.state === 'approved' || page.state === 'queued') {
     top = html`<section class="callout"><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
-      <p>${busy ? 'The agents are at work; it runs when they reach it, or when they have stopped.' : 'It runs with the next run phase, or now.'}</p>
-      <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy ? raw(' disabled') : ''}>${icon('play')}Run now</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
+      <p>${busy ? held : 'It runs first, and is analysed, when you continue the project; or run it now.'}</p>
+      <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Starting…' : 'Run now'}</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
         <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="Take the approval back: it is recorded as cancelled and can be approved again">Do not run it</button></div></section>`;
   } else if (page.state === 'running' && latest && latest.status === 'running') top = liveHTML(store, page, data, latest);
   else if (page.review === 'accepted' && !runs.length && (page.state === 'cancelled' || page.state === 'failed' || page.state === 'succeeded') && app.ui.reapprove !== eid) {
@@ -402,8 +429,8 @@ function detailHTML(store, page, route) {
   else if (page.state === 'running') top = html`<section class="callout"><h2><span class="live-dot" aria-hidden="true"></span>Starting…</h2><p>The run is being set up.</p></section>`;
   const openRun = app.ui.runOpen[eid] === undefined ? (latest && latest.status !== 'running' ? latest.number : null) : app.ui.runOpen[eid];
   const again = page.review === 'accepted' && (page.state === 'succeeded' || page.state === 'cancelled' || page.state === 'failed') && app.ui.reapprove !== eid;
-  const listed = runs.filter((r) => !(r.status === 'running' && page.state === 'running'));
-  return html`${head}${top}
+  const listed = runs.filter((r) => !(r.status === 'running' && page.state === 'running' && !interrupted));
+  return html`${head}${planProblemsHTML(page)}${unacceptForm(page)}${top}
     ${listed.length ? html`<section class="exp-runs"><h2 class="sec-t">${listed.length < runs.length ? 'Earlier runs' : 'Runs'} <span class="quiet">${listed.length}</span>${again ? html`<button class="btn btn-s tabs-r" data-act="reapprove" data-eid="${eid}">Run again…</button>` : ''}</h2>
       ${listed.map((r) => runBlock(store, page, data, r, r.number === openRun))}</section>` : ''}
     <div class="exp-cols"><section class="exp-plan"><h2 class="sec-t">Plan</h2><div class="prose prose-s" data-plan="1" data-prose="${page.path}">${raw(data.html)}</div></section>${codeSection(store, page, data)}</div>
@@ -447,7 +474,7 @@ export const experimentsView = {
       if (!list.length) return '';
       return html`<div class="idx-group"><h3>${g[0]}<span>${list.length}</span></h3>${list.map((x) => html`
         <a class="idx idx-2 r-${x.review}${x.path === cur.path ? ' cur' : ''}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}"${x.path === cur.path ? raw(' aria-current="page"') : ''}>${pageGlyph(x, 16)}
-          <span class="idx-name">${pageName(x)}<span class="idx-sub">${x.review === 'proposed' ? 'proposed · ' + agentName(x.author) : x.review === 'rejected' ? 'rejected' : x.state || 'planned'}</span></span></a>`)}</div>`;
+          <span class="idx-name">${pageName(x)}<span class="idx-sub">${x.review === 'proposed' ? 'proposed · ' + agentName(x.author) : x.review === 'rejected' ? 'rejected' : x.state === 'running' && x.interrupted ? 'interrupted' : x.state || 'planned'}</span></span></a>`)}</div>`;
     });
     setHTML(root, html`<div class="exp"><nav class="exp-rail" aria-label="Experiments"><a class="back" href="${link({ view: 'experiments', sel: '', sub: '' })}">All experiments</a>${rail}<p class="rail-budget">${budgetLine(store)}</p></nav>
       <div class="exp-main"><div class="exp-page">${detailHTML(store, cur, route)}</div></div></div>`);

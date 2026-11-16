@@ -1,16 +1,16 @@
 /* What the person can do: one table of actions (the `data-act` attributes of the markup),
    one handler each for clicks, submits, typing, changes, drops and keys. */
 
-import { VIEWS, app, codeKey, go, reasonsKey, requestKey, select } from './core.js';
+import { VIEWS, app, codeKey, go, keepRested, link, reasonsKey, requestForKey, requestKey, select } from './core.js';
 import { api, connection, Unreachable } from './api.js';
-import { $, ago, bytes, cap, lineDiff, plain, plural, storage } from './util.js';
-import { STAGES, EXTRA_KINDS, agentName } from './vocab.js';
+import { $, $$, ago, bytes, cap, cutoffFrom, cutoffParts, cutoffWords, lineDiff, plain, plural, storage } from './util.js';
+import { STAGES, EXTRA_KINDS, PHASE_DO, ROLE, agentName, phaseName, roleName } from './vocab.js';
 import { dropDraft, isDirty, label, schedulePreview, touchDraft } from './page.js';
 import { mapView } from './map.js';
 import { currentItem } from './inbox.js';
 import { EXAMPLE, clearComposer, composer, composerReady, composerSettings, keepComposer, loadDoctor, loadLibrary, totalSize } from './home.js';
 import { clearToast, closeOverlay, openHelp, openNewPage, openPalette, overlayOpen, renderToast, say, sayError, trapTab } from './overlays.js';
-import { theme } from './shell.js';
+import { dismissNotices, theme } from './shell.js';
 
 const GRACE_MS = 5000;
 /** How the page moves to something: at once for a person who asked for less motion. */
@@ -21,6 +21,15 @@ function keepReasons() {
   const typed = {};
   Object.keys(app.ui.reasons).forEach((ref) => { if (String(app.ui.reasons[ref] || '').trim()) typed[ref] = app.ui.reasons[ref]; });
   if (Object.keys(typed).length) storage.set(reasonsKey(app.store.pid), typed); else storage.remove(reasonsKey(app.store.pid));
+}
+/** The instruction being typed is kept on this device until it is sent, and whom it is for
+    with it: a reload must not turn an instruction for the scout into one for everyone. */
+function keepRequest() {
+  if (!app.store) return;
+  const rq = app.ui.request, pid = app.store.pid;
+  if (!rq.text.trim()) { storage.remove(requestKey(pid)); storage.remove(requestForKey(pid)); return; }
+  storage.set(requestKey(pid), rq.text);
+  if (rq.for && rq.for !== 'all') storage.set(requestForKey(pid), rq.for); else storage.remove(requestForKey(pid));
 }
 let batchCounter = 0;
 const store = () => app.store;
@@ -74,8 +83,16 @@ async function flush(entries) {
   try {
     const out = await s.send(entries);
     if (out.failed.length) sayError(out.failed.map(failureText).join(' '));
-    out.results.forEach((result, i) => { if (result.ok && result.worker_error) sayError(cap(entries[i].label) + ' is accepted and approved, but the run could not start now: ' + plain(result.worker_error.message) + ' It runs with the next run phase.'); });
+    out.results.forEach((result, i) => { if (result.ok && result.worker_error) sayError(cap(entries[i].label) + ' is accepted and approved, but the run could not start now: ' + plain(result.worker_error.message) + ' It runs when you continue.'); });
     out.failed.forEach((failure) => { const page = failure.entry.item && failure.entry.item.page; if (page && page.kind === 'experiment' && page.id) s.invalidateExperiment(page.id); });   // its code may be what changed: read it again
+    /* an experiment was rejected: the server says what rests on it (the findings based on its
+       runs, the verdicts they carry). Kept for its page, which lists it with links, and said. */
+    out.results.forEach((result, i) => {
+      const deps = result.ok && result.dependents, entry = entries[i];
+      if (!deps || !entry) return;
+      keepRested(s, entry.target, deps);
+      if (!out.failed.length && restCount(deps)) say(restSentence(entry.label, deps), { ms: 12000, action: { href: link({ view: 'experiments', sel: entry.target, sub: '' }), label: 'Show' } });
+    });
     app.render('decided');
     return out;
   } catch (error) {
@@ -159,37 +176,81 @@ function undo() {
   return true;
 }
 
+/** How much rests on a rejected experiment, as the server counted it. */
+const restCount = (deps) => ((deps || {}).findings || []).length + ((deps || {}).hypotheses || []).length;
+/** "E1 is rejected. 2 findings and 2 verdicts rest on its runs and were not changed: its page lists them." */
+function restSentence(name, deps) {
+  const findings = (deps.findings || []).length, verdicts = (deps.hypotheses || []).length, one = findings + verdicts === 1;
+  return cap(name) + ' is rejected. ' + [findings ? plural(findings, 'finding') : '', verdicts ? plural(verdicts, 'verdict on a hypothesis', 'verdicts on hypotheses') : ''].filter(Boolean).join(' and ')
+    + (one ? ' rests' : ' rest') + ' on its runs and ' + (one ? 'was' : 'were') + ' not changed: its page lists ' + (one ? 'it' : 'them') + '.';
+}
+
+/** Reject a page that was accepted before. There is nothing optimistic about it and no
+    short undo: the server is asked at once, and for an experiment it answers with what
+    rests on its runs, which is said with the confirmation. */
+async function rejectAccepted(path, reason) {
+  const s = store(), page = s.byPath.get(path);
+  if (!page) return;
+  app.ui.rejecting = null;
+  delete app.ui.reasons[path];
+  keepReasons();
+  try {
+    const answer = await api.review(s.pid, [{ ref: path, decision: 'reject', reason: reason || null, base_updated: page.updated }]);
+    const result = (answer.results || [])[0] || {};
+    s.invalidate(path);
+    if (page.kind === 'experiment' && page.id) s.invalidateExperiment(page.id);
+    await s.refreshNow();
+    if (!result.ok) sayError(result.status === 409 ? cap(label(page)) + ' changed after you read it, so it was not rejected. It is shown as it is now.' : cap(label(page)) + ' was not rejected: ' + plain((result.error && result.error.message) || 'the server refused it.'));
+    else {
+      const deps = result.dependents;
+      if (deps) keepRested(s, path, deps);
+      /* the page in front of the person now says that it is rejected, and lists what rests on it with links */
+      say(restCount(deps) ? restSentence(label(page), deps) : 'Rejected ' + label(page) + ' after all. It is kept with your reason.', { ms: 12000 });
+    }
+  } catch (error) { sayError(cap(label(page)) + ' was not rejected: ' + message(error)); }
+  app.render('decided');
+}
+
 /* ---------- editing a page ---------- */
 const draftKey = (path) => 'po-draft:' + store().pid + ':' + path;
-async function saveEdit(path) {
+/** Save what is in the editor. Editing is not deciding: a proposal stays a proposal and a
+    rejected page stays rejected, unless `accept` says that the save is also the decision
+    ("Save and accept"). The toast says which of the two was done. */
+async function saveEdit(path, accept) {
   const s = store(), page = s.byPath.get(path), draft = app.ui.drafts[draftKey(path)];
   if (!page || !draft || draft.saving) return;
   if (!draft.title.trim()) { draft.error = 'A page needs a title.'; app.render('edit'); return; }
-  draft.saving = true; draft.error = null;
+  draft.saving = true; draft.error = null; draft.accepting = !!accept;
   app.render('saving');
   const fields = { summary: draft.summary };
   if (draft.state && draft.state !== (draft.base.state || '')) fields.state = draft.state;
   try {
-    if (draft.proposal || page.review === 'proposed') {
-      const ref = draft.proposal || path;
-      const entry = { ref, decision: 'accept', edits: { body: draft.body, fields: Object.assign({ title: draft.title }, fields) }, base_updated: draft.proposal ? null : draft.base_updated, target: path, label: label(page), sent: false };
+    if (draft.proposal) {
+      /* a suggested edit has no state of its own to save into: the person's version of it is applied, which decides it */
+      const entry = { ref: draft.proposal, decision: 'accept', edits: { body: draft.body, fields: Object.assign({ title: draft.title }, fields) }, base_updated: null, target: path, label: label(page), sent: false };
       const out = await s.send([entry]);
       if (out.failed.length) {
         const result = out.failed[0].result;
         if (result.status === 409) { const view = await api.page(s.pid, path); draft.conflict = view.page; }
-        else draft.error = (result.error && result.error.message) || 'The server refused it.';
+        else draft.error = plain((result.error && result.error.message) || 'The server refused it.');
         return;
       }
       dropDraft(s, path);
       go({ sub: '' }, true);
-      say(draft.proposal ? 'Saved your version of the change to ' + label(page) + '.' : 'Saved your version and accepted ' + label(page) + '.');
+      say('Saved your version of the change to ' + label(page) + ', and accepted it.');
     } else {
-      await api.putPage(s.pid, path, { title: draft.title, body: draft.body, fields, base_updated: draft.base_updated });
+      const body = { title: draft.title, body: draft.body, fields, base_updated: draft.base_updated };
+      if (accept) body.accept = true;
+      const view = await api.putPage(s.pid, path, body);
+      const now = (view && view.page && view.page.review) || page.review;
       dropDraft(s, path);
       s.invalidate(path);
       await s.refreshNow();
       go({ sub: '' }, true);
-      say('Saved. The previous version is in the history.');
+      say(now === 'proposed' ? 'Saved. ' + label(page) + ' is still a proposal: it waits for your decision.'
+        : now === 'rejected' ? 'Saved. ' + label(page) + ' stays rejected.'
+          : accept ? 'Saved your version and accepted ' + label(page) + '.'
+            : 'Saved. The previous version is in the history.');
     }
   } catch (error) {
     if (error.status === 409 && error.body && error.body.page) draft.conflict = error.body.page;
@@ -215,11 +276,14 @@ async function restoreVersion(path, stamp) {
 }
 
 /* ---------- the agents ---------- */
-async function advance() {
+/** Start the agents. Without `phase` the engine goes on by itself (what is approved runs
+    first); with it, the phase the person chose is run as chosen. */
+async function advance(phase) {
   const s = store();
+  app.ui.goMenu = null;
   await flushAll();
   try {
-    const answer = await api.advance(s.pid, {});
+    const answer = await api.advance(s.pid, phase ? { phase } : {});
     if (answer.worker) s.project.worker = answer.worker;
     if (app.ui.toast && app.ui.toast.kind !== 'error' && !app.ui.toast.undo) clearToast();   // "Stopping…" is no longer true
     if (app.route.view !== 'map' && app.route.view !== 'overview') go({ view: 'map', sel: '', sub: '' });
@@ -228,7 +292,27 @@ async function advance() {
   } catch (error) {
     sayError(error.status === 409 ? error.message : 'The agents were not started: ' + message(error));
     s.refresh();
+    app.render('advance');
   }
+}
+/** Clear the name of a worker the server cannot verify. Nothing is signalled. */
+async function forgetWorker() {
+  const s = store();
+  if (app.ui.forgetting) return;
+  app.ui.forgetting = true;
+  app.render('forget');
+  try {
+    const answer = await api.forgetWorker(s.pid);
+    if (answer.worker) s.project.worker = answer.worker;
+    await s.refreshNow();
+    const still = s.project.worker && s.project.worker.state !== 'idle';
+    say(still ? 'The worker was not forgotten: it is still named in the project\'s files.' : 'Forgotten. Nothing was signalled or stopped; the project can be continued. If a worker is in fact at work, it shows again.');
+  } catch (error) { sayError('Not forgotten: ' + message(error)); s.refresh(); }
+  app.ui.forgetting = false;
+  app.render('forget');
+  /* the button is gone: the keyboard goes to what can be done now */
+  const next = $('.ov-actions [data-act="continue"], .ov-actions [data-go-main], .strip [data-act="continue"], .strip [data-go-main], [data-act="forget-worker"]');
+  if (next && (!document.activeElement || document.activeElement === document.body)) next.focus({ preventScroll: true });
 }
 async function stopAgents() {
   const s = store();
@@ -237,7 +321,7 @@ async function stopAgents() {
     if (answer.worker) s.project.worker = answer.worker;
     const kind = (answer.worker || {}).kind;
     say(answer.worker && answer.worker.state === 'idle' ? 'Nothing was running.'
-      : kind === 'run' ? 'Stopping the run. The experiment is queued again: it runs with the next run phase, or now.'
+      : kind === 'run' ? 'Stopping the run. The experiment is queued again: it runs when you continue, or now.'
       : kind === 'write' ? 'Stopping the write-up. What it has written is kept; it can be started again.'
       : 'Stopping. What was written so far is kept; the phase can be resumed.');
     s.refresh();
@@ -292,8 +376,8 @@ async function approve(eid, start, overrides) {
     if (answer.worker) s.project.worker = answer.worker;
     s.invalidateExperiment(eid);
     await s.refreshNow();
-    if (answer.worker_error) sayError(eid + ' is approved, but the run could not start now: ' + answer.worker_error.message + ' It runs with the next run phase.');
-    else say(start ? eid + ' is approved; its run is starting.' : eid + ' is approved. It runs with the next run phase, or now.');
+    if (answer.worker_error) sayError(eid + ' is approved, but the run could not start now: ' + plain(answer.worker_error.message) + ' It runs when you continue.');
+    else say(start ? eid + ' is approved; its run is starting.' : eid + ' is approved. It runs first when you continue, or now.');
   } catch (error) {
     sayError(eid + ' was not approved: ' + message(error));
     s.invalidateExperiment(eid);
@@ -340,6 +424,8 @@ function startProject() {
   const settings = composerSettings(s);
   const bad = Object.entries(settings.limits || {}).find(([, v]) => Number.isNaN(v) || v < 0);
   if (bad) { s.error = 'A limit must be a number (' + bad[0].replace(/_/g, ' ') + ').'; app.render('start'); return; }
+  const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth);
+  if (cutoff.error) { s.error = cutoff.error; s.adv = true; keepComposer(); app.render('start'); return; }
   const form = new FormData();
   if (s.title.trim()) form.append('title', s.title.trim());
   form.append('brief', s.text);
@@ -360,8 +446,11 @@ function startProject() {
     app.ui.library = null;
     go('#/p/' + encodeURIComponent(project.id) + '/map');
     const skipped = (project.skipped || []).length;
-    if (project.worker_error) sayError('The project is created, but the agents could not be started: ' + project.worker_error.message + ' Start them from here once the cause is put right.');
-    else say('The project is created' + (project.worker ? ' and research has started.' : '.') + (skipped ? ' ' + plural(skipped, 'file') + ' could not be attached.' : ''));
+    /* a file that was given another name in inputs/ (two of one name; a name the project keeps for itself) */
+    const renamed = (project.uploads || []).filter((u) => u && u.sent && u.stored && u.stored !== u.sent).map((u) => u.sent + ' is kept as ' + u.stored);
+    const also = (skipped ? ' ' + plural(skipped, 'file') + ' could not be attached.' : '') + (renamed.length ? ' ' + renamed.slice(0, 3).join('; ') + (renamed.length > 3 ? '; and ' + (renamed.length - 3) + ' more were renamed' : '') + '.' : '');
+    if (project.worker_error) sayError('The project is created, but the agents could not be started: ' + plain(project.worker_error.message) + ' Start them from here once the cause is put right.' + also);
+    else say('The project is created' + (project.worker ? ' and research has started.' : '.') + also);
   }, (error) => {
     s.uploading = false; s.request = null;
     s.error = error && error.name === 'AbortError' ? null : message(error);
@@ -422,7 +511,8 @@ const ACT = {
   'edit-proposal': (el) => { const path = el.dataset.path; dropDraft(store(), path); app.ui.editProposal[path] = el.dataset.ref; go({ view: app.route.view === 'map' ? 'wiki' : app.route.view, sel: path, sub: 'edit' }); },
   'edit-cancel': () => go({ sub: '' }),
   'draft-discard': (el) => { dropDraft(store(), el.dataset.ref); if (app.route.sub === 'edit') go({ sub: '' }); else app.render('draft'); say('The draft is discarded. The page is as it was.'); },
-  'conflict-mine': () => { const d = app.ui.drafts[draftKey(app.route.sel)]; if (!d || !d.conflict) return; d.base_updated = d.conflict.updated; d.conflict = null; saveEdit(app.route.sel); },
+  'save-accept': (el) => saveEdit(el.dataset.ref || app.route.sel, true),
+  'conflict-mine': () => { const d = app.ui.drafts[draftKey(app.route.sel)]; if (!d || !d.conflict) return; d.base_updated = d.conflict.updated; d.conflict = null; saveEdit(app.route.sel, !!d.accepting); },
   'conflict-rebase': () => { const d = app.ui.drafts[draftKey(app.route.sel)]; if (!d || !d.conflict) return; const c = d.conflict; d.theirs = { rows: lineDiff(d.base.body, c.body || ''), by: (c.meta || {}).updated_by || c.author || '', at: c.updated }; d.base = { title: c.title, summary: c.summary || '', state: c.state || '', body: c.body || '' }; d.base_updated = c.updated; d.conflict = null; touchDraft(store(), app.route.sel, 'body', d.body); say('You are now editing on top of the newer version. What it changed stays above the text, so that you can carry it over: saving replaces that version with your text.'); app.render('conflict'); },
   'conflict-theirs': () => { dropDraft(store(), app.route.sel); store().invalidate(app.route.sel); go({ sub: '' }); },
   history: (el) => { const r = app.route, path = el.dataset.ref || r.sel; go({ sel: path, sub: r.sub === 'history' && r.sel === path ? '' : 'history' }); },
@@ -448,8 +538,26 @@ const ACT = {
   'jump-change': () => { const el = $('.prose-marked .diff-changed, .prose-marked ins, .prose-marked del'); if (el) { el.scrollIntoView({ block: 'center', behavior: glide() }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1600); } },
   'close-panel': () => select(''),
   continue: () => advance(),
+  /* the person's own choice of the phase that runs next: more research, above all */
+  'continue-phase': (el) => { const phase = el.dataset.phase; if (PHASE_DO[phase]) advance(phase); },
+  'go-menu': (el) => {
+    const where = el.dataset.where || 'strip';
+    app.ui.goMenu = app.ui.goMenu === where ? null : where;
+    app.render('ui');
+    if (app.ui.goMenu) setTimeout(() => { const first = $('.go.open .go-i'); if (first) first.focus(); }, 0);
+  },
+  'forget-worker': () => forgetWorker(),
+  'notices-seen': () => { dismissNotices(store()); app.render('ui'); },
+  'show-problems': () => { if (app.route.view !== 'overview') go({ view: 'overview', sel: '', sub: '' }); setTimeout(() => { const el = $('#problems'); if (el) el.scrollIntoView({ block: 'start', behavior: glide() }); }, 60); },
+  'cutoff-open': () => {
+    if (app.ui.cutoffEdit) { app.ui.cutoffEdit = null; return; }
+    const parts = cutoffParts(((store().project.settings || {}).research_cutoff));
+    app.ui.cutoffEdit = { year: parts && parts.raw == null ? parts.year : '', month: parts && parts.raw == null ? parts.month : 0, error: null, saving: false };
+    app.render('ui');
+  },
+  'cutoff-none': () => saveCutoff(null),
   stop: () => stopAgents(),
-  'limit-edit': () => { const limits = (store().project.settings || {}).limits || {}; app.ui.limitEdit = { value: String(Math.ceil((limits.model_usd || 25) * 1.5)) }; app.render('limit'); setTimeout(() => { const el = $('#limit-usd'); if (el) el.select(); }, 0); },
+  'limit-edit': () => { const limits = (store().project.settings || {}).limits || {}; app.ui.limitEdit = { value: limits.model_usd > 0 ? String(Math.ceil(limits.model_usd * 1.5)) : '' }; app.render('limit'); setTimeout(() => { const el = $('#limit-usd'); if (el) el.select(); }, 0); },
   'limit-cancel': () => { app.ui.limitEdit = null; app.render('limit'); },
   'limits-open': () => { app.ui.limitsOpen = !app.ui.limitsOpen; if (!app.ui.limitsOpen) app.ui.limits = null; },
   'toggle-activity': () => { app.ui.activityOpen = !app.ui.activityOpen; app.render('ui'); },
@@ -471,7 +579,17 @@ const ACT = {
   'reload-library': () => { loadLibrary(true); app.render('ui'); },
   recheck: () => { loadDoctor(true); app.render('ui'); },
   copy: (el) => { const text = el.dataset.text || ''; if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => say('Copied.'), () => say('Select the text to copy it.')); else say('Select the text to copy it.'); },
-  'rq-del': async (el) => { const s = store(); try { await api.deleteRequest(s.pid, el.dataset.ref); await s.refreshNow(); say('The instruction is withdrawn.'); } catch (error) { sayError('Not withdrawn: ' + message(error)); } },
+  'rq-del': async (el) => {
+    const s = store();
+    try { await api.deleteRequest(s.pid, el.dataset.ref); await s.refreshNow(); say('The instruction is withdrawn. No further phase is given it.'); }
+    catch (error) {
+      /* withdrawn already (in another window: that writes no event): the list is read again, and the row goes */
+      await s.refreshNow();
+      if (error.status === 404 && !s.requests.some((r) => r.id === el.dataset.ref)) say('That instruction was withdrawn already. No further phase is given it.');
+      else sayError('Not withdrawn: ' + message(error));
+    }
+    app.render('request');
+  },
   'feed-more': async () => { const s = store(); app.ui.feedLimit += 60; if (s.activity.length < app.ui.feedLimit && s.moreActivity) { try { await s.loadEarlierActivity(); } catch (error) { sayError(message(error)); } } app.render('ui'); },
   'new-page': () => openNewPage(),
   'show-lessons': () => { app.ui.showLessons = true; app.render('ui'); },
@@ -484,15 +602,22 @@ const ACT = {
   rerun: (el) => { const eid = el.dataset.eid; const chosen = {}; if (el.dataset.backend) chosen.backend = el.dataset.backend; if (el.dataset.minutes) chosen.minutes = String(+el.dataset.minutes); const row = store().expById.get(eid); app.ui.approve[eid] = chosen; approve(eid, true, { base_updated: row ? row.updated : undefined }); },
   'run-now': async (el) => {
     const s = store(), eid = el.dataset.eid;
+    if (app.ui.starting[eid]) return;
+    const again = !!(s.expById.get(eid) || {}).interrupted;
+    /* for a run that was interrupted the server first settles what is left of it, which can take some seconds */
+    app.ui.starting[eid] = true;
+    app.render('run');
     await flushAll();
-    try { const answer = await api.run(s.pid, eid); if (answer.worker) s.project.worker = answer.worker; delete app.ui.runOpen[eid]; s.invalidateExperiment(eid); await s.refreshNow(); say('The run of ' + eid + ' is starting.'); }
-    catch (error) { sayError(eid + ' was not started: ' + message(error)); }
+    try { const answer = await api.run(s.pid, eid); if (answer.worker) s.project.worker = answer.worker; delete app.ui.runOpen[eid]; s.invalidateExperiment(eid); await s.refreshNow(); say(again ? eid + ' is run again. What was left of the interrupted run is settled first.' : 'The run of ' + eid + ' is starting.'); }
+    catch (error) { sayError(eid + ' was not started: ' + message(error)); s.invalidateExperiment(eid); s.refresh(); }
+    delete app.ui.starting[eid];
     app.render('run');
   },
   'cancel-run': async (el) => {
     const s = store(), eid = el.dataset.eid;
-    const waiting = ['approved', 'queued'].indexOf((s.expById.get(eid) || {}).state) >= 0;   // approved, not started: the approval is taken back
-    try { await api.cancel(s.pid, eid); say(waiting ? eid + ' will not run: its approval is taken back. Approve it again when you want it run.' : 'Cancelling the run of ' + eid + '. It is recorded as cancelled.'); s.invalidateExperiment(eid); s.refresh(); }
+    const row = s.expById.get(eid) || {};
+    const waiting = ['approved', 'queued'].indexOf(row.state) >= 0;   // approved, not started: the approval is taken back
+    try { await api.cancel(s.pid, eid); say(waiting ? eid + ' will not run: its approval is taken back. Approve it again when you want it run.' : row.interrupted ? 'The interrupted run of ' + eid + ' is cancelled. Approve it again when you want it run.' : 'Cancelling the run of ' + eid + '. It is recorded as cancelled.'); s.invalidateExperiment(eid); s.refresh(); }
     catch (error) { sayError('Not cancelled: ' + message(error)); }
   },
   'show-run': (el) => { const eid = el.dataset.eid, n = +el.dataset.run; const s = store(), entry = s.exps.get(eid); const runs = ((entry && entry.data && entry.data.runs) || []).slice().sort((a, b) => b.number - a.number); const now = app.ui.runOpen[eid] === undefined ? (runs[0] && runs[0].status !== 'running' ? runs[0].number : null) : app.ui.runOpen[eid]; app.ui.runOpen[eid] = now === n ? null : n; app.render('ui'); },
@@ -512,6 +637,22 @@ const ACT = {
 };
 /** Run an action by name (the palette does). */
 app.act = (name, el) => { if (ACT[name]) return ACT[name](el || { dataset: {} }); return undefined; };
+
+/** Change the project's research cutoff: "2024-06", "2024", or `null` for none. */
+async function saveCutoff(value) {
+  const s = store(), ui = app.ui.cutoffEdit || (app.ui.cutoffEdit = { year: '', month: 0, error: null, saving: false });
+  if (ui.saving) return;
+  ui.saving = true; ui.error = null;
+  app.render('cutoff');
+  try {
+    await api.patchProject(s.pid, { settings: { research_cutoff: value } });
+    app.ui.cutoffEdit = null;
+    await s.refreshNow();
+    const parts = cutoffParts(value);
+    say(parts ? 'The research cutoff is set: only literature published before ' + cutoffWords(parts) + ' is in scope.' : 'The project has no research cutoff now.');
+  } catch (error) { ui.error = message(error); ui.saving = false; }
+  app.render('cutoff');
+}
 
 async function saveCode(form) {
   const s = store(), eid = form.dataset.eid, name = form.dataset.name, key = eid + '/' + name, edit = app.ui.codeEdit[key];
@@ -543,6 +684,8 @@ export function installActions() {
       const again = ev.target.closest('[data-act], button[type=submit], input[type=submit]');
       if (again && !REPEATABLE[again.dataset.act]) { ev.preventDefault(); return; }
     }
+    /* the list of phases beside Continue closes when something else is pressed */
+    if (app.ui.goMenu && !(ev.target.closest && ev.target.closest('.go'))) { app.ui.goMenu = null; app.render('ui'); }
     const actEl = ev.target.closest('[data-act]');
     if (actEl && ACT[actEl.dataset.act]) {
       if (actEl.disabled || actEl.getAttribute('aria-disabled') === 'true') return;
@@ -564,18 +707,40 @@ export function installActions() {
     if (!form) return;
     ev.preventDefault();
     const kind = form.dataset.form, s = store();
-    if (kind === 'reject') decide(form.dataset.ref, 'reject', { reason: (form.elements.reason.value || '').trim() });
+    if (kind === 'reject') {
+      const ref = form.dataset.ref, reason = (form.elements.reason.value || '').trim();
+      /* a proposal is decided with the short undo; a page that was accepted before is rejected at once */
+      if (s.pending().some((it) => it.ref === ref)) decide(ref, 'reject', { reason }); else rejectAccepted(ref, reason);
+    }
     else if (kind === 'bulk-reject') bulk('reject', (form.elements.reason.value || '').trim());
-    else if (kind === 'edit') saveEdit(form.dataset.ref);
+    else if (kind === 'edit') saveEdit(form.dataset.ref, false);
+    else if (kind === 'cutoff') {
+      const ui = app.ui.cutoffEdit;
+      if (!ui) return;
+      const made = cutoffFrom(ui.year, ui.month);
+      if (made.error) { ui.error = made.error; app.render('cutoff'); return; }
+      saveCutoff(made.value);
+    }
     else if (kind === 'code') saveCode(form);
     else if (kind === 'start') startProject();
     else if (kind === 'request') {
       const rq = app.ui.request, text = rq.text.trim();
       if (!text || rq.sending) return;
       const target = rq.about && app.route.sel && s.byPath.has(app.route.sel) ? app.route.sel : null;
+      const role = rq.for && rq.for !== 'all' ? rq.for : null;
       rq.sending = true; rq.error = null;
       app.render('request');
-      api.addRequest(s.pid, text, target).then(async () => { rq.text = ''; storage.remove(requestKey(s.pid)); await s.refreshNow(); say('Added. It goes to the next phase that runs.'); }, (error) => { rq.error = message(error); })
+      api.addRequest(s.pid, text, target, role).then(async (answer) => {
+        const sent = (answer && answer.request && answer.request.for) || role || 'all';
+        const phase = (ROLE[sent] || {}).phase;
+        rq.text = ''; rq.for = 'all';
+        storage.remove(requestKey(s.pid));
+        storage.remove(requestForKey(s.pid));
+        await s.refreshNow();
+        say(!phase ? 'Added for everyone: every phase that runs is given it, until the analysis that ends this round.'
+          : phase === 'research' ? 'Added for the scout. It waits for a research phase: choose “Search the literature again” beside Continue.'
+            : 'Added for ' + roleName(sent) + ': it is given to the next ' + (phase === 'analyze' ? 'analysis' : phaseName(phase) + ' phase') + '.');
+      }, (error) => { rq.error = message(error); })
         .finally(() => { rq.sending = false; app.render('request'); });
     } else if (kind === 'limit') {
       const usd = Number(String(form.elements.usd.value).replace(/[$,\s]/g, ''));
@@ -625,9 +790,9 @@ export function installActions() {
       const s = composer(), was = composerReady(s);
       s.text = t.value; keepComposer();
       if (was !== composerReady(s) || s.error) { s.error = null; app.render('start'); }
-    } else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.dataset.name === 'model_usd') app.render('start'); }
+    } else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.dataset.name === 'model_usd' || t.dataset.name === 'cutoffYear' || s.error) { s.error = null; app.render('start'); } }
     else if (what === 'reason') { app.ui.reasons[t.dataset.ref] = t.value; keepReasons(); }
-    else if (what === 'request') { app.ui.request.text = t.value; if (store()) { if (t.value.trim()) storage.set(requestKey(store().pid), t.value); else storage.remove(requestKey(store().pid)); } }
+    else if (what === 'request') { app.ui.request.text = t.value; keepRequest(); }
     else if (what === 'code') { const edit = app.ui.codeEdit[t.dataset.key]; if (edit) { edit.text = t.value; edit.restored = false; if (store()) storage.set(codeKey(store().pid, t.dataset.key), t.value); } }
     /* drawn again while typing, never on blur: a render between the press and the release of a
        button would swallow the click that follows the typing */
@@ -635,6 +800,7 @@ export function installActions() {
     else if (what === 'ap-gpu') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).gpu = t.value; app.render('backend'); }
     else if (what === 'paper-model') app.ui.paper.model = t.value;
     else if (what === 'limits' && app.ui.limits) app.ui.limits[t.dataset.name] = t.value;
+    else if (what === 'cutoff' && app.ui.cutoffEdit) app.ui.cutoffEdit[t.dataset.name] = t.value;
     else if (what === 'limit' && app.ui.limitEdit) app.ui.limitEdit.value = t.value;
     else if (what === 'new-page-title' && app.ui.newPage) app.ui.newPage.title = t.value;
   });
@@ -653,6 +819,8 @@ export function installActions() {
     else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.tagName === 'SELECT') app.render('start'); }
     else if (what === 'opt-review') { const s = composer(); s.auto[t.dataset.kind] = !t.checked; keepComposer(); }
     else if (what === 'request-about') { app.ui.request.about = t.checked; }
+    else if (what === 'request-for') { app.ui.request.for = t.value; keepRequest(); app.render('request'); }
+    else if (what === 'cutoff' && app.ui.cutoffEdit) { app.ui.cutoffEdit[t.dataset.name] = t.value; }
     else if (what === 'map-round') { app.ui.map.round = t.value === '' ? null : +t.value; mapView.reset(); app.render('map'); }
     else if (what === 'map-lineage') { const m = app.ui.map; m.deep = t.value === 'all'; m.lineageOnly = t.value === 'only'; mapView.reset(); app.render('map'); }
     else if (what === 'paper-template') app.ui.paper.template = t.value;
@@ -717,9 +885,32 @@ export function installActions() {
     const target = ev.target;
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) && target.type !== 'checkbox' && target.type !== 'radio';
     trapTab(ev);
+    if (app.ui.goMenu && ev.key === 'Tab') {
+      /* the list does not stay open behind a keyboard that has left it: it closes, and Tab
+         moves on from the button that opened it (the key's own action is left to the browser) */
+      app.ui.goMenu = null;
+      app.render('ui');
+      const more = $('.go .go-more');
+      if (more) more.focus();
+      return;
+    }
+    if (app.ui.goMenu && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp')) {
+      const items = $$('.go.open .go-i');
+      if (items.length) { const i = items.indexOf(document.activeElement); items[(i + (ev.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus(); ev.preventDefault(); }
+      return;
+    }
     if (ev.key === 'Escape') {
       if (overlayOpen()) { closeOverlay(); return; }
-      if (app.ui.rejecting) { app.ui.rejecting = null; app.render('ui'); return; }
+      if (app.ui.goMenu) { app.ui.goMenu = null; app.render('ui'); const more = $('.go .go-more'); if (more) more.focus(); return; }
+      if (app.ui.rejecting) {
+        const ref = app.ui.rejecting;
+        app.ui.rejecting = null;
+        app.render('ui');
+        /* the keyboard goes back to what opened the question, not to the top of the page */
+        const asked = $$('[data-act="reject-ask"]').find((el) => el.dataset.ref === ref && el.offsetParent !== null);
+        if (asked) asked.focus();
+        return;
+      }
       if (app.ui.confirmDelete) { app.ui.confirmDelete = null; app.render('ui'); return; }
       if (typing) { target.blur(); return; }
       if (r.name === 'project' && r.sub) { go({ sub: '' }); return; }
@@ -729,7 +920,7 @@ export function installActions() {
     const mod = ev.metaKey || ev.ctrlKey;
     if (mod && ev.key.toLowerCase() === 's') {
       const code = $('form[data-form=code]'), edit = $('form[data-form=edit]');
-      if (code || edit) { ev.preventDefault(); if (code && (!edit || code.contains(target))) saveCode(code); else saveEdit(edit.dataset.ref); }
+      if (code || edit) { ev.preventDefault(); if (code && (!edit || code.contains(target))) saveCode(code); else saveEdit(edit.dataset.ref, false); }
       return;
     }
     if (mod && ev.key.toLowerCase() === 'k') { ev.preventDefault(); if (overlayOpen()) closeOverlay(); else openPalette(); return; }
@@ -750,7 +941,9 @@ export function installActions() {
     if ((k === 'a' || k === 'A') && tgt && !r.sub) { decide(tgt.ref, 'accept'); return; }
     if ((k === 'r' || k === 'R') && tgt && !r.sub) { ev.preventDefault(); app.ui.rejecting = tgt.ref; app.render('ui'); return; }
     const cur = r.view === 'inbox' ? (tgt && tgt.page) : s.byPath.get(r.sel);
-    if ((k === 'e' || k === 'E') && cur && editable(cur) && r.view !== 'experiments' && r.view !== 'overview') { if (r.view === 'inbox' && r.sel !== cur.path) go({ sel: cur.path, sub: 'edit' }); else go({ sub: r.sub === 'edit' ? '' : 'edit' }); return; }
+    /* (the editor that opens takes the keyboard at once: without this the letter of the key
+       itself would be typed into the page's text) */
+    if ((k === 'e' || k === 'E') && cur && editable(cur) && r.view !== 'experiments' && r.view !== 'overview') { ev.preventDefault(); if (r.view === 'inbox' && r.sel !== cur.path) go({ sel: cur.path, sub: 'edit' }); else go({ sub: r.sub === 'edit' ? '' : 'edit' }); return; }
     if ((k === 'h' || k === 'H') && cur && r.view !== 'experiments' && r.view !== 'overview') { if (r.sel !== cur.path) go({ sel: cur.path, sub: 'history' }); else go({ sub: r.sub === 'history' ? '' : 'history' }); return; }
     if (k === 'l' || k === 'L') { app.ui.logOpen = !app.ui.logOpen; app.render('ui'); return; }
     if ((k === 'x' || k === 'X') && r.view === 'inbox' && tgt) { const c = app.ui.checked; if (c[tgt.ref]) delete c[tgt.ref]; else c[tgt.ref] = true; app.render('check'); return; }

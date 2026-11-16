@@ -19,7 +19,7 @@ import { $, $$, esc, html, plural, raw, setHTML, tf } from './util.js';
 import { KIND, STAGES, TONE, glyph, glyphInner, icon, kindName, relOf } from './vocab.js';
 import { layout, routeRefs } from './layout.js';
 import { afterRender, label, panelHTML, shortTitle, statusLine, trailHTML } from './page.js';
-import { continueLabel, engineView, strip } from './shell.js';
+import { continueControl, engineView, strip } from './shell.js';
 
 const R = { idea: 9, source: 4.6, topic: 9, question: 8.4, hypothesis: 8, experiment: 9, result: 5.6, finding: 4.6, bundle: 6 };
 const SLOT = { idea: 26, source: 16, topic: 24, question: 22, hypothesis: 22, experiment: 24, result: 16, finding: 22 };
@@ -671,7 +671,7 @@ function emptyHTML(store) {
   return html`<div class="empty-card"><h2>The map is empty beyond your idea.</h2>
     <p>${e.fresh ? 'Research has not started.' : 'Nothing has been written yet.'} Intake reads ${files ? 'your ' + plural(files, 'file') : 'the idea'}, then the scout looks for prior work, verifies every paper and writes down what is known and what is open. It pauses at the first checkpoint and nothing is accepted without you.</p>
     <p class="empty-meta">The limit for models in this project is $${limits.model_usd != null ? Number(limits.model_usd).toFixed(2) : '…'}.</p>
-    <div class="row"><button class="btn btn-primary" data-act="continue">${e.fresh ? 'Start research' : continueLabel(e.next, store)} ${icon('right')}</button>${idea ? html`<a class="btn" href="${link({ view: 'wiki', sel: idea.path, sub: 'edit' })}">Edit the idea first</a>` : ''}</div></div>`;
+    <div class="row">${e.unverified || e.working ? '' : continueControl(store, e, 'empty')}${idea ? html`<a class="btn" href="${link({ view: 'wiki', sel: idea.path, sub: 'edit' })}">Edit the idea first</a>` : ''}</div></div>`;
 }
 
 /** The reference lines of the page the pointer or the keyboard is on, while they are held

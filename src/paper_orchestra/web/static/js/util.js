@@ -62,7 +62,9 @@ export const dayOf = (stamp, now = Date.now()) => {
   return d.getDate() + ' ' + MONTHS[d.getMonth()] + (d.getFullYear() === today.getFullYear() ? '' : ' ' + d.getFullYear());
 };
 export const dateTime = (stamp) => { const day = dayOf(stamp); return day ? (day === 'Today' ? 'today' : day === 'Yesterday' ? 'yesterday' : day) + ', ' + hm(stamp) : ''; };
-/** A sentence of the server as the app says things: the person is "you", a time is "2 min ago" or "today, 01:12". */
+/** A sentence of the server as the app says things: the person is "you", a time is "2 min ago"
+    or "today, 01:12", and what the command line would be told to do is what the app offers
+    for it (more research is "Search the literature again", in the menu beside Continue). */
 export function plain(text) {
   const stamp = '\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d(?::\\d\\d(?:\\.\\d+)?)?(?:Z|[+-]\\d\\d:?\\d\\d)';
   return String(text == null ? '' : text)
@@ -71,16 +73,21 @@ export function plain(text) {
     .replace(/\bhuman (changed|edited|wrote|saved|decided|accepted|rejected|updated|deleted|created|approved)\b/g, 'you $1')
     .replace(/\bby (?:the )?human\b(?!-)/g, 'by you')
     .replace(/\bat the person's request\b/g, 'at your request')
-    .replace(/\bRaise settings\.limits\.\w+ in the project's settings\b/g, 'Raise the limit');
+    .replace(/\bRaise settings\.limits\.\w+ in the project's settings\b/g, 'Raise the limit')
+    .replace(/\b(?:to follow it, )?run (?:it|the research phase next) with `paper-orchestra research advance [^`]*--phase research`, or Continue with research in the app\b/g, (all) => (all.startsWith('to follow it') ? 'to follow it, ' : '') + 'choose “Search the literature again” when you continue')
+    .replace(/ \(next: research\)/g, '');
 }
-/** What a phase did, from the sentence the engine wrote when it paused ("Round 2, design:
-    2 experiments are planned. 1 question and 2 suggested edits are waiting for you.").
-    The count of what waits was true at that moment only; the page shows the live count
-    beside it, so the stale one is left out, and so is the heading the page already has. */
-export const checkpointDid = (summary) => String(summary || '')
+/** What a phase did, from what the engine wrote when it paused ("The theorist proposed 2
+    hypotheses. 2 hypotheses and 6 findings await your review. Next: designing experiments
+    for the hypotheses you accepted."). The count of what waits and what comes next were
+    true at that moment only; the page shows both live beside it, so the stale ones are left
+    out, and so is the heading the page already has. */
+export const checkpointDid = (summary) => plain(String(summary || '')
   .replace(/^Round \d+, [^:.]{1,40}:\s*/, '')
-  .replace(/(^|[.!?]\s+)[^.!?]*\b(?:is|are) waiting for you\.\s*$/, '$1')
-  .trim();
+  /* what comes next is said by the button, from the state as it is now */
+  .replace(/(^|[.!?]\s+)Next: [^.]*\.\s*$/, '$1')
+  .replace(/(^|[.!?]\s+)[^.!?]*\b(?:(?:is|are) waiting for you|awaits? your review)\.\s*$/, '$1')
+  .trim());
 /** "38 min ago", "2 h ago", "3 days ago", then the date. */
 export const ago = (stamp, now = Date.now()) => {
   const t = parseStamp(stamp);
@@ -92,6 +99,27 @@ export const ago = (stamp, now = Date.now()) => {
   if (s < 86400 * 14) { const d = Math.round(s / 86400); return d + (d === 1 ? ' day ago' : ' days ago'); }
   return dayOf(stamp, now);
 };
+/* ---------- the research cutoff: a year, and a month if the person gives one ---------- */
+export const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+/** A research cutoff as the settings hold it ("2024", "2024-06", "2024-06-15") in its parts;
+    `null` for none; `{raw}` when it cannot be read (the server keeps such a value as written
+    and stops the research until it is corrected). */
+export function cutoffParts(value) {
+  if (value == null || String(value).trim() === '') return null;
+  const m = /^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?$/.exec(String(value).trim());
+  if (!m || (m[2] && (+m[2] < 1 || +m[2] > 12)) || (m[3] && (+m[3] < 1 || +m[3] > 31))) return { raw: String(value) };
+  return { year: m[1], month: m[2] ? +m[2] : 0, day: m[3] ? +m[3] : 0 };
+}
+/** From a year and a month as chosen: `{value}` ("2024-06", "2024", or `null` for no cutoff), or `{error}`. */
+export function cutoffFrom(year, month) {
+  const y = String(year == null ? '' : year).trim(), m = +month || 0;
+  if (!y) return m ? { error: 'Give the year of the cutoff as well, or set the month back to “any month”.' } : { value: null };
+  if (!/^\d{4}$/.test(y) || +y < 1900 || +y > 2200) return { error: 'The year of the cutoff is four digits, such as 2024.' };
+  return { value: m ? y + '-' + two(m) : y };
+}
+/** "June 2024", "2024", "15 June 2024": what the literature has to be published before. */
+export const cutoffWords = (parts) => (parts.month ? (parts.day ? parts.day + ' ' : '') + MONTH_NAMES[parts.month - 1] + ' ' + parts.year : String(parts.year));
+
 /** A stopwatch: 1:07, 21:40, 1:02:09. */
 export const clock = (seconds) => {
   const s = Math.max(0, Math.floor(seconds || 0));

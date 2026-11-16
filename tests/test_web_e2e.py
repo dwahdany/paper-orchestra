@@ -7,6 +7,9 @@ port whose workers use the scripted model
 of ``tests/e2e/scripted_model.py``.  The server and the browser are child processes; this
 process opens no socket (it learns the server's address from what the server prints).
 
+The checks pass in both colour schemes; this test runs them in the light one, and with
+``PAPER_ORCHESTRA_E2E_SCHEME=dark`` in the dark one.
+
 Skipped, with the reason, where Node, Playwright or a browser is missing.
 """
 
@@ -34,6 +37,8 @@ NO_BROWSER = 3
 ADDRESS = re.compile(r"running at (http://127\.0\.0\.1:\d+)/")
 #: The option of ``paper-orchestra ui`` that ends the workers with the server.
 STOP_WORKERS = "--stop-workers-on-exit"
+#: ``dark`` runs the flows in the dark theme (``web_check.js --scheme dark``).
+SCHEME = os.environ.get("PAPER_ORCHESTRA_E2E_SCHEME", "").strip().lower()
 
 
 def _playwright_missing() -> str | None:
@@ -155,7 +160,10 @@ def test_the_app_works_in_a_real_browser(server):
     reason = _playwright_missing()
     if reason:
         pytest.skip(reason)
-    result = _run(["node", str(CHECK), "--base", server], env=dict(os.environ), timeout=900)
+    scheme = ["--scheme", "dark"] if SCHEME == "dark" else []
+    result = _run(
+        ["node", str(CHECK), "--base", server, *scheme], env=dict(os.environ), timeout=1200
+    )
     if result.returncode == NO_BROWSER:
         pytest.skip("Playwright could not start a browser: " + result.stderr.strip()[-300:])
     assert result.returncode == 0, f"the browser checks failed:\n{result.stdout}\n{result.stderr}"

@@ -54,6 +54,11 @@ export class Store {
     this._timer = 0;
     this._busy = false;
     this._again = false;
+    /* The state comes with the event stream, the lists of pages and experiments are fetched:
+       `behind` is true from a state that moved until lists read after it have arrived.
+       What is said from both together (what a press of Continue does) waits for that. */
+    this.behind = false;
+    this._moves = 0;
   }
 
   /* ---------- loading ---------- */
@@ -95,17 +100,20 @@ export class Store {
     if (this._busy) { this._again = true; return this._waiting || Promise.resolve(); }
     this._busy = true;
     this._waiting = (async () => {
+      const moves = this._moves;
       try {
         const lists = await this.fetchLists();
         if (this.closed) return;
         this.server = lists;
         this.refreshError = null;
+        if (moves === this._moves) this.behind = false;
         for (const [ref, entry] of this.overlay) if (entry.done) this.overlay.delete(ref);
         this.derive();
         this.lookAtWorker();
       } catch (error) {
         if (!(error instanceof Unreachable)) this.refreshError = error;
-        if (error && error.status === 404) { this.loaded = false; this.loadError = error; }
+        /* the project is gone, or its files can no longer be opened (the server says why) */
+        if (error && (error.status === 404 || error.code === 'project_unreadable')) { this.loaded = false; this.loadError = error; }
       } finally {
         this._busy = false;
         this.onChange('refresh', true);
@@ -232,7 +240,7 @@ export class Store {
     const row = this.server.experiments.find((r) => r.id === eid);
     if (!row) return null;
     const run = row.last_run || {};
-    return [row.updated, row.review, row.state, row.runs, run.status, run.finished, (run.repairs || []).length].join('|');
+    return [row.updated, row.review, row.state, row.runs, run.status, run.finished, (run.repairs || []).length, row.interrupted ? 'interrupted' : ''].join('|');
   }
   /** GET .../experiments/{eid} takes up to half a second: only for the experiment that is open. */
   experiment(eid) {
@@ -249,6 +257,12 @@ export class Store {
     return entry;
   }
   invalidateExperiment(eid) { const entry = this.exps.get(eid); if (entry) { entry.key = null; entry.gen += 1; } }
+  /** The number check of a finding rests on other pages: the records of the runs, whether
+      their experiment is rejected, the sources. When one of those changed, what was read
+      of the findings is read again when it is next shown. */
+  invalidateFindings() {
+    for (const [path, entry] of this.views) { const page = this.byPath.get(path); if (page && page.kind === 'finding') { entry.key = null; entry.gen += 1; } }
+  }
 
   /** A page that was deleted is gone at once, here and in every other tab that hears of it:
       it must not be asked for again on the way to the next refetch of the lists. */
@@ -303,7 +317,7 @@ export class Store {
     if (!wanted) { this.workerLog = null; return; }
     if (this.workerLog && this.workerLog.key === key) return;
     this.workerLog = { key, text: null };
-    api.workerLog(this.pid).then((log) => { if (this.workerLog && this.workerLog.key === key) { this.workerLog.text = log.text || ''; this.onChange('worker-log', true); } }, () => {});
+    api.workerLog(this.pid).then((log) => { if (this.workerLog && this.workerLog.key === key) { this.workerLog.text = log.text || ''; this.workerLog.problem = log.problem || ''; this.onChange('worker-log', true); } }, () => {});
   }
 
   /* ---------- the event stream ---------- */
@@ -345,12 +359,13 @@ export class Store {
     const before = this.project.state || {};
     const moved = before.status !== data.state.status || before.phase !== data.state.phase || before.round !== data.state.round
       || (before.phases || []).length !== (data.state.phases || []).length
-      || ((this.project.worker || {}).state !== (data.worker || {}).state);
+      || ((this.project.worker || {}).state !== (data.worker || {}).state)
+      || ((this.project.worker || {}).verified !== (data.worker || {}).verified);
     this.project.state = data.state;
     this.project.checkpoint = data.state.checkpoint;
     if (data.worker) this.project.worker = data.worker;
     if (this.server) this.server.project = this.project;
-    if (moved) this.refresh();
+    if (moved) { this._moves++; this.behind = true; this.refresh(); }
     this.lookAtWorker();
     this.onChange('state', true);
   }
@@ -378,6 +393,7 @@ export class Store {
       if (data.target && typeof data.target === 'string') this.invalidate(data.target);
       const eid = data.experiment || (type === 'experiment.state' ? data.id : null);
       if (eid) this.invalidateExperiment(eid);
+      if (type === 'run.finished' || (/^(review\.decided|page\.)/.test(type) && /^(experiment|result|source)$/.test(data.kind || 'experiment'))) this.invalidateFindings();
       if (this.paper && /^(paper\.|review\.decided|run\.finished|page\.)/.test(type)) this.loadPaper();
       this.refresh();
     }

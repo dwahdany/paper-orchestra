@@ -70,13 +70,18 @@ export const api = {
   health: () => request('GET', '/api/health'),
   doctor: () => request('GET', '/api/doctor'),
   templates: () => request('GET', '/api/templates'),
+  /** What a new project starts with (`settings`), the phases in order, and whom a request can be for. */
+  defaults: () => request('GET', '/api/defaults'),
   render: (markdown, pid, path, signal) => request('POST', '/api/render', { markdown, project: pid || null, path: path || null }, { signal }),
 
   projects: () => request('GET', '/api/projects'),
   project: (pid) => request('GET', project(pid)),
   patchProject: (pid, patch) => request('PATCH', project(pid), patch),
+  /** `body.phase` names the phase to run; without it the engine decides (what is approved runs first). */
   advance: (pid, body) => request('POST', project(pid) + '/advance', body || {}),
   stop: (pid) => request('POST', project(pid) + '/stop'),
+  /** Clear the name of a worker the server cannot verify. Nothing is signalled. */
+  forgetWorker: (pid) => request('POST', project(pid) + '/worker/forget'),
   workerLog: (pid) => request('GET', project(pid) + '/worker/log'),
   activity: (pid, params) => request('GET', project(pid) + '/activity' + query(params)),
   eventsUrl: (pid, after) => project(pid) + '/events' + query({ after: after || 0 }),
@@ -92,7 +97,8 @@ export const api = {
   proposals: (pid, review) => request('GET', project(pid) + '/proposals' + query({ review })),
   graph: (pid) => request('GET', project(pid) + '/graph?include_rejected=1'),
   requests: (pid) => request('GET', project(pid) + '/requests'),
-  addRequest: (pid, text, target) => request('POST', project(pid) + '/requests', { text, target: target || null }),
+  /** `role` is whom the instruction is for: `all`, or one of the roles of `/api/defaults`. */
+  addRequest: (pid, text, target, role) => request('POST', project(pid) + '/requests', Object.assign({ text, target: target || null }, role ? { for: role } : {})),
   deleteRequest: (pid, rid) => request('DELETE', project(pid) + '/requests/' + encodeURIComponent(rid)),
   search: (pid, q, signal) => request('GET', project(pid) + '/search' + query({ q, limit: 12 }), undefined, { signal }),
 

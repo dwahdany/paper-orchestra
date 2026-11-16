@@ -6,7 +6,7 @@ import { api } from './api.js';
 import { $, $$, debounce, html, raw, setHTML } from './util.js';
 import { KIND, STAGES, glyph, icon, kindName, pageGlyph } from './vocab.js';
 import { shortTitle } from './page.js';
-import { continueLabel, engineView, theme } from './shell.js';
+import { engineView, nextStep, phaseChoices, theme } from './shell.js';
 
 /* ---------- toast ---------- */
 let toastTimer = 0;
@@ -71,8 +71,14 @@ function commands() {
   if (inProject) {
     const e = engineView(store);
     VIEWS.forEach((v, i) => add('Go to ' + v[1], String(i + 1), () => go({ view: v[0], sub: '', sel: v[0] === 'paper' ? '' : r.sel })));
-    if (e.mode === 'running' || e.mode === 'experiment' || e.mode === 'writing') add('Stop the agents', 'ends at the next step', () => app.act('stop'));
-    else add(e.fresh ? 'Start research' : e.mode === 'failed' ? 'Retry the failed phase' : continueLabel(e.next, store), 'runs up to the next checkpoint', () => app.act('continue'));
+    if (e.working) add('Stop the agents', 'ends at the next step', () => app.act('stop'));
+    else if (e.unverified) add('Forget the worker this server cannot verify', 'nothing is stopped', () => app.act('forget-worker'));
+    else {
+      /* what a press of the main button does, and the phases that can be chosen in its place */
+      const step = nextStep(store, e);
+      add(step.label, step.href ? 'opens Experiments' : 'runs up to the next checkpoint', () => (step.href ? go(step.href) : app.act('continue')));
+      phaseChoices(store, e, step).forEach((c) => add(c.title, 'a phase of your choice', () => app.act('continue-phase', { dataset: { phase: c.phase } })));
+    }
     add('New page', 'a page of your own', () => app.act('new-page'));
     add('Leave an instruction for the agents', 'on the overview', () => { go({ view: 'overview', sel: r.sel, sub: '' }); setTimeout(() => { const el = $('#rq-text'); if (el) el.focus(); }, 60); });
     add(app.ui.showRejected ? 'Hide rejected pages' : 'Show rejected pages', '', () => app.act('toggle-rejected'));
@@ -167,7 +173,7 @@ export function openPalette() {
 /* ---------- keyboard sheet ---------- */
 export function openHelp() {
   const rows = [['Views', [['1 … 6', 'Map, Wiki, Inbox, Experiments, Overview, Paper: the selection stays'], ['Ctrl K', 'Find a page, run an action (also /)'], ['T', 'Light or dark'], ['Esc', 'Close, or clear the selection']]],
-    ['Deciding', [['A', 'Accept the proposal in front of you'], ['E', 'Edit, then accept'], ['R', 'Reject, with a reason the agents read'], ['Z', 'Undo, until the decision is sent (five seconds)'], ['X', 'Select in the inbox'], ['⇧A', 'Accept everything selected']]],
+    ['Deciding', [['A', 'Accept the proposal in front of you'], ['E', 'Edit. Saving does not decide; “Save and accept” does'], ['R', 'Reject, with a reason the agents read'], ['Z', 'Undo, until the decision is sent (five seconds)'], ['X', 'Select in the inbox'], ['⇧A', 'Accept everything selected']]],
     ['Moving', [['← →', 'On the map: along the lines'], ['↑ ↓', 'On the map: within a stage'], ['Tab', 'Into the map at the selected page, then on to its tools'], ['J K', 'Next and previous in a list'], ['H', 'History of the page'], ['L', 'Expand or collapse a log'], ['+ − 0', 'Zoom the map, fit it'], ['Ctrl S', 'Save what you are editing']]]];
   const ov = openOverlay('help', html`<div class="help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><h2>Keyboard</h2><div class="help-cols">${rows.map((g) => html`<div><h3>${g[0]}</h3><dl>${g[1].map((row) => html`<div><dt>${row[0].split(' ').map((k) => (k === '…' ? '… ' : html`<kbd>${k}</kbd> `))}</dt><dd>${row[1]}</dd></div>`)}</dl></div>`)}</div>
     <p class="quiet help-note">There is no undo of a decision once it is sent. After that, edit the page or decide again: every version is kept in its history.</p>

@@ -2,6 +2,7 @@
    the open project's store, and the way to ask for a render. `main.js` fills in `render`. */
 
 import { storage } from './util.js';
+import { api } from './api.js';
 
 export const VIEWS = [['map', 'Map'], ['wiki', 'Wiki'], ['inbox', 'Inbox'], ['experiments', 'Experiments'], ['overview', 'Overview'], ['paper', 'Paper']];
 const VIEW_NAMES = VIEWS.map((v) => v[0]);
@@ -32,7 +33,12 @@ export const app = {
     histVersion: {},        // page path -> the stamp of the version looked at
     confirmDelete: null,    // the path of the page about to be deleted
     trail: {},              // project id -> the pages opened on the way
-    request: { text: '', about: true },
+    request: { text: '', about: true, for: 'all' },
+    goMenu: null,           // which Continue control has its list of phases open: 'strip', 'overview' or null
+    rested: {},             // experiment path -> {deps, at}: what rests on it, as the server said when it was rejected
+    cutoffEdit: null,       // the research cutoff being changed on the overview
+    starting: {},           // experiment id -> a run is being started (the server may settle an unfinished one first)
+    defaults: null,         // GET /api/defaults, as last fetched
     feedLimit: 40,
     newPage: null,          // the "new page" dialog
     limitEdit: null,        // raising a limit from the strip
@@ -54,8 +60,37 @@ export const app = {
 };
 
 const freshMap = () => ({ fold: null, round: null, lineageOnly: false, deep: false, open: {} });
+
+/** What a new project starts with, the phases in order and whom a request can be for, as
+    the server says them (GET /api/defaults). `null` until they are known: whoever shows a
+    number then shows none, never one of its own. Asked for once, and again after a failure. */
+export function defaults() {
+  const d = app.ui.defaults || (app.ui.defaults = { data: null, loading: false, error: null, at: 0 });
+  if (!d.data && !d.loading && Date.now() - d.at > 4000) {
+    d.loading = true;
+    api.defaults().then((data) => { d.data = data && typeof data === 'object' ? data : null; d.error = null; }, (error) => { d.error = error; })
+      .finally(() => { d.loading = false; d.at = Date.now(); app.render('defaults', true); });
+  }
+  return d.data;
+}
 /** Where what the person is typing is kept on this device until it is sent or saved. */
 export const requestKey = (pid) => 'po-request:' + pid;
+export const requestForKey = (pid) => 'po-request-for:' + pid;
+export const restedKey = (pid) => 'po-rested:' + pid;
+/** What the server said rests on an experiment when it was rejected, kept with the moment of
+    that rejection: the answer comes once, and the experiment's page lists it for as long as
+    that rejection stands, also after a reload. */
+export function keepRested(store, path, deps) {
+  const page = store.byPath.get(path);
+  app.ui.rested[path] = { deps, at: (page && page.meta && page.meta.decided_at) || '' };
+  storage.set(restedKey(store.pid), app.ui.rested);
+}
+/** The same, read back: `null` once the experiment has been decided again since. */
+export function restedOf(page) {
+  const kept = page && app.ui.rested[page.path];
+  if (!kept || !kept.deps || page.review !== 'rejected') return null;
+  return !kept.at || kept.at === ((page.meta || {}).decided_at || '') ? kept.deps : null;
+}
 export const codeKey = (pid, key) => 'po-code:' + pid + ':' + key;
 export const reasonsKey = (pid) => 'po-reasons:' + pid;
 
@@ -72,8 +107,12 @@ export function openProjectUi(pid) {
   ui.approve = {}; ui.codeTab = {}; ui.codeEdit = {}; ui.runOpen = {}; ui.asDiff = {}; ui.histVersion = {};
   ui.newPage = null; ui.limitEdit = null; ui.limits = null; ui.limitsOpen = false;
   ui.editProposal = {}; ui.reapprove = null; ui.netNudge = null; ui.showLessons = false; ui.focusEditor = '';
+  const rested = storage.get(restedKey(pid), {});
+  ui.goMenu = null; ui.rested = rested && typeof rested === 'object' && !Array.isArray(rested) ? rested : {}; ui.cutoffEdit = null; ui.starting = {};
   ui.paper = { templates: ui.paper.templates, template: ui.paper.template };
-  ui.request = { text: String(storage.get(requestKey(pid), '') || ''), about: true };
+  const typed = String(storage.get(requestKey(pid), '') || '');
+  /* whom the instruction being typed is for is kept with it (and only with it) */
+  ui.request = { text: typed, about: true, for: typed.trim() ? String(storage.get(requestForKey(pid), 'all') || 'all') : 'all' };
   const prefix = codeKey(pid, '');
   storage.keys(prefix).forEach((key) => {
     const text = storage.get(key);

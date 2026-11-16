@@ -2,9 +2,9 @@
    note), body, lineage, editor, history. The body is the server's rendering; a suggested
    edit is read in place (the server's `marked_html`), the unified diff one click away. */
 
-import { app, link } from './core.js';
+import { app, link, restedOf } from './core.js';
 import { api } from './api.js';
-import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, minutes, money, plain, plural, raw, storage, tf } from './util.js';
+import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, listOf, minutes, money, parseStamp, plain, plural, raw, storage, tf } from './util.js';
 import { STATES, TONE, agentName, glyph, icon, kindName, pageGlyph } from './vocab.js';
 
 /* ---------- naming a page ---------- */
@@ -30,6 +30,8 @@ function byline(page) {
   if (page.review === 'accepted' && meta.decided_by && page.author !== 'human' && page.author !== 'system') parts.push('accepted by ' + who(meta.decided_by) + ' ' + ago(meta.decided_at));
   if (page.optimistic) parts.push('decided just now');
   parts.push('updated ' + ago(page.updated) + (meta.updated_by && meta.updated_by !== page.author ? ' by ' + who(meta.updated_by) : ''));
+  /* a page somebody else wrote that the person edited: the stamp the store keeps for it */
+  if (meta.edited_by_person && page.author !== 'human' && meta.updated_by !== 'human') parts.push('edited by you' + (parseStamp(meta.edited_by_person) != null ? ' ' + ago(meta.edited_by_person) : ''));
   return parts.map((text) => html`<span>${text}</span>`);
 }
 
@@ -42,7 +44,7 @@ export function statusParts(store, page) {
   if (page.kind === 'experiment') {
     const row = store.expById.get(page.id) || {};
     const run = row.last_run || {};
-    if (page.state === 'running') return ['running'];
+    if (page.state === 'running') return row.interrupted ? ['interrupted', 'needs you'] : ['running'];
     if (page.state === 'succeeded') return ['succeeded'].concat(run.seconds != null ? [durationShort(run.seconds)] : []);
     if (page.state === 'failed') return ['failed', 'needs you'];
     if (page.state === 'approved') return ['approved', 'runs next'];
@@ -142,6 +144,26 @@ function runOn(store, page, entry) {
     ${runnable.map((o) => html`<option value="${o.backend}"${o.backend === chosen.backend ? raw(' selected') : ''}>${optionLabel(o, data.plan)}</option>`)}</select></label>${networkAsk(page.id, data.plan)}`;
 }
 
+/* ---------- what stops a plan from being approved ---------- */
+/** What the check of an experiment found when it was proposed (the page's `problems` field,
+    written by code): the checkpoint says "its page lists why", and this is the list. */
+export function planProblemsHTML(page) {
+  const found = page.kind === 'experiment' ? (page.meta || {}).problems : null;
+  const list = (Array.isArray(found) ? found : found ? [found] : []).filter((x) => typeof x === 'string' && x.trim());
+  if (!list.length || page.review === 'rejected') return '';
+  return html`<div class="note note-warn plan-problems" data-plan-problems>${icon('warn')}<div><b>It cannot be approved as it stands.</b> The check that was made when it was proposed found:<ul class="reasons">${list.map((x) => html`<li>${plain(x)}</li>`)}</ul></div></div>`;
+}
+
+/* ---------- a page that was accepted can still be rejected ---------- */
+/** Any page the person did not write themselves: an experiment whose plan they no longer
+    stand behind, a source that should not be cited, a finding they changed their mind about. */
+export const canUnaccept = (page) => !!page && page.review === 'accepted' && page.author !== 'human' && page.kind !== 'idea'
+  && !(page.kind === 'experiment' && (page.state === 'queued' || page.state === 'running'));   // a run is cancelled first: the server refuses otherwise
+/** The quiet way in, beside the page's status. */
+export const unacceptLink = (page) => (canUnaccept(page) && app.ui.rejecting !== page.path ? html`<button class="linkish page-unaccept" data-act="reject-ask" data-ref="${page.path}" data-tip="It is kept with your reason; agents see the title and the reason only">Reject it after all…</button>` : '');
+/** The question it opens: a reason, as for any rejection. */
+export const unacceptForm = (page) => (canUnaccept(page) && app.ui.rejecting === page.path ? html`<div class="note note-unaccept" data-unaccept="${page.path}"><span><b>Reject ${label(page)} after all?</b> It is kept with your reason, and nothing is built on it from here on.${page.kind === 'experiment' ? ' What already rests on its runs is not changed: you are told what that is.' : ''}</span>${rejectForm(page.path)}</div>` : '');
+
 /* ---------- review bar: accept / edit, then accept / reject ---------- */
 export function reviewBar(store, page, opt) {
   opt = opt || {};
@@ -160,15 +182,17 @@ export function reviewBar(store, page, opt) {
           ? html`${opt.compact ? '' : html`<button class="btn btn-primary" data-act="accept-run" data-ref="${page.path}"${canRun ? '' : raw(' disabled')}>${icon('play')}Accept and run</button>`}
               <button class="btn${opt.compact ? ' btn-primary' : ''}" data-act="accept" data-ref="${page.path}">${opt.compact ? html`${icon('check')}Accept, keep planned` : 'Accept, keep planned'}${key('A')}</button>`
           : html`<button class="btn btn-primary" data-act="accept" data-ref="${page.path}">${icon('check')}Accept${key('A')}</button>`}
-        <button class="btn" data-act="edit" data-ref="${page.path}">${exp || opt.compact ? 'Edit' : 'Edit, then accept'}${key('E')}</button>
+        <button class="btn" data-act="edit" data-ref="${page.path}" data-tip="Saving an edit does not decide the page: “Save and accept” does">Edit${key('E')}</button>
         <button class="btn btn-neg-quiet" data-act="reject-ask" data-ref="${page.path}">Reject…${key('R')}</button></div>`}
     </div>`);
   }
+  if (whole && !opt.compact) parts.push(unacceptForm(page));
   if (edits) store.pendingFor(page.path).forEach((proposal) => parts.push(changeNote(store, page, proposal, opt)));
   if (whole && page.review === 'rejected' && !opt.compact) {
     const meta = page.meta || {};
     parts.push(html`<div class="note note-rejected"><b>Rejected</b> by ${who(meta.decided_by || 'human')}${meta.decided_at ? ', ' + dateTime(meta.decided_at) : ''}.${meta.decision_reason ? html` <q>${meta.decision_reason}</q>` : ''}
-      <span class="note-sub">The page is kept. Agents see its title and this reason, nothing else. <button class="linkish" data-act="reaccept" data-ref="${page.path}">Accept it after all</button></span></div>`);
+      <span class="note-sub">The page is kept. Agents see its title and this reason, nothing else. <button class="linkish" data-act="reaccept" data-ref="${page.path}">Accept it after all</button></span>
+      ${page.kind === 'experiment' && restedOf(page) ? html`<div class="rested">${restsOnHTML(store, restedOf(page))}</div>` : ''}</div>`);
   }
   return join(parts);
 }
@@ -189,6 +213,7 @@ function changeNote(store, page, proposal, opt) {
       <button class="linkish" data-act="toggle-diff" data-ref="${proposal.id}" aria-pressed="${tf(asDiff)}">${asDiff ? 'show in the text' : 'show as diff'}</button>
       ${asDiff ? '' : html`<button class="linkish" data-act="jump-change">go to the change</button>`}</p>` : ''}
     ${full && full.page_changed ? html`<p class="review-why">${icon('warn')} The page changed after this was suggested. Accepting applies the fields; the text is not replaced.</p>` : ''}
+    ${full && page.kind === 'finding' && !opt.compact ? editNumbersHTML(store, full) : ''}
     ${text && asDiff && full && !opt.compact ? html`<div class="diff-wrap">${raw(full.diff_html)}</div>` : ''}
     ${app.ui.rejecting === proposal.id ? rejectForm(proposal.id) : html`<div class="review-actions">
       <button class="btn btn-primary" data-act="accept" data-ref="${proposal.id}">${icon('check')}Accept${opt.margin || opt.compact ? '' : ' change'}${key('A')}</button>
@@ -197,20 +222,59 @@ function changeNote(store, page, proposal, opt) {
   </div>`;
 }
 
+/* ---------- what rests on an experiment ---------- */
+/** What the server said rests on an experiment when it was rejected: the findings based on
+    its runs and the verdicts on hypotheses they carry, each a link. Nothing of it was
+    changed by the rejection. */
+export function restsOnHTML(store, deps) {
+  const findings = (deps && deps.findings) || [], verdicts = (deps && deps.hypotheses) || [];
+  if (!findings.length && !verdicts.length) return '';
+  const to = (item, text, tip) => { const page = store.byPath.get(item.path); return page ? html`<a class="chip" href="${link({ view: 'wiki', sel: page.path, sub: '' })}" data-sel="${page.path}" data-tip="${tip || pageTip(page)}">${pageGlyph(page, 12)}${text}</a>` : html`<span class="chip" data-tip="${item.title || ''}">${text}</span>`; };
+  return html`${findings.length ? html`<p class="rested-l"><span class="rested-h">${findings.length === 1 ? 'Finding' : 'Findings'} based on its runs</span>${findings.map((f) => html`${to(f, html`<b>${f.id || 'Finding'}</b>${f.review === 'proposed' ? ' proposed' : ''}`, f.title)}${f.only ? html`<span class="rested-only">rests on nothing else</span>` : ''}`)}</p>` : ''}
+    ${verdicts.length ? html`<p class="rested-l"><span class="rested-h">${verdicts.length === 1 ? 'Verdict' : 'Verdicts'} they carry</span>${verdicts.map((h) => html`${to(h, html`<b>${h.id || 'Hypothesis'}</b> ${h.state || ''}`, h.title)}${(h.through || []).length ? html`<span class="rested-only">through ${listOf(h.through)}</span>` : ''}`)}</p>` : ''}
+    <p class="rested-say">None of this was changed: the findings and the verdicts are yours to revisit. The records of a rejected experiment are no evidence for the number check, and a paper does not report a finding that rests on nothing else.</p>`;
+}
+
 /* ---------- number check on findings ---------- */
+/** Where the numbers of a report were found, most telling first: result records, then the rest. */
+function foundPlaces(store, report) {
+  const places = new Map();
+  (report.checked || []).forEach((c) => (c.found_in || []).forEach((path) => places.set(path, (places.get(path) || 0) + 1)));
+  return Array.from(places.entries()).sort((a, b) => (b[0].startsWith('wiki/results/') ? 1 : 0) - (a[0].startsWith('wiki/results/') ? 1 : 0) || b[1] - a[1]).slice(0, 4).map(([path]) => placeLink(store, path));
+}
+/** The lists that stand under the server's sentence: which numbers were found nowhere, which
+    only outside the records the finding is based on (and where), which were not looked at. */
+function reportLists(store, report) {
+  const byNumber = new Map((report.checked || []).map((c) => [String(c.number), c]));
+  const where = (number) => { const c = byNumber.get(String(number)); return c && (c.found_in || []).length ? html` <span class="quiet">in ${join(c.found_in.slice(0, 3).map((path) => placeLink(store, path)), ', ')}${c.found_in.length > 3 ? ' and ' + (c.found_in.length - 3) + ' more' : ''}</span>` : ''; };
+  const nowhere = report.unverified || [], far = report.elsewhere || [], skipped = report.skipped || [];
+  return html`${nowhere.length ? html`<p class="numcheck-flag" data-numbers="unverified">${icon('warn')}<span><b>Not found:</b> ${join(nowhere.map((n) => html`<b class="numcheck-n">${n}</b>`), ', ')}</span></p>` : ''}
+    ${far.length ? html`<p class="numcheck-far" data-numbers="elsewhere"><b>Found only outside the records this finding is based on:</b> ${join(far.map((n) => html`<span><b class="numcheck-n">${n}</b>${where(n)}</span>`), '; ')}</p>` : ''}
+    ${skipped.length ? html`<p class="numcheck-skip" data-numbers="skipped"><b>Not checked</b> (short or round): ${skipped.join(', ')}</p>` : ''}`;
+}
+/** The number check of a finding as the server reports it: its own sentence (what was looked
+    for and where, how many were not found, that short and round numbers are not checked),
+    and under it the numbers that sentence counts. Nothing here says more than the report. */
 export function numberCheckHTML(store, view) {
   if (!view || view.page.kind !== 'finding') return '';
-  const checks = view.number_check;
-  if (checks == null) return html`<section class="numcheck"><h3 class="rail-h">Number check</h3><p class="quiet">The numbers could not be checked${view.number_check_error ? ': ' + view.number_check_error : '.'}</p></section>`;
-  if (!checks.length) return html`<section class="numcheck"><h3 class="rail-h">Number check</h3><p class="quiet">No number in this finding is specific enough to need a record.</p></section>`;
-  const found = checks.filter((c) => (c.found_in || []).length), missing = checks.filter((c) => !(c.found_in || []).length);
-  const places = new Map();
-  found.forEach((c) => c.found_in.forEach((p) => places.set(p, (places.get(p) || 0) + 1)));
-  const top = Array.from(places.entries()).sort((a, b) => (b[0].startsWith('wiki/results/') ? 1 : 0) - (a[0].startsWith('wiki/results/') ? 1 : 0) || b[1] - a[1]).slice(0, 3);
-  return html`<section class="numcheck"><h3 class="rail-h">Number check</h3>
-    <p class="numcheck-sum">${found.length} of ${plural(checks.length, 'number')} ${found.length === 1 ? 'occurs' : 'occur'} in a record, a source or the inputs${top.length ? html`: ${join(top.map(([path]) => placeLink(store, path)), ', ')}` : ''}.</p>
-    ${missing.map((c) => html`<p class="numcheck-flag">${icon('warn')}<span><b>${c.number}</b> was not found in a record, a source or the inputs. It may be derived: check it before you rely on it.</span></p>`)}
+  const report = view.number_report;
+  if (!report) return html`<section class="numcheck"><h3 class="rail-h">Number check</h3><p class="quiet">The numbers could not be checked${view.number_report_error || view.number_check_error ? ': ' + plain(view.number_report_error || view.number_check_error) : '.'}</p></section>`;
+  const places = foundPlaces(store, report);
+  /* beside a suggested edit, which carries the check of the text as it would read */
+  const edited = (view.proposals || []).some((x) => x.number_report && store.pendingFor(view.page.path).some((y) => y.id === x.id));
+  return html`<section class="numcheck"><h3 class="rail-h">Number check${edited ? html` <span class="quiet numcheck-of">of the finding as it is now</span>` : ''}</h3>
+    <p class="numcheck-sum">${report.summary}</p>
+    ${reportLists(store, report)}
+    ${places.length ? html`<p class="numcheck-where"><b>Found in</b> ${join(places, ', ')}</p>` : ''}
+    <p class="numcheck-what">The check says that a number occurs on record, not that it is the number the sentence is about.</p>
   </section>`;
+}
+/** The same report for a suggested edit to a finding: the numbers as the finding would read
+    with the edit applied, checked before the decision. */
+function editNumbersHTML(store, proposal) {
+  const report = proposal.number_report;
+  if (!report) return proposal.number_report_error ? html`<p class="review-num"><b>Numbers, as the finding would read:</b> they could not be checked: ${plain(proposal.number_report_error)}</p>` : '';
+  return html`<div class="review-num"><p><b>Numbers, as the finding would read:</b> ${report.summary}</p>${reportLists(store, report)}</div>`;
 }
 function placeLink(store, path) {
   const page = store.page(path);
@@ -253,7 +317,7 @@ function numberNode(text, check, store, insideLink) {
     const flag = document.createElement('span');
     flag.className = 'num num-flag';
     flag.tabIndex = 0;
-    flag.dataset.tip = text + ' was not found in a record, a source or the inputs.';
+    flag.dataset.tip = text + ' was not found in the run records, sources or your files.';
     flag.append(text);
     const mark = document.createElement('sup');
     mark.textContent = '?';
@@ -264,9 +328,11 @@ function numberNode(text, check, store, insideLink) {
   const place = found.find((p) => p.startsWith('wiki/results/')) || found.find((p) => store.page(p)) || found[0];
   const page = store.page(place);
   const names = found.slice(0, 3).map((p) => { const pg = store.page(p); return pg ? label(pg) : p.replace(/^inputs\//, ''); });
-  const tip = text + ' is in ' + names.join(', ') + (found.length > 3 ? ' and ' + (found.length - 3) + ' more' : '');
+  /* found, but in none of the records the finding is based on: said, and drawn differently */
+  const far = check.in_basis === false;
+  const tip = text + ' occurs in ' + names.join(', ') + (found.length > 3 ? ' and ' + (found.length - 3) + ' more' : '') + (far ? ', not in the records this finding is based on.' : '.');
   const el = document.createElement(insideLink ? 'span' : 'a');
-  el.className = 'num';
+  el.className = far ? 'num num-far' : 'num';
   el.dataset.tip = tip;
   el.textContent = text;
   if (!insideLink) {
@@ -306,7 +372,7 @@ export function trailHTML(store, path) {
 const draftKey = (pid, path) => 'po-draft:' + pid + ':' + path;
 /* written at every keystroke: a reload a moment after typing must not lose the last words */
 const saveDraft = (key, draft) => {
-  const { preview, previewOf, saving, error, conflict, ...kept } = draft; // eslint-disable-line no-unused-vars
+  const { preview, previewOf, saving, error, conflict, accepting, ...kept } = draft; // eslint-disable-line no-unused-vars
   storage.set(key, kept);
 };
 export function draftOf(store, page, view) {
@@ -344,20 +410,30 @@ export function dropDraft(store, path) {
 export const hasDraft = (store, path) => { const key = draftKey(store.pid, path); const d = app.ui.drafts[key] || storage.get(key); return !!(d && d.base && isDirty(d)); };
 
 /* ---------- editor ---------- */
+/** Editing is not deciding. A proposal that is edited and saved is still a proposal; "Save
+    and accept" is the decision, and says so. A rejected page stays rejected with the
+    corrections in it. A suggested edit can only be changed by deciding it: there the one
+    button says both. */
 function editorHTML(store, page, view, mode) {
   const draft = draftOf(store, page, view);
   const dirty = isDirty(draft);
   const states = STATES[page.kind];
-  const proposed = page.review === 'proposed';
-  const what = draft.proposal ? 'Editing a suggested change. Your version is what gets applied.' : proposed ? 'Editing a proposal. Your version is what gets accepted.' : 'Editing. The current version goes to the history.';
-  const submit = draft.proposal ? 'Save and accept the change' : proposed ? 'Save and accept' : 'Save';
+  const proposed = page.review === 'proposed', rejected = page.review === 'rejected';
+  const what = draft.proposal ? 'Editing a suggested change. Saving applies your version and decides the suggestion.'
+    : proposed ? 'Editing a proposal. Save keeps it a proposal; Save and accept decides it.'
+      : rejected ? 'Editing a rejected page. Saving keeps it rejected.'
+        : 'Editing. The current version goes to the history.';
+  const busy = draft.saving ? raw(' disabled') : '';
+  const buttons = draft.proposal ? html`<button class="btn btn-primary" type="submit"${busy}>Save and accept the change <kbd>Ctrl S</kbd></button>`
+    : proposed ? html`<button class="btn" type="submit" data-save="plain"${busy}>Save <kbd>Ctrl S</kbd></button><button class="btn btn-primary" type="button" data-act="save-accept" data-ref="${page.path}"${busy}>${icon('check')}Save and accept</button>`
+      : html`<button class="btn btn-primary" type="submit" data-save="plain"${busy}>Save <kbd>Ctrl S</kbd></button>`;
   const conflict = draft.conflict;
   return html`<form class="editor ed-${mode}" data-form="edit" data-ref="${page.path}">
     <div class="ed-bar"><span class="ed-what">${what}</span>
       <span class="ed-draft" data-draft>${draft.saving ? 'Saving…' : draft.restored ? 'Your unsaved draft was restored' : dirty ? 'Draft kept on this device' : 'No changes yet'}</span>
       ${draft.restored || dirty ? html`<button class="btn btn-quiet" type="button" data-act="draft-discard" data-ref="${page.path}">Discard draft</button>` : ''}
       <button class="btn btn-quiet" type="button" data-act="edit-cancel">Close</button>
-      <button class="btn btn-primary" type="submit"${draft.saving ? raw(' disabled') : ''}>${submit} <kbd>Ctrl S</kbd></button></div>
+      ${buttons}</div>
     ${draft.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span><b>Not saved.</b> ${draft.error} Your text is still here.</span></div>` : ''}
     ${conflict ? conflictHTML(draft, conflict) : draft.theirs ? theirsHTML(draft.theirs) : ''}
     <div class="ed-fields"><label><span>Title</span><input id="ed-title" name="title" value="${draft.title}" autocomplete="off"></label>
@@ -371,7 +447,7 @@ function conflictHTML(draft, conflict) {
   const rows = lineDiff(draft.base.body, conflict.body || '');
   return html`<div class="conflict" role="alert"><p><b>This page changed while you were editing.</b> ${cap(who((conflict.meta || {}).updated_by || conflict.author))} saved a newer version ${ago(conflict.updated)}. Nothing was overwritten, and your text is kept below.</p>
     <details open><summary>What changed in the page since you started</summary>${rows.length ? diffRows(rows) : html`<p class="quiet">Only its fields changed (title, summary or state), not the text.</p>`}</details>
-    <div class="review-actions"><button class="btn btn-primary" type="button" data-act="conflict-mine">Save my version over it</button>
+    <div class="review-actions"><button class="btn btn-primary" type="button" data-act="conflict-mine">${draft.accepting ? 'Save my version over it, and accept' : 'Save my version over it'}</button>
       <button class="btn" type="button" data-act="conflict-rebase">Keep editing on top of the new version</button>
       <button class="btn btn-neg-quiet" type="button" data-act="conflict-theirs">Discard my draft, show the new version</button></div></div>`;
 }
@@ -407,7 +483,7 @@ function historyHTML(store, page, view) {
 function bodyHTML(store, page, view) {
   const proposals = (view.proposals || []).filter((p) => p.body != null && store.pendingFor(page.path).some((x) => x.id === p.id));
   const shown = proposals.find((p) => !app.ui.asDiff[p.id]);
-  if (shown) return html`<div class="prose prose-marked" data-prose="${page.path}">${raw(shown.marked_html)}</div>`;
+  if (shown) return html`<div class="prose prose-marked" data-prose="${page.path}"${page.kind === 'finding' && shown.number_report ? html` data-numbers-of="${shown.id}"` : ''}>${raw(shown.marked_html)}</div>`;
   return html`<div class="prose" data-prose="${page.path}"${page.kind === 'finding' ? raw(' data-numbers="1"') : ''}>${raw(view.html)}</div>`;
 }
 function attachmentsHTML(store) {
@@ -445,7 +521,7 @@ export function panelHTML(store, page, opt) {
     <div class="page-kicker"><span class="kicker-kind">${pageGlyph(page, 18)}<span>${kindName(page.kind)}${hasId(page) ? html` <b>${page.id}</b>` : ''}</span></span><span class="page-tools">${tools}</span></div>
     <${raw(titleTag)} class="page-title">${page.title}</${raw(titleTag)}>
     ${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
-    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by">${byline(page)}</span></div>
+    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by">${byline(page)}</span>${sub ? '' : unacceptLink(page)}</div>
     ${page.kind === 'experiment' && page.meta && page.meta.state_reason && (page.state === 'failed' || page.state === 'planned') ? html`<p class="page-reason${page.state === 'planned' ? ' page-reason-back' : ''}">${icon('warn')}${plain(page.meta.state_reason)}</p>` : ''}
     ${app.ui.confirmDelete === page.path ? html`<div class="note note-neg confirm" role="alertdialog" aria-label="Delete this page"><span><b>Delete this page?</b> Its last version stays under <code>history/</code>; pages that link to it keep the link as text.</span>
       <span class="row"><button class="btn btn-neg" data-act="delete" data-ref="${page.path}">Delete</button><button class="btn btn-quiet" data-act="delete-cancel">Cancel</button></span></div>` : ''}
@@ -455,11 +531,19 @@ export function panelHTML(store, page, opt) {
     body = entry && entry.error
       ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The text of this page could not be loaded: ${entry.error.message} <button class="linkish" data-act="reload-page" data-ref="${page.path}">Try again</button></span></div>`
       : html`<div class="skeleton" aria-busy="true" aria-label="Loading the page"><i></i><i></i><i></i><i class="short"></i></div>`;
-  } else if (sub === 'edit' && !record) body = editorHTML(store, page, view, mode);
+  } else if (sub === 'edit' && !record) {
+    /* An edit is begun on the page as it is now. What is kept of its text may be older (the
+       page was decided or changed a moment ago and is being read again): a draft begun on
+       that would be refused as an edit of a version the person did not see. */
+    const stale = entry.key !== store.viewKey(page.path) && !app.ui.drafts[draftKey(store.pid, page.path)];
+    body = stale ? html`<div class="skeleton" aria-busy="true" aria-label="Loading the page"><i></i><i></i><i></i><i class="short"></i></div>` : editorHTML(store, page, view, mode);
+  }
   else if (sub === 'history') body = historyHTML(store, page, view);
   else {
     const draftWaiting = !record && hasDraft(store, page.path);
-    body = html`${draftWaiting ? html`<div class="note note-draft">${icon('pencil')}<span>You have an unsaved draft of this page on this device.</span><span class="row"><button class="btn btn-s" data-act="edit" data-ref="${page.path}">Resume editing</button><button class="btn btn-quiet btn-s" data-act="draft-discard" data-ref="${page.path}">Discard it</button></span></div>` : ''}
+    body = html`${view.edited_record ? html`<div class="note note-warn note-edited" data-edited-record>${icon('pencil')}<span><b>This record was edited by hand.</b> It no longer reads as code wrote it${page.kind === 'result' ? ' from the run. The number check and a paper read the metrics from the run\'s own record, not from this page' : ''}. <button class="linkish" data-act="history" data-ref="${page.path}">Open its history</button></span></div>` : ''}
+      ${draftWaiting ? html`<div class="note note-draft">${icon('pencil')}<span>You have an unsaved draft of this page on this device.</span><span class="row"><button class="btn btn-s" data-act="edit" data-ref="${page.path}">Resume editing</button><button class="btn btn-quiet btn-s" data-act="draft-discard" data-ref="${page.path}">Discard it</button></span></div>` : ''}
+      ${app.route.view === 'experiments' ? '' : planProblemsHTML(page)}
       ${notesHTML(store, page, opt.notes === 'rail' ? { part: 'page' } : {})}
       ${bodyHTML(store, page, view)}
       ${page.kind === 'idea' ? attachmentsHTML(store) : ''}
@@ -516,7 +600,10 @@ export function afterRender(root) {
   if (!store || !store.loaded) return;
   $$('[data-prose]', root).forEach((el) => {
     decorate(store, el);
-    if (el.dataset.numbers) { const view = (store.views.get(el.dataset.prose) || {}).data; if (view && view.number_check) markNumbers(el, view.number_check, store); }
+    const view = (store.views.get(el.dataset.prose) || {}).data;
+    if (el.dataset.numbers && view) { const checks = (view.number_report && view.number_report.checked) || view.number_check; if (checks) markNumbers(el, checks, store); }
+    /* a suggested edit read in place: the numbers are those of the finding as it would read */
+    if (el.dataset.numbersOf && view) { const edit = (view.proposals || []).find((x) => x.id === el.dataset.numbersOf); if (edit && edit.number_report) markNumbers(el, edit.number_report.checked || [], store); }
   });
   $$('.prose-s[data-plan], .hist-body, .ed-prev', root).forEach((el) => decorate(store, el));
   /* The two lines that head a diff of versions name them by a raw stamp. The row above
