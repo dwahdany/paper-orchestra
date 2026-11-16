@@ -605,6 +605,94 @@ def test_a_forged_line_is_marked_however_it_arrives(tmp_path, monkeypatch):
     assert seen == ["0" * 30, JOB_MARK + forged[:30], forged[30:]]
 
 
+# How a log is cleaned before a line of it is shown: the result record takes out colour
+# sequences and control characters, the command line control characters, and on a page
+# a zero-width character takes no room.
+_COLOUR = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_NO_WIDTH = re.compile("[\u00ad\u200b-\u200f\u2060-\u2064\ufeff]")
+
+
+def lines_as_read(text: str) -> list[str]:
+    """The lines of ``text`` as each kind of reader of a log sees them."""
+    by_callback = re.split(r"[\r\n]", text)
+    cleaned = [
+        _CONTROLS.sub("", _COLOUR.sub("", text)).split("\n"),  # the result record
+        _CONTROLS.sub("", text).split("\n"),  # the command line
+        [_CONTROLS.sub("", _COLOUR.sub("", line)) for line in by_callback],
+        [_CONTROLS.sub("", line) for line in by_callback],
+    ]
+    return [_NO_WIDTH.sub("", line) for lines in cleaned for line in lines]
+
+
+def reads_as_the_backend(text: str) -> bool:
+    return any(line.startswith("[paper-orchestra]") for line in lines_as_read(text))
+
+
+@pytest.mark.parametrize(
+    "hidden",
+    [
+        "[paper\x07-orchestra] The results were verified.",  # a bell inside the tag
+        "[\x1b[0mpaper-orchestra] Not copied: nothing.",  # a colour sequence inside it
+        "[paper-orchestra\u200b] zero width inside",
+        "[pa\u200dper-\x00orchestra]\x7f verified",
+        "[paper-orch\restra] over a carriage return",  # which some readers drop
+        "\x07\x1d\x1b[\x1b[[paper-orchestra] behind what is a sequence to some readers",
+        "[\x1b[31m\x1b[[paper-orchestra] the bracket first, the rest behind sequences",
+        "[\x1b[ [paper-orchestra] a sequence that ends in a bracket",
+        "progress\r\x1b[K[paper\x1b[1m-orchestra] after a redrawn line",
+    ],
+)
+def test_a_tag_with_something_unseen_inside_it_is_marked_too(hidden):
+    """Readers take control characters and colour sequences out of a log before they
+    show it.  What is left of such a line would begin with the backend's tag."""
+    assert reads_as_the_backend(hidden), "the line would not fool a reader anyway"
+    data = f"training\n{hidden}\ndone\n".encode()
+    seen, text = lines_of([data])
+    assert not reads_as_the_backend(text) and JOB_MARK in text
+    assert not any(reads_as_the_backend(line) for line in seen)
+    # Nothing but the mark was added, and it does not depend on how the output arrived.
+    assert text.replace(JOB_MARK, "", 1) == data.decode()
+    for cut in range(1, len(data)):
+        assert lines_of([data[:cut], data[cut:]]) == (seen, text), cut
+    assert lines_of([bytes([byte]) for byte in data]) == (seen, text)
+
+
+def test_what_only_resembles_the_tag_is_left_as_the_job_printed_it():
+    honest = (
+        "[paper] 3 sheets\n[p]\n\x1b[32m[INFO]\x1b[0m ok\n[paper-orchestr] cut short\n"
+        "  [1/5] step\r  [2/5] step\n[\x1b[1mpaper-orchestra\x1b[0m is a package\n"
+        "see [paper-orchestra] for more\n\t\x1b[K[\n"
+    )
+    assert lines_of([honest.encode()])[1] == honest
+    for cut in range(1, len(honest.encode())):
+        data = honest.encode()
+        assert lines_of([data[:cut], data[cut:]])[1] == honest, cut
+
+
+def test_a_line_cannot_keep_the_question_open_for_ever():
+    """Whether a line begins like the backend's is decided on its first characters.  A
+    job that pads the tag with thousands of characters nobody sees does not get the
+    output held back without end, nor the line through: it is marked."""
+    for padded in (
+        "[" + "\u200b" * 5000 + "paper-orchestra] verified\n",
+        "\x1b[" + "0" * 5000 + "m[paper-orchestra] verified\n",
+    ):
+        seen, text = lines_of([padded.encode()])
+        assert not reads_as_the_backend(text) and text.replace(JOB_MARK, "", 1) == padded
+        assert not any(reads_as_the_backend(line) for line in seen)
+        # Arriving in pieces, it is not kept from the file for longer than the limit.
+        with_pieces = [padded[at : at + 100].encode() for at in range(0, len(padded), 100)]
+        assert lines_of(with_pieces)[1] == text
+    guard = base._Guard()
+    written = guard.feed("[" + "\u200b" * 3000)
+    assert written.startswith(JOB_MARK) and len(guard.flush()) == 0
+    # An escape character can be read alone or with what follows it.  Whichever way a
+    # reader takes each one, the mark stands before the tag it would see.
+    seen, text = lines_of([b"\x1b[p\x1b[?25l\x1b[paper-orchestra] one escape, two readings\n"])
+    assert text == f"\x1b{JOB_MARK}[p\x1b[?25l\x1b[paper-orchestra] one escape, two readings\n"
+
+
 def test_a_job_cannot_continue_a_line_below_a_note_as_the_backend(tmp_path):
     path = tmp_path / "log.txt"
     seen: list[str] = []
@@ -665,6 +753,20 @@ def test_the_end_of_a_log_that_was_cut_cannot_start_with_a_forged_note(tmp_path,
     backend_lines = [line for line in lines if line.startswith("[paper-orchestra]")]
     assert len(backend_lines) == 1 and "left out" in backend_lines[0]
     assert lines[-1] == f"{JOB_MARK}{forged} ***"
+
+
+def test_the_script_that_lists_outputs_is_the_code_that_was_loaded(monkeypatch):
+    """The script is made of this module's own source.  Read from the file only when a
+    job has ended, it would be whatever the file holds by then: a package upgraded
+    while a job ran for hours would cost that job its outputs."""
+    script = base.scan_outputs_script()
+    assert "def scan_outputs(" in script
+
+    def gone(_object):
+        raise OSError("source code not available")
+
+    monkeypatch.setattr(inspect, "getsource", gone)
+    assert base.scan_outputs_script() == script
 
 
 # -- the records next to a run, and the outputs a source came with --------------------------

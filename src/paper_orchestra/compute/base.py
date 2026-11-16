@@ -31,6 +31,7 @@ import shutil
 import stat
 import threading
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -142,7 +143,9 @@ HANDLE_NAME = "handle.txt"
 COST_NAME = "cost.json"
 #: Where a backend whose jobs are processes of this machine records what a job started,
 #: for whoever has to clean up after a worker that died:
-#: ``{"session": int, "session_started": str, "scratch": str}``.
+#: ``{"session": int, "session_started": str, "scratch": str}``.  The working directory
+#: is on record from the moment it exists; the session is ``0`` (and its start ``""``)
+#: until the command has been started.
 JOB_NAME = "job.json"
 #: Names in a run directory that the backend or the engine writes: the records above,
 #: the engine's ``run.json``, its snapshot of the code that ran (``code``) and its copy of
@@ -725,97 +728,198 @@ _TAG = NOTE_PREFIX.rstrip()
 _ESCAPE = "\x1b"
 # What a terminal or a page shows nothing of: blanks, control and zero-width characters.
 # The escape character is looked at by itself, because what follows it may go with it.
-_UNSEEN = re.compile(
-    r"[\s\x00-\x1a\x1c-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u2028-\u202f\u2060-\u2064\ufeff]*"
-)
-# A colour or cursor sequence, which a terminal shows nothing of either, and one that
-# the text seen so far may still be in the middle of.
-_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_OPEN_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]{0,32}[ -/]{0,4})?")
+_UNSEEN_SET = r"\s\x00-\x1a\x1c-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u2028-\u202f\u2060-\u2064\ufeff"
+# What most lines that have anything before their first word begin with: characters
+# of that kind, and colour or cursor sequences that can only be read as such.  (One
+# that could also be read as the escape character followed by the beginning of the
+# tag, such as ``ESC [ p``, is not among them, nor is one of a length no terminal
+# sends: those are read character by character, see :func:`_line_start`.)
+_LEAD = re.compile(rf"(?:[{_UNSEEN_SET}]+|\x1b\[(?:[0-?]{{1,256}}[ -/]{{0,16}}[@-~]|[@-oq-~]))*")
+# The kinds of character (Unicode general categories) that are drawn as nothing or as a
+# gap: controls, format characters, marks that sit on another character, separators,
+# and code points that are no character at all.  And letters that are drawn as nothing.
+_UNSEEN_KINDS = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Mn", "Me", "Zs", "Zl", "Zp"})
+_BLANK_LETTERS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
+#: Characters at the start of a line that are held back at most while it cannot be told
+#: whether the line begins like one of the backend's; a line that keeps it open for
+#: longer is taken for one.  No output of a real program comes near it.  The limit is
+#: counted in the text, not in what has arrived, so that it cuts every delivery alike.
+_HELD_CHARS = 1024
+#: Ways of reading the start of one line that are followed at once, at most.
+_MAX_READINGS = 64
+_CLEAN, _TAGGED, _OPEN = "clean", "tagged", "open"
 
 
-def _may_become(word: str, text: str, index: int) -> bool:
-    """Whether ``text`` ends, from ``index`` on, with a beginning of ``word`` that is
-    not all of it (the empty beginning included)."""
-    return len(text) - index < len(word) and word.startswith(text[index:])
+def _unseen(char: str) -> bool:
+    """Whether a reader sees nothing of ``char``, or no more than a gap."""
+    return char.isspace() or unicodedata.category(char) in _UNSEEN_KINDS or char in _BLANK_LETTERS
+
+
+def _in_sequence(char: str, phase: int) -> int | None:
+    """Where the reading of a colour or cursor sequence stands after ``char``.
+
+    A sequence is the escape character, ``[``, parameters (``0`` to ``?``),
+    intermediates (blank to ``/``) and one final character (``@`` to ``~``).  ``phase``
+    is 1 after the escape character, 2 among the parameters and 3 among the
+    intermediates; the result is the next phase, 0 when ``char`` ended the sequence,
+    and ``None`` when ``char`` cannot stand there, so that this is no sequence.
+    """
+    if phase == 1:
+        return 2 if char == "[" else None
+    if phase == 2 and "0" <= char <= "?":
+        return 2
+    if " " <= char <= "/":
+        return 3
+    return 0 if "@" <= char <= "~" else None
+
+
+#: One way of reading the start of a line: how many characters of the tag were read,
+#: where the tag began, where the sequence began that is being read (-1: none is), and
+#: how far that sequence is read (see :func:`_in_sequence`; 0: none is).
+_Reading = tuple[int, int, int, int]
+#: A line at whose start nothing has been read yet.
+_UNREAD: frozenset[_Reading] = frozenset({(0, -1, -1, 0)})
+
+
+def _held_from(readings: Iterable[_Reading], otherwise: int) -> int:
+    """The first place that one of ``readings`` still depends on: where the tag it has
+    begun to read starts, or the sequence it is in the middle of."""
+    places = [
+        began if began >= 0 else escape
+        for _, began, escape, _ in readings
+        if began >= 0 or escape >= 0
+    ]
+    return min(places, default=otherwise)
+
+
+def _line_start(
+    text: str, index: int, resume: tuple[Iterable[_Reading], int] | None = None
+) -> tuple[str, int, set[_Reading]]:
+    """How the line that starts at ``index`` of ``text`` begins for a reader.
+
+    Returns ``(_TAGGED, place, ...)`` when it reads as starting with the tag of the
+    backend's lines, whose first character is at ``place``; ``(_CLEAN, place, ...)``
+    when it does not, which is settled at ``place``; and ``(_OPEN, place, readings)``
+    when that depends on text that has not arrived: the text from ``place`` on has to
+    be kept, and ``(readings, len(text))`` is the ``resume`` to go on with once more
+    of it is there.
+
+    What counts is what is left once everything a reader does not see is taken out,
+    before the tag and *inside* it: the log is shown by programs that drop control
+    characters, colour sequences or both, and by pages on which a zero-width character
+    takes no room.  They do not agree on what goes with an escape character (it alone,
+    or the whole sequence it begins), so both readings are followed, and the line is
+    the backend's look-alike if either makes it one.  A carriage return is dropped by
+    some readers and starts a new line for others; it is taken both ways too.
+    """
+    size, last = len(text), len(_TAG) - 1
+    if resume is None:
+        lead = _LEAD.match(text, index)
+        position = lead.end() if lead else index
+        readings = set(_UNREAD)
+        # Nearly every line is settled by its first visible character or the one after
+        # it.  Told here, without the bookkeeping below: a job prints lines by the million.
+        if position < size and "!" <= (char := text[position]) <= "~":
+            if char != _TAG[0]:
+                return _CLEAN, position, readings
+            second = text[position + 1 : position + 2]
+            if "!" <= second <= "~" and second != _TAG[1]:
+                return _CLEAN, position + 1, readings
+    else:
+        readings, position = set(resume[0]), resume[1]
+    while position < size:
+        char = text[position]
+        if char == "\n":
+            return _CLEAN, position, readings
+        following: set[_Reading] = set()
+        if char == "\r":
+            following.update(_UNREAD)
+        for read, began, escape, phase in readings:
+            if phase:
+                step = _in_sequence(char, phase)
+                if step is not None:
+                    following.add((read, began, escape if step else -1, step))
+            elif char == _ESCAPE:
+                following.add((read, began, -1, 0))
+                following.add((read, began, position, 1))
+            elif char == _TAG[read]:
+                if read == last:
+                    # Before the first place any reading has a tag begin at: whichever
+                    # of them a reader follows, the mark then stands before its tag.
+                    first = min(began for _, began, _, _ in readings if began >= 0)
+                    return _TAGGED, first, readings
+                following.add((read + 1, began if read else position, -1, 0))
+            elif _unseen(char):
+                following.add((read, began, -1, 0))
+        if not following:
+            return _CLEAN, position, readings
+        held = _held_from(following, position)
+        if len(following) > _MAX_READINGS or position - held >= _HELD_CHARS:
+            # Nothing honest keeps the question open for so long, or in so many ways.
+            return _TAGGED, held, following
+        readings = following
+        position += 1
+    return _OPEN, _held_from(readings, size), readings
 
 
 class _Guard:
     """Keeps a job from printing lines that read as the backend's own.
 
-    A line of the backend starts with ``NOTE_PREFIX``.  Where a line of the job starts
-    with that tag, behind nothing a reader would see, ``JOB_MARK`` is put before the
-    tag.  The text arrives in pieces; the few characters at the start of a line that
+    A line of the backend starts with ``NOTE_PREFIX``.  Where a line of the job reads
+    as starting with that tag (see :func:`_line_start`), ``JOB_MARK`` is put before
+    the tag.  The text arrives in pieces; the characters at the start of a line that
     may be the beginning of the tag are held back until the next piece tells.
     """
 
     def __init__(self) -> None:
         self._pending = ""
+        #: How the held-back text has been read so far, with places counted from its
+        #: start; ``None`` when it is to be read from its beginning.
+        self._readings: set[_Reading] | None = None
         #: Nothing visible has been printed on the current line yet.
         self._fresh = True
 
     def feed(self, text: str) -> str:
+        resume = (self._readings, len(self._pending)) if self._readings else None
         text = self._pending + text
-        self._pending = ""
+        self._pending, self._readings = "", None
         pieces: list[str] = []
         index = 0
         while index < len(text):
             if not self._fresh:
+                # The rest of the line is the job's to fill: copied, never looked at.
                 end = _LINE_END.search(text, index)
                 stop = len(text) if end is None else end.end()
                 pieces.append(text[index:stop])
                 index = stop
                 self._fresh = end is not None
                 continue
-            unseen = _UNSEEN.match(text, index)
-            assert unseen is not None  # it matches the empty string
-            pieces.append(unseen.group())
-            index = unseen.end()
-            if index == len(text):
+            verdict, place, readings = _line_start(text, index, resume)
+            resume = None
+            pieces.append(text[index:place])
+            index = place
+            if verdict == _OPEN:
+                self._pending = text[place:]
+                if self._pending:  # else nothing was read that the next piece depends on
+                    self._readings = {
+                        (read, max(began - place, -1), max(escape - place, -1), phase)
+                        for read, began, escape, phase in readings
+                    }
                 break
-            # The rest of the text is only ever copied where it is short: a job prints
-            # megabytes, and this runs at the start of every line of them.
-            if text.startswith(_TAG, index):
+            if verdict == _TAGGED:
                 pieces.append(JOB_MARK)
-                self._fresh = False
-            elif _may_become(_TAG, text, index):
-                self._pending = text[index:]
-                break
-            elif text[index] == _ESCAPE:
-                skipped = self._behind_escape(text, index)
-                if skipped is None:
-                    self._pending = text[index:]
-                    break
-                pieces.append(skipped)
-                index += len(skipped)
-            else:
-                self._fresh = False
+            self._fresh = False
         return "".join(pieces)
 
-    @staticmethod
-    def _behind_escape(text: str, index: int) -> str | None:
-        """What a reader sees nothing of at ``index`` of ``text``, where the escape
-        character stands; ``None`` while more text has to arrive to tell.
-
-        A viewer that drops the escape character alone shows what follows it; a
-        terminal takes a whole sequence with it.  The tag may hide behind either.
-        """
-        if text.startswith(_TAG, index + 1):
-            return _ESCAPE
-        if _may_become(_TAG, text, index + 1):
-            return None
-        sequence = _SEQUENCE.match(text, index)
-        if sequence is not None:
-            return sequence.group()
-        return None if _OPEN_SEQUENCE.fullmatch(text, index) else _ESCAPE
-
     def flush(self) -> str:
-        pending, self._pending = self._pending, ""
+        pending, self._pending, self._readings = self._pending, "", None
         return pending
 
     def new_line(self) -> None:
-        """What comes next starts a line, whatever came before (a note went in between)."""
+        """What comes next starts a line, whatever came before (a note went in between):
+        what is held back is read again, as the beginning of that line."""
         self._fresh = True
+        self._readings = None
 
 
 def _as_the_jobs(piece: str) -> str:
@@ -844,9 +948,11 @@ class JobLog:
     ``on_log``.  The strings in ``mask`` (credentials) are replaced by ``MASKED``,
     also where one arrives in two pieces.  And a line that begins with the tag of
     ``NOTE_PREFIX`` gets ``JOB_MARK`` in front of the tag, so that a line starting
-    with the prefix is always the backend's.  For both, a few characters that may be
-    the beginning of such a string are held back until more output, or the end,
-    tells.
+    with the prefix is always the backend's.  "Begins with" is meant as a reader
+    takes it: characters and colour sequences that are not seen, before the tag or
+    inside it, do not hide it (see :func:`_line_start`).  For both, a few characters
+    that may be the beginning of such a string are held back until more output, or
+    the end, tells.
 
     ``skip_lines`` withholds that many lines from ``on_log``: a log that is rebuilt
     from the start of a job reports only what was not reported before.  ``append``
@@ -1288,16 +1394,22 @@ def scan_outputs(
     return {"entries": entries, "truncated": truncated}
 
 
+# Put together when this module is loaded, from the source it was loaded from.  Read
+# from the file only when a job has ended, it would be whatever the file holds by then:
+# a package that was upgraded while a job ran would cost that job its outputs.
+_SCAN_SCRIPT = (
+    "from __future__ import annotations\n\n\n"
+    + inspect.getsource(scan_outputs)
+    + "\n\nimport json\nimport sys\n\n"
+    "listing = scan_outputs('.', sys.argv[3:], int(sys.argv[1]), int(sys.argv[2]))\n"
+    "print(json.dumps(listing))\n"
+)
+
+
 def scan_outputs_script() -> str:
     """A standalone script that prints :func:`scan_outputs` of its working directory as
     JSON.  Its arguments are ``max_entries``, ``max_chars`` and then the outputs."""
-    return (
-        "from __future__ import annotations\n\n\n"
-        + inspect.getsource(scan_outputs)
-        + "\n\nimport json\nimport sys\n\n"
-        "listing = scan_outputs('.', sys.argv[3:], int(sys.argv[1]), int(sys.argv[2]))\n"
-        "print(json.dumps(listing))\n"
-    )
+    return _SCAN_SCRIPT
 
 
 def choose_outputs(

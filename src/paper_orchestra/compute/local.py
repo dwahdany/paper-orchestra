@@ -14,11 +14,12 @@ blocked; ``supports`` and the notes of a result say so.
 
 What a job starts is ended with it: its process group, its session and, on
 Linux, every process that still carries the job's mark in its environment
-(``JOB_ENV``), wherever it went.  A process that left the session *and* dropped
-its environment cannot be found; that is the limit of what is tracked here.
-When the job starts, ``job.json`` in the run directory records its session and
-its working directory, so that :meth:`LocalBackend.end_job` can clean up after
-a worker that was killed and could not.
+(``JOB_ENV``), wherever it went, with whatever shares a session with one.  A
+process that left the session *and* dropped its environment cannot be found;
+that is the limit of what is tracked here.  ``job.json`` in the run directory
+records the job's working directory as soon as it exists and the session of its
+command once that is started, so that :meth:`LocalBackend.end_job` can clean up
+after a worker that was killed and could not.
 """
 
 from __future__ import annotations
@@ -239,6 +240,19 @@ def _marked(mark: str) -> set[int]:
     return found
 
 
+def _with_their_sessions(marked: set[int], processes: Iterable[tuple[int, int]]) -> set[int]:
+    """``marked`` and every process of ``processes`` (``(pid, session)``) that shares a
+    session with one of them.
+
+    A process cannot join a session, only start one.  So whatever is in a session with
+    a process of the job was started by the job, whether or not it still carries the
+    mark: the job's own session, and any session something of the job went on to start.
+    """
+    processes = list(processes)
+    sessions = {session for pid, session in processes if pid in marked and session > 1}
+    return marked | {pid for pid, session in processes if session in sessions}
+
+
 def _kill(pid: int) -> bool:
     try:
         os.kill(pid, signal.SIGKILL)
@@ -269,20 +283,21 @@ def _kill_job(process: subprocess.Popen[bytes], mark: str = "") -> set[int]:
     start to a process group of its own, which a signal to the job's group does not
     reach.  The session is still the job's, so on Linux the processes of the session
     are looked up and killed too.  What started a session of its own (a daemon) is
-    found by the job's ``mark`` in its environment, see :func:`_marked`.  Call this
-    before the process is reaped: until then its id cannot have been given to an
-    unrelated process group or session.
+    found by the job's ``mark`` in its environment, see :func:`_marked`, and with it
+    what shares its session.  Call this before the process is reaped: until then its
+    id cannot have been given to an unrelated process group or session.
     """
     _kill_group(process)
     strays: set[int] = set()
     if not _on_linux():
         return strays
     for _ in range(_SWEEPS):
-        marked = _marked(mark) if mark else set()
+        processes = list(_processes())
+        found = _with_their_sessions(_marked(mark), processes) if mark else set()
         killed = False
-        for pid, session in list(_processes()):
+        for pid, session in processes:
             inside = session == process.pid
-            if (inside or pid in marked) and pid != os.getpid() and _kill(pid):
+            if (inside or pid in found) and pid != os.getpid() and _kill(pid):
                 killed = True
                 if not inside:
                     strays.add(pid)
@@ -294,20 +309,29 @@ def _kill_job(process: subprocess.Popen[bytes], mark: str = "") -> set[int]:
 def _left_behind(session: int, started: str, scratch: str) -> set[int]:
     """The processes that still run of a job whose worker died, from its record.
 
-    Processes that carry the job's mark are the job's wherever they are.  The
-    processes of its session are the job's if the session is still the one on record:
-    its leader is the process that was started at ``started``, or, the leader gone, a
-    process in it carries the mark (the number of a session is not given out again
-    while a process of it lives).  A session that cannot be told to be the job's is
-    left alone: its number may have gone to somebody else's processes since.
+    Processes that carry the job's mark are the job's wherever they are, and so is
+    what shares a session with one of them.  The processes of the session on record
+    are the job's as well if it is still that session: its leader is the process that
+    was started at ``started``.  With the leader gone, the session is only known to be
+    the job's through a process in it that carries the mark (the number of a session
+    is not given out again while a process of it lives); one that cannot be told to be
+    the job's is left alone, since its number may have gone to somebody else's
+    processes since.
     """
-    marked = _marked(scratch) if scratch else set()
-    if session <= 1:
-        return marked
-    members = {pid for pid, of in _processes() if of == session}
-    leader = _session_started(session)
-    same = bool(started) and leader == started if leader else bool(members & marked)
-    return marked | members if same else marked
+    processes = list(_processes())
+    found = _with_their_sessions(_marked(scratch), processes) if scratch else set()
+    if session > 1 and started and _session_started(session) == started:
+        found |= {pid for pid, of in processes if of == session}
+    found.discard(os.getpid())
+    return found
+
+
+def _job_record(scratch: str, session: int = 0) -> dict[str, Any]:
+    """What ``job.json`` holds of a job that works in ``scratch``: the session its
+    command leads and when that was started, or ``0`` and ``""`` while the command has
+    not been started and the source is still being copied."""
+    started = _session_started(session) if session else ""
+    return {"session": session, "session_started": started, "scratch": scratch}
 
 
 def _job_fields(record: Any) -> tuple[int, str, str]:
@@ -750,6 +774,9 @@ class LocalBackend(ComputeBackend):
                 with scratch as name:
                     work, home = Path(name, "work"), Path(name, "home")
                     home.mkdir()
+                    # From here on a worker that is killed leaves this directory behind:
+                    # the record says where it is before anything is copied into it.
+                    write_record(run_dir / JOB_NAME, _job_record(name))
                     self._note(result, log, copy_source(source, work, should_stop))
                     # A result is what the command writes, not what its source brought.
                     leftovers = clear_outputs(work, spec.outputs)
@@ -796,13 +823,15 @@ class LocalBackend(ComputeBackend):
         """Clean up after a local job whose worker died before it could, and return
         notes on what was done.
 
-        ``record`` is what the job wrote to ``job.json`` in its run directory when it
-        started (``session``, ``session_started``, ``scratch``), or a record that
-        holds it under ``"job"``.  The processes the job left running are killed: those
-        that carry its mark, and those of its session if that is still the session on
-        record (see :func:`_left_behind`; Linux only).  Then its working directory is
-        removed, if it is one that this backend made.  Nothing is done, and nothing
-        returned, for a record that names neither; calling this twice is safe.
+        ``record`` is what the job wrote to ``job.json`` in its run directory
+        (``session``, ``session_started``, ``scratch``; the session is ``0`` in a
+        record from before the command was started), or a record that holds it under
+        ``"job"``.  The processes the job left running are killed: those that carry its
+        mark with what shares a session with them, and those of the session on record
+        if it is still that session (see :func:`_left_behind`; Linux only).  Then its
+        working directory is removed, if it is one that this backend made.  Nothing is
+        done, and nothing returned, for a record that names neither; calling this
+        twice is safe.
         """
         session, started, scratch = _job_fields(record)
         path = Path(scratch)
@@ -884,14 +913,7 @@ class LocalBackend(ComputeBackend):
         try:
             # For whoever settles this run if this process is killed: what to end, and
             # what to remove (see end_job).
-            write_record(
-                run_dir / JOB_NAME,
-                {
-                    "session": process.pid,
-                    "session_started": _session_started(process.pid),
-                    "scratch": mark,
-                },
-            )
+            write_record(run_dir / JOB_NAME, _job_record(mark, process.pid))
             outcome = supervise(
                 _pipe_chunks(process.stdout),
                 log,

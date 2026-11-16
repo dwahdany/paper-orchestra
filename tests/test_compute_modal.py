@@ -737,6 +737,8 @@ def test_check_finds_a_missing_modal_token_without_contacting_modal(fake, backen
     [problem] = backend.check()
     assert "Modal is not authenticated" in problem
     assert "`modal setup`" in problem and "--compute local" in problem
+    # The same sentence is shown when one experiment is approved, where the option is another.
+    assert "`--backend local` when you approve an experiment" in problem
     # The paper itself is compiled in a sandbox, so this holds without figure code too.
     assert backend.check(python=False, latex=True) == [problem]
     assert backend.check(python=False, latex=False) == []
@@ -1412,6 +1414,47 @@ def test_the_handle_is_on_disk_before_anything_runs_in_the_sandbox(fake, backend
 
 
 @needs_coreutils
+def test_the_packed_source_does_not_lie_on_this_machine_while_the_job_runs(fake, backend, job):
+    """The archive of the source is a copy of the person's repository.  A worker that is
+    killed removes nothing, and a job runs for hours: once the archive is uploaded
+    there is none of it left here for a dead worker to leave behind."""
+    source = job.source("import time\nprint('running', flush=True)\ntime.sleep(0.5)\n")
+    while_running: list[list[str]] = []
+
+    def on_log(line: str) -> None:
+        if line == "running":
+            while_running.append(sorted(p.name for p in job.scratch.rglob("*") if p.is_file()))
+
+    result, _ = run_main(backend, job, source, on_log=on_log)
+    assert result.ok and while_running == [[]]
+    # It was made and uploaded, all the same.
+    assert any(call[0] == "filesystem.copy_from_local" for call in fake.calls)
+
+
+@needs_coreutils
+def test_a_job_is_not_started_next_to_the_archive_it_was_unpacked_from(
+    fake, backend, job, monkeypatch
+):
+    """The archive holds the source as it was sent, also what the first step of a job
+    takes out of its files before the command may read them (the token of a repository
+    address).  If it cannot be removed from the sandbox, the command is not started."""
+    remove = FakeFilesystem.remove
+
+    def failing(self, remote_path: str, *, recursive: bool = False) -> None:
+        if remote_path.endswith(".tar"):
+            raise ConnectionError("the connection to the sandbox was lost")
+        remove(self, remote_path, recursive=recursive)
+
+    monkeypatch.setattr(FakeFilesystem, "remove", failing)
+    result, seen = run_main(backend, job, job.source("print('the command ran')\n"))
+    assert result.returncode is None and "could not run the job" in result.error
+    assert "the connection to the sandbox was lost" in result.error
+    assert "the command ran" not in job.log() and "the command ran" not in seen
+    assert fake.sandboxes[0].terminated
+    assert not any("main.py" in call[1] for call in fake.calls if call[0] == "Sandbox.exec")
+
+
+@needs_coreutils
 def test_the_network_is_open_only_when_the_job_asks_for_it(fake, job):
     backend = ModalBackend(cpu=1.5, memory_mb=3000, idle_timeout=120)
     source = job.source("print('ok')\n")
@@ -2043,6 +2086,29 @@ def test_an_interrupted_run_leaves_its_cost_on_file(fake, backend, job, monkeypa
     assert cost["final"] is True and 6000 <= cost["seconds"] < 6100
     assert cost["cost_usd"] == pytest.approx(cost["seconds"] * H100_PER_SECOND, rel=0.001)
     assert cost["cost_usd"] > 6.0
+
+
+@needs_coreutils
+def test_a_sandbox_that_could_not_be_ended_is_charged_for_as_long_as_it_can_live(
+    fake, backend, job, monkeypatch
+):
+    """The call that ends a sandbox can fail like any other.  The sandbox then lives, and
+    is billed, until Modal ends it: the cost on record is that of its whole life, not of
+    the time until the call failed."""
+
+    def unreachable(self, *, wait: bool = False) -> None:
+        raise ConnectionError("the connection to Modal was lost")
+
+    monkeypatch.setattr(FakeSandbox, "terminate", unreachable)
+    source = job.source("print('ok')\n")
+    result, _ = run_main(backend, job, source, spec={"gpu": "H100", "timeout": 600})
+    assert result.ok  # the job itself went well
+    assert result.cost_usd == pytest.approx((600 + 900) * H100_PER_SECOND, rel=0.001)
+    cost = cost_on_file(job)
+    assert cost["final"] is True and cost["cost_usd"] == result.cost_usd
+    assert cost["seconds"] == 1500
+    [note] = [note for note in result.notes if "could not be ended" in note]
+    assert "1500 s" in note
 
 
 @needs_coreutils

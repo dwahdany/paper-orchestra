@@ -718,6 +718,8 @@ class ModalBackend(ComputeBackend):
         self._retired: list[Any] = []
         #: Sandboxes of experiment jobs that ``run_job`` or ``attach`` is working on.
         self._jobs: list[Any] = []
+        #: Sandboxes of jobs whose termination failed: they may still run, and bill.
+        self._lingering: list[Any] = []
 
     # -- python ----------------------------------------------------------------
 
@@ -1191,7 +1193,13 @@ class ModalBackend(ComputeBackend):
             _write_handle(run_dir, result.handle)
             # The sandbox costs money from now on, whatever becomes of this process.
             self._record_cost(run_dir, job, final=False)
-            self._await(lambda: self._launch(sandbox, spec, job, archive), should_stop)
+            try:
+                self._await(lambda: self._launch(sandbox, spec, job, archive), should_stop)
+            finally:
+                # A copy of the person's files, of no use any more.  The job may run for
+                # hours, and a worker that is killed in that time removes nothing.
+                with contextlib.suppress(OSError):
+                    archive.unlink(missing_ok=True)
             self._finish(
                 sandbox, job, run_dir, scratch, job_log, should_stop, result, since=time.time()
             )
@@ -1277,7 +1285,11 @@ class ModalBackend(ComputeBackend):
         filesystem.write_bytes(b"", f"{_JOB_DIR}/{LOG_NAME}")
         filesystem.copy_from_local(archive, f"{_JOB_DIR}/{_ARCHIVE}")
         self._unpack(sandbox, _JOB_DIR, "the source directory")
-        self._remove(sandbox, f"{_JOB_DIR}/{_ARCHIVE}")
+        # Not best effort, as other tidying is: the archive holds the source as it was
+        # sent, and the command must not find in it what the first step of a job takes
+        # out of its files before the command may read them (the token of a
+        # repository's address).  A job whose archive cannot be removed is not started.
+        filesystem.remove(f"{_JOB_DIR}/{_ARCHIVE}", recursive=True)
         # Not waited for and not read: the job reports through its files (see _RUNNER).
         sandbox.exec(
             "sh",
@@ -1533,20 +1545,38 @@ class ModalBackend(ComputeBackend):
         with self._state_lock:
             self._jobs.append(sandbox)
 
-    def _release(self, sandbox: Any) -> None:
+    def _release(self, sandbox: Any) -> bool:
         """Terminate the sandbox of a job, once: a stop request, ``close`` on another
-        thread and the end of ``run_job`` may all come to it."""
+        thread and the end of ``run_job`` may all come to it.  Returns whether it was
+        ended, now or by an earlier call."""
         with self._state_lock:
             if sandbox not in self._jobs:
-                return
+                return not any(sandbox is other for other in self._lingering)
             self._jobs.remove(sandbox)
-        self._terminate(sandbox)
+        if self._terminate(sandbox):
+            return True
+        with self._state_lock:
+            self._lingering.append(sandbox)
+        return False
 
     def _settle(self, sandbox: Any, job: _Job, result: JobResult, run_dir: Path) -> None:
         """The end of every job, however it went: no sandbox left, and the bill estimated
-        and on file, where it is found even if the result never reaches the caller."""
-        self._release(sandbox)
-        result.cost_usd = self._record_cost(run_dir, job, final=True)
+        and on file, where it is found even if the result never reaches the caller.
+
+        A sandbox that could not be ended lives, and is billed, until Modal ends it:
+        the run is then charged for as long as its sandbox can live, and told so.
+        """
+        if self._release(sandbox):
+            result.cost_usd = self._record_cost(run_dir, job, final=True)
+            return
+        seconds = job.longest()
+        result.cost_usd = self._record_cost(run_dir, job, final=True, seconds=seconds)
+        if job.created is not None:
+            result.notes.append(
+                "The sandbox could not be ended (Modal did not answer). It ends by itself, "
+                f"at the latest {seconds:.0f} s after it was made, and the run is charged "
+                "for all of that time. Look for it on your Modal dashboard to stop it sooner."
+            )
 
     def _reason(self, exc: BaseException) -> str:
         if isinstance(exc, ComputeError | _SandboxLost):
@@ -1703,14 +1733,18 @@ class ModalBackend(ComputeBackend):
                 slot.sandbox = None
         self._terminate(sandbox)
 
-    def _terminate(self, sandbox: Any) -> None:
+    def _terminate(self, sandbox: Any) -> bool:
+        """End ``sandbox``; returns whether Modal took the request."""
+        ended = True
         try:
             sandbox.terminate()
         except self._transport_errors as exc:
             log.warning("Could not terminate a Modal sandbox: %s", exc)
+            ended = False
         # Releases the client-side connection; the sandbox itself is already going away.
         with contextlib.suppress(*self._transport_errors):
             sandbox.detach()
+        return ended
 
     def _remove(self, sandbox: Any, job_dir: str) -> None:
         """Best-effort cleanup of a job directory; the sandbox is disposable anyway."""
@@ -1727,11 +1761,12 @@ class ModalBackend(ComputeBackend):
         # Inside a Modal Function the container's own identity starts the sandboxes.
         if not needs_sandbox or not self._modal.is_local() or modal_token_configured():
             return []
+        # Read by whoever asked for Modal: for a paper, for figure code, for one experiment.
         return [
-            "Modal is not authenticated (no token is configured on this machine), so the "
-            "sandboxes that compile the paper and run figure code cannot be started. Run "
-            "`modal setup` (or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET), or use "
-            "--compute local."
+            "Modal is not authenticated (no token is configured on this machine), so no "
+            "sandbox can be started there. Run `modal setup` (or set MODAL_TOKEN_ID and "
+            "MODAL_TOKEN_SECRET), or use the local backend instead: `--compute local`, or "
+            "`--backend local` when you approve an experiment."
         ]
 
     def close(self) -> None:
@@ -1745,10 +1780,15 @@ class ModalBackend(ComputeBackend):
             sandboxes.extend(self._retired)
             self._retired.clear()
             # A job that is still running is ended too; its run_job reports the loss.
-            sandboxes.extend(self._jobs)
+            jobs = list(self._jobs)
             self._jobs.clear()
         for sandbox in sandboxes:
             self._terminate(sandbox)
+        for sandbox in jobs:
+            if not self._terminate(sandbox):
+                # Its run_job charges it for as long as it can live (see _settle).
+                with self._state_lock:
+                    self._lingering.append(sandbox)
 
     def describe(self) -> dict[str, Any]:
         info: dict[str, Any] = {

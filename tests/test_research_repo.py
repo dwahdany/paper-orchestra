@@ -175,6 +175,57 @@ def test_a_copy_at_a_ref_is_the_committed_tree(repository, tmp_path):
         repo.copy_local(repository, tmp_path / "third", ref="main", use_git=False)
 
 
+def stored(directory: Path, data: str, *args: str) -> str:
+    """The id git gives ``data`` when it is fed to ``git <args>`` on standard input."""
+    done = subprocess.run(
+        ["git", *args], cwd=directory, input=data, check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the tree holds symbolic links")
+def test_a_commit_that_names_a_link_and_a_file_alike_writes_nothing_outside_the_copy(
+    repository, tmp_path
+):
+    """A commit is data like any other, and one that came with the directory can say what
+    no working tree can hold: a link, and under the same name a directory or a file.
+    Written out in that order, the file would go where the link leads; and a link that
+    stays inside the copy as it is spelled (``d1/up/..``) can lead out of it."""
+    blob = ["hash-object", "-w", "--stdin"]
+    up = stored(repository, "..", *blob)
+    out = stored(repository, "d1/up/..", *blob)
+    onto = stored(repository, "d1/up/../victim.txt", *blob)
+    evil = stored(repository, "written by the repository\n", *blob)
+    train = git(repository, "rev-parse", "HEAD:train.py").strip()
+    d1 = stored(repository, f"120000 blob {up}\tup\n", "mktree")
+    inner = stored(repository, f"100644 blob {evil}\tevil.txt\n", "mktree")
+    listing = (
+        f"040000 tree {d1}\td1\n"
+        f"120000 blob {out}\tl2\n040000 tree {inner}\tl2\n"
+        f"120000 blob {onto}\tx\n100644 blob {evil}\tx\n"
+        f"100644 blob {train}\ttrain.py\n"
+    )
+    crafted = stored(repository, listing, "mktree")
+    commit = git(
+        repository, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit-tree", "-m",
+        "crafted", crafted,
+    ).strip()  # fmt: skip
+    git(repository, "update-ref", "refs/heads/crafted", commit)
+    run = tmp_path / "runs" / "1"
+    run.mkdir(parents=True)
+    (run / "victim.txt").write_text("the run's own record\n")
+
+    made = repo.copy_local(repository, run / "repo", ref="crafted")
+
+    assert (run / "repo" / "train.py").read_text() == TRAIN
+    assert (run / "victim.txt").read_text() == "the run's own record\n"
+    assert sorted(path.name for path in run.iterdir()) == ["repo", "victim.txt"]
+    assert not os.path.exists(run / "evil.txt")
+    left_out = {entry["path"] for entry in made.skipped}
+    assert {"l2/evil.txt", "x"} <= left_out
+
+
 def test_a_copy_that_would_be_too_large_is_refused_with_the_numbers(tree, tmp_path):
     (tree / "big.csv").write_text("x" * 4000)
     with pytest.raises(repo.RepoError, match="larger than") as refused:
@@ -190,6 +241,62 @@ def test_links_that_lead_out_of_the_repository_are_left_out(tree, tmp_path):
     assert not (tmp_path / "copy" / "leak").exists()
     assert (tmp_path / "copy" / "inside").is_symlink()
     assert "leak" in {entry["path"] for entry in made.skipped}
+
+
+@needs_git
+def test_files_git_lists_behind_a_link_are_not_read_through_it(repository, tmp_path):
+    """A directory git tracks became a link to somewhere else (the person moved their
+    data, or the repository came from someone who meant it): git still lists the files
+    it tracked there, and reading them would bring in what lies outside the repository,
+    the private files of this machine among them."""
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "util.py").write_text("PRIVATE = 'not part of the repository'\n")
+    shutil.rmtree(repository / "lib")
+    (repository / "lib").symlink_to(private)
+    assert "lib/util.py" in git(repository, "ls-files")
+
+    made = repo.copy_local(repository, tmp_path / "copy")
+
+    assert made.method == "git"
+    assert not os.path.lexists(tmp_path / "copy" / "lib")
+    assert (tmp_path / "copy" / "train.py").read_text() == TRAIN
+    reasons = {entry["path"]: entry["reason"] for entry in made.skipped}
+    assert "leads out of the repository" in reasons["lib/util.py"]
+    assert "leads out of the repository" in reasons["lib"]
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for git is a shell script")
+def test_a_listing_that_leads_out_of_the_repository_is_not_followed(tree, tmp_path, monkeypatch):
+    """What git lists comes from the repository's index, a file like any other: one that
+    came with the directory can name anything.  Nothing outside the repository is read
+    for the copy, and nothing is written outside the copy."""
+    git(tree, "init", "-q", "-b", "main")
+    (tmp_path / "outside.txt").write_text("outside the repository\n")
+    (tmp_path / "bin").mkdir()
+    listing = tmp_path / "listing"
+    names = [b"train.py", b"../outside.txt", b"lib/../../outside.txt"]
+    listing.write_bytes(b"\0".join([*names, os.fsencode(tmp_path / "outside.txt"), b""]))
+    forged = tmp_path / "bin" / "git"
+    forged.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        f'  if [ "$arg" = ls-files ]; then exec cat {listing}; fi\n'
+        "done\n"
+        f'exec {shutil.which("git")} "$@"\n'
+    )
+    forged.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    dest = tmp_path / "runs" / "1" / "repo"
+
+    made = repo.copy_local(tree, dest)
+
+    assert made.method == "git" and copied(dest) == {"train.py"}
+    assert copied(tmp_path / "runs") == {"1/repo/train.py"}
+    assert (tmp_path / "outside.txt").read_text() == "outside the repository\n"
+    left_out = {entry["path"] for entry in made.skipped}
+    assert {"../outside.txt", "lib/../../outside.txt", str(tmp_path / "outside.txt")} <= left_out
 
 
 @pytest.mark.parametrize("use_git", [pytest.param(True, marks=needs_git), False])
@@ -330,6 +437,39 @@ def test_reading_a_repository_starts_no_program_its_configuration_names(
 
 
 @needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for git is a shell script")
+def test_git_is_given_no_credential_and_nothing_that_points_it_elsewhere(
+    repository, tmp_path, monkeypatch
+):
+    """git starts programs of its own and of the person's configuration.  What the worker
+    holds (the model's key, a token) is not for them, and what would point git at another
+    repository or another way of reaching one is not passed on."""
+    (tmp_path / "bin").mkdir()
+    seen = tmp_path / "environments"
+    spy = tmp_path / "bin" / "git"
+    spy.write_text(f'#!/bin/sh\nenv >> {seen}\nexec {shutil.which("git")} "$@"\n')
+    spy.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-NOT-A-KEY-000")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_NOT-A-TOKEN-000")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /home/someone/.ssh/id_ed25519")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.pager")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "less")
+
+    made = repo.copy_local(repository, tmp_path / "copy")
+    at_ref = repo.copy_local(repository, tmp_path / "at-the-ref", ref="main")
+    repo.apply_patch(tmp_path / "at-the-ref", PATCH, use_git=True)
+
+    assert made.method == "git" and at_ref.method == "archive"
+    given = seen.read_text()
+    assert given.count("GIT_TERMINAL_PROMPT=0") >= 6  # every call went through the stand-in
+    for name in ("ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GIT_SSH_COMMAND", "GIT_CONFIG_COUNT"):
+        assert f"{name}=" not in given, name
+    assert "NOT-A-KEY" not in given and "NOT-A-TOKEN" not in given
+
+
+@needs_git
 @pytest.mark.skipif(sys.platform == "win32", reason="the programs are shell commands")
 def test_whether_the_tree_is_dirty_is_told_without_running_filters(tree, tmp_path):
     git(tree, "init", "-q", "-b", "main")
@@ -382,7 +522,10 @@ def partial_clone(tmp_path: Path, repository: Path) -> Path:
 @needs_git
 @pytest.mark.skipif(sys.platform == "win32", reason="the programs are shell commands")
 @pytest.mark.parametrize("transport", ["uploadpack", "ext", "ssh"])
-def test_a_copy_never_fetches_what_a_partial_clone_lacks(repository, tmp_path, transport):
+@pytest.mark.parametrize("git_knows_the_switch", [True, False])
+def test_a_copy_never_fetches_what_a_partial_clone_lacks(
+    repository, tmp_path, monkeypatch, transport, git_knows_the_switch
+):
     """Where a repository says git may fetch missing files from, git does so by itself
     when a command needs one, with the program its configuration names for the way
     there.  A copy runs none of them and contacts nobody: it takes what is on the disk."""
@@ -397,6 +540,17 @@ def test_a_copy_never_fetches_what_a_partial_clone_lacks(repository, tmp_path, t
     else:
         git(clone, "config", "remote.origin.url", "ssh://git.example.invalid/x.git")
         git(clone, "config", "core.sshCommand", f"touch {pwned}/ran; false")
+    if not git_knows_the_switch:
+        # A git older than 2.45 ignores GIT_NO_LAZY_FETCH and tries to fetch: it must
+        # then find that no way to another repository is open to it.
+        environment = repo._git_env
+
+        def older(ceiling: Path | None = None) -> dict[str, str]:
+            env = environment(ceiling)
+            env.pop("GIT_NO_LAZY_FETCH", None)
+            return env
+
+        monkeypatch.setattr(repo, "_git_env", older)
     before = snapshot(clone)
 
     # The newest commit is all there: it is copied, at the ref and as the tree stands.
@@ -726,6 +880,10 @@ def test_ordinary_urls_and_refs_are_accepted():
         ("ssh://me:s3cret@example.org/o/p", "ssh://me:***@example.org/o/p"),
         ("git@github.com:owner/project.git", "git@github.com:owner/project.git"),
         ("/home/someone/project", "/home/someone/project"),
+        # A password written with an @ in it: git takes the last one for the host's.
+        ("https://bot:p@ss@github.com/o/p.git", "https://bot:***@github.com/o/p.git"),
+        ("https://to@ken@github.com/o/p.git", "https://***@github.com/o/p.git"),
+        ("https://github.com/owner/p@v2.git", "https://github.com/owner/p@v2.git"),
     ],
 )
 def test_a_url_is_shown_without_its_password_or_token(url, shown):
@@ -745,12 +903,18 @@ def test_a_url_is_shown_without_its_password_or_token(url, shown):
         ("git@github.com:owner/project.git", None),
         ("/home/someone/project", None),
         ("", None),
+        ("https://bot:p@ss@github.com/o/p.git", "p@ss"),
+        ("https://to@ken@github.com/o/p.git", "to@ken"),
+        ("https://github.com/owner/p@v2.git", None),
+        ("https://@github.com/o/p.git", None),
     ],
 )
 def test_the_secret_of_a_url_is_named_for_masking(url, secret):
     assert repo.userinfo(url) == secret
     if secret:
         assert secret not in repo.display_url(url)
+        # Nor is any part of it in what a tool is told the address is.
+        assert not set(secret.split("@")) & set(repo._without_secret(url).split("@"))
 
 
 # -- cloning inside the job --------------------------------------------------------------
@@ -819,6 +983,33 @@ def test_results_that_came_with_a_cloned_repository_are_not_results_of_the_run(
     assert not (tmp_path / "run" / "artifacts").exists()
     [said] = [line for line in repo.clone_lines(log.splitlines()) if line.startswith("Removed")]
     assert "Removed metrics.json, artifacts that was there before the run" in said
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the repository holds a symbolic link")
+def test_the_clone_job_removes_no_result_through_a_link_of_the_repository(repository, tmp_path):
+    """A repository can hold a link where the run writes its results to.  What lies
+    behind it is not the working directory's, and is never collected either."""
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    (kept / "metrics.json").write_text('{"accuracy": 0.9}\n')
+    (repository / "results").symlink_to(kept, target_is_directory=True)
+    git(repository, "add", "results")
+    git(repository, "commit", "-q", "-m", "results live elsewhere")
+    seed = tmp_path / "seed"
+    command = repo.clone_source(
+        seed,
+        url=str(repository),
+        command=["python", "train.py"],
+        outputs=("results/metrics.json", "metrics.json"),
+    )
+    result = LocalBackend(scratch_dir=tmp_path / "scratch").run_job(
+        JobSpec(command=command, timeout=60, network=True, outputs=("metrics.json",)),
+        source_dir=seed,
+        run_dir=tmp_path / "run",
+    )
+    assert result.ok, (tmp_path / "run" / "log.txt").read_text()
+    assert (kept / "metrics.json").read_text() == '{"accuracy": 0.9}\n'
 
 
 @needs_git
@@ -966,6 +1157,15 @@ def test_the_clone_job_never_prints_the_password_of_its_url(tmp_path):
     assert "Authentication failed for ***" in encoded.stdout
     assert "p@ss-w0rd" not in encoded.stdout and "p%40ss-w0rd" not in encoded.stdout
 
+    # ...or written with the @ as it is.  git then names the address without what stands
+    # before the first @, which is not all of the password.
+    as_git_names_it = "https://ss-w0rd@example.org/o/p.git"
+    plain = clone_job(
+        tmp_path, "https://bot:p@ss-w0rd@example.org/o/p.git", FAKE_GIT_FAILS=as_git_names_it
+    )
+    assert "Authentication failed for https://bot:***@example.org/o/p.git" in plain.stdout
+    assert "ss-w0rd" not in plain.stdout + plain.stderr
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for git is a shell script")
 @pytest.mark.parametrize(
@@ -982,6 +1182,11 @@ def test_the_clone_job_never_prints_the_password_of_its_url(tmp_path):
             "https://example.org/org/private.git",
         ),
         ("ssh://me:s3cret-token@example.org/o/p", "s3cret-token", "ssh://me@example.org/o/p"),
+        (
+            "https://bot:s3cret@token@example.org/org/private.git",
+            "s3cret@token",
+            "https://example.org/org/private.git",
+        ),
     ],
 )
 def test_the_token_of_a_repository_url_is_out_of_the_commands_reach(tmp_path, url, secret, remote):

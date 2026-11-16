@@ -1322,6 +1322,102 @@ def test_cleaning_up_never_touches_what_is_not_the_jobs(job, tmp_path):
     assert not scratch.exists() and len(notes) == 1 and str(scratch) in notes[0]
 
 
+COPYING_WORKER = (
+    "import sys, time\n"
+    "from pathlib import Path\n"
+    "from paper_orchestra.compute import JobSpec, LocalBackend\n"
+    "def should_stop():\n"
+    "    # Asked while the source is copied: the copy takes its time.\n"
+    "    Path(sys.argv[4]).write_text('copying')\n"
+    "    time.sleep(120)\n"
+    "LocalBackend(scratch_dir=sys.argv[3]).run_job(\n"
+    "    JobSpec(command=['python', 'main.py'], timeout=300),\n"
+    "    source_dir=Path(sys.argv[1]), run_dir=Path(sys.argv[2]), should_stop=should_stop)\n"
+)
+
+
+def test_a_worker_killed_while_the_source_is_copied_leaves_a_record_to_clean_up_by(job):
+    """A repository of gigabytes takes a while to copy.  The copy that a worker leaves
+    half-made when it is killed is as large as the one of a job that had started, and
+    the record next to the run names it from the moment it exists."""
+    source = job.source("print('never reached')\n", **{"data/table.csv": "1,2,3\n"})
+    copying = job.root / "copying"
+    command = [sys.executable, "-c", COPYING_WORKER]
+    worker = subprocess.Popen([*command, str(source), str(job.run), str(job.scratch), str(copying)])
+    try:
+        deadline = time.monotonic() + 30
+        while not copying.exists():
+            assert time.monotonic() < deadline and worker.poll() is None
+            time.sleep(0.05)
+    finally:
+        worker.kill()
+        worker.wait()
+    [scratch] = job.scratch.iterdir()
+
+    record = json.loads((job.run / "job.json").read_text())
+    # No process of the job exists yet: the record names no session, and says where it is.
+    assert record == {"session": 0, "session_started": "", "scratch": str(scratch)}
+    notes = LocalBackend.end_job(record)
+    assert not scratch.exists()
+    assert notes == [f"Removed the working directory {scratch} that the run had left behind."]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="looks processes up in /proc")
+def test_what_a_detached_helper_started_is_ended_with_it(backend, job):
+    """A helper that left the job's session is found by the job's mark.  What it started
+    in its own session without the mark (``env -i``) is the job's just the same."""
+    source = job.source(
+        """
+        import subprocess, sys, time
+        inner = "import subprocess, sys, time\\n"
+        inner += "child = subprocess.Popen(['env', '-i', sys.executable, '-c', "
+        inner += "'import time; time.sleep(300)'])\\n"
+        inner += "print(child.pid, flush=True)\\ntime.sleep(300)\\n"
+        helper = subprocess.Popen(
+            [sys.executable, "-c", inner],
+            start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        print(helper.pid, int(helper.stdout.readline()), flush=True)
+        helper.stdout.close()
+        if "--stay" in sys.argv:
+            time.sleep(300)
+        """
+    )
+    result, seen = run_main(backend, job, source)
+    helper, unmarked = (int(pid) for pid in seen[0].split())
+    try:
+        assert result.ok
+        assert_gone(helper)
+        assert_gone(unmarked)
+        [note] = [note for note in result.notes if "outside its own session" in note]
+        assert note.startswith("2 processes")
+    finally:
+        for pid in (helper, unmarked):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+    # The same when the worker was killed and the run is cleaned up from its record.
+    (job.root / "code" / "main.py").write_text(
+        (job.root / "code" / "main.py").read_text().replace('"--stay" in sys.argv', "True")
+    )
+    (job.run / "log.txt").unlink()  # the first run's: the next worker starts a new one
+    main_line = killed_worker(job, job.root / "code", 1)[0]
+    helper, unmarked = (int(pid) for pid in main_line.split())
+    try:
+        assert alive(helper) and alive(unmarked), "the scenario needs survivors"
+        notes = LocalBackend.end_job(json.loads((job.run / "job.json").read_text()))
+        assert_gone(helper)
+        assert_gone(unmarked)
+        assert notes[0].startswith("Stopped 2 processes")
+    finally:
+        for pid in (helper, unmarked):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for leftover in job.scratch.iterdir():
+            shutil.rmtree(leftover, ignore_errors=True)
+
+
 def test_outputs_that_came_with_the_source_are_not_results_of_the_run(backend, job):
     """A repository often holds a metrics.json and figures of earlier work."""
     source = job.source(

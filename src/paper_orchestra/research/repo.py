@@ -80,7 +80,10 @@ CLONE_PREFIX = "[repo] "
 _URL = re.compile(r"^(?:https?|ssh|git)://(?:[^\s@/]+@)?[A-Za-z0-9][^\s]*$", re.IGNORECASE)
 _SCP_URL = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*@[A-Za-z0-9][A-Za-z0-9_.\-]*:[^\s]+$")
 _REF = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./\-~^]*$")
-_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)([^/@\s]+)@")
+# The user information of a URL: all that stands before the *last* ``@`` of the part
+# that names the host, as git and curl read it.  A password with an ``@`` in it is
+# written that way more often than it is escaped.
+_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)([^/?#\s]*)@")
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _GIT_SECONDS = 120.0
 # The name of a filter driver, from a key of git's configuration such as
@@ -113,11 +116,20 @@ _GIT_INERT = (
     "-c",
     f"core.hooksPath={os.devnull}",
 )
+#: The one "protocol" git may use to reach another repository, which is none: the name
+#: is no protocol of git's, and nothing can stand in for one under it (no alias and no
+#: helper program is found by a name with ``_`` in it).  See :func:`_git_env`.
+_NO_TRANSPORT = "no_transport"
+#: Keys of a configuration that make a repository a partial clone: it holds part of
+#: the files of its history and names the remote git fetches the others from.
+_PROMISOR_KEYS = r"^(extensions\.partialclone|remote\..*\.promisor)$"
 
 _BY_NAME = "left out by name (version-control data, caches, environments and .env files)"
 _OWN_FILES = "the research project's own files, which are not part of the repository"
 _VENV = "virtual environment"
 _OUTSIDE = "a link that leads out of the repository, or a special file"
+_BEYOND = "listed by git under a path that leads out of the repository (up, or through a link)"
+_THROUGH_A_LINK = "named where the copy already holds a link or a file, or below a link"
 
 
 class RepoError(ProjectError):
@@ -174,7 +186,7 @@ def userinfo(location: str) -> str | None:
     user, colon, password = match.group(2).partition(":")
     if colon:
         return password or None
-    return user if match.group(1).lower().startswith("http") else None
+    return user or None if match.group(1).lower().startswith("http") else None
 
 
 def _without_secret(location: str) -> str:
@@ -236,10 +248,18 @@ def _git_env(ceiling: Path | None = None) -> dict[str, str]:
     ``GIT_OPTIONAL_LOCKS=0`` keeps read-only commands (``status``) from
     refreshing the index: the person's repository is looked at, never written.
     ``ceiling`` stops git from finding a repository above that directory.
+
+    Nor does git fetch anything.  A partial clone names a remote from which git
+    gets, by itself, a file that a command needs and the repository lacks, through
+    whatever program the configuration names for the way there (``core.sshCommand``,
+    ``remote.<name>.uploadpack``, an ``ext::`` address).  ``GIT_NO_LAZY_FETCH`` tells
+    git not to (2.45 and later); for a git that does not know it, no protocol is
+    allowed, which overrides what the repository's configuration allows.
     """
     env = {key: os.environ[key] for key in _GIT_ENV if key in os.environ}
     env.setdefault("PATH", os.defpath)
     env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C", GIT_PAGER="cat")
+    env.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL=_NO_TRANSPORT)
     if ceiling is not None:
         env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
     return env
@@ -306,6 +326,13 @@ def _quiet_filters(source: Path) -> list[str] | None:
         # A filter that "must succeed" would otherwise fail every file it is not run on.
         options += ["-c", f"filter.{name}.required=false"]
     return options
+
+
+def _is_partial_clone(source: Path) -> bool:
+    """Whether the repository in ``source`` holds only part of the files of its history
+    and names a remote for the rest."""
+    done = _git(["config", "--includes", "--get-regexp", _PROMISOR_KEYS], cwd=source)
+    return done.returncode == 0 and bool(done.stdout.strip())
 
 
 def _is_dirty(source: Path, quiet: Sequence[str] | None) -> bool | None:
@@ -433,6 +460,36 @@ class _Environments:
         return False
 
 
+class _Tree:
+    """Tells which of the paths git lists lie in the tree itself.
+
+    What git lists comes from the repository's index, which is a file like any other
+    and may have come with the directory.  It can name a path that leads up and out
+    (``../``), an absolute one, or a file below a directory that is a link by now.
+    Reading any of them would bring files from outside the repository into the copy,
+    and placing them could write outside the copy.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._links: dict[str, bool] = {}
+
+    def holds(self, relative: str) -> bool:
+        """Whether ``relative`` names a place inside the tree that no link leads to."""
+        path = PurePosixPath(relative)
+        if path.is_absolute() or os.path.isabs(relative) or ".." in path.parts:
+            return False
+        folder = path.parent
+        while folder.parts:
+            key = folder.as_posix()
+            if key not in self._links:
+                self._links[key] = (self._root / key).is_symlink()
+            if self._links[key]:
+                return False
+            folder = folder.parent
+        return True
+
+
 def _link_stays_inside(path: Path, relative: str) -> bool:
     """Whether the link is relative and still points into the tree once the tree is copied."""
     target = os.readlink(path)
@@ -440,6 +497,41 @@ def _link_stays_inside(path: Path, relative: str) -> bool:
         return False
     resolved = os.path.normpath(os.path.join(os.path.dirname(relative), target))
     return resolved != ".." and not resolved.startswith(".." + os.sep)
+
+
+class _Landing:
+    """Tells whether a file, link or directory would be written inside the copy.
+
+    ``git archive`` writes out what a commit says, and a commit that came with the
+    directory can say what no working tree holds: a link and, under the same name, a
+    directory or a file.  Written in that order the file would go where the link
+    leads, and a link can lead out of the copy although its target is spelled as a
+    path inside it (it passes through another link).  A file system that takes
+    ``Data`` and ``data`` for one name makes the same of an ordinary tree.  So
+    nothing is written through a link, and nothing where something already is.
+    """
+
+    def __init__(self, dest: Path) -> None:
+        self._dest = dest
+        #: Directories of the copy that are known to be directories, not links.  They
+        #: stay that: nothing is ever placed where something is.
+        self._real: set[str] = set()
+
+    def admits(self, relative: str, *, directory: bool) -> bool:
+        parts = PurePosixPath(relative).parts
+        for depth in range(1, len(parts)):
+            key = "/".join(parts[:depth])
+            if key in self._real:
+                continue
+            path = self._dest / key
+            if path.is_symlink() or (os.path.lexists(path) and not path.is_dir()):
+                return False
+            if path.is_dir():
+                self._real.add(key)
+        target = self._dest / relative
+        if not os.path.lexists(target):
+            return True
+        return directory and target.is_dir() and not target.is_symlink()
 
 
 def _place(source: Path, target: Path) -> None:
@@ -493,8 +585,13 @@ def _copy_listed(
     own: tuple[str, ...],
 ) -> None:
     environments = _Environments(source)
+    tree = _Tree(source)
+    landing = _Landing(dest)
     for relative in _listed_by_git(source):
         stop.check()
+        if not tree.holds(relative):
+            copy.skip(relative, _BEYOND)
+            continue
         if relative.startswith(own):
             continue
         path = source / relative
@@ -508,6 +605,8 @@ def _copy_listed(
             copy.skip(relative, _VENV)
         elif stat.S_ISDIR(mode):
             copy.skip(relative, "a repository inside the repository (a submodule)")
+        elif not landing.admits(relative, directory=False):
+            copy.skip(relative, _THROUGH_A_LINK)
         elif stat.S_ISLNK(mode):
             if _link_stays_inside(path, relative):
                 _place(path, dest / relative)
@@ -529,6 +628,7 @@ def _copy_walked(
 ) -> None:
     report = SourceReport()
     environments: list[str] = []
+    landing = _Landing(dest)
     for relative, path, kind in walk_source(source, report, should_stop):
         if f"{relative}/".startswith((*own, *environments)):
             continue
@@ -538,6 +638,8 @@ def _copy_walked(
             if (path / "pyvenv.cfg").is_file():
                 environments.append(relative + "/")
                 copy.skip(relative, _VENV)
+        elif not landing.admits(relative, directory=False):
+            copy.skip(relative, _THROUGH_A_LINK)
         elif kind == "link" or budget.admits(relative, path.lstat().st_size):
             _place(path, dest / relative)
     for relative in report.excluded:
@@ -578,10 +680,13 @@ def _extract(
     archive: tarfile.TarFile, dest: Path, copy: RepoCopy, budget: _Budget, stop: _Stopper
 ) -> None:
     """Write the members of ``archive`` that belong in a copy under ``dest``."""
+    landing = _Landing(dest)
     for member in archive:
         stop.check()
         relative = member.name.rstrip("/")
         problem = _member_problem(member)
+        if problem is None and not landing.admits(relative, directory=member.isdir()):
+            problem = _THROUGH_A_LINK
         if problem:
             copy.skip(relative, problem)
         elif member.isdir():
@@ -686,7 +791,17 @@ def _copy_archived(
         said.seek(0)
         words = said.read().decode("utf-8", errors="replace").strip()
     if failed is not None or status != 0:
-        raise RepoError(f"git could not export {commit[:12]} of {source}: {words or failed}")
+        why = f"git could not export {commit[:12]} of {source}: {words or failed}"
+        if _is_partial_clone(source):
+            why += (
+                f"\n{source} is a partial clone that does not hold every file of that "
+                "commit, and nothing is fetched for a copy: git would contact the remote, "
+                "with the programs the repository's configuration names, from this "
+                f"machine. Let git fetch the files once yourself (`git -C {source} archive "
+                f"-o {os.devnull} {commit[:12]}` does), or remove the ref from the project's "
+                "repository settings to copy the working tree as it is."
+            )
+        raise RepoError(why)
 
 
 def copy_local(
@@ -712,6 +827,12 @@ def copy_local(
     are never copied; :attr:`RepoCopy.skipped` lists them.  Neither are ``dest``
     itself and the directories in ``exclude`` where they lie inside ``source``
     (the research project, when it lives in the repository it experiments on).
+
+    The copy holds what is in the repository and nothing else, whatever the
+    repository's own data says: a path git lists that leads out of the tree (up,
+    or through a directory that is a link) is not read, nothing is written
+    through a link or where the copy already holds something, and git fetches
+    nothing (a partial clone is copied as far as its files are on this disk).
 
     Raises :class:`RepoError` when ``source`` is not a directory, the ref does
     not exist, a file cannot be read or written, or the copy would exceed
@@ -1241,6 +1362,18 @@ def take_address():
     return job, url, secret
 
 
+def spellings(url):
+    """The address as it is, and as git names it: without what stands before its first
+    "@", which is not all of a password that has an "@" in it."""
+    scheme, separator, rest = url.partition("://")
+    found = [url]
+    while separator and "@" in rest.split("/", 1)[0]:
+        rest = rest.split("@", 1)[1]
+        found.append(scheme + separator + rest)
+    # The last one is the address without any user information: nothing to hide in it.
+    return found[:-1] or found
+
+
 def forget(secrets):
     """Remove what git kept of the fetch, and the secret from whatever else it wrote."""
     try:
@@ -1269,10 +1402,14 @@ def forget(secrets):
 
 def clear_results(names):
     """A result is what the command writes: what the repository, the patch or the
-    experiment's files brought under those names is removed before it starts."""
+    experiment's files brought under those names is removed before it starts.  Not
+    through a link, though: what lies behind one is not this directory's to remove,
+    and is never collected as a result either."""
     removed = []
     for name in names:
-        if not os.path.lexists(name):
+        parts = name.split("/")
+        above = (os.path.join(*parts[:depth]) for depth in range(1, len(parts)))
+        if any(os.path.islink(folder) for folder in above) or not os.path.lexists(name):
             continue
         if os.path.isdir(name) and not os.path.islink(name):
             shutil.rmtree(name)
@@ -1295,7 +1432,8 @@ def main():
 
     def shown(text):
         # The log is kept and read; the password or token of the URL is not for it.
-        text = text.replace(url, job["shown"])
+        for spelling in spellings(url):
+            text = text.replace(spelling, job["shown"])
         for text_secret in secrets:
             text = text.replace(text_secret, "***")
         return text
