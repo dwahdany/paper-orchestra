@@ -1229,12 +1229,24 @@ def test_a_pid_that_is_no_workers_is_never_adopted_or_signalled(
 def test_what_a_process_started_is_not_looked_up_for_the_server_or_its_ancestors(signals):
     # "Everything the worker started" of pid 1 is every process of the machine, and of
     # an ancestor of the server it includes the server.
-    for pid in (1, 0, -1, True, os.getpid(), os.getppid(), 10**30):
-        targets = workers_module._targets_of(pid)
-        assert targets.groups == {} and targets.processes == {}, pid
-        targets.signal(signal.SIGKILL)
-    assert signals == []
-    assert {os.getpid(), os.getppid()} <= workers_module._own_lineage()
+    # Something this very process started, in a session of its own, as a worker's job is:
+    # what would be found by a walk from the server or from one of its ancestors.
+    # It ends when its input closes: no signal can be sent in this test (see ``signals``).
+    started = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        for pid in (1, 0, -1, True, os.getpid(), os.getppid(), 10**30):
+            targets = workers_module._targets_of(pid)
+            assert targets.groups == {} and targets.processes == {}, pid
+            targets.signal(signal.SIGKILL)
+        assert signals == []
+        assert {os.getpid(), os.getppid()} <= workers_module._own_lineage()
+    finally:
+        started.stdin.close()
+        started.wait(timeout=60)
 
 
 HOSTILE = [
@@ -1291,6 +1303,37 @@ def test_no_value_in_the_record_of_a_live_worker_makes_a_look_at_it_fail(project
             assert status["pid"] in (None, pid) and status["state"] in ("idle", "running")
             (project.root / RECORD_FILE).write_text(json.dumps(record))
     assert process_exists(pid)
+
+
+@pytest.mark.parametrize("name", ["state.json", RECORD_FILE])
+def test_a_file_nested_too_deep_to_read_is_no_file_of_a_worker(project, make_workers, name):
+    # The API reads state.json through read_state for every row of the library: text that
+    # the JSON reader gives up on (not with a ValueError) must not become a 500 for all.
+    deep = "[" * 200_000 + "]" * 200_000
+    (project.root / name).write_text('{"status": "running", "worker": ' + deep + "}")
+    assert workers_module.read_state(project.root) == {}
+    assert make_workers().status(project.root)["state"] == "idle"
+    (project.root / name).write_text(deep)
+    assert workers_module.read_state(project.root) == {}
+    assert make_workers().status(project.root)["state"] == "idle"
+
+
+def test_a_file_far_larger_than_any_state_is_not_taken_into_memory(project, monkeypatch):
+    # The library reads state.json of every project at every look.
+    with (project.root / "state.json").open("wb") as file:
+        file.truncate(3 * 1024**3)  # sparse: it takes no room on disk
+    taken = 0
+    real_read = os.read
+
+    def read(descriptor, count):
+        nonlocal taken
+        piece = real_read(descriptor, count)
+        taken += len(piece)
+        return piece
+
+    monkeypatch.setattr(os, "read", read)
+    assert workers_module.read_state(project.root) == {}
+    assert taken == 0
 
 
 def test_a_state_file_that_is_a_link_is_not_read(project, make_workers, tmp_path):
@@ -1459,8 +1502,11 @@ def test_a_worker_that_cannot_be_verified_is_shown_without_a_stop_and_can_be_for
     assert "cannot show" in status["note"] and "forget" in status["note"]
     assert str(lock_holder.pid) in status["note"]
     assert workers.glance(project.root) == "running" and workers.live() == 0
-    with pytest.raises(WorkerBusy):
+    with pytest.raises(WorkerBusy) as busy:
         workers.start(project.root, "advance")
+    # The refusal names what can be done here: such a worker has no Stop.
+    assert "forget" in str(busy.value) and "stop it first" not in str(busy.value)
+    assert busy.value.status["verified"] is False
     with pytest.raises(WorkerError, match="does not signal") as refused:
         workers.stop(project.root)
     assert "forget" in str(refused.value)
@@ -1943,6 +1989,167 @@ def test_a_run_that_may_still_have_its_remote_job_is_left_for_the_next_worker(pr
     assert (directory / "run.json").read_text() == before
     assert experiments.runs(project, eid)[0]["status"] == "running"
     assert Project.open(project.root).page(eid).state == "running"
+
+
+# Settling a run also cleans up after its job: recovery ends the process session the run's
+# record names and removes its working directory.  That record lies in the project
+# directory like every other file, and the server settles at a mere look.  So the server
+# settles only where nothing the record names is still there to be ended.
+
+on_linux = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="what a job left running is found through /proc"
+)
+
+
+def name_job(directory: Path, job: dict, *, where: str) -> None:
+    """Put the record of a run's job where recovery reads it: in ``run.json``, or next to
+    it in ``job.json`` (where the backend writes it when the job starts)."""
+    if where == "record":
+        record = json.loads((directory / "run.json").read_text())
+        (directory / "run.json").write_text(json.dumps({**record, "job": job}))
+    else:
+        (directory / "job.json").write_text(json.dumps(job))
+
+
+def session_record(pid: int, scratch: str = "") -> dict:
+    """What the local backend records of a job whose session ``pid`` leads."""
+    from paper_orchestra.compute import local
+
+    started = local._session_started(pid)
+    assert started, "the start of the session could not be read"
+    return {"session": pid, "session_started": started, "scratch": scratch}
+
+
+@on_linux
+@pytest.mark.parametrize("where", ["record", "job.json"])
+def test_a_run_record_that_names_somebody_elses_session_ends_nothing_at_a_look(
+    project, make_workers, victim, monkeypatch, where
+):
+    # A project directory from somebody else: an experiment at running, a run record that
+    # names a session of the person's as its job, and a state that names a worker.  Every
+    # number in it can be read by anybody (/proc/<pid>/stat).  A look at the library used
+    # to end that session.
+    from paper_orchestra.research import experiments
+
+    monkeypatch.setattr(workers_module, "_JOB_GONE_WAIT_SECONDS", 0.3, raising=False)
+    eid, directory = run_left_by_a_dead_worker(project)
+    name_job(directory, session_record(victim.pid), where=where)
+    before = (directory / "run.json").read_text()
+    plant_state(project, {"pid": dead_pid(), "host": HOST, "heartbeat": stamp(-300)})
+
+    workers = make_workers(settle_runs=None)  # the real settling, as the server has it
+    assert workers.status(project.root)["state"] == "idle"
+    assert workers.settled(project.root, timeout=60)
+    assert victim.poll() is None and process_exists(victim.child)
+    # Nothing was settled either: the run is left for a worker, which the person starts.
+    assert (directory / "run.json").read_text() == before
+    assert experiments.runs(project, eid)[0]["status"] == "running"
+    assert workers_module.settle_stale_runs(project.root) == []
+    assert victim.poll() is None and process_exists(victim.child)
+
+
+@on_linux
+def test_a_run_record_that_names_the_working_directory_of_a_live_job_ends_nothing(
+    project, tmp_path, monkeypatch
+):
+    # The working directories of jobs can be listed by anybody (they are made in the
+    # temporary directory).  A record that names the one of a job that is running, of
+    # another project, used to get that job killed and its directory removed.
+    from paper_orchestra.compute import local
+
+    monkeypatch.setattr(workers_module, "_JOB_GONE_WAIT_SECONDS", 0.3, raising=False)
+    scratch = tmp_path / f"{local.SCRATCH_PREFIX}another"
+    (scratch / "work").mkdir(parents=True)
+    (scratch / "work" / "checkpoint.bin").write_text("hours of work")
+    job = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={**os.environ, local.JOB_ENV: str(scratch)},
+        start_new_session=True,
+    )
+    try:
+        _, directory = run_left_by_a_dead_worker(project)
+        name_job(
+            directory,
+            {"session": 0, "session_started": "", "scratch": str(scratch)},
+            where="record",
+        )
+        before = (directory / "run.json").read_text()
+        assert workers_module.settle_stale_runs(project.root) == []
+        assert job.poll() is None
+        assert (scratch / "work" / "checkpoint.bin").read_text() == "hours of work"
+        assert (directory / "run.json").read_text() == before
+    finally:
+        job.kill()
+        job.wait()
+
+
+@on_linux
+def test_what_a_dead_job_left_behind_is_still_cleaned_up_when_its_run_is_settled(project, tmp_path):
+    from paper_orchestra.compute import local
+
+    scratch = tmp_path / f"{local.SCRATCH_PREFIX}left"
+    (scratch / "work").mkdir(parents=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    record = session_record(gone.pid, str(scratch))
+    gone.wait()
+    _, directory = run_left_by_a_dead_worker(project)
+    name_job(directory, record, where="job.json")
+    [settled] = workers_module.settle_stale_runs(project.root)
+    assert settled["status"] == "failed" and "worker stopped" in settled["error"]
+    assert not scratch.exists()
+
+
+@on_linux
+def test_a_job_that_is_just_dying_with_its_worker_is_waited_for(project, monkeypatch):
+    # The job of a worker that was killed is killed with it, a moment later.
+    monkeypatch.setattr(workers_module, "_JOB_GONE_WAIT_SECONDS", 120.0, raising=False)
+    dying = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(1.5)"], start_new_session=True
+    )
+    try:
+        _, directory = run_left_by_a_dead_worker(project)
+        name_job(directory, session_record(dying.pid), where="record")
+        collected = threading.Thread(target=dying.wait, daemon=True)
+        collected.start()  # as the system collects a job whose worker is gone
+        [settled] = workers_module.settle_stale_runs(project.root)
+        assert settled["status"] == "failed"
+        assert dying.wait(timeout=60) == 0  # it ended by itself: the server ended nothing
+    finally:
+        dying.kill()
+        dying.wait()
+
+
+def test_a_start_waits_for_the_runs_of_a_worker_it_finds_dead_itself(script, project):
+    # `research run` in a terminal was killed while no server looked.  The start that
+    # notices it must not launch its worker beside the settling it has just set off: the
+    # worker would find the experiment held by the server.
+    order: list[str] = []
+    entered, release = threading.Event(), threading.Event()
+
+    def settle(root):
+        entered.set()
+        release.wait(60)
+        order.append("settled")
+
+    def launcher(kind, root, options):
+        order.append("launched")
+        return worker_command(script, kind, root, "quick")
+
+    plant_state(project, {"pid": dead_pid(), "host": HOST, "heartbeat": stamp(-300)}, "checkpoint")
+    workers = Workers(launcher=launcher, settle_runs=settle)
+    try:
+        start = threading.Thread(target=lambda: workers.start(project.root, "run"), daemon=True)
+        start.start()
+        assert entered.wait(60)
+        time.sleep(0.3)  # time for a start that does not wait to show itself
+        assert order == []
+        release.set()
+        start.join(60)
+        assert order == ["settled", "launched"]
+        assert workers.wait(project.root, timeout=60)
+    finally:
+        release.set()
+        workers.shutdown(grace=1.0)
 
 
 def test_the_worker_lock_has_the_engines_name():

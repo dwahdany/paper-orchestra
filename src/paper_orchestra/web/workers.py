@@ -43,7 +43,10 @@ project's files.  What this module guarantees:
 * **A worker that dies is not shown as running.**  Its exit is observed; when it
   left ``state.json`` at ``running``, the phase is recorded as interrupted here,
   and the runs of experiments it left at ``running`` are settled through the
-  experiments module's recovery, without anything being started.
+  experiments module's recovery, without anything being started.  That
+  recovery ends what a run's record names as its job; the server lets it settle
+  only where nothing so named is still running, because the record is a file
+  like any other and the server settles at a mere look.
 
 No ``preexec_fn`` (unsafe in a threaded server) and no parent-death signal (it
 follows the thread that started the child, and server threads end): the child
@@ -130,6 +133,13 @@ _POLL_SECONDS = 0.1
 _KILL_WAIT_SECONDS = 5.0
 #: How long a start waits for the runs of a dead worker to be settled before it goes on.
 _SETTLE_WAIT_SECONDS = 20.0
+#: How long the processes that a run's record names as its job are given to go before
+#: the run is left unsettled: the job of a worker that was killed dies with it, a moment
+#: after the server saw the worker go.
+_JOB_GONE_WAIT_SECONDS = 3.0
+#: The most a JSON file of a project may hold to be read here.  ``state.json`` with the
+#: phases of hundreds of rounds stays far below it.
+_MAX_JSON_BYTES = 32 * 1024 * 1024
 #: No process has a number this large (Linux allows up to 2**22), and one that large in a
 #: file cannot even be asked about.
 _PID_LIMIT = 2**22
@@ -152,6 +162,11 @@ class WorkerBusy(WorkerError):
     def __init__(self, status: Mapping[str, Any]) -> None:
         self.status = dict(status)
         self.phase = status.get("phase") or status.get("kind")
+        if status.get("verified") is False:
+            # It has no Stop here; the note says where it can be stopped, and that it
+            # can be forgotten when nothing runs.
+            super().__init__(f"Nothing was started. {status.get('note') or ''}".strip())
+            return
         doing = (
             f"the {self.phase} phase"
             if status.get("phase")
@@ -653,27 +668,36 @@ def _now() -> str:
     return format_stamp(datetime.now(UTC))
 
 
-def _read_json(path: Path) -> Any:
+def _read_json(path: Path, *, follow_links: bool = False) -> Any:
     """What a JSON file of the project holds; ``None`` when it is absent, not JSON, or
     not an ordinary file.
 
-    Never read through a symbolic link: what ``state.json`` holds is shown in the
-    app, and a project directory that came from somebody else could name any
-    JSON file of the person's that way.
+    Not read through a symbolic link unless ``follow_links`` says so: what
+    ``state.json`` holds is shown in the app, and a project directory that came
+    from somebody else could name any JSON file of the person's that way.  A file
+    far larger than any of these files gets is not taken into memory: they are
+    read for every project at every look at the library.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= 0 if follow_links else getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        found = os.fstat(descriptor)
+        if not stat.S_ISREG(found.st_mode) or found.st_size > _MAX_JSON_BYTES:
             return None
         chunks = []
-        while chunk := os.read(descriptor, 1 << 20):
+        taken = 0
+        while taken <= _MAX_JSON_BYTES and (chunk := os.read(descriptor, 1 << 20)):
             chunks.append(chunk)
+            taken += len(chunk)
+        if taken > _MAX_JSON_BYTES:
+            return None  # it grew while it was read
         return json.loads(b"".join(chunks).decode("utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError: brackets nested deeper than the reader follows.
         return None
     finally:
         os.close(descriptor)
@@ -770,14 +794,25 @@ def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
 
     A run on a remote backend may still have its job, which recovery would
     follow to its end for as long as that takes; that is a worker's to do, so a
-    project with such a run is left for the next worker.  Returns the records of
-    the runs that were settled.
+    project with such a run is left for the next worker.
+
+    Recovery also cleans up after a local job: it ends the processes of the
+    session the run's record names and removes its working directory.  That
+    record is a file of the project directory, which may have come from anywhere,
+    and the server settles at a mere look.  It ends nothing on the word of a
+    file: when a process is still running that a record names, the project's
+    runs are left as they are, for the next worker or the person's Cancel.  The
+    job of a worker that was killed is killed with it, a moment later, and is
+    waited for that long.
+
+    Returns the records of the runs that were settled.
     """
     from paper_orchestra.research import experiments
     from paper_orchestra.research.project import Project
 
     project = Project.open(Path(root))
     stale = False
+    jobs: list[Any] = []
     for page in project.pages(kind="experiment", state=("queued", "running")):
         if not page.id:
             continue
@@ -791,12 +826,96 @@ def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
                 running[0].get("backend") or "its backend",
             )
             return []
+        if running:
+            jobs += [run.get("job") for run in running]
+            jobs += _job_files(project.experiment_dir(page.id) / experiments.RUNS_DIR)
         stale = stale or bool(running) or page.state == "running"
-    return list(experiments.recover(project)) if stale else []
+    if not stale:
+        return []
+    if _job_still_running(jobs):
+        log.info(
+            "A run in %s names processes that are still running as its job. The server "
+            "ends no process because a file names it, so the run is left as it is: the "
+            "next worker of the project settles it, or cancelling the experiment does.",
+            project.root,
+        )
+        return []
+    return list(experiments.recover(project))
 
 
 def _is_running(run: Any) -> bool:
     return isinstance(run, Mapping) and run.get("status") == "running"
+
+
+def _job_files(runs: Path) -> list[Any]:
+    """What the ``job.json`` files of an experiment's run directories hold: the record a
+    local job leaves when it starts, which recovery reads where ``run.json`` has none.
+    Read as recovery reads them, through a link too."""
+    from paper_orchestra.research import experiments
+
+    try:
+        directories = [entry for entry in runs.iterdir() if entry.is_dir()]
+    except OSError:
+        return []
+    return [_read_json(entry / experiments.JOB_FILE, follow_links=True) for entry in directories]
+
+
+def _job_claims(job: Any, depth: int = 3) -> list[tuple[int, str]]:
+    """``(process session, working directory)`` as a job record names them, also where it
+    holds them one level down under ``"job"``; ``0`` and ``""`` for what it does not name."""
+    if not isinstance(job, Mapping) or depth <= 0:
+        return []
+    session, scratch = job.get("session"), job.get("scratch")
+    if isinstance(session, bool) or not isinstance(session, int | float | str):
+        session = 0
+    try:
+        number = int(session)
+    except (ValueError, OverflowError):
+        number = 0
+    claims = [(number, scratch if isinstance(scratch, str) else "")]
+    return claims + _job_claims(job.get("job"), depth - 1)
+
+
+def _names_live_process(jobs: Sequence[Any], proc: Path = Path("/proc")) -> bool:
+    """Whether a process is running that one of the job records names: one of the
+    session it names, or one that carries the mark of the working directory it names
+    in its environment (how the local backend finds what a job left behind).
+
+    Linux only, as the backend's own clean-up: elsewhere it ends no process.
+    """
+    from paper_orchestra.compute import local
+
+    claims = [claim for job in jobs for claim in _job_claims(job)]
+    sessions = {session for session, _ in claims if session > 1}
+    marks = {f"{local.JOB_ENV}={scratch}".encode() for _, scratch in claims if scratch}
+    if not (sessions or marks) or not sys.platform.startswith("linux"):
+        return False
+    try:
+        entries = [entry.name for entry in os.scandir(proc) if entry.name.isdigit()]
+    except OSError:
+        return False
+    for name in entries:
+        try:
+            stat_ = (proc / name / "stat").read_bytes().rsplit(b")", 1)[1].split()
+            if stat_[0] == b"Z":
+                continue  # it only waits to be collected: there is nothing left to end
+            if int(stat_[3]) in sessions:
+                return True
+            if marks and marks.intersection((proc / name / "environ").read_bytes().split(b"\0")):
+                return True
+        except (OSError, ValueError, IndexError):
+            continue  # gone meanwhile, or not ours to read (and then not ours to end)
+    return False
+
+
+def _job_still_running(jobs: Sequence[Any]) -> bool:
+    """Whether what the job records name is still running once it had a moment to go."""
+    deadline = time.monotonic() + _JOB_GONE_WAIT_SECONDS
+    while _names_live_process(jobs):
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(_POLL_SECONDS)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -918,7 +1037,9 @@ class Workers:
                 f"'{kind}' is not a kind of worker; the kinds are: {', '.join(KINDS)}."
             )
         # What a worker that died left half done is put in order first, so that the new
-        # one does not find an experiment held by the server.
+        # one does not find an experiment held by the server.  A look comes before the
+        # wait: it is what notices a worker that died while no server watched it.
+        self.status(root)
         self.settled(root, timeout=_SETTLE_WAIT_SECONDS)
         with self._guard:
             if self._closed:
@@ -1168,7 +1289,8 @@ class Workers:
         except PathEscape as exc:
             raise WorkerError(
                 f"The worker's log cannot be used ({exc}); no worker was started. Remove "
-                f"{root / WORKER_LOG} (it is not a file the server made) and start again."
+                f"or rename {root / WORKER_LOG} and start again: the server then makes a "
+                "new log."
             ) from exc
         except OSError as exc:
             raise WorkerError(
