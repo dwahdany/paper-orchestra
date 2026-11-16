@@ -267,6 +267,23 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
+#: Text a page shows as code: fenced blocks (``` or ~~~) and inline spans.
+_CODE = re.compile(
+    r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:^[ ]{0,3}(?P=fence)[`~]*[ \t]*$|\Z)"
+    r"|(?P<ticks>`+)[^\n]*?(?P=ticks)",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _body_links(page: ResearchPage) -> list[str]:
+    """Wiki link targets in a page's prose, in order.
+
+    What a page shows as code is quoted material (a job's log, a diff, a matrix
+    that numpy prints as ``[[0.1 0.2]]``), not the page referring to another one.
+    """
+    return Page(page.path, {}, _CODE.sub(" ", page.body)).links()
+
+
 def _split(text: str) -> tuple[dict[str, Any], str]:
     """Front matter and body of a page file as it was read.
 
@@ -2145,7 +2162,7 @@ class Project:
         for page in shown:
             joined: set[str] = set()
             links = [(name, t) for name, targets in page.relations.items() for t in targets]
-            links += [(MENTIONS, target) for target in Page(page.path, {}, page.body).links()]
+            links += [(MENTIONS, target) for target in _body_links(page)]
             seen: set[tuple[str, str]] = set()
             for type, target in links:
                 path = resolver.resolve(target)

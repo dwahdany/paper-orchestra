@@ -1402,6 +1402,26 @@ def test_events_carry_the_round_and_phase_the_engine_is_in(project):
 # -- graph ----------------------------------------------------------------------
 
 
+def test_text_shown_as_code_is_not_a_link(project):
+    # A result record quotes the job's log.  numpy prints matrices as [[0.1 0.2]], and a job
+    # may print anything: neither is a statement by the page about another page.
+    hyp = hypothesis(project)
+    record = project.write_record(
+        "result",
+        "E9-run1",
+        "A run",
+        "Mentions [[H1]] in prose.\n\n"
+        "```\nweights [[0.1 0.2]]\nsee [[idea]]\n```\n\n"
+        "~~~text\n[[topics/nowhere]]\n~~~\n\n"
+        "Inline `[[idea]]` and ``[[topics/nowhere]]`` are code too.\n",
+    )
+    graph = project.graph()
+    assert [(e["target"], e["type"]) for e in graph["edges"] if e["source"] == record.path] == [
+        (hyp.path, "mentions")
+    ]
+    assert graph["dangling"] == []
+
+
 def test_the_graph_has_typed_edges_mentions_and_reports_what_dangles(project):
     source = project.write_record("source", "Smith2020Deep", "Deep things", "Abstract.")
     topic = project.create_page(
