@@ -372,6 +372,22 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+# The bracket that would begin a tag: ``</wiki_index>``, ``<system>``; ``p < 0.05`` has none.
+_TAG_START = re.compile(r"<(?=[/!?]?[A-Za-z_])")
+
+
+def _no_tags(text: str) -> str:
+    """``text`` with nothing in it that begins a tag.
+
+    The index stands inside a block of every agent's prompt, and what it lists are
+    words of pages: a model's, or a paper's.  A title that held the block's closing
+    tag would end the block and read on as if the system spoke, so the bracket is
+    replaced and the words stay an entry of the list (as ``prompts.inert_line`` does
+    for the lists the agents' messages carry).
+    """
+    return _TAG_START.sub("‹", text)
+
+
 def _sentence(text: str) -> str:
     text = _one_line(text)
     return text if text.endswith((".", "!", "?")) else text + "."
@@ -3003,7 +3019,7 @@ class Project:
                 reason = _clip(page.decision_reason, 200) or "no reason given"
                 label = f"{page.kind} {page.id}" if page.id and page.kind != "source" else page.kind
                 lines.append(f'- {label} "{_clip(page.title, 100)}": {reason}')
-        return "\n".join(lines) + "\n"
+        return _no_tags("\n".join(lines) + "\n")
 
     def counts(self) -> dict[str, Any]:
         """Numbers for summaries.
