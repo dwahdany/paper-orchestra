@@ -1254,6 +1254,41 @@ def test_something_else_in_the_place_of_the_state_file_is_named_before_any_work(
     assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 1, "hypothesize")
 
 
+@pytest.mark.parametrize("name", ["state.json", "events.jsonl", "usage.json"])
+def test_a_link_in_the_place_of_a_record_the_engine_keeps_is_not_worked_through(
+    project, team, backend, tmp_path, name
+):
+    """The engine opens its state, the events and the usage ledger by name.  Through a
+    link it would read where something else stands and write its own account there; a
+    project directory can come from anywhere.  The app starts nothing in such a project,
+    and neither does the command line."""
+    advance(project, team, backend)
+    accept_all(project)
+    path = project.root / name
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    kept = elsewhere / name
+    kept.write_bytes(path.read_bytes() if path.exists() else b"{}")
+    before = kept.read_bytes()
+    path.unlink(missing_ok=True)
+    path.symlink_to(kept)
+    calls = len(team.calls)
+
+    with pytest.raises(EngineError, match="is not a file") as refusal:
+        advance(project, team, backend)
+
+    assert str(path) in str(refusal.value) and "symbolic link" in str(refusal.value)
+    assert team.calls[calls:] == [] and kept.read_bytes() == before and path.is_symlink()
+    with pytest.raises(EngineError, match="is not a file"), as_worker(project, kind="write"):
+        raise AssertionError("the worker began")
+    # With the project's own file back in its place the project goes on.
+    path.unlink()
+    path.write_bytes(before)
+    state = advance(project, team, backend)
+    assert team.calls[calls:] == ["hypothesize.theorist"]
+    assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 1, "hypothesize")
+
+
 def test_without_state_and_without_events_the_engine_asks_which_phase_to_run(
     project, team, backend
 ):

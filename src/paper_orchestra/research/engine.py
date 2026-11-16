@@ -45,6 +45,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -77,7 +78,7 @@ from paper_orchestra.research.model import (
     is_agent,
     parse_stamp,
 )
-from paper_orchestra.research.project import EXPERIMENTS_DIR, STATE_FILE, Project
+from paper_orchestra.research.project import EVENTS_FILE, EXPERIMENTS_DIR, STATE_FILE, Project
 from paper_orchestra.research.sources import CutoffError
 from paper_orchestra.utils.common import write_json
 from paper_orchestra.utils.scholar import SemanticScholar
@@ -575,15 +576,39 @@ def worker_alive(state: Mapping[str, Any], *, now: datetime | None = None) -> bo
     return here and _pid_alive(worker.get("pid"))
 
 
+#: The records a worker reads and writes by name in the project's directory.
+_OWN_RECORDS = (STATE_FILE, EVENTS_FILE, USAGE_FILE)
+
+
 def _refuse_unwritable_state(project: Project) -> None:
-    """Say what is in the way when the state file's place is taken by something that is
-    not a file, before a worker does anything that could then not be recorded."""
-    path = project.root / STATE_FILE
-    if path.exists() and not path.is_file():
+    """Say what is in the way when the place of a record the engine keeps (its state,
+    the events, the usage ledger) is taken by something that is not a file of the
+    project, before a worker does anything that could then not be recorded.
+
+    A directory or a pipe cannot hold the record.  Through a symbolic link the engine
+    would read where something else stands and write its own account there, and a
+    project directory can come from anywhere: the app starts nothing in such a
+    project, and neither does a worker.
+    """
+    for name in _OWN_RECORDS:
+        path = project.root / name
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise EngineError(f"{path} cannot be looked at ({exc}).") from None
+        if stat.S_ISREG(mode):
+            continue
+        what = "a symbolic link" if stat.S_ISLNK(mode) else "something else in its place"
+        after = (
+            "the state is then rebuilt from the project's events"
+            if name == STATE_FILE
+            else f"put the project's own {name} in its place if you have it"
+        )
         raise EngineError(
-            f"{path} is not a file, so the engine cannot keep its state there. Remove "
-            "or rename it and run the command again; the state is then rebuilt from "
-            "the project's events."
+            f"{path} is not a file ({what}), so the engine neither reads it nor keeps its "
+            f"records there. Remove or rename it and run the command again; {after}."
         )
 
 
