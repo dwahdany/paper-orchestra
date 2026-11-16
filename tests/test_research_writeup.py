@@ -71,6 +71,7 @@ def test_export_writes_the_three_things_the_paper_pipeline_reads(project, export
         "figures",
         "figures/E1-run1-loss_curve.png",
         "figures/info.json",
+        "figures/provided-loss_curves.png",
         "idea.md",
     ]
     # Exporting reads the project; it changes nothing in it.
@@ -223,7 +224,12 @@ def test_figures_are_the_image_artifacts_of_succeeded_runs_with_captions(project
         {
             "name": "E1-run1-loss_curve.png",
             "caption": "Warmup against no warmup at batch sizes 16 and 256 (E1 run 1): loss curve.",
-        }
+        },
+        # The image the person attached to the project is a figure too, and says whose it is.
+        {
+            "name": "provided-loss_curves.png",
+            "caption": "Provided by the researcher: loss curves.",
+        },
     ]
     assert "- E1-run1-loss_curve.png" in text_of(exported / "experimental_log.md")
 
@@ -248,6 +254,7 @@ def test_only_real_image_files_inside_the_run_directory_become_figures(project, 
     assert sorted(p.name for p in (out / "figures").iterdir()) == [
         "E1-run1-loss_curve.png",
         "info.json",
+        "provided-loss_curves.png",  # attached by the person, not smuggled in by the run
     ]
 
 
@@ -281,6 +288,7 @@ def test_figures_get_names_that_are_unique_and_safe_in_a_latex_path(project, tmp
         "E1-run1-small-plot.png",
         "E1-run1-large-plot.png",
         "E1-run1-50-drop-more-1.PNG",
+        "provided-loss_curves.png",
     ]
     assert sorted(p.name for p in figures.iterdir()) == sorted([*names, "info.json"])
     assert (figures / "E1-run1-small-plot.png").read_bytes() == b"small"
@@ -381,6 +389,7 @@ def test_write_paper_runs_the_pipeline_in_the_projects_paper_directory(project, 
         "experimental_log.md",
         "figures/E1-run1-loss_curve.png",
         "figures/info.json",
+        "figures/provided-loss_curves.png",
         "idea.md",
     ]
     # The figures are what the runs produced: they are used, and kept if more are generated.
@@ -458,7 +467,7 @@ def test_write_paper_tells_the_project_when_it_starts_and_how_it_ended(project, 
     assert started["type"] == "paper.started"
     assert started["summary"] == (
         "Writing a paper from the wiki with the cvpr2025 template: 1 succeeded run, "
-        "1 accepted finding."
+        "1 accepted finding, 3 attached files."
     )
     assert started["refs"] == [
         "paper/raw_materials/idea.md",
@@ -469,7 +478,8 @@ def test_write_paper_tells_the_project_when_it_starts_and_how_it_ended(project, 
         "dir": "paper",
         "results": ["wiki/results/E1-run1.md"],
         "findings": [project.page("F1").path],
-        "figures": ["E1-run1-loss_curve.png"],
+        "figures": ["E1-run1-loss_curve.png", "provided-loss_curves.png"],
+        "provided": ["notes.md", "prior_run.csv", "loss_curves.png"],
     }
     assert finished["type"] == "paper.finished"
     assert finished["summary"] == "The paper is written: paper/final_paper.pdf."
@@ -521,6 +531,7 @@ def test_write_paper_refuses_a_project_without_a_succeeded_run(tmp_path, pipelin
 
     message = refused(fresh, pipeline, "no accepted experiment has a run that succeeded")
 
+    assert "no results were attached" in message
     assert "paper-orchestra research approve" in message
 
 
@@ -534,10 +545,79 @@ def test_write_paper_refuses_a_project_without_an_accepted_finding(project, pipe
     assert project.page("F2").review == "proposed"
 
 
-def test_a_run_whose_plan_was_rejected_is_not_a_run_to_report(project, pipeline):
+def test_a_run_whose_plan_was_rejected_is_not_a_run_to_report(project, tmp_path):
     project.review("E1", "reject", reason="Wrong toy problem.")
 
-    refused(project, pipeline, "no accepted experiment has a run that succeeded")
+    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
+
+    assert "E1 run 1" not in log.split("## Findings")[0]
+    assert "No experiment of this project has a run that succeeded." in log
+
+
+def test_results_the_person_brought_are_what_a_paper_reports_when_nothing_was_run(
+    tmp_path, pipeline
+):
+    # Someone who already has results attaches them, writes down what they mean, and
+    # wants the paper.  No experiment of the project needs to have run for that.
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    (mine / "results.csv").write_text("batch,warmup,peak\n16,no,3.41\n16,yes,2.31\n")
+    (mine / "notes.md").write_text("# Notes\n\nThree seeds each.\n```\nraw\n```\n")
+    (mine / "loss curve.png").write_bytes(b"\x89PNG fake")
+    (mine / "kingma2015.pdf").write_bytes(b"%PDF-1.4 someone else's paper")
+    project = Project.create(
+        tmp_path / "own",
+        title="My own results",
+        brief="Warmup matters at small batches.",
+        files=sorted(mine.iterdir()),
+    )
+    project.create_page(
+        "finding", "Warmup lowers the peak", "The peak falls from 3.41 to 2.31.\n", author="human"
+    )
+
+    assert writeup.write_paper(project, template="cvpr2025").success
+
+    raw = project.paper_dir / "raw_materials"
+    log = text_of(raw / "experimental_log.md")
+    assert "## Material the researcher provided" in log
+    assert "### inputs/results.csv" in log and "16,no,3.41\n16,yes,2.31" in log
+    # A fence in the file cannot end the block it is quoted in.
+    assert "````text\n# Notes" in log and "```\nraw\n```\n````" in log
+    assert "%PDF" not in log and "kingma2015" not in log
+    assert log.index("## Material the researcher provided") < log.index("## Findings")
+    assert "### F1: Warmup lowers the peak" in log
+    assert read_json(raw / "figures" / "info.json") == [
+        {"name": "provided-loss-curve.png", "caption": "Provided by the researcher: loss curve."}
+    ]
+    (started, _finished) = paper_events(project)
+    assert started["summary"].endswith("0 succeeded runs, 1 accepted finding, 3 attached files.")
+    assert started["data"]["provided"] == ["loss curve.png", "notes.md", "results.csv"]
+
+
+def test_attached_text_is_given_whole_up_to_a_limit_and_says_where_it_was_cut(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(writeup, "MAX_PROVIDED_FILE_CHARS", 40)
+    monkeypatch.setattr(writeup, "MAX_PROVIDED_CHARS", 60)
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    (mine / "a.txt").write_text("a" * 100)
+    (mine / "b.txt").write_text("b" * 100)
+    (mine / "c.txt").write_text("c" * 100)
+    project = Project.create(tmp_path / "own", title="T", brief="b", files=sorted(mine.iterdir()))
+    (project.inputs_dir / "link.txt").symlink_to(tmp_path / "mine" / "a.txt")
+    manifest = read_json(project.inputs_dir / "manifest.json")
+    manifest["files"] += [{"name": "link.txt"}, {"name": "../../mine/a.txt"}, {"name": 7}]
+    write_json(project.inputs_dir / "manifest.json", manifest)
+
+    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
+
+    assert "a" * 40 in log and "a" * 41 not in log
+    assert "_Cut after 40 of 100 characters" in log
+    assert "b" * 20 in log and "b" * 21 not in log
+    assert "### inputs/c.txt\n\n_Left out for lack of room" in log
+    # A manifest is data: only regular files inside inputs/ are read.
+    assert "link.txt" not in log and "mine/a.txt" not in log
 
 
 def test_an_unknown_template_or_option_is_refused_before_anything_is_written(project, pipeline):
@@ -622,7 +702,7 @@ def test_the_write_command_writes_the_paper_of_a_project(project, pipeline):
     events = [line for line in result.stderr.splitlines() if line.strip()]
     assert events[0].endswith(
         "paper: Writing a paper from the wiki with the cvpr2025 template: 1 succeeded run, "
-        "1 accepted finding."
+        "1 accepted finding, 3 attached files."
     )
     assert events[-1].endswith("paper: The paper is written: paper/final_paper.pdf.")
 

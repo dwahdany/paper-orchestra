@@ -16,7 +16,7 @@ import contextlib
 import inspect
 import re
 import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -57,6 +57,27 @@ _LISTED_BY_ID = frozenset({"hypothesis", "experiment", "finding"})
 _SETUP_FIELDS = ("mode", "entrypoint", "command", "repo", "gpu", "packages", "timeout_seconds")
 
 
+#: Attached files handed to the paper's writers as they are: the person's own notes,
+#: tables and logs.  (A PDF is a paper they attached, an image is a figure.)
+PROVIDED_TEXT_SUFFIXES = frozenset(
+    {".md", ".markdown", ".txt", ".csv", ".tsv", ".json", ".jsonl", ".log", ".yaml", ".yml", ".tex"}
+)
+PROVIDED_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
+#: Most text taken from one attached file, and from all of them together: the materials
+#: are read whole by every stage of the paper pipeline.
+MAX_PROVIDED_FILE_CHARS = 20_000
+MAX_PROVIDED_CHARS = 60_000
+
+
+@dataclass(frozen=True)
+class _Provided:
+    """A file the person attached that a paper may draw on."""
+
+    name: str  # as listed under inputs/
+    path: Path
+    image: bool
+
+
 @dataclass(frozen=True)
 class _Materials:
     """What one export wrote, for the events that report it."""
@@ -65,6 +86,7 @@ class _Materials:
     runs: list[_Run]
     findings: list[ResearchPage]
     figures: list[str]
+    provided: list[str]
 
 
 @dataclass(frozen=True)
@@ -267,13 +289,21 @@ def _log_text(
     runs: list[_Run],
     findings: list[ResearchPage],
     figures: Mapping[str, list[str]],
+    provided: Sequence[_Provided] = (),
 ) -> str:
-    """Every succeeded run with its setup and metrics, then the accepted findings."""
-    parts = [
-        "# Experimental log",
-        "Each run below succeeded. Its metrics table is copied from the result record, "
-        "which was written by code from the files the run produced.",
-    ]
+    """Every succeeded run with its setup and metrics, what the person attached, then
+    the accepted findings."""
+    parts = ["# Experimental log"]
+    if runs:
+        parts.append(
+            "Each run below succeeded. Its metrics table is copied from the result record, "
+            "which was written by code from the files the run produced."
+        )
+    elif provided:
+        parts.append(
+            "No experiment of this project has a run that succeeded. The results are the "
+            "material the researcher provided, below."
+        )
     for run in runs:
         table = _metrics_table(run.result.body) or (
             f"_The result record has no metrics table; see {run.result.path}._"
@@ -287,6 +317,7 @@ def _log_text(
         ]
         if figures.get(run.result.path):
             parts += ["### Figures", "\n".join(f"- {name}" for name in figures[run.result.path])]
+    parts += _provided_text(provided, figures.get(PROVIDED_KEY, []))
     if findings:
         parts += [
             "## Findings",
@@ -317,28 +348,102 @@ def _log_text(
 
 
 # ---------------------------------------------------------------------------
+# What the person attached
+# ---------------------------------------------------------------------------
+
+#: Key of the figure listing under which the attached images are found.
+PROVIDED_KEY = "inputs"
+
+
+def _provided(project: Project) -> list[_Provided]:
+    """The attached files a paper may draw on: text and tables, and images as figures.
+
+    They are the person's own material, so they may be reported; a paper they
+    attached (a PDF) or a file of another kind is left to the wiki's pages.
+    """
+    found: list[_Provided] = []
+    for entry in project.attachments():
+        name = entry.get("name")
+        file = _inside(project.inputs_dir, name) if isinstance(name, str) else None
+        if file is None:
+            continue
+        suffix = file.suffix.lower()
+        if suffix in PROVIDED_TEXT_SUFFIXES or suffix in PROVIDED_IMAGE_SUFFIXES:
+            found.append(_Provided(str(name), file, suffix in PROVIDED_IMAGE_SUFFIXES))
+    return found
+
+
+def _fenced(text: str) -> str:
+    """``text`` in a code fence that nothing in it can close."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text.rstrip()}\n{fence}"
+
+
+def _provided_text(provided: Sequence[_Provided], figures: Sequence[str]) -> list[str]:
+    """The section of the log that holds the attached text files, each as it is."""
+    texts = [item for item in provided if not item.image]
+    if not texts and not figures:
+        return []
+    parts = [
+        "## Material the researcher provided",
+        "These files were attached to the project by the researcher. They are the "
+        "researcher's own material and were not produced by this project's runs.",
+    ]
+    room = MAX_PROVIDED_CHARS
+    for item in texts:
+        try:
+            text = item.path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            parts += [f"### inputs/{item.name}", f"_This file could not be read ({exc})._"]
+            continue
+        take = min(len(text), MAX_PROVIDED_FILE_CHARS, room)
+        parts.append(f"### inputs/{item.name}")
+        if take <= 0:
+            parts.append(
+                f"_Left out for lack of room: the file has {len(text)} characters and the "
+                "files before it fill what the materials can hold._"
+            )
+            continue
+        room -= take
+        parts.append(_fenced(text[:take]))
+        if take < len(text):
+            parts.append(
+                f"_Cut after {take} of {len(text)} characters; the rest is in the "
+                "project's inputs._"
+            )
+    if figures:
+        parts += ["### Figures provided", "\n".join(f"- {name}" for name in figures)]
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
 
 
-def _artifact(run_dir: Path, name: str) -> Path | None:
-    """The image file an artifact entry of a run record names, or ``None``.
-
-    The entry is data: it must lead to a regular file inside the run directory,
-    reached through no symbolic link, of a type the paper pipeline takes as a figure.
-    """
+def _inside(base: Path, name: str) -> Path | None:
+    """The regular file ``name`` leads to inside ``base``, reached through no symbolic
+    link, or ``None``.  ``name`` is data: an entry of a run record or of a manifest."""
     try:
         relative = safe_relative(name)
     except ComputeError:
         return None
-    if relative.suffix.lower() not in FIGURE_SUFFIXES:
-        return None
-    file = run_dir
+    file = base
     for part in relative.parts:
         file = file / part
         if file.is_symlink():
             return None
     return file if file.is_file() else None
+
+
+def _artifact(run_dir: Path, name: str) -> Path | None:
+    """The image file an artifact entry of a run record names, or ``None``: a regular
+    file inside the run directory of a type the paper pipeline takes as a figure."""
+    file = _inside(run_dir, name)
+    if file is None or file.suffix.lower() not in FIGURE_SUFFIXES:
+        return None
+    return file
 
 
 def _figure_name(run: _Run, artifact: PurePosixPath, taken: set[str]) -> str:
@@ -360,11 +465,16 @@ def _figure_name(run: _Run, artifact: PurePosixPath, taken: set[str]) -> str:
     return name
 
 
-def _export_figures(project: Project, runs: list[_Run], dest: Path) -> dict[str, list[str]]:
-    """Copy the image artifacts of ``runs`` to ``dest`` with an ``info.json``.
+def _export_figures(
+    project: Project, runs: list[_Run], dest: Path, provided: Sequence[_Provided] = ()
+) -> dict[str, list[str]]:
+    """Copy the image artifacts of ``runs`` and the attached images to ``dest`` with an
+    ``info.json``.
 
-    Returns the figure names per result record path.  A caption says which
-    experiment and run the figure comes from and what the run called it.
+    Returns the figure names per result record path, and under ``PROVIDED_KEY``
+    those of the attached images.  A caption says where the figure comes from:
+    which experiment and run and what the run called it, or that the researcher
+    provided it.
     """
     # Figures of an earlier export would pass for figures of this one.
     if dest.is_dir() and not dest.is_symlink():
@@ -391,6 +501,21 @@ def _export_figures(project: Project, runs: list[_Run], dest: Path) -> dict[str,
                 {"name": name, "caption": f"{run.experiment.title} ({run.name}): {what}."}
             )
             by_result.setdefault(run.result.path, []).append(name)
+    for item in provided:
+        if not item.image:
+            continue
+        base = _NOT_IN_A_NAME.sub("-", f"provided-{PurePosixPath(item.name).with_suffix('')}")
+        suffix = item.path.suffix.lower()
+        name, number = base + suffix, 1
+        while name.lower() in taken:
+            number += 1
+            name = f"{base}-{number}{suffix}"
+        taken.add(name.lower())
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(item.path, dest / name)
+        what = item.path.stem.replace("_", " ").replace("-", " ")
+        entries.append({"name": name, "caption": f"Provided by the researcher: {what}."})
+        by_result.setdefault(PROVIDED_KEY, []).append(name)
     if entries:
         write_json(dest / FIGURES_INFO, entries)
     return by_result
@@ -409,9 +534,12 @@ def export_materials(project: Project, dest: str | Path) -> Path:
     * ``idea.md``: the idea page, the accepted hypotheses with their state, and the
       method as the accepted experiments that ran describe it;
     * ``experimental_log.md``: for each succeeded run its setup and the metrics
-      table copied verbatim from the result record, then the accepted findings;
-    * ``figures/``: the image artifacts of those runs with ``info.json``
-      (``[{"name", "caption"}]``).  An earlier ``figures/`` is replaced.
+      table copied verbatim from the result record, then the text files the person
+      attached to the project as they are (bounded in size), then the accepted
+      findings;
+    * ``figures/``: the image artifacts of those runs and the images the person
+      attached, with ``info.json`` (``[{"name", "caption"}]``).  An earlier
+      ``figures/`` is replaced.
 
     Proposed and rejected pages are never used, and neither is an experiment
     without a succeeded run.  Nothing in the project is changed.
@@ -427,20 +555,23 @@ def _reportable(project: Project) -> tuple[list[_Run], list[ResearchPage]]:
 def _export(
     project: Project, dest: Path, runs: list[_Run], findings: list[ResearchPage]
 ) -> _Materials:
-    figures = _export_figures(project, runs, dest / FIGURES_DIR)
+    provided = _provided(project)
+    figures = _export_figures(project, runs, dest / FIGURES_DIR, provided)
     write_text(dest / IDEA_FILE, _idea_text(project, runs))
-    write_text(dest / LOG_FILE, _log_text(project, runs, findings, figures))
+    write_text(dest / LOG_FILE, _log_text(project, runs, findings, figures, provided))
     names = [name for listed in figures.values() for name in listed]
-    return _Materials(dest, runs, findings, names)
+    return _Materials(dest, runs, findings, names, [item.name for item in provided])
 
 
-def _check_ready(runs: list[_Run], findings: list[ResearchPage]) -> None:
-    """Raise unless the wiki holds what a paper reports: a succeeded run and a finding."""
-    if not runs:
+def _check_ready(project: Project, runs: list[_Run], findings: list[ResearchPage]) -> None:
+    """Raise unless the project holds what a paper reports: results (a succeeded run, or
+    results the person attached) and an accepted finding that says what they mean."""
+    if not runs and not _provided(project):
         raise ProjectError(
             "There is nothing to write a paper from yet: no accepted experiment has a run "
-            "that succeeded. Approve an experiment and run it (`paper-orchestra research "
-            "approve`, then `research run`), then start the write-up again."
+            "that succeeded, and no results were attached to the project. Approve an "
+            "experiment and run it (`paper-orchestra research approve`, then `research "
+            "run`), then start the write-up again."
         )
     if not findings:
         raise ProjectError(
@@ -550,7 +681,7 @@ def write_paper(project: Project, *, template: str, **options: Any) -> PaperResu
     with ``success=False``, and an interrupt is passed on after it was recorded.
     """
     runs, findings = _reportable(project)
-    _check_ready(runs, findings)
+    _check_ready(project, runs, findings)
     cfg = _paper_config(project, template, options)
     with _as_the_worker(project):
         return _write(project, template, cfg, runs, findings)
@@ -570,7 +701,12 @@ def _write(
         "paper.started",
         f"Writing a paper from the wiki with the {Path(template).name} template: "
         f"{len(made.runs)} succeeded run{'s' if len(made.runs) != 1 else ''}, "
-        f"{len(made.findings)} accepted finding{'s' if len(made.findings) != 1 else ''}.",
+        f"{len(made.findings)} accepted finding{'s' if len(made.findings) != 1 else ''}"
+        + (
+            f", {len(made.provided)} attached file{'s' if len(made.provided) != 1 else ''}."
+            if made.provided
+            else "."
+        ),
         refs=[_relative(project, made.dest / IDEA_FILE), _relative(project, made.dest / LOG_FILE)],
         data={
             "template": template,
@@ -578,6 +714,7 @@ def _write(
             "results": [run.result.path for run in made.runs],
             "findings": [page.path for page in made.findings],
             "figures": made.figures,
+            "provided": made.provided,
         },
     )
     try:
