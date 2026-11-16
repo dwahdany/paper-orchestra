@@ -1021,6 +1021,29 @@ def test_the_background_is_bounded(project, tmp_path, monkeypatch):
     assert len(background) < 2000 and "left out for lack of room" in background
 
 
+def test_a_paper_directory_that_is_a_link_out_of_the_project_is_not_written_to(
+    project, pipeline, tmp_path
+):
+    """The write-up puts its materials, its state and the paper under paper/.  Through
+    a link out of the project it would write them to wherever the link leads; a project
+    directory can come from anywhere."""
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    (project.root / "paper").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ProjectError, match=r"symbolic link.*out of the project"):
+        writeup.write_paper(project, template="cvpr2025")
+
+    assert pipeline.configs == [] and list(outside.iterdir()) == []
+    assert not [event for event in project.events() if event["type"] == "paper.started"]
+    # A link that stays inside the project is the project's own place.
+    (project.root / "paper").unlink()
+    (project.root / "drafts").mkdir()
+    (project.root / "paper").symlink_to("drafts", target_is_directory=True)
+    assert writeup.write_paper(project, template="cvpr2025").success
+    assert (project.root / "drafts" / "raw_materials" / "idea.md").is_file()
+
+
 def test_a_cutoff_that_cannot_be_read_stops_the_write_up(project, pipeline):
     data = read_json(project.root / "project.json")
     data["settings"]["research_cutoff"] = "June 2024"

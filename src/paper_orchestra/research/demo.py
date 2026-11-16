@@ -1785,10 +1785,6 @@ def _analyze(story: _Story, experiments: Any, metrics: Mapping[str, Any]) -> Non
                 after=30,
             )
         story.say("analyst", "E2 failed twice: the second failure is in the plan, not the code.")
-        project.create_page(
-            "lesson", LESSON_TITLE, LESSON_BODY, author="agent:analyst",
-            summary="Check the largest batch of a sweep against the size of the data set.",
-        )  # fmt: skip
         for ref, state, summary in (
             ("H1", "supported", "Mark H1 as supported by F1"),
             ("H2", "supported", "Mark H2 as supported by F1"),
@@ -1852,6 +1848,12 @@ def _review_analysis(story: _Story) -> None:
     )
     story.wait(seconds=30)
     project.set_state("Q1", "answered", by="human", reason="F1: no spike at batch size 256.")
+    story.wait(seconds=90)
+    # A lesson is the person's to write: no agent creates one, and all of them read it.
+    project.create_page(
+        "lesson", LESSON_TITLE, LESSON_BODY, author="human",
+        summary="Check the largest batch of a sweep against the size of the data set.",
+    )  # fmt: skip
     story.wait(minutes=1)
     project.add_request(
         "Sweep the warmup length instead of fixing it at 100 steps.", target="H2", role="designer"

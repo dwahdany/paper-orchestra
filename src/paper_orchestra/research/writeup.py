@@ -1093,7 +1093,8 @@ def write_paper(project: Project, *, template: str, **options: Any) -> PaperResu
     Refuses with ``ProjectError`` when no accepted experiment has a succeeded run
     or no accepted finding can be reported (the message names the findings that
     rest only on rejected or missing experiments), when the project's research
-    cutoff cannot be read, and when the project has a worker at work (the
+    cutoff cannot be read, when ``paper/`` is a symbolic link that leads out of the
+    project, and when the project has a worker at work (the
     write-up holds the project's worker lock while it runs: one worker at a time);
     raises ``FileNotFoundError`` for an unknown template and ``TypeError`` for an
     unknown option.  Emits ``paper.started`` and ``paper.finished`` on the project.
@@ -1102,9 +1103,31 @@ def write_paper(project: Project, *, template: str, **options: Any) -> PaperResu
     """
     runs, findings, left = _reportable(project)
     _check_ready(project, runs, findings, left)
+    _refuse_a_paper_directory_elsewhere(project)
     cfg = _paper_config(project, template, options)
     with _as_the_worker(project):
         return _write(project, template, cfg, runs, findings, left)
+
+
+def _refuse_a_paper_directory_elsewhere(project: Project) -> None:
+    """Raise ``ProjectError`` when ``paper/`` is a symbolic link that leads out of the
+    project: the materials, the state and the paper would be written to wherever it
+    leads, and a project directory can come from anywhere.  A link that stays inside
+    the project is the project's own place."""
+    paper = project.paper_dir
+    if not paper.is_symlink():
+        return
+    try:
+        inside = paper.resolve().is_relative_to(project.root.resolve())
+    except (OSError, RuntimeError):  # a loop of links leads nowhere
+        inside = False
+    if not inside:
+        raise ProjectError(
+            f"{paper} is a symbolic link that leads out of the project, so no paper is "
+            "written: its materials and the paper itself would be put where the link "
+            "leads. Remove the link (a directory is made in its place) and start the "
+            "write-up again."
+        )
 
 
 def _write(

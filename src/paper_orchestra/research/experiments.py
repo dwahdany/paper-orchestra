@@ -2696,6 +2696,18 @@ def _emit(project: Project, type: str, summary: str, **details: Any) -> None:
         project.emit(type, summary, agent="runner", **details)
 
 
+def _masked_entries(entries: Mapping[str, Any] | None, secrets: Sequence[str]) -> Any:
+    """``entries`` (the metrics of a run, or their text as written) with every credential
+    blanked out of the names and of the values that are text; numbers stay as they are.
+    ``None`` stays ``None``."""
+    if not entries or not secrets:
+        return entries
+    return {
+        _masked(str(name), secrets): _masked(value, secrets) if isinstance(value, str) else value
+        for name, value in entries.items()
+    }
+
+
 def _finish(
     project: Project, experiment: ResearchPage, attempt: _Attempt, outcome: _Outcome
 ) -> dict[str, Any]:
@@ -2714,6 +2726,10 @@ def _finish(
     if cost is None and (result is None or result.error or result.cancelled):
         cost = _cost_without_result(attempt)  # the job's own account never came back
     error = _shorten(_masked(outcome.error, secrets) if outcome.error else outcome.error)
+    # A text metric, and the name of any metric, are the job's words as much as a line
+    # of its log: the record and the result page are written from the masked ones.
+    metrics = _masked_entries(outcome.metrics, secrets)
+    metrics_text = _masked_entries(outcome.metrics_text, secrets)
     cloned = _clone_notes(record, attempt.directory)
     notes = [*attempt.notes, *cloned, *(result.notes if result else []), *dropped]
     record.update(
@@ -2722,7 +2738,7 @@ def _finish(
         seconds=round(seconds, 3) if seconds is not None else None,
         exit_code=result.returncode if result is not None else None,
         timed_out=bool(result is not None and result.timed_out),
-        metrics=outcome.metrics,
+        metrics=metrics,
         artifacts=artifacts,
         error=error,
         cost_usd=cost,
@@ -2738,8 +2754,8 @@ def _finish(
     # A record found on disk may be older than these fields, or written by hand.
     record.setdefault("repairs", [])
     record.setdefault("result", None)
-    if outcome.metrics_text:
-        record["metrics_text"] = outcome.metrics_text
+    if metrics_text:
+        record["metrics_text"] = metrics_text
     attempt.save()
     refs = [experiment.path]
     if not outcome.requeued:

@@ -635,17 +635,16 @@ def describe_event(role: str, event: Mapping[str, Any]) -> tuple[str, list[str]]
         return f"{who} searched the wiki for {said(given.get('query'), 80)}.", []
     if name == "verify_paper":
         return f"{who} checked {said(given.get('title'), 100)} against Semantic Scholar.", []
-    if name == "write_code":
-        experiment = named(given.get("experiment"), 60)
-        return f"{who} wrote {named(given.get('name'), 60)} for {experiment}.", []
     if name == "repo_search":
         return f"{who} searched for {said(given.get('query'), 80)} in your repository.", []
     if name in ("repo_list", "repo_read"):
         what = named(given["path"], 80) if given.get("path") else "the top level"
         verb = "listed" if name == "repo_list" else "read"
         return f"{who} {verb} {what} in your repository.", []
-    if name in ("propose_edit", "name_project"):
-        return None  # the project says what came of these itself
+    if name in ("propose_edit", "name_project", "write_code"):
+        # What came of these is told where it happens (the project's own events, the
+        # tool once the file is written): a call that was refused did nothing.
+        return None
     return f"{who} used {named(name, 40)}.", []
 
 
@@ -1449,6 +1448,13 @@ def write_code_tool(ctx: AgentContext, backend: ProjectMemoryBackend) -> ToolSpe
             )
         except ProjectError as exc:
             raise ToolError(str(exc)) from exc
+        # Told here and not when the call was made: only now is it true.
+        role = role_of(backend.author) or "designer"
+        ctx.activity(
+            f"The {role} wrote {named(name.strip(), 60)} for {page.id}.",
+            agent=role,
+            refs=[page.path],
+        )
         if not problems:
             return f"Wrote {name} for {page.id}. Its code parses and the entry point is there."
         found = "\n".join(f"- {problem}" for problem in problems)

@@ -2238,6 +2238,37 @@ class Leaky(FakeModal):
         return JobResult(returncode=1, seconds=0.5, backend=self.name, log_path=None)
 
 
+def test_a_credential_a_job_writes_as_a_metric_is_masked_in_what_code_keeps(
+    project, backend, monkeypatch
+):
+    """A text metric is the job's words as much as a line of its log.  What the code
+    writes from it (the run record, the result page, which agents read and a paper
+    copies) holds no credential the worker knows, in a value or in a name."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
+    code = QUICK.replace(
+        '{"loss": 0.25}',
+        f'{{"loss": 0.25, "note": "used {FAKE_KEY} today", "{FAKE_KEY}": 1}}',
+    )
+    approved(project, backend, {"main.py": code})
+
+    record = experiments.run(project, "E1", compute=backend)
+
+    assert record["status"] == "succeeded" and record["metrics"]["loss"] == 0.25
+    assert record["metrics"]["note"] == "used [redacted] today"
+    result = project.page("E1-run1")
+    for text in (
+        json.dumps(record),
+        (project.root / "experiments" / "E1" / "runs" / "1" / "run.json").read_text(),
+        result.body,
+        result.summary,
+        (project.root / "events.jsonl").read_text(),
+        (project.root / "MEMORY.md").read_text(),
+    ):
+        assert FAKE_KEY not in text
+    # (In the page's table a bracket is written so that it is not read as markup.)
+    assert "used \\[redacted\\] today" in result.body
+
+
 def test_what_a_job_prints_of_a_credential_is_masked_before_it_is_kept(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
     project = Project.create(

@@ -544,6 +544,15 @@ def test_the_demonstration_follows_the_rules_of_a_real_project(demo):
         "failed",
         "approved",
     ]
+    # Every page an agent wrote is of a kind that agent can write in a real project.
+    from paper_orchestra.research.model import may_create, role_of
+
+    assert not [
+        (page.path, page.author)
+        for page in demo.pages()
+        if page.author.startswith("agent:") and not may_create(role_of(page.author), page.kind)
+    ]
+    assert demo.pages(kind="lesson")[0].author == "human"
     # It is the directory it was created as, and no record on it is an edited one.
     assert demo.at_home() is True
     assert not [
