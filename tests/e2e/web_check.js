@@ -592,7 +592,8 @@ CHECKS.experiments = async ({ page, pid }) => {
   ok((await count(page, '.run.open .fig img')) >= 1, 'and with its figure, from the files endpoint');
   const natural = await page.evaluate(async () => { const img = document.querySelector('.run.open .fig img'); if (!img) return 0; if (!img.complete) await new Promise((r) => { img.onload = r; img.onerror = r; }); return img.naturalWidth; });
   ok(natural > 50, 'the figure really loads (' + natural + ' px wide)');
-  ok(/succeeded/.test(await text(page, '.page-status .tag-state')), 'the experiment is succeeded: ' + (await text(page, '.page-status')));
+  /* (the pill follows the run's own block by a render: wait for it, do not read it once) */
+  await until(page, () => /succeeded/.test((document.querySelector('.page-status .tag-state') || {}).textContent || ''), null, 20000, 'the experiment is succeeded');
   await shot(page, 'experiment-succeeded');
   await idle(pid);
   /* the person edits the code so that it runs long, approves it again, and cancels the run */
