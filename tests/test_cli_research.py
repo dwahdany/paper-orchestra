@@ -394,24 +394,32 @@ def test_status_summarises_round_phase_what_is_waiting_experiments_and_cost(proj
     assert f"paper-orchestra research review {project.root}" in out
 
 
-def test_status_before_the_first_phase_says_how_to_start(project):
-    result = invoke("status", str(project.root))
+@pytest.fixture
+def untouched(workspace: Path) -> Project:
+    """A project as `research new --no-run` leaves it: the person's idea, nothing by agents."""
+    return Project.create(
+        workspace / "research" / "untouched", title="Untouched", brief="An idea of mine."
+    )
+
+
+def test_status_before_the_first_phase_says_how_to_start(untouched):
+    result = invoke("status", str(untouched.root))
 
     assert result.exit_code == 0
     out = flat(result.stdout)
     assert "Not started" in out
-    assert f"paper-orchestra research advance {project.root}" in out
+    assert f"paper-orchestra research advance {untouched.root}" in out
 
 
-def test_status_of_a_project_the_engine_only_opened_reads_as_not_started(project):
+def test_status_of_a_project_the_engine_only_opened_reads_as_not_started(untouched):
     """Running an experiment by hand leaves a state file in which no phase has run."""
     idle = checkpoint_state(status="idle", round=0, phase=None, next_phase="intake")
-    write_json(project.root / "state.json", {**idle, "checkpoint": None})
+    write_json(untouched.root / "state.json", {**idle, "checkpoint": None})
 
-    out = flat(invoke("status", str(project.root)).stdout)
+    out = flat(invoke("status", str(untouched.root)).stdout)
 
     assert "Not started: no phase has run yet." in out and "idle" not in out
-    assert f"paper-orchestra research advance {project.root}` starts the research" in out
+    assert f"paper-orchestra research advance {untouched.root}` starts the research" in out
 
 
 def test_status_of_a_failed_project_shows_the_error_and_the_way_on(project):
@@ -1539,6 +1547,28 @@ def test_status_of_a_project_whose_state_file_is_lost_does_not_read_as_not_start
     out = flat(result.stdout)
     assert "Not started" not in out and "starts the research" not in out
     assert "state.json is missing or cannot be read" in out
+
+
+def test_status_says_so_when_neither_the_state_nor_the_events_tell_where_a_project_stands(
+    project,
+):
+    # Both files are gone (a partial restore) while the wiki holds what agents wrote.
+    # `advance` refuses to start from the beginning then, so `status` must not offer that.
+    project.create_page("topic", "What is known", "Text.", author="agent:scout")
+    (project.root / "events.jsonl").unlink()
+    assert not (project.root / "state.json").exists()
+
+    result = invoke("status", str(project.root))
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout)
+    assert "Not started" not in out and "starts the research" not in out
+    assert "--phase" in out
+
+    # A project nobody has worked on yet is simply not started.
+    fresh = Project.create(project.root.parent / "fresh", title="Fresh", brief="An idea.")
+    untouched = flat(invoke("status", str(fresh.root)).stdout)
+    assert "Not started: no phase has run yet." in untouched
 
 
 def test_new_takes_a_research_cutoff(workspace, engine):

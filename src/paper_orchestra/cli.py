@@ -846,7 +846,7 @@ def _state_as_it_is(project: Project) -> dict[str, Any]:
     """The engine's state for a summary: a phase whose worker died reads as stopped,
     which is what the engine makes of it when it next starts."""
     state = _engine_state(project)
-    lost = project.state_lost()
+    lost = project.state_lost() or _state_problem(project, state)
     if lost:
         # Phases ran and their account is gone or unreadable: the engine reads where the
         # project stands from its events, and so does this summary.
@@ -854,6 +854,20 @@ def _state_as_it_is(project: Project) -> dict[str, Any]:
     if _worker_alive(state) is False:
         return {**state, "status": "stopped", "worker_gone": True}
     return state
+
+
+def _state_problem(project: Project, state: Mapping[str, Any]) -> str | None:
+    """What the engine says is wrong when the state holds no record of a phase: also the
+    case the store cannot see, where the events are gone too while the wiki holds what
+    agents wrote.  The engine is only loaded for a project without such records."""
+    phases = state.get("phases")
+    if isinstance(phases, list) and any(isinstance(record, Mapping) for record in phases):
+        return None
+    with contextlib.suppress(Exception):
+        from paper_orchestra.research import engine
+
+        return engine.state_problem(project)
+    return None
 
 
 def _rebuilt_state(project: Project) -> dict[str, Any]:
