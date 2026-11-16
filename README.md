@@ -92,7 +92,7 @@ A project is a directory; its `wiki/` holds one Markdown page per thing:
 | experiment | `wiki/experiments/E1-….md` | agents, you | The plan of one experiment; its code is under `experiments/E1/code/`. |
 | result | `wiki/results/E1-run1.md` | code | What one run produced: metrics exactly as written, the log's last lines, artifacts. |
 | finding | `wiki/findings/F1-….md` | agents, you | What a result means, and which hypothesis it supports or refutes. |
-| journal | `wiki/journal/round-1.md` | agents | A short account of each round. |
+| journal | `wiki/journal/round-1.md` | agents, you | A short account of each round; a note of your own, such as a decision and its reason. |
 | lesson | `wiki/lessons/….md` | you | Something about how to work on this project that the agents should keep in mind in later rounds. |
 
 Pages point at each other with typed relations in their front matter (`cites`, `about`, `answers`, `motivated_by`, `tests`, `run_of`, `based_on`, `supports`, `refutes`, `follows`) and with `[[links]]` in their text. Those relations are the map.
@@ -198,6 +198,8 @@ Proposed and rejected pages never reach a paper. A finding that rests only on a 
   requests/        your instructions to the agents
   experiments/     code and runs of each experiment
   transcripts/     every model session, for checking what an agent actually saw and did
+  notes/           kept for the memory harness the agents work through; the research agents write nothing here
+  MEMORY.md        the index of the wiki that every agent session starts from, written by code
   paper/           the write-up, if you asked for one
 ```
 
