@@ -16,6 +16,18 @@ and every turn of one, and after every model request inside a turn: a turn that
 takes the project past it ends at its next model call, and the phase stops at a
 checkpoint that says it was cut short.  A phase that ends past the limit says so
 at its checkpoint as well.
+
+What ``advance()`` does when no phase is named: it first runs what the person
+approved and analyses results that have no analysis yet, pauses after that
+analysis when anything ran, and otherwise goes on with the phase that was next.
+Which phase is next is never changed by what an agent or a request says: more
+research is asked for by naming the phase.
+
+``state.json`` is the engine's account of where the project stands, and the
+project's events are a second one: :func:`read_state` rebuilds round, phases
+and what comes next from ``events.jsonl`` when the file is lost or damaged, and
+:func:`state_problem` says so.  A project with work on file is never taken for
+one that has not started.
 """
 
 from __future__ import annotations
@@ -49,6 +61,7 @@ from paper_orchestra.pipeline import read_carried_usage, usage_report
 from paper_orchestra.research import agents, experiments
 from paper_orchestra.research.agents import AgentContext, AgentReport
 from paper_orchestra.research.model import (
+    FOR_ALL,
     SCHEMA,
     Limits,
     NotFound,
@@ -56,9 +69,11 @@ from paper_orchestra.research.model import (
     Request,
     ResearchPage,
     format_stamp,
+    is_agent,
     parse_stamp,
 )
 from paper_orchestra.research.project import EXPERIMENTS_DIR, STATE_FILE, Project
+from paper_orchestra.research.sources import CutoffError
 from paper_orchestra.utils.common import write_json
 from paper_orchestra.utils.scholar import SemanticScholar
 
@@ -69,6 +84,7 @@ __all__ = [
     "WorkerBusy",
     "as_worker",
     "read_state",
+    "state_problem",
     "worker_alive",
 ]
 
@@ -80,6 +96,14 @@ WORKER_LOCK_FILE = ".worker.lock"
 USAGE_FILE = "usage.json"
 #: A worker whose heartbeat is older than this, and whose process is gone, is dead.
 STALE_HEARTBEAT_SECONDS = 60.0
+#: How far ahead of this machine's clock a heartbeat may lie and still be a sign of life.
+#: Further ahead, the clock was set back since (or the file is not an engine's), and the
+#: beat says nothing.  A worker on this machine wrote it by this clock; one on another
+#: machine wrote it by its own, which may differ by more.  The web server uses the same
+#: two numbers.
+FUTURE_HEARTBEAT_SECONDS = 5.0
+FUTURE_HEARTBEAT_SECONDS_ELSEWHERE = 60.0
+STATUSES = ("idle", "running", "checkpoint", "stopped", "failed")
 
 _ROLE = {
     "intake": "intake",
@@ -115,15 +139,10 @@ _DOING = {
 }
 #: Phases whose agent can act on a request of the person.
 _TAKES_REQUESTS = ("research", "hypothesize", "design", "analyze")
+#: The phases that follow an approval, not a checkpoint's "next": what the person approved
+#: is run, and what ran is analysed, wherever in the round that falls.
+_RUNS = ("run", "analyze")
 _EXPERIMENT_DIR = re.compile(r"E\d+")
-#: A request that reads as asking for more of the literature sends the next round to the
-#: research phase first, and stays open until that phase has had it.  The words are a
-#: guess at what the person meant, so they never keep a request from another phase.
-_ASKS_FOR_RESEARCH = re.compile(
-    r"\b(more research|literature|prior work|related work|papers|sources|citations?|"
-    r"references|look up|search for|survey)\b",
-    re.IGNORECASE,
-)
 
 
 class EngineError(ProjectError):
@@ -172,29 +191,257 @@ def _number(value: Any) -> float:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
 
+def _whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _state_on_file(project: Project) -> dict[str, Any] | None:
+    """``state.json`` as the object it holds; ``None`` when it is missing or is not one."""
+    try:
+        data = json.loads((project.root / STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _records(value: Any) -> list[dict[str, Any]]:
+    """The phase records in ``value``: objects that name a phase and a round.  Anything
+    else in the list (a file edited by hand) is not a record."""
+    return [
+        record
+        for record in (value if isinstance(value, list) else [])
+        if isinstance(record, dict)
+        and record.get("phase") in PHASES
+        and _whole(record.get("round"))
+        and record["round"] >= 0
+    ]
+
+
+def _read_checkpoint(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    pending = value.get("pending")
+    counted = {
+        str(kind): count
+        for kind, count in (pending.items() if isinstance(pending, dict) else ())
+        if _whole(count)
+    }
+    summary = value.get("summary")
+    return {**value, "summary": summary if isinstance(summary, str) else "", "pending": counted}
+
+
+def _read_leniently(data: Mapping[str, Any]) -> dict[str, Any]:
+    """The state an object from ``state.json`` describes, every value of the type the
+    engine and whoever shows the state count on.  What is of another type (a file
+    edited by hand, or cut short and patched up) is replaced by what the rest implies."""
+    state = _blank_state()
+    spent = data.get("spent") if isinstance(data.get("spent"), Mapping) else {}
+    state["spent"] = {name: _number(spent.get(name)) for name in state["spent"]}
+    phases = state["phases"] = copy.deepcopy(_records(data.get("phases")))
+    last = phases[-1] if phases else None
+    rounds = [record["round"] for record in phases]
+    round = data.get("round")
+    if rounds:
+        # The round is that of one of the phases on record: the last one's, unless the
+        # file names another of them.
+        state["round"] = round if _whole(round) and round in rounds else rounds[-1]
+    else:
+        state["round"] = round if _whole(round) and round >= 0 else 0
+    phase, following = data.get("phase"), data.get("next_phase")
+    state["phase"] = phase if phase in PHASES else (last["phase"] if last else None)
+    state["next_phase"] = following if following in PHASES else (None if phases else "intake")
+    state["checkpoint"] = _read_checkpoint(copy.deepcopy(data.get("checkpoint")))
+    worker = data.get("worker")
+    state["worker"] = copy.deepcopy(worker) if isinstance(worker, dict) else None
+    error = data.get("error")
+    state["error"] = error if isinstance(error, str) or error is None else _one_line(error)
+    status = data.get("status")
+    if status in STATUSES:
+        state["status"] = status
+    elif phases:
+        # Nothing says how the last call ended: a checkpoint that is on file, else stopped.
+        state["status"] = "checkpoint" if state["checkpoint"] else "stopped"
+    return state
+
+
+def _unfinished(records: Sequence[dict[str, Any]], phase: str, round: int) -> dict | None:
+    """The latest record of the phase in the round, when it has not completed."""
+    for record in reversed(records):
+        if record["phase"] == phase and record["round"] == round:
+            return record if record["status"] != "completed" else None
+    return None
+
+
+def _from_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The state as the project's events tell it; ``None`` when they hold no phase.
+
+    ``phase.started``, ``phase.finished``, ``phase.failed`` and ``checkpoint`` carry
+    round, phase, what was produced, the error and what comes next.  A phase that
+    was started and neither finished nor failed was interrupted: whoever reads a
+    state from the events has no live worker's file to read it from.
+    """
+    state = _blank_state()
+    records: list[dict[str, Any]] = state["phases"]
+    for event in events:
+        kind, phase, round = event.get("type"), event.get("phase"), event.get("round")
+        if phase not in PHASES or not _whole(round):
+            continue
+        data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+        stamp = str(event.get("ts") or "")
+        if kind == "phase.started":
+            record = _unfinished(records, phase, round)
+            if record is None:
+                record = Engine._new_record(phase, round, None)
+                record["started"] = stamp
+            else:
+                # Resumed: the engine lists the record of the phase in flight last, also
+                # after a run and its analysis came in between.
+                records[:] = [known for known in records if known is not record]
+            records.append(record)
+            word, given = data.get("instruction"), data.get("requests")
+            record.update(status="running", finished=None, error=None)
+            record["attempts"] += 1
+            if isinstance(word, str) and word.strip():
+                record["instruction"] = word
+            if isinstance(given, list):
+                record["requests"] = [str(item) for item in given]
+            state.update(
+                status="running", round=round, phase=phase, next_phase=phase, checkpoint=None
+            )
+            state["error"] = None
+        elif kind in ("phase.finished", "phase.failed"):
+            record = _unfinished(records, phase, round)
+            if record is None:
+                continue
+            if kind == "phase.finished":
+                produced = data.get("produced")
+                record.update(
+                    status="completed",
+                    finished=stamp,
+                    seconds=_number(data.get("seconds")),
+                    produced=[str(path) for path in produced] if isinstance(produced, list) else [],
+                )
+                state.update(round=round, phase=phase, next_phase=_NEXT[phase])
+            else:
+                error, attempts = data.get("error"), data.get("attempts")
+                error = error if isinstance(error, str) else _one_line(event.get("summary"))
+                record.update(status="failed", finished=stamp, error=error)
+                if _whole(attempts):
+                    record["attempts"] = attempts  # a retry in the same call starts no event
+                state.update(status="failed", round=round, phase=phase, next_phase=phase)
+                state["error"] = error
+        elif kind == "checkpoint" and records:
+            following, pending = data.get("next"), data.get("pending")
+            unfinished = _unfinished(records, phase, round)
+            if unfinished is not None:
+                # A checkpoint in the middle of a phase: a budget ended it early.
+                unfinished.update(status="interrupted", finished=stamp)
+            state.update(
+                status="checkpoint",
+                round=round,
+                phase=phase,
+                next_phase=following if following in PHASES else _NEXT[phase],
+                checkpoint=_read_checkpoint(
+                    {
+                        "round": round,
+                        "phase": phase,
+                        "at": stamp,
+                        "summary": event.get("summary"),
+                        "pending": pending,
+                    }
+                ),
+            )
+            state["error"] = None
+    if not records:
+        return None
+    for record in records:
+        if record["status"] == "running":
+            record.update(status="interrupted", finished=record["finished"] or record["started"])
+    if state["status"] == "running":
+        # Between two phases, or in one: either way no worker is there to go on.
+        state["status"] = "stopped"
+    return state
+
+
+def _rebuilt(project: Project, written: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The state rebuilt from ``events.jsonl``, for a state file that holds no phase."""
+    state = _from_events(project.events())
+    if state is None:
+        return None
+    spent = written.get("spent") if written and isinstance(written.get("spent"), Mapping) else {}
+    state["spent"] = {name: _number(spent.get(name)) for name in state["spent"]}
+    if not spent:
+        # The ledger of the model spend is a file of its own; what the runs cost is
+        # counted again from their records by the next worker.
+        try:
+            ledger = json.loads((project.root / USAGE_FILE).read_text(encoding="utf-8"))
+            state["spent"]["model_usd"] = round(_number(ledger.get("estimated_cost_usd")), 4)
+        except (OSError, ValueError, AttributeError):
+            pass
+    return state
+
+
 def read_state(project: Project) -> dict[str, Any]:
     """The engine's state of ``project`` in the shape of ``state.json``.
 
     A project the engine has not touched yet reads as ``idle`` with ``intake``
-    next.  A file that is missing keys, or is not JSON, is read as far as it goes.
+    next.  A file that is missing keys, or holds values of the wrong type, is
+    read as far as it goes.  A file that is missing, is not JSON or holds no
+    phase record is not taken for "never started" when ``events.jsonl`` says
+    that phases ran: round, phases, the checkpoint and what comes next are then
+    rebuilt from the events (see :func:`state_problem`).  Nothing is written.
     """
-    state = _blank_state()
-    try:
-        data = json.loads((project.root / STATE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    data = data if isinstance(data, dict) else {}
-    for key in state:
-        if key in data and key != "spent":
-            state[key] = copy.deepcopy(data[key])
-    spent = data.get("spent") if isinstance(data.get("spent"), Mapping) else {}
-    state["spent"] = {name: _number(spent.get(name)) for name in state["spent"]}
-    phases = state["phases"] if isinstance(state["phases"], list) else []
-    # A record is an object; anything else in the list (a file edited by hand) is not one.
-    state["phases"] = [record for record in phases if isinstance(record, dict)]
-    if not isinstance(state["round"], int) or isinstance(state["round"], bool):
-        state["round"] = 0
+    written = _state_on_file(project)
+    state = _read_leniently(written or {})
+    if not state["phases"]:
+        return _rebuilt(project, written) or state
     return state
+
+
+def _agents_wrote(project: Project) -> bool:
+    """Whether the wiki holds what only a phase of the engine leaves behind: a page an
+    agent wrote, or a source record.  (A result record does not say so: the person can
+    have an experiment of their own run before any phase.)"""
+    return any(is_agent(page.author) or page.kind == "source" for page in project.pages())
+
+
+def state_problem(project: Project) -> str | None:
+    """What is wrong with ``state.json``, for whoever shows the project; ``None`` when
+    the file is the account of the phases that ran, or none has run.
+
+    Two things can be wrong.  The file is lost or damaged but the project's
+    events tell where it stands: :func:`read_state` then answers from the
+    events, and the engine writes the file anew the next time it works.  Or the
+    events do not tell either while the wiki holds what agents wrote: then
+    nobody can say what was next, and ``advance()`` asks for a phase by name
+    instead of starting from the beginning.
+    """
+    written = _state_on_file(project)
+    if written is not None and _records(written.get("phases")):
+        return None
+    path = project.root / STATE_FILE
+    what = (
+        "holds no record of the phases that ran"
+        if written is not None
+        else "cannot be read"
+        if path.exists()
+        else "is missing"
+    )
+    if _from_events(project.events()) is not None:
+        return (
+            f"{STATE_FILE} {what}. Round, phases and what comes next are read from the "
+            "project's events (events.jsonl) instead; the file is written anew the next "
+            "time the agents work. Check that the round and the next phase are what you "
+            "expect before you continue."
+        )
+    if _agents_wrote(project):
+        return (
+            f"{STATE_FILE} {what} and events.jsonl holds no record of a phase either, but "
+            "the wiki holds pages the agents wrote: the engine cannot tell where the "
+            "project stands, and does not start it from the beginning by itself. Name the "
+            "phase to go on with."
+        )
+    return None
 
 
 def _is_zombie(pid: int) -> bool:
@@ -235,16 +482,35 @@ def worker_alive(state: Mapping[str, Any], *, now: datetime | None = None) -> bo
     """Whether the worker ``state`` names is still at work.
 
     It is dead when its heartbeat is older than a minute and its process is gone;
-    on another machine only the heartbeat can be judged.
+    on another machine only the heartbeat can be judged.  A heartbeat that lies in
+    the future is no sign of life (by more than a few seconds for a worker on
+    this machine, by more than a minute for one on another, whose clock is its
+    own): after the clock was set back it would count as fresh for as long as
+    the difference lasts, however long ago its writer died.  The process
+    decides then.
     """
     worker = state.get("worker")
     if not isinstance(worker, Mapping):
         return False
+    here = worker.get("host") == socket.gethostname()
+    ahead = FUTURE_HEARTBEAT_SECONDS if here else FUTURE_HEARTBEAT_SECONDS_ELSEWHERE
     beat = parse_stamp(worker.get("heartbeat"))
     age = ((now or datetime.now(UTC)) - beat).total_seconds() if beat else float("inf")
-    if age <= STALE_HEARTBEAT_SECONDS:
+    if -ahead <= age <= STALE_HEARTBEAT_SECONDS:
         return True
-    return worker.get("host") == socket.gethostname() and _pid_alive(worker.get("pid"))
+    return here and _pid_alive(worker.get("pid"))
+
+
+def _refuse_unwritable_state(project: Project) -> None:
+    """Say what is in the way when the state file's place is taken by something that is
+    not a file, before a worker does anything that could then not be recorded."""
+    path = project.root / STATE_FILE
+    if path.exists() and not path.is_file():
+        raise EngineError(
+            f"{path} is not a file, so the engine cannot keep its state there. Remove "
+            "or rename it and run the command again; the state is then rebuilt from "
+            "the project's events."
+        )
 
 
 class _WorkerLock(WikiLock):
@@ -284,7 +550,8 @@ def as_worker(project: Project, *, kind: str) -> Iterator[None]:
     this process under ``state.json["worker"]`` with a heartbeat and its
     ``kind``, as an engine does, so that the web server shows the worker and
     nothing else starts beside it.  The rest of the state is left as it is.
-    Raises ``WorkerBusy`` when the project has a worker.
+    Raises ``WorkerBusy`` when the project has a worker, and ``EngineError`` when
+    the state file's place is taken by something that is not a file.
     """
     lock = _WorkerLock(project.root)
     with lock:
@@ -299,6 +566,7 @@ def as_worker(project: Project, *, kind: str) -> Iterator[None]:
                 "experiment, or a write-up that was started before. Wait for it to "
                 "finish, or stop it, then start again; a project has one worker at a time."
             )
+        _refuse_unwritable_state(project)
         path = project.root / STATE_FILE
         started = _now()
         mine = {"pid": os.getpid(), "host": socket.gethostname(), "started": started}
@@ -441,10 +709,16 @@ class Engine:
         self._state = read_state(project)
         self._carried: list[dict[str, Any]] = []
         self._baseline: list[dict[str, Any]] = []
+        #: Model spend that state.json had recorded and the usage ledger no longer
+        #: accounts for (the ledger was lost): carried, so that spending never goes down.
+        self._carried_usd = 0.0
         #: Models that were used and have no known price: the model budget cannot count them.
         self._unpriced: list[str] = []
         #: Experiments the run phase in flight has executed.
         self._ran = 0
+        #: What was wrong with state.json when this worker started, before it wrote the
+        #: file anew (:func:`state_problem`); ``None`` when nothing was.
+        self._lost: str | None = None
 
     # -- public ------------------------------------------------------------------
 
@@ -469,24 +743,46 @@ class Engine:
     ) -> dict[str, Any]:
         """Run from the next phase (or ``phase``) up to the next checkpoint; return the state.
 
+        With no ``phase`` named, what the person approved comes first: experiments
+        that are approved or queued are run and results without an analysis are
+        analysed before the phase that was next.  When anything ran, the call ends
+        at the checkpoint after that analysis and the phase that was next stays
+        next; when nothing could run, it goes on with that phase in the same call.
+        A named phase is run as named: a run phase asked for by name pauses also
+        when nothing ran, and says so.
+
         ``instruction`` is the person's word for this run, handed to the agents of
-        the phases it covers.  The returned state says how it ended: ``checkpoint``
-        (also when a spent budget ended a phase early: its summary and a
-        ``budget.warning`` event say so, and the same call resumes the phase once
-        the limit is raised), ``stopped`` (interrupted; the same call resumes) or
-        ``failed`` (a phase failed twice; ``error`` says why).  Raises
+        the phases it covers; a phase that is resumed without one runs under the
+        instruction it was started with.  When the call ends after an analysis that
+        came before the phase that was next, the checkpoint says that this phase
+        has not had the instruction.
+
+        The returned state says how it ended: ``checkpoint`` (also when a spent
+        budget ended a phase early: its summary and a ``budget.warning`` event say
+        so, and the same call resumes the phase once the limit is raised),
+        ``stopped`` (interrupted; the same call resumes) or ``failed`` (a phase
+        failed twice, or cannot run as the project is set; ``error`` says why).  Raises
         :class:`WorkerBusy` when another worker has the project,
-        :class:`EngineError` when the project's models cannot serve the agents, and
-        ``KeyboardInterrupt`` after recording the interruption.
+        :class:`EngineError` when the project's models cannot serve the agents or
+        when nothing on file says where the project stands and no phase is named,
+        and ``KeyboardInterrupt`` after recording the interruption.
         """
         if phase is not None and phase not in PHASES:
             raise EngineError(f"{phase!r} is not a phase; the phases are: {', '.join(PHASES)}.")
         instruction = (instruction or "").strip() or None
         with self._working():
             self._refuse_unusable_models()
+            if phase is None:
+                self._refuse_unknown_position()
             name: str | None = phase or self._first_phase()
             told: list[str] = []
             notes: list[str] = []
+            back: str | None = None
+            first = self._overdue(name) if phase is None and name else None
+            if first is not None:
+                # (Before an analysis that is still to be finished, the run is the
+                # round's own or returns where the records say: nothing to remember.)
+                back, name = (None if name in _RUNS else name), first
             while name:
                 outcome = self._run_phase(name, instruction)
                 if outcome.status != "completed" or outcome.report is None:
@@ -494,7 +790,9 @@ class Engine:
                 # What the phases of this call did and found is told at its checkpoint.
                 told.append(outcome.report.summary)
                 notes += outcome.report.notes
-                name = self._after(name, outcome, told, notes)
+                if name == "analyze" and back is not None and instruction:
+                    notes.append(self._instruction_note(instruction, back))
+                name = self._after(name, outcome, told, notes, back=back, named=phase is not None)
         return self.state
 
     def run_experiment(
@@ -544,9 +842,15 @@ class Engine:
         with lock:
             if not lock.acquired:
                 raise WorkerBusy(self._busy_message(lock.error))
+            _refuse_unwritable_state(self.project)
             self._stop.clear()
             self.project.reload()
+            # What writers that were killed left behind does not pile up crash by crash.
+            swept = self.project.sweep_temporary_files()
+            if swept:
+                log.info("Removed %d temporary file(s) of processes that are gone.", len(swept))
             with self._lock:
+                lost = self._lost = state_problem(self.project)
                 self._state = read_state(self.project)
                 self._settle_dead_worker()
                 self._count_runs()
@@ -559,7 +863,12 @@ class Engine:
                 }
                 self._carried = read_carried_usage(self.project.root / USAGE_FILE)
                 self._baseline = self.harness.usage.to_dict()["by_label"]
+                missing = self._carry_recorded_spend()
                 self._save()
+            if lost and self._state["phases"]:
+                self._say_rebuilt(lost)
+            if missing:
+                self._say_carried(missing)
             beat = _Heartbeat(self._beat, self.HEARTBEAT_SECONDS)
             beat.start()
             restore = self._stop_on_sigterm()
@@ -641,6 +950,63 @@ class Engine:
         )
         state["next_phase"] = state["phase"]
 
+    def _say_rebuilt(self, problem: str) -> None:
+        """Tell the feed that the state file was lost and what it was rebuilt as."""
+        state = self._state
+        following = state["next_phase"] if state["next_phase"] in PHASES else None
+        self.project.emit(
+            "error",
+            f"{STATE_FILE} was lost or damaged ({_one_line(problem.split('. ')[0], 120)}) and "
+            f"has been rebuilt from the project's events (events.jsonl): round "
+            f"{state['round']}, {_plural(len(state['phases']), 'phase')} on record"
+            + (f", next: {_DOING[following]}" if following else "")
+            + ". Check that this is where the project stood.",
+            round=state["round"],
+            data={"rebuilt": STATE_FILE, "round": state["round"], "next": following},
+        )
+
+    def _ledger_usd(self) -> float:
+        """What the usage ledger adds up to, with what was carried over a lost one."""
+        report = usage_report(self.harness.usage, self._carried, self._baseline)
+        return _number(report.get("estimated_cost_usd")) + self._carried_usd
+
+    def _carry_recorded_spend(self) -> float:
+        """Keep what the state file recorded as spent on models when the usage ledger
+        accounts for less; return the difference (nothing when the ledger covers it).
+
+        The ledger (usage.json) is where the spend is counted, and state.json only
+        repeats its sum.  When the ledger is lost or cannot be read, that sum is
+        all that is left of what the project spent: without it the count would
+        start again at zero and the model budget would no longer mean the
+        project's total.
+        """
+        try:
+            ledger = json.loads((self.project.root / USAGE_FILE).read_text(encoding="utf-8"))
+            self._carried_usd = _number(ledger.get("carried_usd"))
+        except (OSError, ValueError, AttributeError):
+            self._carried_usd = 0.0
+        recorded = self._state["spent"]["model_usd"]
+        missing = round(recorded - self._ledger_usd(), 4)
+        # Both sums are estimates rounded to four places, priced from a table that may
+        # have been corrected since: a difference that small is not a lost ledger.
+        if missing <= 0.0002 + 0.001 * recorded:
+            return 0.0
+        self._carried_usd = round(self._carried_usd + missing, 4)
+        return missing
+
+    def _say_carried(self, missing: float) -> None:
+        limit = float(self.project.settings.limits.model_usd)
+        spent = self._write_usage()
+        self.project.emit(
+            "budget.warning",
+            f"The usage ledger ({USAGE_FILE}) was lost or accounts for less than the "
+            f"project had recorded as spent on models: {_money(missing)} of that record "
+            f"is carried over, so the model budget still counts it ({_money(spent)} of "
+            f"{_money(limit)} is spent). The token counts behind that amount are gone.",
+            round=max(1, self._state["round"]),
+            data={"limit": "model_usd", "spent": spent, "allowed": limit, "carried": missing},
+        )
+
     def _beat(self) -> None:
         with self._lock:
             worker = self._state.get("worker")
@@ -662,9 +1028,14 @@ class Engine:
         """
         with self._lock:
             report = usage_report(self.harness.usage, self._carried, self._baseline)
-            write_json(self.project.root / USAGE_FILE, report)
             self._unpriced = [str(model) for model in report.get("unpriced_models") or []]
-            spent = _number(report.get("estimated_cost_usd"))
+            spent = _number(report.get("estimated_cost_usd")) + self._carried_usd
+            if self._carried_usd:
+                # Spend the rows above do not account for: recorded before the ledger
+                # was lost.  On file, so that the next worker carries it too.
+                report["carried_usd"] = self._carried_usd
+                report["estimated_cost_usd"] = round(spent, 4)
+            write_json(self.project.root / USAGE_FILE, report)
             self._state["spent"]["model_usd"] = round(spent, 4)
             return spent
 
@@ -684,12 +1055,43 @@ class Engine:
 
     # -- what may run ------------------------------------------------------------
 
+    def _clean(self, text: Any) -> str:
+        """``text`` without the credentials this process holds.
+
+        A library may quote the request it failed with, key and all, in its error.
+        What the engine writes of an error goes into state.json and events.jsonl,
+        which the app, the command line and later sessions read: the value is
+        blanked before it gets there.
+        """
+        return experiments.mask_credentials(self.project, str(text))
+
     def _refuse_unusable_models(self) -> None:
-        problems = agents.model_problems(self.project, self.harness)
+        problems = [
+            self._clean(problem) for problem in agents.model_problems(self.project, self.harness)
+        ]
         if not problems:
             return
         message = " ".join(problems)
         self.project.emit("error", _one_line(message, 600), data={"problems": problems})
+        raise EngineError(message)
+
+    def _refuse_unknown_position(self) -> None:
+        """Refuse to choose a phase when nothing on file says where the project stands.
+
+        Without phase records in state.json and without phase events, the first
+        phase would be intake: on a project whose wiki holds the agents' pages that
+        would do its first steps a second time, and pay for them.
+        """
+        if self._state["phases"] or not _agents_wrote(self.project):
+            return
+        # (As the file was found: this worker has written an empty one since.)
+        problem = self._lost or state_problem(self.project) or ""
+        message = (
+            f"{problem} For example `paper-orchestra research "
+            f"advance {self.project.root} --phase hypothesize` (the phases are: "
+            f"{', '.join(PHASES)}), or Continue with a phase in the app."
+        ).strip()
+        self.project.emit("error", _one_line(message, 600), data={"state": "unknown"})
         raise EngineError(message)
 
     def _guard(self) -> None:
@@ -721,8 +1123,7 @@ class Engine:
         """
         limit = float(self.project.settings.limits.model_usd)
         with self._lock:
-            report = usage_report(self.harness.usage, self._carried, self._baseline)
-        spent = _number(report.get("estimated_cost_usd")) + (estimate_cost_usd(model, usage) or 0.0)
+            spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0)
         if spent < limit:
             return None
         role = _ROLE.get(str(self._state.get("phase")), "agent")
@@ -786,9 +1187,6 @@ class Engine:
 
     # -- which phase, which round ------------------------------------------------
 
-    def _research_requested(self) -> bool:
-        return any(_ASKS_FOR_RESEARCH.search(r.text) for r in self.project.requests())
-
     def _unsettled_phase(self) -> str | None:
         """The phase that completed without what follows it having been decided.
 
@@ -816,44 +1214,184 @@ class Engine:
         owed = self._unsettled_phase()
         if owed is None:
             return self._next_phase()
+        record = self._state["phases"][-1]
+        self._complete_record(record)
         note = f"The worker stopped right after the {_NOUN[owed]} phase had finished."
+        # What the worker may not have got round to: closing the requests the phase was
+        # given, and saying in the feed that it finished.
+        since = self._events_of(record)
+        if not any(event.get("type") == "phase.finished" for event in since):
+            self._announce(record)
+        else:
+            self._settle_requests(record)
+        written = [event for event in since if event.get("type") == "checkpoint"]
+        if written:
+            # It had announced the pause and died before the state said so: one pause
+            # is one event, so the event that is there is the checkpoint.
+            self._adopt_checkpoint(written[-1], note)
+            return None
         return self._after(owed, _Outcome("completed"), [], [note])
+
+    def _events_of(self, record: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """The events of the phase ``record`` is of, from its latest start on."""
+        name, round = record["phase"], record["round"]
+        events = [
+            event
+            for event in self.project.events()
+            if event.get("phase") == name and event.get("round") == round
+        ]
+        starts = [i for i, event in enumerate(events) if event.get("type") == "phase.started"]
+        return events[starts[-1] :] if starts else events
+
+    def _adopt_checkpoint(self, event: Mapping[str, Any], note: str) -> None:
+        """Make the state say what a checkpoint event on file announced."""
+        data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+        name, round = str(event["phase"]), int(event["round"])
+        following = data.get("next") if data.get("next") in PHASES else _NEXT[name]
+        checkpoint = _read_checkpoint(
+            {
+                "round": round,
+                "phase": name,
+                "at": event.get("ts"),
+                "summary": f"{note} {event.get('summary') or ''}".strip(),
+                "pending": data.get("pending"),
+            }
+        )
+        with self._lock:
+            self._state.update(
+                status="checkpoint",
+                round=round,
+                phase=name,
+                next_phase=following,
+                error=None,
+                checkpoint=checkpoint,
+            )
+            self._save()
+
+    def _since_last_phase(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """The latest record of a phase other than run and analysis, and the runs and
+        analyses on record after it, oldest first."""
+        phases = self._state["phases"]
+        for index in range(len(phases) - 1, -1, -1):
+            if phases[index].get("phase") not in _RUNS:
+                return phases[index], phases[index + 1 :]
+        return None, list(phases)
+
+    @staticmethod
+    def _analysed(records: Sequence[Mapping[str, Any]]) -> bool:
+        """Whether an analysis among ``records`` has completed."""
+        return any(
+            record.get("phase") == "analyze" and record.get("status") == "completed"
+            for record in records
+        )
+
+    def _return_phase(self) -> str | None:
+        """The phase the work goes back to after the run and the analysis at the end of
+        the records, when those were not the round's own; ``None`` when they were.
+
+        The round's own run follows its design phase, and the first analysis that
+        completes after it ends the round.  A run the person approved at any
+        other point (an experiment run once more, one of their own) and its
+        analysis are done where they fall, and afterwards the round is where it
+        was: at the phase that was interrupted, at the one after the last that
+        completed, at the first phase of the next round when the round's own
+        analysis had completed already, or at intake when no phase has run yet.
+        Read from the records, so that a stop or a failure in between does not
+        lose it.
+        """
+        base, since = self._since_last_phase()
+        if base is None:
+            # Only runs and analyses so far: the project itself is where it started.
+            return "intake"
+        if base.get("phase") not in PHASES:
+            return None
+        if base.get("status") != "completed":
+            return str(base["phase"])
+        following = _NEXT[base["phase"]]
+        if following != "run":
+            return following
+        # After the design phase.  The last record is the run or the analysis that is
+        # asked about: it is the round's own unless the round's analysis completed
+        # before it, at whose checkpoint the person then approved this one.
+        return _NEXT["analyze"] if self._analysed(since[:-1]) else None
 
     def _after_last_record(self) -> str:
         """What comes next going by the phase records alone."""
         last = self._state["phases"][-1] if self._state["phases"] else None
         if last is None or last.get("phase") not in PHASES:
             return "intake"
-        return _NEXT[last["phase"]] if last.get("status") == "completed" else last["phase"]
-
-    def _analysed_round(self) -> int | None:
-        """The round whose analysis is the last thing that completed; ``None`` when
-        something has run since, or nothing has been analysed yet."""
-        last = self._state["phases"][-1] if self._state["phases"] else None
-        ended = (
-            isinstance(last, dict)
-            and last.get("phase") == "analyze"
-            and last.get("status") == "completed"
-        )
-        return last.get("round") if ended and isinstance(last.get("round"), int) else None
+        if last.get("status") != "completed":
+            return str(last["phase"])
+        if last["phase"] == "analyze":
+            return self._return_phase() or _NEXT["analyze"]
+        return _NEXT[last["phase"]]
 
     def _next_phase(self) -> str:
-        """The phase ``advance()`` starts with when none is named."""
+        """The phase ``advance()`` goes on with when none is named.
+
+        What the state file says is next, as the last checkpoint told the person.
+        Nothing else moves it: not a request, whatever its words, and not what an
+        agent wrote.  More research is the person's choice, made by naming the phase.
+        """
         name = self._state.get("next_phase")
         if name not in PHASES:
             # A state file that does not say (written by hand, or by an older version):
             # going back to intake would do the project's first steps a second time.
             name = self._after_last_record()
-        analysed = self._analysed_round()
-        if analysed is not None and name in ("research", "hypothesize"):
-            # Whether the round begins with the literature was decided at the checkpoint
-            # by what stood then.  The person may have accepted or rejected the journal
-            # page since: it is their decision that counts, so it is looked at again.
-            name = "research" if self._journal_asks_for_research(analysed) else "hypothesize"
-        # Asked for after the checkpoint was written: more of the literature comes first.
-        if name == "hypothesize" and self._research_requested():
-            return "research"
-        return name
+        return str(name)
+
+    def _overdue(self, name: str) -> str | None:
+        """What ``advance()`` does before ``name``, the phase that is next, when no phase
+        was named: ``run`` when an experiment is approved (or was left queued or
+        running by a worker that is gone), ``analyze`` when a result has no analysis
+        yet, ``None`` when neither is the case or ``name`` is that phase already.
+
+        The person approved a run for it to happen, and a result that nobody has
+        looked at should not wait behind phases that would have built on it.  An
+        analysis that is still to be finished waits for what was approved since, and
+        then reads all of it.
+        """
+        if name == "run":
+            return None
+        waiting = self.project.pages(
+            kind="experiment", review="accepted", state=["approved", "queued", "running"]
+        )
+        if waiting:
+            return "run"
+        return "analyze" if name != "analyze" and self._new_results() else None
+
+    @staticmethod
+    def _instruction_note(instruction: str, back: str) -> str:
+        """What the checkpoint says when a call that was given an instruction ended after
+        the analysis of what the person had approved, before the phase that was next.
+
+        The instruction went to the phases the call ran.  The person may have
+        written it for the phase the last checkpoint named as next, which has not
+        run: they are told, instead of finding out from what that phase proposes.
+        """
+        return (
+            f"The instruction you gave with this run ({agents.said(instruction, 160)}) was "
+            f"handed to the analysis. The {_NOUN[back]} phase, which comes next, has not had "
+            "it: give it again when you continue, or leave it as a request, if it was meant "
+            "for that phase."
+        )
+
+    def _open_record(self, name: str, round: int) -> dict[str, Any] | None:
+        """The record of this phase in this round that is still to be completed.
+
+        The latest record when it is this phase's, or the one that what the person
+        approved meanwhile came in after: an analysis that was unfinished when a
+        further experiment ran, any other phase that was unfinished when a run and
+        its analysis did.  The phase is resumed in its own record, under the
+        instruction it was started with.
+        """
+        came_between = () if name == "run" else ("run",) if name == "analyze" else _RUNS
+        for record in reversed(self._state["phases"]):
+            if record.get("phase") in came_between:
+                continue
+            mine = record.get("phase") == name and record.get("round") == round
+            return record if mine and record.get("status") != "completed" else None
+        return None
 
     def _last_record(self, name: str, round: int) -> dict[str, Any] | None:
         """The latest record, when it is of this phase in this round."""
@@ -863,15 +1401,25 @@ class Engine:
             return last
         return None
 
-    def _round_for(self) -> int:
-        """A new round begins with the first phase after a completed analysis."""
+    def _round_for(self, name: str) -> int:
+        """The round the phase ``name`` runs in.
+
+        A new round begins with the first phase after the analysis that ended the
+        last one: the analysis of the round's own run, which follows its design
+        phase.  A run, an analysis, and whatever follows a run that was not the
+        round's own stay in the round.  What was approved after the round's
+        analysis (and ran, or could not run) does not keep the round open.
+        """
         current = max(1, self._state["round"])
-        last = self._state["phases"][-1] if self._state["phases"] else None
+        if name in _RUNS:
+            return current
+        base, since = self._since_last_phase()
         ended = (
-            isinstance(last, dict)
-            and last.get("phase") == "analyze"
-            and last.get("status") == "completed"
-            and last.get("round") == current
+            base is not None
+            and base.get("phase") == "design"
+            and base.get("status") == "completed"
+            and base.get("round") == current
+            and self._analysed(since)
         )
         return current + 1 if ended else current
 
@@ -888,16 +1436,20 @@ class Engine:
             "error": None,
             "produced": [],
             "instruction": instruction,
+            "requests": [],
         }
 
     def _complete_record(self, record: dict[str, Any]) -> None:
         """Give a record found in the state file the fields a resumed phase counts on."""
         for key, value in self._new_record(record["phase"], record["round"], None).items():
             record.setdefault(key, value)
-        if not isinstance(record["produced"], list):
-            record["produced"] = []
+        for key in ("produced", "requests"):
+            if not isinstance(record[key], list):
+                record[key] = []
         if not isinstance(record["attempts"], int) or isinstance(record["attempts"], bool):
             record["attempts"] = 0
+        if not isinstance(record["instruction"], str) or not record["instruction"].strip():
+            record["instruction"] = None
 
     def _session(self, name: str, round: int) -> str:
         """The session stem of this run of a phase: the same while it is resumed, new otherwise."""
@@ -910,23 +1462,37 @@ class Engine:
         )
         return f"r{round}-{name}" + (f"-{done + 1}" if done else "")
 
+    # -- requests ----------------------------------------------------------------
+
     def _requests_for(self, name: str) -> list[Request]:
-        """The person's open requests, for a phase whose agent can act on requests."""
-        return list(self.project.requests()) if name in _TAKES_REQUESTS else []
+        """The person's open requests that the agent of this phase is shown: the ones
+        addressed to its role and the ones for every agent."""
+        if name not in _TAKES_REQUESTS:
+            return []
+        mine = (FOR_ALL, _ROLE[name])
+        requests = self.project.requests()
+        return [request for request in requests if agents.addressee(request) in mine]
 
-    def _close_requests(self, requests: Sequence[Request], name: str, round: int) -> None:
-        """Close what the completed phase was given.
+    def _settle_requests(self, record: Mapping[str, Any]) -> None:
+        """Note on every request the completed phase was given that it had it, and close
+        the ones nobody else is to be shown.
 
-        A request that reads as asking for more of the literature is closed by the
-        research phase only: any other phase was shown it, in case it was meant for
-        that phase after all, but only research can do what it most likely asks.
+        A request for one role is closed by that role's phase.  A request for every
+        agent stays open for the phases that follow and is closed by the analysis
+        that ends the round.  Done again after a worker died in the middle, it
+        changes nothing that was already done.
         """
-        for request in requests:
-            if name != "research" and _ASKS_FOR_RESEARCH.search(request.text):
+        name, round = record["phase"], record["round"]
+        given = {str(request_id) for request_id in record.get("requests") or []}
+        ends_round = name == "analyze" and self._return_phase() is None
+        for request in self.project.requests():
+            if request.id not in given:
                 continue
+            whom = agents.addressee(request)
+            close = whom == _ROLE[name] or (whom == FOR_ALL and ends_round)
             # (One the person withdrew while the phase ran is gone, which is as good.)
             with contextlib.suppress(NotFound):
-                self.project.close_request(request.id, round=round, phase=name)
+                self.project.note_request(request.id, round=round, phase=name, close=close)
 
     # -- one phase ---------------------------------------------------------------
 
@@ -951,20 +1517,58 @@ class Engine:
             over_budget=self._over_budget,
             scholar=self._scholar,
             compute=self._compute,
+            handover=self._handover(name, round),
         )
+
+    def _handover(self, name: str, round: int) -> tuple[str, ...]:
+        """The roles whose undecided pages of this round the phase's agent may read.
+
+        The scout that follows intake directly: intake wrote down what the
+        person's files say, and the first look at the literature should know that,
+        although the person has not reviewed those pages yet.  Every other agent
+        builds only on what the person accepted.
+        """
+        if name != "research":
+            return ()
+        earlier = [
+            record
+            for record in self._state["phases"]
+            if not (record.get("phase") == "research" and record.get("round") == round)
+        ]
+        last = earlier[-1] if earlier else None
+        after_intake = (
+            last is not None
+            and last.get("phase") == "intake"
+            and last.get("status") == "completed"
+            and last.get("round") == round
+        )
+        return ("intake",) if after_intake else ()
 
     def _run_phase(self, name: str, instruction: str | None) -> _Outcome:
         """Run one phase to its end, retrying a failure once; record how it went."""
         self.project.reload()
-        round = self._round_for()
+        round = self._round_for(name)
         session = self._session(name, round)
-        record = self._last_record(name, round)
-        if record is None or record.get("status") == "completed":
+        record = self._open_record(name, round)
+        kept = False
+        if record is None:
             record = self._new_record(name, round, instruction)
         else:
             self._complete_record(record)
+            # A phase that is resumed runs under the word it was started with, unless
+            # the person gives a new one: its record says so, and it must be true.
+            kept = instruction is None and record["instruction"] is not None
+            instruction = instruction or record["instruction"]
         requests = self._requests_for(name)
-        self._enter(record, instruction)
+        self._enter(record, instruction, requests)
+        if kept:
+            self._emit(
+                "agent.activity",
+                f"The {_NOUN[name]} phase goes on under the instruction it was started "
+                f"with: {agents.said(instruction, 200)}.",
+                phase=name,
+                round=round,
+            )
         clock = time.monotonic()
         ctx = self._context(name, round, session, requests, instruction)
         self._ran = 0
@@ -995,36 +1599,46 @@ class Engine:
             except Exception as exc:
                 if self._stopping() or any(isinstance(e, RunCancelled) for e in chain(exc)):
                     return self._interrupted(record, clock, ctx)
-                if attempt == 2 or stops_the_run(exc):
+                # (A setting that cannot be read is no better read a second time.)
+                if attempt == 2 or stops_the_run(exc) or isinstance(exc, CutoffError):
                     return self._failed(record, clock, ctx, exc)
                 log.warning("The %s phase failed; trying once more.", name, exc_info=True)
                 # An error can carry text a model wrote: it stands there as a quotation.
                 self._emit(
                     "agent.activity",
-                    f"The {_NOUN[name]} phase failed ({agents.said(exc, 200)}); trying it once "
-                    "more.",
+                    f"The {_NOUN[name]} phase failed ({agents.said(self._clean(exc), 200)}); "
+                    "trying it once more.",
                     phase=name,
                     round=round,
                 )
         assert report is not None
-        outcome = self._completed(record, clock, ctx, report, requests)
+        outcome = self._completed(record, clock, ctx, report)
         outcome.ran = self._ran if name == "run" else 0
         return outcome
 
-    def _enter(self, record: dict[str, Any], instruction: str | None) -> None:
+    def _enter(
+        self, record: dict[str, Any], instruction: str | None, requests: Sequence[Request]
+    ) -> None:
         """Say in the state file that this run of a phase is in flight.
 
-        Its record is listed from the start (as ``running``), and the phase itself
-        is what comes next for as long as it has not completed: whoever finds the
-        state after this worker died resumes the phase by running ``advance()``.
+        Its record is listed from the start (as ``running``), with the instruction
+        it runs under and the requests it is given, and the phase itself is what
+        comes next for as long as it has not completed: whoever finds the state
+        after this worker died resumes the phase by running ``advance()``.  The
+        event says the same, so that a state rebuilt from the events knows it too.
         """
         name, round = record["phase"], record["round"]
         with self._lock:
             record.update(status="running", finished=None, error=None)
-            if instruction:
-                record["instruction"] = instruction
-            if not any(record is known for known in self._state["phases"]):
-                self._state["phases"].append(record)
+            record["instruction"] = instruction
+            # Every request an attempt was given: a resumed phase adds to the list.
+            given = dict.fromkeys([*record["requests"], *(request.id for request in requests)])
+            record["requests"] = list(given)
+            # The record of the phase in flight is the last one, also when the phase is
+            # resumed after a run and its analysis came in between: whoever settles the
+            # state after this worker died looks for it there.
+            phases = self._state["phases"]
+            phases[:] = [known for known in phases if known is not record] + [record]
             self._state.update(
                 status="running",
                 round=round,
@@ -1034,11 +1648,13 @@ class Engine:
                 error=None,
             )
             self._save()
+        said = {"instruction": instruction} if instruction else {}
         self._emit(
             "phase.started",
             f"Round {round}: the {_NOUN[name]} phase started.",
             phase=name,
             round=round,
+            data={**said, "requests": record["requests"]} if record["requests"] else said,
         )
 
     def _execute(self, ctx: AgentContext) -> AgentReport:
@@ -1054,7 +1670,9 @@ class Engine:
         if name == "run":
             return self._run_approved(ctx)
         results = self._new_results()
-        report = agents.run_analyst(ctx, results=results, journal=self._journal_name(ctx))
+        report = agents.run_analyst(
+            ctx, results=results, journal=self._journal_name(ctx), spent=self._state["spent"]
+        )
         for result in results:
             # What marks a record as analysed has to survive the engine: it is on the record.
             # (A record the person deleted meanwhile needs no mark.)
@@ -1086,29 +1704,42 @@ class Engine:
             self._save()
 
     def _completed(
-        self,
-        record: dict[str, Any],
-        clock: float,
-        ctx: AgentContext,
-        report: AgentReport,
-        requests: Sequence[Request],
+        self, record: dict[str, Any], clock: float, ctx: AgentContext, report: AgentReport
     ) -> _Outcome:
-        name, round = record["phase"], record["round"]
+        """Record the phase as completed, then do what goes with it.
+
+        One save says that the phase completed and what follows it.  Closing the
+        requests it was given and announcing it come right after; a worker that
+        dies in between leaves both to the next one, which finds the completed
+        record without its checkpoint and does them (:meth:`_first_phase`).
+        """
         ctx.note(report.produced)
-        self._settle(record, clock, ctx, "completed", None)
         with self._lock:
-            self._state["next_phase"] = _NEXT[name]
-            self._save()
-        self._close_requests(requests, name, round)
+            self._state["next_phase"] = self._after_completed(record["phase"])
+        self._settle(record, clock, ctx, "completed", None)
+        self._announce(record, report.summary)
+        return _Outcome("completed", report)
+
+    def _after_completed(self, name: str) -> str:
+        """What the state names as next once ``name`` has completed, until a checkpoint
+        says it for the person: after an analysis that was not the round's own, the
+        phase the round was at."""
+        if name == "analyze":
+            return self._return_phase() or _NEXT[name]
+        return _NEXT[name]
+
+    def _announce(self, record: Mapping[str, Any], summary: str | None = None) -> None:
+        """Close the requests a completed phase was given and say that it finished."""
+        name = record["phase"]
+        self._settle_requests(record)
         self._emit(
             "phase.finished",
-            report.summary or f"The {_NOUN[name]} phase finished.",
+            summary or f"The {_NOUN[name]} phase finished.",
             phase=name,
-            round=round,
+            round=record["round"],
             refs=record["produced"][:50],
             data={"produced": record["produced"], "seconds": record["seconds"]},
         )
-        return _Outcome("completed", report)
 
     def _interrupted(self, record: dict[str, Any], clock: float, ctx: AgentContext) -> _Outcome:
         name, round = record["phase"], record["round"]
@@ -1128,14 +1759,17 @@ class Engine:
         self, record: dict[str, Any], clock: float, ctx: AgentContext, exc: BaseException
     ) -> _Outcome:
         name, round = record["phase"], record["round"]
-        error = f"{type(exc).__name__}: {_one_line(exc, 1000)}"
+        # What is written of an error is read by the app, the command line and later
+        # sessions: no credential a library quoted in it gets that far.
+        told = self._clean(exc)
+        error = f"{type(exc).__name__}: {_one_line(told, 1000)}"
         log.error("The %s phase failed.", name, exc_info=exc)
         self._settle(record, clock, ctx, "failed", error)
         with self._lock:
             self._state.update(status="failed", next_phase=name, error=error)
             self._save()
         again = " twice" if record["attempts"] > 1 else ""
-        why = agents.said(_one_line(exc, 300).rstrip("."), 300)
+        why = agents.said(_one_line(told, 300).rstrip("."), 300)
         self._emit(
             "phase.failed",
             f"The {_NOUN[name]} phase failed{again}: {why}. Run it again once the cause is "
@@ -1170,16 +1804,38 @@ class Engine:
     # -- between phases ----------------------------------------------------------
 
     def _after(
-        self, name: str, outcome: _Outcome, told: Sequence[str], notes: Sequence[str]
+        self,
+        name: str,
+        outcome: _Outcome,
+        told: Sequence[str],
+        notes: Sequence[str],
+        *,
+        back: str | None = None,
+        named: bool = False,
     ) -> str | None:
-        """The phase that follows at once, or ``None`` after writing the checkpoint."""
+        """The phase that follows at once, or ``None`` after writing the checkpoint.
+
+        ``named`` says that the person asked for the phase of this call by name: a
+        run phase they named pauses also when nothing ran, instead of going on
+        with a phase they did not ask for.
+
+        ``back`` is the phase that was next when this call began with a run or an
+        analysis that was not the round's own.  :meth:`_return_phase` knows that
+        phase from the records; ``back`` stands in where the state file named
+        another one than the records imply (a file edited by hand).
+        """
         round = self._state["round"]
         if name == "intake":
             return "research"
+        aside = self._return_phase() or back
         if name == "run":
             if outcome.ran or self._new_results():
                 return "analyze"
-            self._checkpoint(name, round, "run", told, notes)
+            if aside is not None and not named:
+                # Nothing ran, so there is nothing to pause for: what could not be run
+                # is said at the checkpoint of the phase that was next.
+                return aside
+            self._checkpoint(name, round, aside or "run", told, notes)
             return None
         if name == "analyze" and len(told) < 2:
             # The run phase reports the experiments that are planned again where its
@@ -1188,20 +1844,33 @@ class Engine:
             # itself), and what it said then went with that call: said from the pages.
             notes = [*notes, *self._planned_again()]
         following = _NEXT[name]
-        if name == "analyze" and self._journal_asks_for_research(round):
-            following = "research"
-        elif name == "analyze" and self._journal_asks_for_research(round, review="proposed"):
-            notes = [
-                *notes,
-                "The journal page of this round asks for another look at the literature "
-                "before new hypotheses (next: research). It awaits your review: accept it "
-                "and the next round starts with research; otherwise it starts with "
-                "hypotheses.",
-            ]
-        if following == "hypothesize" and self._research_requested():
-            following = "research"
+        if name == "analyze":
+            following = aside or following
+            notes = [*notes, *self._journal_note(round)]
         self._checkpoint(name, round, following, told, notes)
         return None
+
+    def _journal_note(self, round: int) -> list[str]:
+        """What the checkpoint repeats when the round's journal recommends more research.
+
+        ``next: research`` in the journal's front matter is the analyst's
+        recommendation and changes nothing about what runs next: which phase runs
+        is the person's to choose, and going back to the literature costs a session.
+        """
+        asked = any(
+            str(page.meta.get("next") or "").strip().lower() == "research"
+            for page in self.project.pages(kind="journal", review=["accepted", "proposed"])
+            if page.round == round
+        )
+        if not asked:
+            return []
+        return [
+            "The journal page of this round recommends another look at the literature "
+            "before new hypotheses (next: research). That is yours to decide and changes "
+            "nothing by itself: to follow it, run the research phase next with "
+            f"`paper-orchestra research advance {self.project.root} --phase research`, or "
+            "Continue with research in the app."
+        ]
 
     def _checkpoint(
         self,
@@ -1232,7 +1901,13 @@ class Engine:
             f"{_and(waiting)} {verb} your review." if waiting else "Nothing awaits your review."
         )
         resumes = " (it resumes where it stopped)" if following == name and name != "run" else ""
-        closing = [*notes, *self._unpriced_note(), review, f"Next: {_DOING[following]}{resumes}."]
+        closing = [
+            *notes,
+            *self._waiting_for_research(following),
+            *self._unpriced_note(),
+            review,
+            f"Next: {_DOING[following]}{resumes}.",
+        ]
         refs = [page.path for page in self.project.pages(review="proposed")][:50]
         event = self._emit(
             "checkpoint",
@@ -1283,6 +1958,29 @@ class Engine:
         )
         self._warn_budget(exc, phase=name)
         return [str(exc)]
+
+    def _waiting_for_research(self, following: str) -> list[str]:
+        """Said at every checkpoint while a request addressed to the scout is open and the
+        research phase is not what comes next.
+
+        A request for one role waits for that role's phase.  The theorist, the
+        designer and the analyst come round by themselves; the scout does not,
+        because more research is the person's choice.  Without this sentence
+        such a request would wait for good, and nothing would say so.
+        """
+        if following == "research":
+            return []
+        scout = _ROLE["research"]
+        waiting = [r for r in self.project.requests() if agents.addressee(r) == scout]
+        if not waiting:
+            return []
+        count = len(waiting)
+        return [
+            f"{_plural(count, 'request')} for the {scout} {'waits' if count == 1 else 'wait'} "
+            "for the research phase, which does not come round by itself: run it with "
+            f"`paper-orchestra research advance {self.project.root} --phase research`, or "
+            "Continue with research in the app."
+        ]
 
     def _unpriced_note(self) -> list[str]:
         """Said at every checkpoint while it holds: a budget that cannot count is no limit."""
@@ -1478,12 +2176,13 @@ class Engine:
         ``planned``.  The person has to look at it and approve it again, so the
         checkpoint names it, gives the reason and says where it stands.
         """
+        told = self._clean(exc)  # a backend's error may quote what it was configured with
         with contextlib.suppress(ProjectError):
             if self.project.page(page.path).state == "planned":
-                why = _sentence(exc, 400)
+                why = _sentence(told, 400)
                 named = why if why.startswith(f"{page.id} ") else f"{page.id} was not run: {why}"
                 return f"{named} It is planned again."
-        return f"{page.id} could not be run: {_one_line(exc, 300)}"
+        return f"{page.id} could not be run: {_one_line(told, 300)}"
 
     def _refused_note(self, page: ResearchPage, record: Mapping[str, Any]) -> str | None:
         """What the checkpoint says about a run that was refused before any job started;
@@ -1545,15 +2244,22 @@ class Engine:
             page = waiting[0]
             tried.add(page.path)
             self._heed_stop()
-            self._check_experiment_budget(page)
+            record = None
             try:
+                self._check_experiment_budget(page)
                 record = self._run_one(page, ctx)
+            except _BudgetSpent as exc:
+                if self._return_phase() is None:
+                    raise  # the round's own run phase stops here, at a checkpoint
+                # A run the person approved outside the order of the phases: what the
+                # budget does not cover must not keep the phase that was next from running.
+                self._warn_budget(exc, phase="run")
+                notes.append(str(exc))
             except (ProjectError, ComputeError) as exc:
                 if stops_the_run(exc):
                     raise
                 # One experiment that cannot run does not keep the others from running.
                 notes.append(self._not_run(page, exc))
-                record = None
             # Looked up again after every run: the person may approve one more while
             # another is running, and may cancel or change one that was waiting.
             waiting = [
@@ -1596,18 +2302,3 @@ class Engine:
             if path is None or self.project.page(path).session == own:
                 return name
             number += 1
-
-    def _journal_asks_for_research(self, round: int, *, review: str = "accepted") -> bool:
-        """Whether a journal page of the round, in that review state, says the literature
-        needs another look.
-
-        Only an accepted page sends a round anywhere (by the person, or on creation
-        where the project accepts journal pages that way).  ``next: research`` on a
-        page that awaits review or was rejected is the analyst's suggestion and no
-        more; the phases that run are the person's to decide.
-        """
-        return any(
-            str(page.meta.get("next") or "").strip().lower() == "research"
-            for page in self.project.pages(kind="journal", review=review)
-            if page.round == round
-        )

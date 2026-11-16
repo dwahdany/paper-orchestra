@@ -189,30 +189,32 @@ def test_a_create_that_fails_part_way_can_simply_be_tried_again(tmp_path, monkey
 
 
 def test_two_requests_to_create_the_same_project_do_not_write_into_each_other(tmp_path):
-    from paper_orchestra.research import project as store
+    root = tmp_path / "ws" / "p"
+    outcomes: dict[str, Project | BaseException] = {}
+    together = threading.Barrier(2)
 
-    root = tmp_path / "p"
-    root.mkdir()
-    refused: list[BaseException] = []
-
-    def late() -> None:
+    def create(name: str) -> None:
+        together.wait()
         try:
-            Project.create(root, title="Second", brief="second idea")
+            outcomes[name] = Project.create(root, title=name, brief=f"{name} idea")
         except BaseException as exc:
-            refused.append(exc)
+            outcomes[name] = exc
 
-    other = threading.Thread(target=late, daemon=True)
-    with store._lock_for(root):
-        other.start()
-        time.sleep(0.3)  # it has found the directory empty and now waits for the lock
-        Project.create(root, title="First", brief="first idea")
-    other.join(30)
-    assert len(refused) == 1 and isinstance(refused[0], ProjectError)
-    assert "already holds a research project" in str(refused[0])
+    threads = [threading.Thread(target=create, args=(name,)) for name in ("First", "Second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    # Each is built on its own and one is moved into place: the other is told so.
+    (winner,) = [name for name, outcome in outcomes.items() if isinstance(outcome, Project)]
+    (loser,) = [name for name in outcomes if name != winner]
+    assert isinstance(outcomes[loser], ProjectError)
+    assert "already holds a research project" in str(outcomes[loser])
     opened = Project.open(root)
-    assert opened.title == "First" and opened.page("idea").body == "first idea\n"
-    assert opened.history("idea") == [] and "Second" not in raw(opened, "events.jsonl")
+    assert opened.title == winner and opened.page("idea").body == f"{winner} idea\n"
+    assert opened.history("idea") == [] and loser not in raw(opened, "events.jsonl")
     assert [event["type"] for event in opened.events()] == ["project.created"]
+    assert [entry.name for entry in root.parent.iterdir()] == ["p"]
 
 
 def test_a_folder_that_cannot_be_listed_is_reported_as_left_out(tmp_path, monkeypatch):
@@ -746,32 +748,79 @@ def test_an_agent_cannot_decide_or_approve_through_fields(project):
 
 def test_pipeline_code_sets_fields_but_does_not_rewrite_what_the_person_decided(project):
     finding = project.create_page("finding", "Gap", "Seen: 0.9.", author="agent:analyst")
-    flagged = project.update_page(finding.path, author="system", fields={"unverified": ["0.9"]})
-    assert flagged.meta["unverified"] == ["0.9"] and flagged.review == "proposed"
+    flagged = project.update_page(finding.path, author="system", fields={"checked": ["0.9"]})
+    assert flagged.meta["checked"] == ["0.9"] and flagged.review == "proposed"
     project.update_page(finding.path, author="system", body="Rewritten while undecided.")
     project.review(finding.path, "accept")
-    project.update_page(finding.path, author="system", fields={"unverified": None})
-    assert "unverified" not in project.page(finding.path).meta
+    project.update_page(finding.path, author="system", fields={"checked": None})
+    assert "checked" not in project.page(finding.path).meta
     with pytest.raises(NotAllowed, match="does not rewrite its text"):
         project.update_page(finding.path, author="system", body="Rewritten after the decision.")
     with pytest.raises(NotAllowed, match="does not rewrite its text"):
         project.update_page("wiki/idea.md", author="system", body="A better idea.")
 
 
-def test_a_page_the_person_edits_is_accepted(project):
+def test_editing_is_not_deciding(project):
     page = hypothesis(project)
     edited = project.update_page("H1", author="human", body="## Statement\n\nMy wording.")
-    assert edited.review == "accepted" and edited.author == "agent:theorist"
-    assert edited.meta["decided_by"] == "human" and edited.meta["decided_at"] == edited.updated
-    assert edited.meta["updated_by"] == "human"
+    # The correction is in, and the decision is still open.
+    assert edited.review == "proposed" and edited.author == "agent:theorist"
+    assert "decided_by" not in edited.meta and edited.meta["updated_by"] == "human"
+    assert [item.path for item in project.pending()] == [page.path]
+    assert project.events()[-1]["type"] == "page.updated"
     assert project.history("H1")[0].author == "agent:theorist"
+    # What the person wrote is not its author's to rewrite any more.
+    with pytest.raises(NotAllowed, match="edited by the person"):
+        project.update_page("H1", author="agent:theorist", body="Back to mine.")
+    # Nor after pipeline code set a field on it since.
+    project.update_page("H1", author="system", fields={"note": "seen"})
+    with pytest.raises(NotAllowed, match="edited by the person"):
+        project.update_page("H1", author="agent:theorist", body="Back to mine.")
+    # A page that was turned down stays turned down, with its reason.
+    other = project.review(hypothesis(project, "Other").path, "reject", reason="vague")
+    reworded = project.update_page(other.path, author="human", body="Sharper now.")
+    assert reworded.review == "rejected" and reworded.decision_reason == "vague"
+    assert page.created == edited.created
+
+
+def test_save_and_accept_is_the_explicit_decision(project):
+    page = hypothesis(project)
+    saved = project.update_page(
+        "H1", author="human", body="## Statement\n\nMy wording.", accept=True
+    )
+    assert saved.review == "accepted" and saved.body.endswith("My wording.\n")
+    assert saved.meta["decided_by"] == "human" and saved.meta["decided_at"] == saved.updated
+    event = project.events()[-1]
+    assert (event["type"], event["data"]["decision"], event["data"]["edited"]) == (
+        "review.decided",
+        "accept",
+        True,
+    )
+    assert project.pending() == []
     with pytest.raises(NotAllowed, match="accepted by the person"):
         project.update_page("H1", author="agent:theorist", body="Back to mine.")
-    # The same holds for a page that was turned down: the person changed their mind.
+    # The person changed their mind about one they had turned down.
     other = project.review(hypothesis(project, "Other").path, "reject", reason="vague")
-    revived = project.update_page(other.path, author="human", body="Sharper now.")
+    revived = project.update_page(other.path, author="human", body="Sharper now.", accept=True)
     assert revived.review == "accepted" and "decision_reason" not in revived.meta
-    assert page.created == edited.created
+    # Saving an accepted page with it is an edit and nothing more.
+    again = project.update_page("H1", author="human", fields={"summary": "Mine"}, accept=True)
+    assert again.meta["decided_at"] == saved.meta["decided_at"]
+    assert project.events()[-1]["type"] == "page.updated"
+    # Only the person decides, however the call is made.
+    third = hypothesis(project, "Third")
+    with pytest.raises(NotAllowed, match="Only the person"):
+        project.update_page(third.path, author="agent:theorist", body="x", accept=True)
+    assert project.page(third.path).review == "proposed" and page.created == saved.created
+
+
+def test_a_page_accepted_without_review_is_the_persons_once_they_edit_it(project):
+    journal = project.create_page("journal", "Round 1", "What happened.", author="agent:analyst")
+    assert journal.review == "accepted" and "decided_by" not in journal.meta
+    edited = project.update_page(journal.path, author="human", body="What really happened.")
+    assert edited.review == "accepted" and edited.meta["decided_by"] == "human"
+    with pytest.raises(NotAllowed, match="accepted by the person"):
+        project.update_page(journal.path, author="agent:analyst", body="Mine again.")
 
 
 def test_a_page_of_the_persons_marked_proposed_by_hand_can_be_accepted(project):
@@ -790,11 +839,14 @@ def test_a_page_of_the_persons_marked_proposed_by_hand_can_be_accepted(project):
     # ... so does accepting with a correction, which is applied ...
     edited = project.review("topics/three", "accept", edits={"body": "Corrected."})
     assert (edited.review, edited.body) == ("accepted", "Corrected.\n")
-    # ... and so does editing it: a page the person edits is accepted.
+    # ... and so does saving it with the decision; a plain edit leaves it waiting.
     saved = project.update_page("topics/two", author="human", body="Rewritten.")
+    assert saved.review == "proposed" and len(project.pending()) == 1
+    saved = project.update_page("topics/two", author="human", accept=True)
     assert saved.review == "accepted"
     assert project.pending() == []
-    assert all(len(project.history(f"topics/{name}")) == 1 for name in ("one", "two", "three"))
+    # (The second one was saved twice: once as an edit, once with the decision.)
+    assert [len(project.history(f"topics/{name}")) for name in ("one", "two", "three")] == [1, 2, 1]
     # Their own accepted page has nothing to decide, and is never "rejected".
     before = raw(project, "wiki/idea.md")
     assert project.review("idea", "accept").decided_by is None
@@ -974,7 +1026,7 @@ def test_an_edit_proposal_is_stored_in_the_documented_shape(project):
     assert event["type"] == "proposal.created" and event["agent"] == "analyst"
     assert event["summary"] == (
         'The analyst proposed an edit to hypothesis H1 "Warmup reduces variance": '
-        "Mark H1 as supported by F1."
+        '"Mark H1 as supported by F1".'
     )
     assert event["refs"] == [page.path, f"proposals/{proposal.id}.json"]
     # Nothing changed yet.
@@ -1009,7 +1061,7 @@ def test_accepting_an_edit_applies_it_and_keeps_the_previous_version(project):
     assert project.proposals() == [] and project.proposals(review=None) == [decided]
     assert project.events()[-1]["summary"] == (
         'You accepted the analyst\'s edit to hypothesis H1 "Warmup reduces variance": '
-        "Support and sharpen."
+        '"Support and sharpen".'
     )
     with pytest.raises(ProjectError, match="already accepted"):
         project.review(proposal.id, "reject")
@@ -1341,7 +1393,8 @@ def test_requests_steer_the_agents(project):
         "target": None,
         "created": first.created,
         "state": "open",
-        "handled_in": None,
+        "for": "all",
+        "handled_in": [],
     }
     assert project.requests() == [first, second]
     event = project.events()[-1]
@@ -1352,7 +1405,7 @@ def test_requests_steer_the_agents(project):
     project.close_request(first.id, round=2, phase="hypothesize")
     assert project.requests() == [second]
     (done,) = project.requests(state="done")
-    assert done.handled_in == {"round": 2, "phase": "hypothesize"}
+    assert done.handled_in == [{"round": 2, "phase": "hypothesize"}]
     assert len(project.requests(state=None)) == 2
     project.delete_request(second.id)
     assert project.requests() == []
@@ -1483,7 +1536,8 @@ def test_the_graph_has_typed_edges_mentions_and_reports_what_dangles(project):
         "kind": "hypothesis",
         "label": "H1",
         "title": "Warmup reduces variance",
-        "summary": "As in [[H1]] and [[topics/warmup]].",
+        # Taken from the text, where the links are markup: here they are words.
+        "summary": "As in H1 and warmup.",
         "review": "proposed",
         "state": "open",
         "author": "agent:theorist",
@@ -2091,3 +2145,369 @@ def test_the_feed_says_how_a_run_was_approved(project):
         'The run of experiment E1 "Sweep warmup length" goes on with the code as the runner '
         "repaired it."
     )
+
+
+# -- round 2 of the audit repairs -----------------------------------------------
+
+
+def test_a_request_is_for_one_role_or_for_every_agent(project):
+    page = hypothesis(project)
+    shared = project.add_request("Keep every run under a minute")
+    own = project.add_request(
+        "Use batch size 8 and three seeds", role="agent:designer", target="H1"
+    )
+    assert (shared.role, own.role, own.target) == ("all", "designer", page.path)
+    assert json.loads(raw(project, f"requests/{own.id}.json"))["for"] == "designer"
+    summaries = [e["summary"] for e in project.events() if e["type"] == "request.created"]
+    assert summaries == [
+        "You asked the agents: Keep every run under a minute.",
+        "You asked the designer: Use batch size 8 and three seeds.",
+    ]
+    assert project.events()[-1]["data"]["for"] == "designer"
+    with pytest.raises(ProjectError, match="scout, theorist, designer, analyst"):
+        project.add_request("Run it", role="runner")
+    assert len(project.requests()) == 2
+
+    # Every phase that was given a request is on it, in order; closing it is separate.
+    project.note_request(shared.id, round=1, phase="hypothesize")
+    project.note_request(shared.id, round=1, phase="hypothesize")  # said twice, noted once
+    project.note_request(shared.id, round=1, phase="design")
+    (still_open,) = [r for r in project.requests() if r.id == shared.id]
+    assert still_open.handled_in == [
+        {"round": 1, "phase": "hypothesize"},
+        {"round": 1, "phase": "design"},
+    ]
+    project.close_request(shared.id, round=1, phase="analyze")
+    (done,) = project.requests(state="done")
+    assert [item["phase"] for item in done.handled_in] == ["hypothesize", "design", "analyze"]
+    assert json.loads(raw(project, f"requests/{shared.id}.json"))["state"] == "done"
+
+
+def test_no_credential_reaches_the_event_stream(project, monkeypatch):
+    secret = "sk-audit-FAKE-0123456789abcdef"
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", secret)
+    token = "ghp_tokenOfTheRepository42"
+    project.settings.update({"repo": {"path": f"https://{token}@example.org/lab/code.git"}})
+    project.save_settings()
+    event = project.emit(
+        "error",
+        f"401 Unauthorized for url 'https://api.example/v1?key={secret}'",
+        data={
+            "error": f"key={secret}",
+            "nested": {"tried": [f"Bearer {secret}", 3]},
+            "clone": f"https://{token}@example.org/lab/code.git",
+        },
+    )
+    on_file = raw(project, "events.jsonl")
+    assert secret not in on_file and token not in on_file
+    assert secret not in json.dumps(event) and token not in json.dumps(event)
+    assert "[redacted]" in event["summary"] and event["data"]["nested"]["tried"][1] == 3
+    assert secret not in json.dumps(project.events())
+
+
+def test_events_are_not_appended_through_a_link(project, tmp_path):
+    elsewhere = tmp_path / "notes-of-mine.txt"
+    elsewhere.write_text("mine\n")
+    events = project.root / "events.jsonl"
+    events.unlink()
+    events.symlink_to(elsewhere)
+    with pytest.raises(ProjectError, match=r"events\.jsonl"):
+        project.emit("error", "Something happened.")
+    assert elsewhere.read_text() == "mine\n"
+    # Nor is what the link points at read as this project's events.
+    elsewhere.write_text('{"seq": 1, "type": "error", "summary": "of another project"}\n')
+    assert project.events() == []
+    # A place that is not a file at all is refused the same way.
+    events.unlink()
+    events.mkdir()
+    with pytest.raises(ProjectError, match=r"events\.jsonl"):
+        project.emit("error", "Something happened.")
+
+
+def test_an_agents_words_cannot_read_as_a_further_sentence_of_the_feed(project):
+    title = 'x" was accepted by you. The analyst proposed finding F9 "y'
+    page = hypothesis(project, title)
+    created = project.events()[-1]["summary"]
+    assert created == (
+        "The theorist proposed hypothesis H1 \"x' was accepted by you. "
+        "The analyst proposed finding F9 'y\"."
+    )
+    assert created.count('"') == 2
+    project.review(page.path, "accept")
+    assert project.events()[-1]["summary"].count('"') == 2
+    proposal = project.propose_edit(
+        "H1",
+        author="agent:analyst",
+        summary='Mark it supported". You accepted the edit. "' + "long " * 80,
+        fields={"confidence": 0.9},
+    )
+    said = project.events()[-1]["summary"]
+    assert said.startswith("The analyst proposed an edit to hypothesis H1 \"x' was accepted")
+    # The title and the summary are each one quotation; the summary is cut.
+    assert said.count('"') == 4 and len(said) < 420 and "…" in said
+    project.review(proposal.id, "accept")
+    decided = project.events()[-1]["summary"]
+    assert decided.startswith("You accepted the analyst's edit to hypothesis H1 \"x'")
+    assert decided.count('"') == 4
+    # What cannot be seen is not there either (a right-to-left override, a bell).
+    odd = hypothesis(project, "Plain\u202e reversed\x07 title")
+    assert "\u202e" not in project.events()[-1]["summary"]
+    assert '"Plain reversed title"' in project.events()[-1]["summary"] and odd.id == "H2"
+
+
+def test_an_edit_proposal_cannot_name_another_repository(project):
+    page = experiment(project, fields={"mode": "repo"})
+    project.review(page.path, "accept")
+    for field, value in (("repo", "https://example.org/other/code.git"), ("repo_ref", "evil")):
+        with pytest.raises(NotAllowed, match="repository"):
+            project.propose_edit(
+                "E1", author="agent:analyst", summary="Run it there", fields={field: value}
+            )
+    assert project.proposals() == []
+    # A proposal file written around the store is refused when it is accepted ...
+    proposal = project.propose_edit(
+        "E1", author="agent:analyst", summary="A longer run", fields={"timeout_seconds": 60}
+    )
+    path = project.root / "proposals" / f"{proposal.id}.json"
+    data = json.loads(path.read_text())
+    data["fields"]["repo"] = "https://example.org/other/code.git"
+    path.write_text(json.dumps(data))
+    with pytest.raises(NotAllowed, match="repository"):
+        project.review(proposal.id, "accept")
+    assert "repo" not in project.page("E1").meta
+    # ... unless the fields are the person's own: the repository is theirs to name.
+    project.review(proposal.id, "accept", edits={"fields": {"repo": "/srv/code"}})
+    assert project.page("E1").meta["repo"] == "/srv/code"
+    # Another kind of page has no repository to protect.
+    other = hypothesis(project)
+    project.propose_edit(other.path, author="agent:analyst", summary="x", fields={"repo": "n/a"})
+
+
+KILLED_WHILE_CREATING = """
+import os, sys
+from paper_orchestra.research import project as store
+
+def die(*args, **kwargs):
+    os._exit(9)
+
+if sys.argv[2] == "while moving":
+    real, moved = os.rename, []
+
+    def rename(source, target):
+        if len(moved) == int(sys.argv[3]):
+            os._exit(9)
+        moved.append(target)
+        real(source, target)
+
+    store.os.rename = rename
+else:
+    setattr(store.Project, sys.argv[2], die)
+store.Project.create(sys.argv[1], title="Swept", brief="Does warmup matter?")
+"""
+
+
+@pytest.mark.parametrize("killed_in", ["_write_project_file", "_changed", "while moving"])
+@pytest.mark.parametrize("existed", [False, True])
+def test_creating_a_project_is_all_or_nothing(tmp_path, killed_in, existed):
+    # Killed before project.json exists, between project.json and the idea page's index,
+    # and while the finished project is put in place: no directory is left that a second
+    # attempt refuses, or that is listed as a project and cannot be advanced.
+    root = tmp_path / "ws" / "swept"
+    root.mkdir(parents=True) if existed else None
+    inode = root.stat().st_ino if existed else None
+    # (A new directory appears with one rename; into one that exists, entry by entry.)
+    renames = "4" if existed else "0"
+    done = subprocess.run(
+        [sys.executable, "-c", KILLED_WHILE_CREATING, str(root), killed_in, renames], check=False
+    )
+    assert done.returncode == 9
+    assert not (root / "project.json").exists() and root.exists() == existed
+    for entry in (tmp_path / "ws").iterdir():  # as if the dead process had left it a while ago
+        os.utime(entry, (time.time() - 3600, time.time() - 3600))
+
+    # The second attempt succeeds, and what the first one left behind is gone with it.
+    created = Project.create(root, title="Swept", brief="Does warmup matter?")
+
+    assert [entry.name for entry in (tmp_path / "ws").iterdir()] == ["swept"]
+    assert not [name for name in os.listdir(root) if name.startswith(".paper-orchestra")]
+    assert created.root == root and Project.open(root).page("idea").body.strip() == (
+        "Does warmup matter?"
+    )
+    assert created.problems() == [] and created.at_home() is True
+    # A directory that was there is still that directory: a shell standing in it is not
+    # left in one that no longer exists.
+    assert inode is None or root.stat().st_ino == inode
+
+
+def test_a_directory_that_holds_something_else_is_not_taken_for_an_unfinished_creation(tmp_path):
+    root = tmp_path / "mine"
+    (root / "wiki").mkdir(parents=True)  # a name a project has, but nobody was creating one
+    with pytest.raises(ProjectError, match="not an empty directory"):
+        Project.create(root, title="T", brief=BRIEF)
+    (root / ".paper-orchestra-new-1-abcd").mkdir()  # process 1 is alive
+    with pytest.raises(ProjectError, match=r"being created.*process 1"):
+        Project.create(root, title="T", brief=BRIEF)
+    assert (root / "wiki").is_dir()
+
+
+def test_a_failed_creation_leaves_an_existing_empty_directory_as_it_was(tmp_path, monkeypatch):
+    root = tmp_path / "ws" / "mine"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(Project, "_changed", lambda self: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        Project.create(root, title="T", brief=BRIEF)
+    assert root.is_dir() and list(root.iterdir()) == []
+    assert [entry.name for entry in (tmp_path / "ws").iterdir()] == ["mine"]
+    monkeypatch.undo()
+    assert Project.create(root, title="T", brief=BRIEF).page("idea").title == "T"
+
+
+def test_two_projects_are_not_created_in_one_directory(tmp_path):
+    root = tmp_path / "ws" / "same"
+    Project.create(root, title="First", brief=BRIEF)
+    with pytest.raises(ProjectError, match="already holds a research project"):
+        Project.create(root, title="Second", brief=BRIEF)
+    assert Project.open(root).title == "First"
+    assert [entry.name for entry in (tmp_path / "ws").iterdir()] == ["same"]
+
+
+def test_a_missing_idea_page_is_written_again_from_the_brief(project):
+    (project.root / "wiki" / "idea.md").unlink()
+    opened = Project.open(project.root)
+    idea = opened.page("idea")
+    assert (idea.title, idea.author, idea.review, idea.round) == (
+        "Warmup and variance",
+        "human",
+        "accepted",
+        0,
+    )
+    assert idea.body.strip() == BRIEF
+    assert opened.problems() == []
+    assert "written again" in opened.events()[-1]["summary"]
+    # Nothing is done twice, and a project without a brief on file is only reported.
+    assert len(Project.open(project.root).events()) == len(opened.events())
+    (project.root / "wiki" / "idea.md").unlink()
+    (project.root / "inputs" / "brief.md").unlink()
+    assert Project.open(project.root).problems() == [
+        {"path": "wiki/idea.md", "message": "the idea page is missing"}
+    ]
+
+
+def test_a_project_knows_whether_it_is_where_it_was_created(tmp_path):
+    import shutil
+
+    original = Project.create(tmp_path / "ws" / "warmup", title="T", brief=BRIEF)
+    assert original.at_home() is True
+    shutil.copytree(original.root, tmp_path / "ws" / "backup-warmup")
+    copy = Project.open(tmp_path / "ws" / "backup-warmup")
+    assert copy.id == original.id and copy.at_home() is False
+    # Renaming the directory moves the project; it is still the one that was created.
+    os.rename(original.root, tmp_path / "ws" / "renamed")
+    assert Project.open(tmp_path / "ws" / "renamed").at_home() is True
+    # A project from before this was recorded cannot tell.
+    data = json.loads((copy.root / "project.json").read_text())
+    del data["home"]
+    (copy.root / "project.json").write_text(json.dumps(data))
+    assert Project.open(copy.root).at_home() is None
+
+
+def test_temporary_files_of_dead_processes_are_swept(project):
+    gone = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    dead, alive = int(gone.stdout), os.getpid()
+    experiment(project)
+    run = project.root / "experiments" / "E1" / "runs" / "1"
+    run.mkdir(parents=True)
+    litter = [
+        project.root / f".state.json.{dead}.0a1b2c3d.tmp",
+        project.root / "wiki" / "hypotheses" / f".H1-x.md.{dead}.0a1b2c3d.tmp",
+        project.root / "history" / f".20261115T120000Z-human.md.{dead}.ffffffff.tmp",
+        run / f".run.json.{dead}.00000000.tmp",
+    ]
+    kept = [
+        project.root / f".state.json.{alive}.0a1b2c3d.tmp",  # its writer is at work
+        project.root / f".usage.json.{dead}.11111111.tmp",  # too new to judge
+        project.root / "wiki" / "hypotheses" / ".notes.tmp",  # not one of ours
+        project.root / "inputs" / f".brief.md.{dead}.0a1b2c3d.tmp",  # the person's folder
+    ]
+    for file in [*litter, *kept]:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("half")
+    old = time.time() - 3600
+    for file in [*litter, kept[0], *kept[2:]]:
+        os.utime(file, (old, old))
+    removed = project.sweep_temporary_files()
+    assert sorted(removed) == sorted(file.relative_to(project.root).as_posix() for file in litter)
+    assert not any(file.exists() for file in litter) and all(file.exists() for file in kept)
+    assert project.sweep_temporary_files() == []
+
+
+def test_a_lost_state_file_is_a_problem_to_report(project):
+    assert project.problems() == []
+    project.emit("phase.finished", "The research phase finished.", phase="research", round=1)
+    problem = {"path": "state.json", "message": project.problems()[0]["message"]}
+    assert project.problems() == [problem]
+    assert "events.jsonl" in problem["message"] and "not started" in problem["message"]
+    (project.root / "state.json").write_text("[1, 2")
+    assert [item["path"] for item in project.problems()] == ["state.json"]
+    (project.root / "state.json").write_text(json.dumps({"round": 1, "phases": []}))
+    assert [item["path"] for item in project.problems()] == ["state.json"]  # no phase on record
+    phase = {"round": 1, "phase": "research", "status": "completed"}
+    (project.root / "state.json").write_text(json.dumps({"round": 1, "phases": [phase]}))
+    assert project.problems() == [] and project.state_lost() is None
+
+
+def test_a_project_file_nested_beyond_reading_is_a_project_that_cannot_be_opened(project):
+    (project.root / "project.json").write_text("[" * 200_000)
+    with pytest.raises(ProjectError, match=r"project\.json"):
+        Project.open(project.root)
+
+
+def test_text_that_cannot_be_stored_is_refused_and_nothing_is_kept(project):
+    lone = "half a pair \ud800 here"
+    before = project.events()
+    refusals = (
+        lambda: project.create_page("topic", lone, "x", author="human"),
+        lambda: project.create_page("topic", "T", lone, author="human"),
+        lambda: project.update_page("idea", author="human", body=lone),
+        lambda: project.update_page("idea", author="human", fields={"summary": lone}),
+        lambda: project.add_request(lone),
+        lambda: project.propose_edit("idea", author="agent:analyst", summary=lone, body="x"),
+        lambda: project.propose_edit("idea", author="agent:analyst", summary="s", body=lone),
+    )
+    for refused in refusals:
+        with pytest.raises(ProjectError, match="cannot be stored"):
+            refused()
+    assert project.events() == before and project.requests() == [] and project.proposals() == []
+    assert [page.path for page in project.pages()] == ["wiki/idea.md"]
+    assert not list((project.root / "wiki").rglob(".*.tmp"))
+    # A title that cannot be saved is not kept in memory either.
+    project.title = lone
+    with pytest.raises(ProjectError, match="cannot be stored"):
+        project.save_settings()
+    assert project.title == "Warmup and variance"
+    with pytest.raises(ProjectError, match="cannot be stored"):
+        project.rename(lone, by="human")
+    assert project.title == Project.open(project.root).title == "Warmup and variance"
+    # The event stream takes what it is given, in a form that can be read back.
+    event = project.emit("error", f"The model answered {lone}.")
+    assert project.events()[-1]["seq"] == event["seq"]
+    assert "half a pair" in project.events()[-1]["summary"]
+
+
+def test_settings_that_could_not_be_saved_are_not_kept(project, monkeypatch):
+    from paper_orchestra.research import project as store
+
+    def full_disk(path, data):
+        raise OSError(28, "No space left on device")
+
+    project.settings.update({"compute": "modal"})
+    project.title = "Another title"
+    monkeypatch.setattr(store, "write_json", full_disk)
+    with pytest.raises(OSError, match="No space left"):
+        project.save_settings()
+    assert (project.title, project.settings.compute) == ("Warmup and variance", "local")

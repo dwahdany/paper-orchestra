@@ -11,15 +11,20 @@ is everything between the two:
   :func:`options` tells them what each backend could do with the plan;
 * :func:`run` executes one approved experiment on a compute backend, repairs a
   programming error a bounded number of times, and writes the run's records;
-  :func:`request_cancel` and :func:`recover` end and settle runs;
-* :func:`number_check` traces the numbers of a finding back to records.
+  :func:`request_cancel`, :func:`withdraw` and :func:`recover` end and settle
+  runs;
+* :func:`number_check` and :func:`number_report` say where the numbers of a
+  finding occur on record, :func:`dependents` what rests on an experiment.
 
-Three rules shape all of it.  Nothing here approves anything: only :func:`approve`
+Four rules shape all of it.  Nothing here approves anything: only :func:`approve`
 moves an experiment to ``approved``, and it acts for the person.  An approval is
 a record of exactly what may run (:func:`plan_digest`), and a run starts only
-while the experiment still is that.  And nothing here is written by a model:
-``run.json`` and the result page are made by code from what the run produced,
-with the values as the run wrote them.
+while the experiment still is that.  One approval is one run: a run takes the
+stamp of its approval with it, and an experiment whose approved run is over is
+never started again, whatever became of its page.  And nothing here is written
+by a model: ``run.json`` and the result page are made by code from what the run
+produced, with the values as the run wrote them.  The files of a run are read
+only inside the project and never through a symbolic link.
 """
 
 from __future__ import annotations
@@ -64,11 +69,12 @@ from paper_orchestra.errors import stops_the_run
 # The scan that keeps a paper's results out of the shared memory already knows how
 # numbers are written and which of them are specific enough to be someone's result;
 # a finding is checked with the same notion, not with a second one.
-from paper_orchestra.memory.leakscan import NUMBER, is_identifying, number_readings, numbers_in
+from paper_orchestra.memory.leakscan import NUMBER, is_identifying, number_readings
 from paper_orchestra.memory.lock import WikiLock
 from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import (
     COMPUTE_BACKENDS,
+    EDITED_BY_PERSON,
     HUMAN,
     RUN_FIELDS,
     SYSTEM,
@@ -85,6 +91,7 @@ from paper_orchestra.research.model import (
     normalize_author,
     parse_id,
     parse_stamp,
+    quotable,
     stamp_after,
     with_article,
 )
@@ -100,20 +107,28 @@ __all__ = [
     "code_digest",
     "code_dir",
     "code_files",
+    "dependents",
+    "edit_report",
+    "edited_record",
     "job_command",
     "job_spec",
     "load_plan",
     "mask_credentials",
+    "metrics_table",
     "number_check",
+    "number_report",
     "options",
     "plan_digest",
     "recover",
+    "reportable_text",
     "request_cancel",
+    "result_records",
     "run",
     "runs",
     "split_problems",
     "supplies_missing_code",
     "unverified_numbers",
+    "withdraw",
     "write_code",
 ]
 
@@ -211,6 +226,8 @@ _DESIGNER = agent_author("designer")
 _REPAIRABLE = frozenset({"exit", "metrics", "code", "patch"})
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"})
 _NAME_PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
+#: A value that reads as itself in a sentence: a word, a number, a path.
+_PLAIN_VALUE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_/.:\-]*")
 _RUN_NUMBER = re.compile(r"[0-9]{1,9}")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -313,8 +330,54 @@ def _plain_number(value: float) -> int | float:
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
+
+
+def _real_dir(path: Path) -> bool:
+    """Whether ``path`` is a directory of its own, not a link to one."""
+    return not path.is_symlink() and path.is_dir()
+
+
+def _own_file(directory: Path, name: str) -> Path | None:
+    """The regular file ``name`` in a run directory, or ``None``: a link there is not a
+    file of the run, whatever it points at.  A project directory can come from anywhere,
+    and what a run left is read, ended and removed on the word of these files."""
+    path = directory / name
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def _read_own_json(directory: Path, name: str) -> Any:
+    path = _own_file(directory, name)
+    return _read_json(path) if path is not None else None
+
+
+def _in_project(project: Project, path: Path) -> bool:
+    """Whether ``path`` lies inside the project and no part of the way to it, from the
+    project's root down, is a symbolic link."""
+    try:
+        relative = path.relative_to(project.root)
+    except ValueError:
+        return False
+    here = project.root
+    for part in relative.parts:
+        here = here / part
+        if here.is_symlink():
+            return False
+    return True
+
+
+def _remove_copy(directory: Path) -> None:
+    """Remove a run's prepared copy of the repository, where it is a directory of the
+    run's own (a link there is left alone: what it points at is not the run's)."""
+    copy = directory / REPO_COPY
+    if _real_dir(copy):
+        shutil.rmtree(copy, ignore_errors=True)
 
 
 def _experiment(project: Project, ref: Any) -> ResearchPage:
@@ -918,6 +981,17 @@ def _shown_field(name: str, value: Any) -> str:
     return f"{value:g}" if isinstance(value, float) else str(value)
 
 
+def _as_said(value: Any) -> str:
+    """A field value in the sentence that says what changed since an approval.  A plain
+    one (``false``, ``900``, ``main.py``) stands as it is; anything else (a command, a
+    list, whatever an agent wrote into the field) is a quotation, cut, with nothing in
+    it that reads as its end: the sentence is shown at checkpoints as this module's."""
+    text = _one_line(value)
+    if len(text) <= 80 and _PLAIN_VALUE.fullmatch(text):
+        return text
+    return f'"{quotable(text, 160)}"'
+
+
 def _file_digests(directory: Path) -> dict[str, str]:
     return {
         name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in _code_paths(directory)
@@ -979,7 +1053,8 @@ def _changes_since(project: Project, page: ResearchPage, fields: Mapping[str, An
     # Outside repo mode the command follows from the entry point, which is named.
     derived = {"command"} if "repo" not in (then.get("mode"), fields.get("mode")) else set()
     changes = [
-        f"{field}: {then[field]} when approved, now {_shown_field(field, value)}"
+        f"{field}: {_as_said(then[field])} when approved, now "
+        f"{_as_said(_shown_field(field, value))}"
         for field, value in fields.items()
         if field in then and field not in derived and then[field] != _shown_field(field, value)
     ]
@@ -1461,7 +1536,9 @@ def _build(name: str) -> _Choice:
     try:
         return _Choice(name, get_backend(name), owned=True)
     except (ComputeError, ValueError) as exc:
-        return _Choice(name, problem=f"The {name} backend cannot be used: {exc}")
+        # A library may quote the key it was refused with; the reason is shown and kept.
+        why = _masked(str(exc), doctor.secret_values(os.environ))
+        return _Choice(name, problem=f"The {name} backend cannot be used: {why}")
 
 
 def _choices(backends: Any) -> list[_Choice]:
@@ -1523,6 +1600,13 @@ def _cost_bound(plan: ExperimentPlan, backend: Any, seconds: float) -> float | N
     )
 
 
+def _priced_gpus() -> list[str]:
+    """The GPU types the cost estimate knows a price for."""
+    from paper_orchestra.compute.modal_backend import MODAL_PRICES_USD_PER_SECOND
+
+    return sorted(MODAL_PRICES_USD_PER_SECOND["gpu"])
+
+
 def _spent_usd(project: Project) -> float:
     """What the runs of the project have cost so far, by their records.
 
@@ -1579,14 +1663,14 @@ def _budget_refusals(
             "Shorten the time limit, or raise the limit in the project's settings."
         )
     billed = getattr(backend, "name", "") == "modal"
-    unknown = plan.est_usd is None and bound is None
-    if billed and unknown and limits.usd - spent <= 1e-9:
-        # Nothing says what this run would cost, and nothing is left to spend on it.
-        used = "" if remainder else f": ${spent:.2f} of ${limits.usd:.2f} is spent"
+    if billed and plan.gpu and bound is None:
+        # Without a price nothing holds the run to the limit, and its cost would count
+        # as nothing: it is not run until its type has one.
         refusals.append(
-            "Nothing is left of what the project allows for its experiments "
-            f"(settings.limits.experiment_usd){used}, and this run would be billed. Raise "
-            "the limit in the project's settings."
+            f"The GPU type {_as_said(plan.gpu)} has no price estimate, so what a run costs "
+            "could not be held to what the project allows for its experiments "
+            "(settings.limits.experiment_usd). Choose a type with a price: "
+            f"{', '.join(_priced_gpus())} (gpu: on the page, or --gpu at the approval)."
         )
     return refusals
 
@@ -1602,9 +1686,28 @@ def _refusals(
     elif choice.backend is not None and not reading.problems:
         backend = choice.backend
         reasons += list(backend.supports(job_spec(reading.plan)))
-        reasons += list(backend.check(python=True, latex=False))
+        checks = backend.check(python=True, latex=False)
+        reasons += [_for_an_experiment(str(reason), reading.plan) for reason in checks]
         reasons += _budget_refusals(reading.plan, backend, limits, spent)
     return list(dict.fromkeys(reasons))
+
+
+def _for_an_experiment(reason: str, plan: ExperimentPlan) -> str:
+    """What a backend's own check says, where it speaks of the paper pipeline (compiling
+    the paper, ``--compute``), said for the approval of an experiment instead."""
+    if "Modal is not authenticated" not in reason:
+        return reason
+    other = (
+        "Modal is the only backend with GPUs, so this experiment cannot run on this machine."
+        if plan.gpu
+        else "Or approve the run for this machine: `--backend local` (in the app, choose "
+        "the local backend)."
+    )
+    return (
+        "Modal is not authenticated (no token is configured on this machine), so the "
+        "sandbox this experiment would run in cannot be started. Run `modal setup` (or set "
+        f"MODAL_TOKEN_ID and MODAL_TOKEN_SECRET) and approve it again. {other}"
+    )
 
 
 def _backend_notes(
@@ -1638,8 +1741,6 @@ def _backend_notes(
             f"${bound:.2f}; the project allows ${limits.usd:.2f} for its experiments in "
             f"total{used}."
         )
-    elif choice.name == "modal" and plan.gpu:
-        notes.append(f"No price is known for the GPU type {plan.gpu}, so its cost is not bounded.")
     return notes
 
 
@@ -1795,9 +1896,10 @@ def approve(
 
     Refused with ``ProjectError``, saying why, when the page is not accepted, is
     queued or running, when the plan or its code has errors, when the chosen
-    backend cannot run it (``ComputeBackend.supports`` and ``check``), or when
-    it could cost more than is left of what the project allows for all its runs
-    together.  ``base_updated`` is the page's ``updated`` stamp as the person
+    backend cannot run it (``ComputeBackend.supports`` and ``check``), when it
+    could cost more than is left of what the project allows for all its runs
+    together, or when it asks a billed backend for a GPU type that has no price
+    (its cost could not be held to that limit).  ``base_updated`` is the page's ``updated`` stamp as the person
     saw it and ``code_digest`` the digest (:func:`code_digest`) of the code
     they read: a page or code changed since is a ``Conflict``, because what is
     approved is what was read; so is one that changes while it is being
@@ -1857,11 +1959,15 @@ def _record_approval(
     nothing is approved.
     """
     name = str(page.id)
-    stamp = _now()
     fields = _run_fields(plan)
     digest = _digest_of(fields, code)
     with project.locked():
         current = project.page(page.path)
+        # An approval is told from the one before it by its stamp, which a run takes
+        # with it: two approvals within a second are still two.
+        earlier = [_text(current.meta.get("approved_at"))]
+        earlier += [_text(record.get("approval")) for record in runs(project, name)]
+        stamp = stamp_after(_now(), max(earlier))
         if current.updated != page.updated or _current_digest(project, name) != code:
             raise Conflict(
                 f"{name} changed while it was being approved (its page or its code was "
@@ -1906,7 +2012,8 @@ def _runs_dir(project: Project, experiment_id: str) -> Path:
 def runs(project: Project, experiment_id: str) -> list[dict[str, Any]]:
     """The run records (``run.json``) of the experiment, by run number.
 
-    A directory without a readable record is left out.
+    A directory without a readable record is left out, and so is anything that is
+    reached through a symbolic link: only the project's own files are read.
     """
     return [record for _, record in _numbered_runs(project, experiment_id)]
 
@@ -1916,16 +2023,29 @@ def _run_number(name: str) -> int | None:
     return int(name) if _RUN_NUMBER.fullmatch(name) else None
 
 
+def _run_dirs(project: Project, experiment_id: str) -> list[tuple[int, Path]]:
+    """``(number, directory)`` of the experiment's run directories, by number: real
+    directories inside the project.  A link in their place (or on the way to them) is
+    not a run of this project."""
+    folder = _runs_dir(project, _experiment_id(project, experiment_id))
+    if not folder.is_dir() or not _in_project(project, folder):
+        return []
+    found = [
+        (number, entry)
+        for entry in folder.iterdir()
+        if (number := _run_number(entry.name)) is not None and _real_dir(entry)
+    ]
+    return sorted(found, key=lambda item: item[0])
+
+
 def _numbered_runs(project: Project, experiment_id: str) -> list[tuple[int, dict[str, Any]]]:
     """``(number of the run directory, its record)``, by number."""
-    folder = _runs_dir(project, _experiment_id(project, experiment_id))
     found: list[tuple[int, dict[str, Any]]] = []
-    for entry in folder.iterdir() if folder.is_dir() else ():
-        number = _run_number(entry.name)
-        record = _read_json(entry / RUN_FILE) if number is not None else None
-        if number is not None and isinstance(record, dict):
+    for number, directory in _run_dirs(project, experiment_id):
+        record = _read_own_json(directory, RUN_FILE)
+        if isinstance(record, dict):
             found.append((number, record))
-    return sorted(found, key=lambda item: item[0])
+    return found
 
 
 def _recorded_runs(project: Project, experiment_id: str) -> list[int]:
@@ -1945,6 +2065,12 @@ def _new_run_dir(project: Project, experiment_id: str) -> tuple[int, Path]:
     """
     folder = _runs_dir(project, experiment_id)
     folder.mkdir(parents=True, exist_ok=True)
+    if not _in_project(project, folder):
+        raise ProjectError(
+            f"{folder} is reached through a symbolic link, so no run is made there: a run "
+            "writes and removes files in its directory. Replace the link with a real "
+            "directory inside the project."
+        )
     taken = [_run_number(entry.name) or 0 for entry in folder.iterdir()]
     number = max([*taken, *_recorded_runs(project, experiment_id)], default=0)
     while True:
@@ -1971,6 +2097,8 @@ class _Attempt:
     backend: Any = None
     #: Strings that must not be written into the record, the result page or an event.
     secrets: Sequence[str] = ()
+    #: Why the code could not be copied for the run, said when the attempt is executed.
+    unready: Exception | None = None
 
     def save(self) -> None:
         write_json(self.directory / RUN_FILE, self.record)
@@ -1984,8 +2112,7 @@ class _Outcome:
     error: str | None = None
     #: Why it failed: ``exit``, ``metrics``, ``code``, ``patch`` (the code's own, which a
     #: repair can cure), ``command`` (it could not be started), ``timeout``, ``backend``,
-    #: ``budget``, ``setup``, ``approval`` (the code changed between the check of the
-    #: approval and the copy that would have run), ``worker``, ``internal``.
+    #: ``budget``, ``setup``, ``worker``, ``internal``.
     kind: str | None = None
     #: The run did not get to finish for a reason outside the experiment, and the
     #: experiment is back in the queue.
@@ -2015,6 +2142,9 @@ def _new_record(
         "cost_usd": None,
         "code_digest": None,
         "repairs": [dict(repair) for repair in repairs],
+        # The approval this run uses (its ``approved_at``): one approval is one run, and
+        # a settled run that carries the stamp of the page's approval has used it.
+        "approval": None,
         # Beyond the fields every reader relies on: why it failed, whether it will run
         # again by itself, what the person should know, and where its record page is.
         "error_kind": None,
@@ -2173,8 +2303,11 @@ def _log_tail(
     """The last lines of a run's log, cleaned of terminal control sequences and of the
     ``secrets``: what is returned goes into records, pages, events and a repairer's
     prompt, whatever the job managed to print."""
+    log = _own_file(directory, LOG_NAME)  # not what a link of that name points at
+    if log is None:
+        return []
     try:
-        with open(directory / LOG_NAME, "rb") as stream:
+        with open(log, "rb") as stream:
             size = stream.seek(0, os.SEEK_END)
             stream.seek(max(0, size - 256 * 1024))
             data = stream.read()
@@ -2195,15 +2328,16 @@ def _last_words(tail: Sequence[str]) -> str:
 
 
 def _read_handle(directory: Path) -> str | None:
+    path = _own_file(directory, HANDLE_NAME)
     try:
-        return (directory / HANDLE_NAME).read_text(encoding="utf-8").strip() or None
-    except OSError:
+        return (path.read_text(encoding="utf-8").strip() or None) if path else None
+    except (OSError, UnicodeDecodeError):
         return None
 
 
 def _read_job(directory: Path) -> dict[str, Any] | None:
     """What the backend recorded of a job it started on this machine (``job.json``)."""
-    job = _read_json(directory / JOB_FILE)
+    job = _read_own_json(directory, JOB_FILE)
     return job if isinstance(job, dict) and job else None
 
 
@@ -2220,7 +2354,7 @@ def _cost_without_result(attempt: _Attempt) -> float | None:
     for the time since it started, at most its time limit plus the backend's margin.
     """
     record = attempt.record
-    on_file = _read_json(attempt.directory / COST_FILE)
+    on_file = _read_own_json(attempt.directory, COST_FILE)
     on_file = on_file if isinstance(on_file, dict) else None
     known = float(on_file["cost_usd"]) if on_file and _is_amount(on_file.get("cost_usd")) else None
     if on_file and on_file.get("final") is True:
@@ -2352,20 +2486,36 @@ def _and_more(more: int) -> str:
     return f"… and {more} more in run.json."
 
 
+def _metric_rows(record: Mapping[str, Any]) -> list[str]:
+    """One table row for each metric of a run record, with the value as the run wrote it."""
+    metrics = record.get("metrics")
+    written = record.get("metrics_text")
+    written = written if isinstance(written, dict) else {}
+    rows = []
+    for name, value in metrics.items() if isinstance(metrics, dict) else ():
+        text = str(written.get(name, json.dumps(value, ensure_ascii=False)))
+        rows.append(f"| {_inert(name)} | {_inert(text)}{_decimal_form(text)} |")
+    return rows
+
+
+def metrics_table(record: Mapping[str, Any]) -> str:
+    """The metrics of a run record (``run.json``) as a Markdown table, every one of them
+    and each value as the run wrote it; empty when the record holds none.  It is the
+    table of the run's result page without the page's limit on its size: for whoever
+    reports the metrics and must not take them from a page that can be edited."""
+    rows = _metric_rows(record)
+    return "\n".join(["| metric | value |", "|---|---|", *rows]) if rows else ""
+
+
 def _metrics_section(record: Mapping[str, Any], directory: Path, room: int) -> list[str]:
-    metrics = record.get("metrics") or {}
-    if not metrics:
+    rows = _metric_rows(record)
+    if not rows:
         if record.get("status") != "succeeded" and (directory / "metrics.json").is_file():
             return [
                 "The run wrote metrics.json, but its values are not reported here: the run "
                 "did not finish, so they are not a result."
             ]
         return ["The run reported no metrics."]
-    written = record.get("metrics_text") or {}
-    rows = []
-    for name, value in metrics.items():
-        text = str(written.get(name, json.dumps(value, ensure_ascii=False)))
-        rows.append(f"| {_inert(name)} | {_inert(text)}{_decimal_form(text)} |")
     shown, more = _fitting(rows, room)
     return ["| metric | value |", "|---|---|", *shown, *(["", _and_more(more)] if more else [])]
 
@@ -2623,7 +2773,21 @@ def _record_result(
         )
         return None
     record["result"] = page.path
+    # What code wrote, so that a later look can tell a page someone edited since.
+    record["result_digest"] = _page_digest(page)
     return page
+
+
+def _page_digest(page: ResearchPage) -> str:
+    """SHA-256 over what a result page says: its title, summary and text."""
+    said = f"{page.title}\0{page.summary}\0{page.body}"
+    return hashlib.sha256(said.encode("utf-8")).hexdigest()
+
+
+def _has_result(project: Project, record: Mapping[str, Any]) -> bool:
+    """Whether the result page a settled run's record names is there."""
+    path = record.get("result")
+    return isinstance(path, str) and bool(path) and project.resolve(path) is not None
 
 
 # -- how a job ended ----------------------------------------------------------------------
@@ -2664,7 +2828,10 @@ def _judge(
             said = " ".join(repositories.clone_lines(tail)[-3:])
             return _Outcome("failed", _one_line(f"{cloning[1]} {said}"), kind=cloning[0])
         said = _last_words(tail) or (tail[-1].removeprefix(NOTE_PREFIX) if tail else "")
-        why = f"The command exited with status {result.returncode}" + (f": {said}" if said else ".")
+        # What the job printed last is the job's own words (its code may be a model's):
+        # a quotation in the sentence, not a continuation of it.
+        quoted = f': "{quotable(said, 300)}".' if said else "."
+        why = f"The command exited with status {result.returncode}{quoted}"
         # 126 and 127 are what a shell gives a command it could not start.  The command is
         # the plan's, not the code's: no corrected file changes it.
         return _Outcome("failed", why, "command" if result.returncode in (126, 127) else "exit")
@@ -2688,11 +2855,62 @@ def _final_state(record: Mapping[str, Any]) -> tuple[str, str | None]:
     return ("cancelled" if record["status"] == "cancelled" else "failed"), record.get("error")
 
 
-def _move(project: Project, path: str, state: str, reason: str | None = None) -> None:
+def _move(
+    project: Project, path: str, state: str, reason: str | None = None, *, limit: int = 300
+) -> None:
     """Move the experiment along its run.  When the page is no longer where the run left
     it (the person changed or removed it meanwhile), theirs stands."""
     with contextlib.suppress(ProjectError):
-        project.set_state(path, state, by=SYSTEM, reason=_clip(reason, 300) if reason else None)
+        project.set_state(path, state, by=SYSTEM, reason=_clip(reason, limit) if reason else None)
+
+
+# -- one approval is one run ------------------------------------------------------------------
+
+
+def _run_of_approval(project: Project, page: ResearchPage) -> tuple[int, dict[str, Any]] | None:
+    """The run that used the approval now on ``page``, as ``(number, record)``: the
+    newest run of the experiment, when it is settled, will not be repeated by itself
+    (it is not ``requeued`` and no repair of it is owed) and carries the stamp of that
+    approval.  ``None`` when the approval has not been used.
+
+    One approval is one run.  The record of a run is written before the experiment's
+    page moves, so a worker that stops or dies in between leaves a page that still
+    reads as waiting or running; this is what tells that its run is over.
+    """
+    stamp = _text(page.meta.get("approved_at"))
+    found = _numbered_runs(project, str(page.id)) if stamp and page.id else []
+    if not found:
+        return None
+    number, record = found[-1]
+    unsettled = record.get("status") in (None, "running")
+    if unsettled or record.get("requeued") or record.get("repair_owed"):
+        return None
+    return (number, record) if _text(record.get("approval")) == stamp else None
+
+
+def _conclude(project: Project, page: ResearchPage) -> dict[str, Any] | None:
+    """Where the approval on ``page`` has been used by a run that is over: give the run
+    the result page it is owed, move the page to the state that run left the experiment
+    in, and return the run's record.  ``None``, and nothing done, when the experiment
+    may still run.  The caller holds the experiment's run lock."""
+    found = _run_of_approval(project, page)
+    if found is None:
+        return None
+    number, record = found
+    # The directory says which run it is, whatever a record edited by hand says.
+    record.update(experiment=str(page.id), number=number)
+    record.setdefault("notes", [])
+    directory = _runs_dir(project, str(page.id)) / str(number)
+    if not _has_result(project, record):
+        attempt = _Attempt(number, directory, record, secrets=_secrets(project))
+        if _record_result(project, page, attempt) is not None:
+            with contextlib.suppress(OSError):
+                attempt.save()
+    if page.state in ("approved", "queued", "running"):
+        _move(project, page.path, *_final_state(record))
+        with contextlib.suppress(OSError):
+            _flag_path(project, str(page.id)).unlink(missing_ok=True)
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -2810,8 +3028,11 @@ def _clone_notes(record: Mapping[str, Any], directory: Path) -> list[str]:
     repo = record.get("repo")
     if not isinstance(repo, dict) or repo.get("method") != "clone":
         return []
+    log = _own_file(directory, LOG_NAME)
+    if log is None:
+        return []
     try:
-        with open(directory / LOG_NAME, "rb") as stream:
+        with open(log, "rb") as stream:
             head = stream.read(CLONE_HEAD_BYTES).decode("utf-8", errors="replace")
     except OSError:
         return []
@@ -2920,13 +3141,17 @@ class _Session:
         """Raise ``ProjectError``, with the experiment back at ``planned``, unless it is
         still what the person approved (or the runner's recorded repair of that)."""
         reason = self._departure()
-        if reason is None:
-            return
+        if reason is not None:
+            self._not_approved(reason)
+
+    def _not_approved(self, reason: str) -> None:
+        """Put the experiment back to ``planned`` with the reason and raise ``ProjectError``."""
         _move(
             self.project,
             self.page.path,
             "planned",
             f"Not run: {reason}. Approve it again.",
+            limit=700,
         )
         raise ProjectError(
             f"{self.plan.id} was not run: {reason}. Look at the experiment as it is now and "
@@ -3014,7 +3239,7 @@ class _Session:
     def _open(self) -> _Attempt:
         number, directory = _new_run_dir(self.project, self.plan.id)
         record = _new_record(self.plan, number, self.backend_name, self._repairs)
-        record["code_digest"] = code_digest(self.project, self.plan.id)
+        record["approval"] = _text(self.page.meta.get("approved_at")) or None
         attempt = _Attempt(
             number,
             directory,
@@ -3025,8 +3250,11 @@ class _Session:
             secrets=self._mask,
         )
         attempt.notes.extend(self.reading.notes)
-        attempt.save()
+        self._copy_code(attempt)
+        # From its first save on the attempt is this session's to settle, whatever comes:
+        # a stop between the two lines must not leave a record that reads running.
         self._current = attempt
+        attempt.save()
         self._pending.clear()
         self._last_log_event = -math.inf
         _move(self.project, self.page.path, "running")
@@ -3039,6 +3267,28 @@ class _Session:
             data={"experiment": self.plan.id, "run": number, "backend": self.backend_name},
         )
         return attempt
+
+    def _copy_code(self, attempt: _Attempt) -> None:
+        """Copy the code into the run directory and hold the copy against the approval.
+
+        The copy is what runs.  A write that landed between the look at the code
+        directory and the copy is not run: the run directory is removed again (no run
+        took place, so none is on record), the experiment goes back to ``planned``
+        and ``ProjectError`` says what changed, as at the first look.
+        """
+        record, directory = attempt.record, attempt.directory
+        try:
+            record["code_digest"] = _snapshot(
+                code_dir(self.project, self.plan.id), directory / CODE_DIR
+            )
+        except (_Setup, OSError) as exc:
+            # The run's own failure, on its record: said when the attempt is executed.
+            attempt.unready = exc
+            return
+        changed = self._departure(record["code_digest"])
+        if changed is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+            self._not_approved(changed)
 
     def _refused(self) -> _Setup | None:
         """Why this attempt cannot start at all, checked before anything is copied."""
@@ -3088,17 +3338,9 @@ class _Session:
         """The directory the job is given and what it is asked to do; ``_Setup`` when the
         run cannot be made ready."""
         plan, directory, record = self.plan, attempt.directory, attempt.record
-        code = directory / CODE_DIR
-        record["code_digest"] = _snapshot(code_dir(self.project, plan.id), code)
-        # The copy is what runs.  It is held against the approval once more: a write
-        # that landed between the look at the code directory and the copy is not run.
-        changed = self._departure(record["code_digest"])
-        if changed is not None:
-            raise _Setup(
-                "approval",
-                f"The run was not started: {changed}. Look at the experiment as it is now "
-                f"and approve it again ({_HOW_TO_APPROVE}).",
-            )
+        if attempt.unready is not None:
+            raise attempt.unready
+        code = directory / CODE_DIR  # copied, and held against the approval, by _copy_code
         spec = job_spec(plan)
         if plan.mode != "repo":
             return code, spec
@@ -3182,7 +3424,7 @@ class _Session:
                 mask=tuple(self._mask),
             )
         finally:
-            shutil.rmtree(attempt.directory / REPO_COPY, ignore_errors=True)
+            _remove_copy(attempt.directory)
         return _judge(
             attempt.result,
             attempt.directory,
@@ -3210,11 +3452,25 @@ class _Session:
         )
         if curable:
             self._interrupted = self._stop_reason()
+            if self._interrupted == "stop":
+                self._owe_repair(record, True)  # it goes back to the queue for it
         return curable and self._interrupted is None
 
-    def _note(self, record: dict[str, Any], note: str) -> None:
-        record["notes"].append(note)
+    def _save(self, record: dict[str, Any]) -> None:
         write_json(_runs_dir(self.project, self.plan.id) / str(record["number"]) / RUN_FILE, record)
+
+    def _note(self, record: dict[str, Any], note: str) -> None:
+        # A note may quote an error, and an error what it was given (a key, a URL).
+        record["notes"].append(_masked(note, self._mask))
+        self._save(record)
+
+    def _owe_repair(self, record: dict[str, Any], owed: bool) -> None:
+        """Note on a failed run's record whether its repair is still to come.  While it
+        is, the failure is not how the approved run ended: a worker that stops in the
+        middle leaves the experiment to be run again, not failed."""
+        if bool(record.get("repair_owed")) != owed:
+            record["repair_owed"] = owed
+            self._save(record)
 
     def _still_approved(self, record: dict[str, Any]) -> bool:
         """Whether the experiment is still what was approved; if not, the failed run's
@@ -3238,6 +3494,15 @@ class _Session:
         assert self._repair is not None
         if not self._still_approved(record):
             return False
+        self._owe_repair(record, True)
+        changed = self._repair_code(record)
+        if not changed:
+            self._owe_repair(record, False)  # the failure stands: that is how it ended
+        return changed
+
+    def _repair_code(self, record: dict[str, Any]) -> bool:
+        """Ask the repairer and write what it returns; true when the code changed."""
+        assert self._repair is not None
         self._rounds += 1
         directory = _runs_dir(self.project, self.plan.id) / str(record["number"])
         before = code_files(self.project, self.plan.id)
@@ -3351,9 +3616,16 @@ class _Session:
                 attempt.record.update(status=outcome.status, error=outcome.error, finished=_now())
                 with contextlib.suppress(Exception):
                     attempt.save()
-            shutil.rmtree(attempt.directory / REPO_COPY, ignore_errors=True)
+            _remove_copy(attempt.directory)
+        elif attempt is not None:
+            # The job had ended and its outcome was being written down when this came.
+            # The outcome stands: it is saved, and the run is not started a second time.
+            with contextlib.suppress(Exception):
+                attempt.save()
+            _remove_copy(attempt.directory)
         with contextlib.suppress(Exception):
-            if self.project.page(self.page.path).state == "running":
+            page = self.project.page(self.page.path)
+            if _conclude(self.project, page) is None and page.state == "running":
                 state = "queued" if requeue else "failed"
                 _move(self.project, self.page.path, state, None if requeue else said)
 
@@ -3413,10 +3685,23 @@ def run(
     :func:`plan_digest` of its code and run-defining fields is compared with the
     ``approved_digest`` on the page (or with ``repaired_digest``, which the run
     itself writes when the runner's repair changed the code).  This holds for a
-    resumed, a recovered and a repeated run alike.  On a mismatch, or without a
-    recorded approval, nothing runs: the experiment goes back to ``planned`` with
-    a ``state_reason`` naming what changed (which field, or which file and who
-    wrote it), and ``ProjectError`` says the same and to approve it again.
+    resumed, a recovered and a repeated run alike, and it is checked twice: on
+    the page and code directory, and once more on the copy of the code that is
+    about to run.  On a mismatch, or without a recorded approval, nothing runs
+    and nothing is recorded as a run: the experiment goes back to ``planned``
+    with a ``state_reason`` naming what changed (which field, with its values as
+    quotations, or which file and who wrote it), and ``ProjectError`` says the
+    same and to approve it again.
+
+    One approval is one run.  A run takes the stamp of the approval it uses
+    (``run.json["approval"]``); an experiment whose newest run is over, is not
+    to be repeated by itself (``requeued``, or a repair still owed) and carries
+    the stamp of the approval on the page is not started again, whatever state
+    its page shows: the page is moved to how that run ended, the run gets its
+    result page if it has none, and ``ProjectError`` says that it needs a new
+    approval.  The end of a run is recorded on the page from ``approved`` and
+    ``queued`` as well as from ``running``, so a page saved from an editor
+    during the run does not read as waiting afterwards.
 
     ``compute`` is a ``ComputeBackend`` or a function ``(plan) -> ComputeBackend``.
     ``on_log`` gets every line of output, with the credentials of this process's
@@ -3436,7 +3721,9 @@ def run(
     project's total for all its runs: a run is refused (``error_kind``
     ``budget``, with the numbers) when its estimate, or what it could cost at
     its time limit, does not fit into what is left of it, which is worked out
-    from the cost of the runs on record.  A caller that keeps the project's
+    from the cost of the runs on record; so is a run on a billed backend whose
+    GPU type has no price, because nothing could hold it to the limit.  A
+    caller that keeps the project's
     accounts itself passes what is left as ``limits["experiment_usd"]``: an
     amount given this way is what this call may spend, on all its attempts
     together, and nothing recorded earlier is taken off it again.
@@ -3594,7 +3881,7 @@ def _clean_up(attempt: _Attempt, backend_for: Callable[[Mapping[str, Any]], Any]
                 f"({type(exc).__name__}: {exc}). Its record names the process session and "
                 f"the working directory: session {job.get('session')}, {job.get('scratch')}."
             )
-    shutil.rmtree(attempt.directory / REPO_COPY, ignore_errors=True)
+    _remove_copy(attempt.directory)
     return notes
 
 
@@ -3607,25 +3894,41 @@ def _settle_stale(
     should_stop: Callable[[], bool] | None = None,
     on_log: Callable[[str], None] | None = None,
     cancel: bool = False,
+    follow: bool = True,
 ) -> list[dict[str, Any]]:
-    """Settle the runs of an experiment that read ``running`` although nothing runs them.
+    """Settle the runs of an experiment that read ``running`` although nothing runs them,
+    and the page of an experiment whose run is over although the page does not say so.
 
     The caller holds the experiment's run lock, which is what says that nothing
-    does.  A remote job that outlived its worker is followed to its end; any
+    runs it.  A remote job that outlived its worker is followed to its end; any
     other run is failed with "the worker stopped", and the experiment goes back
     to the queue unless that keeps happening.  With ``cancel`` the person has
     cancelled the experiment: the runs end ``cancelled`` instead.  Either way
     what the dead worker's job left on this machine is ended and removed, and a
     job whose cost never came back is charged for the time it can have run.
+    Without ``follow`` a run that has a remote job is left as it is, and its
+    experiment with it: settling it could mean waiting for hours.
+
+    One approval is one run: where the newest run is over and used the approval
+    on the page, the page is moved to the state that run left (and the run gets
+    its result page, if it has none) instead of going back to the queue.
     """
     settled: list[dict[str, Any]] = []
     secrets = _secrets(project, plan)
+    left_alone = False
+    for _, directory in _run_dirs(project, plan.id):
+        with contextlib.suppress(OSError):
+            if not any(directory.iterdir()):
+                directory.rmdir()  # made by a worker that was killed before it wrote anything
     for number, record in _numbered_runs(project, plan.id):
         if record.get("status") != "running":
             continue
         # The directory says which run it is, whatever a record edited by hand says.
         record.update(experiment=plan.id, number=number)
         directory = _runs_dir(project, plan.id) / str(number)
+        if not follow and not cancel and (record.get("handle") or _read_handle(directory)):
+            left_alone = True  # its remote job may be alive: for a worker to follow
+            continue
         attempt = _Attempt(number, directory, record, plan=plan, secrets=secrets)
         if cancel:
             _stop_remote(attempt, backend_for)
@@ -3647,12 +3950,15 @@ def _settle_stale(
                     "again to retry."
                 )
         attempt.notes += _clean_up(attempt, backend_for)
-        if attempt.backend is None:
+        billed = record.get("handle") or _own_file(directory, COST_FILE) is not None
+        if attempt.backend is None and billed:
             with contextlib.suppress(Exception):
                 attempt.backend = backend_for(record)  # to price a job that is gone
         settled.append(_finish(project, page, attempt, outcome))
     current = project.page(page.path)
-    if cancel or current.state not in ("queued", "running"):
+    if cancel or left_alone or current.state not in ("approved", "queued", "running"):
+        return settled
+    if _conclude(project, current) is not None or current.state == "approved":
         return settled
     if settled and not settled[-1].get("requeued"):
         _move(project, page.path, *_final_state(settled[-1]))
@@ -3717,7 +4023,9 @@ def request_cancel(project: Project, ref: str) -> None:
     experiment as ``cancelled``.  When no process is running it (it waits to
     run, or its worker died), it is cancelled here and now.  An experiment that
     is neither approved, queued nor running has nothing to cancel, and nothing
-    happens.
+    happens; neither does one whose run had ended without its page saying so
+    (the page is moved to how the run ended).  :func:`withdraw` takes back an
+    approval without cancelling anything.
     """
     page = _experiment(project, ref)
     if page.state not in ("approved", "queued", "running"):
@@ -3735,6 +4043,8 @@ def request_cancel(project: Project, ref: str) -> None:
             page = _experiment(project, page.path)
             if page.state not in ("approved", "queued", "running"):
                 return
+            if _conclude(project, page) is not None:
+                return  # its run was over already: the page now says how it ended
             plan = _read(project, page, cap=True).plan
             _settle_stale(project, page, plan, backends.for_record, cancel=True)
             project.set_state(
@@ -3745,12 +4055,35 @@ def request_cancel(project: Project, ref: str) -> None:
             flag.unlink(missing_ok=True)
 
 
+def withdraw(project: Project, ref: str) -> ResearchPage:
+    """The person takes back the approval of a run that has not started; returns the
+    page, ``planned`` again.
+
+    Nothing is cancelled and nothing is recorded as a run: the experiment is simply
+    a plan again, to be approved when the person wants it run.  ``ProjectError``
+    for an experiment that is not ``approved`` (a queued or running one is ended
+    with :func:`request_cancel`).
+    """
+    page = _experiment(project, ref)
+    if page.state != "approved":
+        how = (
+            " Cancel its run instead (`paper-orchestra research cancel`, or Cancel in the app)."
+            if page.state in ("queued", "running")
+            else ""
+        )
+        raise ProjectError(f"{page.id} is {page.state}; there is no approval to withdraw.{how}")
+    return project.set_state(
+        page.path, "planned", by=HUMAN, reason="You withdrew the approval of its run."
+    )
+
+
 def recover(
     project: Project,
     *,
     compute: Any = None,
     should_stop: Callable[[], bool] | None = None,
     on_log: Callable[[str], None] | None = None,
+    follow: bool = True,
 ) -> list[dict[str, Any]]:
     """Settle the runs that a worker which died left at ``running``; returns their records.
 
@@ -3773,6 +4106,18 @@ def recover(
     limit plus ``REMOTE_MARGIN_SECONDS``, so that the project's budget counts it
     before the experiment is started again.
 
+    One approval is one run.  An experiment whose page reads ``approved``,
+    ``queued`` or ``running`` although the run it was approved for is over (the
+    worker stopped or died after the run's record was written and before the
+    page moved, or the page was saved from an editor meanwhile) is not put back
+    in the queue: its page is moved to how that run ended, and the run gets the
+    result page it is owed.
+
+    With ``follow=False`` only what needs no waiting is settled: a run with a
+    remote job is left at ``running`` for a worker to follow, and nothing is
+    started or waited for.  That is the call for a process that must not block
+    (the web server, after it saw a worker die).
+
     ``compute`` is what :func:`run` takes; without it the backend named in a
     run's record is built with its defaults when a remote job has to be picked
     up.  Experiments that a live process is running are left alone.
@@ -3780,9 +4125,12 @@ def recover(
     settled: list[dict[str, Any]] = []
     backends = _Backends(compute)
     try:
-        for page in project.pages(kind="experiment", state=("queued", "running")):
+        waiting = project.pages(kind="experiment", state=("approved", "queued", "running"))
+        for page in waiting:
             if not page.id:
                 continue
+            if page.state == "approved" and not _run_dirs(project, page.id):
+                continue  # approved and never run: nothing a worker could have left
             with _RunLock(project.experiment_dir(page.id)) as lock:
                 if not lock.acquired:
                     continue
@@ -3794,6 +4142,7 @@ def recover(
                     backends.for_record,
                     should_stop=should_stop,
                     on_log=on_log,
+                    follow=follow,
                 )
     finally:
         backends.close()
@@ -3803,6 +4152,77 @@ def recover(
 # ---------------------------------------------------------------------------
 # The numbers of a finding
 # ---------------------------------------------------------------------------
+
+#: The kinds of evidence a number can be found in, in the order they are given.
+EVIDENCE_KINDS: tuple[str, ...] = ("metric", "source", "input")
+#: The text that takes the place of a number of a finding that was found nowhere, where
+#: the finding is handed on (the paper's materials).
+NOT_ON_RECORD = "[a number not on record]"
+#: A number as a text writes it: a minus sign where one can stand (not the hyphen of
+#: ``0.1-0.2`` or ``E1-run1``), the digits as ``leakscan.NUMBER`` reads them, and an
+#: exponent (``1.5e-9``, ``2.5 x 10^-7``).  Sign and exponent are part of the number:
+#: ``-0.121`` is not 0.121 and ``1.5e-9`` is not 1.5.
+_QUOTED_NUMBER = re.compile(
+    rf"(?P<sign>(?<![\w.)\]%])[-\u2212])?(?P<digits>{NUMBER.pattern})"
+    r"(?:[eE](?P<exp>[+\-\u2212]?\d{1,3})(?![\w.])"
+    r"|\s*(?:\u00d7|x|\*|\\times|\\cdot)\s*10\s*\^\s*\{?\s*(?P<pow>[+\-\u2212]?\d{1,3})\s*\}?)?"
+)
+
+
+def _plain_decimal(value: Decimal) -> str:
+    """``0.0015`` for ``1.5E-3``: the canonical way a value is written here, as plain
+    digits without a sign, an exponent, a thousands separator or zeros that say nothing."""
+    whole, _, fraction = format(abs(value), "f").partition(".")
+    whole, fraction = whole.lstrip("0") or "0", fraction.rstrip("0")
+    return f"{whole}.{fraction}" if fraction else whole
+
+
+@dataclass(frozen=True)
+class _Quoted:
+    """One number as a text writes it, and what it can stand for."""
+
+    #: As written, sign and exponent included.
+    raw: str
+    #: Whether it is written with a minus sign.
+    negative: bool
+    #: The value in plain digits, without its sign; then, for ``12,345``, the items of
+    #: the list it may also be.
+    readings: tuple[str, ...]
+
+    @property
+    def value(self) -> str:
+        return self.readings[0]
+
+    @property
+    def key(self) -> str:
+        return f"-{self.value}" if self.negative else self.value
+
+
+def _quoted_spans(text: str) -> Iterator[tuple[_Quoted, int, int]]:
+    """Every number in ``text``, in order, each as it is written, with where it stands."""
+    for match in _QUOTED_NUMBER.finditer(text):
+        readings = number_readings(match.group("digits"))
+        power = (match.group("exp") or match.group("pow") or "").replace("\u2212", "-")
+        if power:
+            try:
+                readings = [_plain_decimal(Decimal(readings[0]).scaleb(int(power)))]
+            except (InvalidOperation, ValueError):
+                continue
+        negative = bool(match.group("sign")) and readings[0] != "0"
+        yield _Quoted(match.group(0), negative, tuple(readings)), match.start(), match.end()
+
+
+def _quoted_numbers(text: str) -> Iterator[_Quoted]:
+    return (quoted for quoted, _, _ in _quoted_spans(text))
+
+
+def _numbers_in(text: str) -> frozenset[str]:
+    """The numbers of a piece of evidence, in plain digits; a negative one with its sign."""
+    found: set[str] = set()
+    for quoted in _quoted_numbers(text):
+        found.add(quoted.key)
+        found.update(quoted.readings[1:])
+    return frozenset(found)
 
 
 class _Index:
@@ -3814,28 +4234,49 @@ class _Index:
     thousands of numbers is checked against dozens of records in one pass.
     """
 
-    def __init__(self, evidence: Sequence[tuple[str, frozenset[str]]]) -> None:
+    def __init__(self, evidence: Sequence[tuple[str, str, frozenset[str]]]) -> None:
         #: In the order the evidence was given: results, then sources, then inputs.
-        self.paths = [path for path, _ in evidence]
+        self.paths = [path for path, _, _ in evidence]
+        #: ``metric``, ``source`` or ``input`` for each of them.
+        self.kinds = [kind for _, kind, _ in evidence]
         self._exact: dict[str, list[int]] = {}
         self._where: dict[float, list[int]] = {}
-        for position, (_, numbers) in enumerate(evidence):
+        for position, (_, _, numbers) in enumerate(evidence):
             for number in numbers:
                 self._exact.setdefault(number, []).append(position)
                 with contextlib.suppress(ValueError):
                     self._where.setdefault(float(number), []).append(position)
         self._values = sorted(self._where)
+        self._any_negative = bool(self._values) and self._values[0] < 0
         #: value -> (the value as a decimal, how many decimal places it is written with).
         self._decimals: dict[float, tuple[Decimal, int]] = {}
         self._per_piece: list[list[float]] | None = None
 
+    def holders(self, quoted: _Quoted) -> list[int]:
+        """The positions of the pieces of evidence that hold the number.
+
+        A number written with a minus sign is held only as a negative value.  One
+        written without is the value or its size: "a drop of 0.25" quotes a recorded
+        change of -0.25.  ``12,345`` is one number, or the two items of a list.
+        """
+        if quoted.negative:
+            return sorted(self._holding(quoted.key))
+        found = self._either_sign(quoted.value)
+        if quoted.readings[1:]:
+            found |= set.intersection(*(self._either_sign(part) for part in quoted.readings[1:]))
+        return sorted(found)
+
     def found_in(self, number: str, parts: Sequence[str] = ()) -> list[str]:
-        """The pieces of evidence that hold ``number``, or every one of ``parts``
-        (``12,345`` is one number, or the two items of a list)."""
+        """The pieces of evidence that hold ``number`` (in plain digits, with its sign if
+        it is negative), or every one of ``parts``."""
+        quoted = _Quoted(number, number.startswith("-"), (number.lstrip("-"), *parts))
+        return [self.paths[position] for position in self.holders(quoted)]
+
+    def _either_sign(self, number: str) -> set[int]:
         holders = self._holding(number)
-        if parts:
-            holders |= set.intersection(*(self._holding(part) for part in parts))
-        return [self.paths[position] for position in sorted(holders)]
+        if self._any_negative and number != "0":
+            holders |= self._holding(f"-{number}")
+        return holders
 
     def _holding(self, number: str) -> set[int]:
         holders = set(self._exact.get(number, ()))
@@ -3905,9 +4346,9 @@ class _Index:
 
 
 #: The numbers of a piece of evidence, by what identifies its content: a record's path
-#: and version, an input file's path, time of change and size.  A finding is checked on
-#: every look at its page, three times in an analysis and once more in a write-up; what
-#: did not change is not read and searched again.
+#: and version, a run record's or an input file's path, time of change and size.  A
+#: finding is checked on every look at its page, three times in an analysis and once
+#: more in a write-up; what did not change is not read and searched again.
 _NUMBERS_KEPT: dict[tuple[Any, ...], frozenset[str]] = {}
 #: The index last built for a project, with the evidence it was built from.
 _INDEX_KEPT: dict[str, tuple[tuple[tuple[Any, ...], ...], _Index]] = {}
@@ -3920,7 +4361,7 @@ def _numbers_of(key: tuple[Any, ...], text: Callable[[], str]) -> frozenset[str]
         known = _NUMBERS_KEPT.get(key)
     if known is not None:
         return known
-    numbers = frozenset(numbers_in(text()))
+    numbers = _numbers_in(text())
     with _KEPT_GUARD:
         if len(_NUMBERS_KEPT) >= MAX_EVIDENCE_KEPT:
             _NUMBERS_KEPT.clear()  # rare, and cheaper than keeping an order
@@ -3929,10 +4370,11 @@ def _numbers_of(key: tuple[Any, ...], text: Callable[[], str]) -> frozenset[str]
 
 
 def _measured(body: str) -> str:
-    """The values of the metrics table of a result page, one per line: what the run
-    measured.  Nothing else on the page counts as a result: not its first line with the
-    plan's title, not an error, a repair's diff or the log, which hold whatever a plan
-    or a job chose to say."""
+    """The values of the metrics table of a result page, one per line: what the page says
+    the run measured.  Nothing else on the page counts as a result: not its first line
+    with the plan's title, not an error, a repair's diff or the log, which hold whatever
+    a plan or a job chose to say.  (Read only where the run's own record is not on file
+    any more.)"""
     values: list[str] = []
     fence: str | None = None
     in_metrics = False
@@ -3955,12 +4397,114 @@ def _measured(body: str) -> str:
         written = cells[1].split(" (", 1)[0]  # `1e-05 (0.00001)`: as written, then in digits
         with contextlib.suppress(ValueError):
             float(written)  # true/false and texts are not measurements
-            values.append(cells[1])
+            values.append(written)
     return "\n".join(values)
 
 
-def _input_numbers(project: Project) -> Iterator[tuple[tuple[Any, ...], str, frozenset[str]]]:
-    """``(key, path, numbers)`` of the text files the person gave the project."""
+def _metric_values(record: Mapping[str, Any]) -> str:
+    """The measurements of a run record, one per line, as the run wrote them.  A metric
+    that is true/false or a text is not a measurement."""
+    metrics = record.get("metrics")
+    written = record.get("metrics_text")
+    written = written if isinstance(written, dict) else {}
+    lines: list[str] = []
+    for name, value in metrics.items() if isinstance(metrics, dict) else ():
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            continue
+        text = written.get(name)
+        lines.append(text if isinstance(text, str) else json.dumps(value))
+    return "\n".join(lines)
+
+
+def _run_of_result(project: Project, page: ResearchPage) -> tuple[str, int] | None:
+    """``("E1", 3)`` for the result record ``wiki/results/E1-run3.md``."""
+    match = re.fullmatch(r"(E[0-9]{1,9})-run([0-9]{1,9})", PurePosixPath(page.path).stem)
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _record_of_result(project: Project, page: ResearchPage) -> dict[str, Any] | None:
+    """The run record (``run.json``) a result page was written from, where it is still
+    on file: read inside the project, and not through a link."""
+    named = _run_of_result(project, page)
+    if named is None:
+        return None
+    directory = _runs_dir(project, named[0]) / str(named[1])
+    if not _real_dir(directory) or not _in_project(project, directory):
+        return None
+    record = _read_own_json(directory, RUN_FILE)
+    return record if isinstance(record, dict) else None
+
+
+def _said_to_be_edited(page: ResearchPage) -> bool:
+    """Whether the page itself says that someone other than pipeline code wrote it."""
+    writer = str(page.meta.get("updated_by") or SYSTEM)
+    return bool(page.meta.get(EDITED_BY_PERSON)) or actor_class_or_person(writer) != "code"
+
+
+def actor_class_or_person(author: str) -> str:
+    """``model.actor_class``, with an author that cannot be read taken for a person."""
+    try:
+        return actor_class(author)
+    except ProjectError:
+        return "person"
+
+
+def edited_record(project: Project, page: ResearchPage | str) -> bool:
+    """Whether a record (a result or a source page) is no longer only what code wrote.
+
+    True when the person edited it through the project, and, for a result, when its
+    text differs from the text the run's record says was written (an edit of the
+    file itself).  The metrics of a run are always read from ``run.json``, so an
+    edited record changes neither the number check nor a paper; this is for saying
+    so where the page is shown.  ``False`` for a page that is not a record.
+    """
+    if not isinstance(page, ResearchPage):
+        page = project.page(str(page))
+    if not page.is_record:
+        return False
+    if _said_to_be_edited(page):
+        return True
+    record = _record_of_result(project, page) if page.kind == "result" else None
+    digest = record.get("result_digest") if record else None
+    return isinstance(digest, str) and digest != _page_digest(page)
+
+
+def _run_evidence(
+    project: Project, root: str, page: ResearchPage, plans: Mapping[str, ResearchPage]
+) -> tuple[tuple[Any, ...], str, str, frozenset[str]] | None:
+    """The measurements behind an accepted result record of a run that succeeded, or
+    ``None`` when they are no evidence: the experiment was rejected or is gone, or the
+    run's record says something else than the page."""
+    owners = [project.resolve(target) for target in page.relations.get("run_of", [])]
+    plan = next((plans[path] for path in owners if path in plans), None)
+    if plan is None or plan.review == "rejected":
+        return None
+    record = _record_of_result(project, page)
+    if record is not None:
+        if record.get("status") != "succeeded":
+            return None
+        text = _metric_values(record)
+        named = _run_of_result(project, page)
+        file = _runs_dir(project, named[0]) / str(named[1]) / RUN_FILE if named else None
+        try:
+            status = file.stat() if file else None
+        except OSError:
+            status = None
+        version = (status.st_mtime_ns, status.st_size) if status else (len(text),)
+        key: tuple[Any, ...] = ("run", root, page.path, *version)
+    elif _said_to_be_edited(page):
+        return None  # its record is gone and the page is not what code wrote
+    else:
+        # Run directories may be cleared to save space; the page code wrote stands in.
+        text = _measured(page.body)
+        key = ("page", root, page.path, page.updated, len(text))
+    return key, page.path, "metric", _numbers_of(key, lambda: text)
+
+
+def _input_numbers(
+    project: Project,
+) -> Iterator[tuple[tuple[Any, ...], str, str, frozenset[str]]]:
+    """``(key, path, kind, numbers)`` of the text files the person gave the project."""
     root = project.inputs_dir
     for folder, dirs, names in os.walk(root):
         dirs[:] = sorted(name for name in dirs if not (Path(folder) / name).is_symlink())
@@ -3975,31 +4519,31 @@ def _input_numbers(project: Project) -> Iterator[tuple[tuple[Any, ...], str, fro
                     continue
                 key = ("file", str(path), status.st_mtime_ns, status.st_size)
                 numbers = _numbers_of(key, lambda path=path: path.read_bytes().decode("utf-8"))
-                yield key, f"{INPUTS_DIR}/{relative}", numbers
+                yield key, f"{INPUTS_DIR}/{relative}", "input", numbers
 
 
 def _evidence(project: Project) -> _Index:
-    """Where a number of a finding may come from: the metrics of runs that succeeded (as
-    their accepted result records give them), accepted source records, and the inputs."""
+    """Where a number of a finding may come from: the metrics of runs that succeeded, of
+    experiments the person did not reject (read from the runs' own records), accepted
+    source records, and the text files under ``inputs/``."""
     root = str(project.root.resolve())
-    found: list[tuple[tuple[Any, ...], str, frozenset[str]]] = []
-    for page in project.pages(kind=("result", "source"), review="accepted"):
-        if page.kind == "result" and page.state != "succeeded":
-            continue  # what a run that failed or was cancelled wrote is not a result
-        if page.kind == "result":
-            text = _measured(page.body)
-        else:
-            text = f"{page.title}\n{page.summary}\n{page.body}"
+    found: list[tuple[tuple[Any, ...], str, str, frozenset[str]]] = []
+    plans = {page.path: page for page in project.pages(kind="experiment")}
+    for page in project.pages(kind="result", review="accepted", state="succeeded"):
+        entry = _run_evidence(project, root, page, plans)
+        if entry is not None:
+            found.append(entry)
+    for page in project.pages(kind="source", review="accepted"):
+        text = f"{page.title}\n{page.summary}\n{page.body}"
         key = ("page", root, page.path, page.updated, len(text))
-        found.append((key, page.path, _numbers_of(key, lambda text=text: text)))
-    found.sort(key=lambda item: not item[1].startswith("wiki/results/"))
+        found.append((key, page.path, "source", _numbers_of(key, lambda text=text: text)))
     found += _input_numbers(project)
-    keys = tuple(key for key, _, _ in found)
+    keys = tuple((kind, *key) for key, _, kind, _ in found)
     with _KEPT_GUARD:
         kept = _INDEX_KEPT.get(root)
     if kept is not None and kept[0] == keys:
         return kept[1]
-    index = _Index([(path, numbers) for _, path, numbers in found])
+    index = _Index([(path, kind, numbers) for _, path, kind, numbers in found])
     with _KEPT_GUARD:
         if len(_INDEX_KEPT) >= 8:
             _INDEX_KEPT.clear()
@@ -4007,45 +4551,295 @@ def _evidence(project: Project) -> _Index:
     return index
 
 
+def _is_reference(project: Project, text: str) -> bool:
+    """Whether ``text`` is a reference to a page rather than text to check: one word
+    (an id, a path, a link) that names a page of the project."""
+    word = text.strip()
+    return 0 < len(word) <= 300 and not re.search(r"\s", word) and project.resolve(word) is not None
+
+
+def _checked_text(page: ResearchPage) -> str:
+    """What is checked of a page: its title, the summary its author gave it, its text.
+    (A summary that was only taken from the text can be a sentence cut short, and with
+    it a number.)"""
+    summary = page.meta.get("summary")
+    return "\n".join([page.title, summary if isinstance(summary, str) else "", page.body])
+
+
+def _look_up(
+    project: Project, text: str, basis: Iterable[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The check of every specific number of ``text``, and the numbers it did not look
+    at because they are too unspecific, each as written, in order and once."""
+    index = _evidence(project)
+    own = {path for ref in basis if (path := project.resolve(str(ref)))}
+    checks: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    seen: set[str] = set()
+    for quoted in _quoted_numbers(text):
+        if quoted.key in seen:
+            continue
+        seen.add(quoted.key)
+        if not is_identifying(quoted.value):
+            skipped.append(quoted.raw)
+            continue
+        holders = index.holders(quoted)
+        found_in = [index.paths[position] for position in holders]
+        kinds = {index.kinds[position] for position in holders}
+        checks.append(
+            {
+                "number": quoted.raw,
+                "found_in": found_in,
+                "in_basis": any(path in own for path in found_in),
+                "kinds": [kind for kind in EVIDENCE_KINDS if kind in kinds],
+            }
+        )
+    return checks, skipped
+
+
+def _was(count: int) -> str:
+    return f"{count} {'was' if count == 1 else 'were'}"
+
+
+def _report_summary(checks: Sequence[Any], skipped: Sequence[Any], missing: int, far: int) -> str:
+    """One sentence that says what the check looked at and what it found: what it
+    proves, no more."""
+    left = f" ({len(skipped)} here)" if skipped else ""
+    tail = f"short and round numbers are not checked{left}."
+    where = "in the run records, sources and your files"
+    if not checks:
+        return f"No number in it is specific enough to be looked for {where}; {tail}"
+    looked = f"{len(checks)} number{'s' if len(checks) != 1 else ''}"
+    parts = [f"{_was(missing)} not found" if missing else "all were found"]
+    if far:
+        parts.append(f"{_was(far)} found only outside the records this finding is based on")
+    verb = "was" if len(checks) == 1 else "were"
+    return f"{looked} {verb} looked for {where}: {', '.join(parts)}; {tail}"
+
+
+def number_report(
+    project: Project, page_or_text: ResearchPage | str, *, basis: Iterable[str] | None = None
+) -> dict[str, Any]:
+    """What the number check finds in a finding, or in any text, and what it did not
+    look at::
+
+        {"checked": [{"number": "0.91", "found_in": ["wiki/results/E1-run1.md"],
+                      "in_basis": True, "kinds": ["metric"]}, ...],
+         "skipped": ["5", "300"],
+         "elsewhere": ["12.5"],
+         "unverified": ["98765.4"],
+         "summary": "4 numbers were looked for in the run records, ..."}
+
+    ``page_or_text`` is a page, a reference to one (an id, a path), or text to
+    check as it is: the text of a finding as it would read with a suggested edit
+    applied, say.  ``basis`` names the records the text is based on (references to
+    result records); for a page it defaults to the page's ``based_on``.
+
+    ``checked`` is :func:`number_check`'s list.  ``skipped`` are the numbers that
+    were not looked at because they are too unspecific to trace (small counts,
+    round figures, years, one significant digit).  ``elsewhere`` are the numbers
+    that were found, but in none of the records of the basis: in another run's
+    metrics, a source or an input file.  ``unverified`` are those found nowhere.
+    ``summary`` says all of it in one sentence, for whoever shows the report.
+
+    The check proves that a number occurs on record, not that it is the number
+    the sentence is about; ``in_basis`` and ``kinds`` say how close it came.
+    """
+    text = page_or_text
+    if isinstance(text, str) and _is_reference(project, text):
+        text = project.page(text.strip())
+    if isinstance(text, ResearchPage):
+        basis = text.relations.get("based_on", []) if basis is None else basis
+        text = _checked_text(text)
+    checks, skipped = _look_up(project, str(text), basis or ())
+    unverified = [check["number"] for check in checks if not check["found_in"]]
+    elsewhere = [c["number"] for c in checks if c["found_in"] and not c["in_basis"]]
+    return {
+        "checked": checks,
+        "skipped": skipped,
+        "elsewhere": elsewhere,
+        "unverified": unverified,
+        "summary": _report_summary(checks, skipped, len(unverified), len(elsewhere)),
+    }
+
+
+def edit_report(project: Project, proposal: Any) -> dict[str, Any] | None:
+    """The :func:`number_report` of a finding as it would read with an edit proposal
+    applied (its title, summary and text replaced where the proposal gives new ones, and
+    the records it adds to ``based_on`` counted as its basis); ``None`` when the proposal
+    is not about a finding or its page is gone.
+
+    For whoever shows a suggested edit to the person: the numbers an edit brings are
+    checked where the decision is taken, not after it.
+    """
+    try:
+        page = project.page(str(proposal.target))
+    except ProjectError:
+        return None
+    if page.kind != "finding":
+        return None
+    fields = proposal.fields if isinstance(proposal.fields, Mapping) else {}
+    summary = fields.get("summary", page.meta.get("summary"))
+    text = "\n".join(
+        [
+            str(fields.get("title") or page.title),
+            summary if isinstance(summary, str) else "",
+            page.body if proposal.body is None else str(proposal.body),
+        ]
+    )
+    added = proposal.relations_add.get("based_on", []) if proposal.relations_add else []
+    return number_report(project, text, basis=[*page.relations.get("based_on", []), *added])
+
+
 def number_check(project: Project, page: ResearchPage | str) -> list[dict[str, Any]]:
     """Where each number in a finding comes from.
 
-    For every number in the page's text that is specific enough to be a result
-    (the notion of ``memory.leakscan``: two or more significant digits; not a
-    small count, a round figure or a year), in the order they appear and each
-    once::
+    For every number in the page's title, summary and text that is specific
+    enough to be a result (the notion of ``memory.leakscan``: two or more
+    significant digits; not a small count, a round figure or a year), in the
+    order they appear and each once::
 
-        {"number": "2.37", "found_in": ["wiki/results/E1-run1.md"]}
+        {"number": "2.37", "found_in": ["wiki/results/E1-run1.md"],
+         "in_basis": True, "kinds": ["metric"]}
 
-    ``number`` is the number as the page writes it.  ``found_in`` lists what
-    holds it: accepted result records of runs that succeeded, accepted source
-    records and text files under ``inputs/``.  Of a result record only the
-    metrics count (the values of its metrics table, which are the run's own
-    ``metrics.json``): not the plan's title, the log, an error or a repair's
-    diff, and nothing of a run that failed.  A number is held as written,
-    rounded to the digits the page gives (0.8765 is quoted as 0.88), or as a
-    percentage of a fraction.  An empty list means that nothing on record
-    supports the number.  ``page`` is a page or a reference to one.
+    ``number`` is the number as the page writes it, with its sign and its
+    exponent, which are part of it: ``-0.121`` is not found in a record of 0.121,
+    nor ``1.5e-9`` in one of 1.5e-3.  (A number written without a sign is also
+    found as the size of a negative value: "a drop of 0.25".)
 
-    The evidence is indexed once per call and kept between calls for as long as
-    it does not change, so the check stays quick on a project with many records.
+    ``found_in`` lists what holds it, ``kinds`` of what kind those are:
+    ``metric`` (the metrics of a run that succeeded, of an experiment the person
+    did not reject, read from the run's own ``run.json``: not the result page's
+    text, the plan's title, the log, an error or a repair's diff, and nothing of
+    a run that failed), ``source`` (an accepted source record) and ``input`` (a
+    text file under ``inputs/``).  ``in_basis`` says whether one of them is a
+    record the page names in ``based_on``.  A number is held as written, rounded
+    to the digits the page gives (0.8765 is quoted as 0.88), or with the decimal
+    point moved two places (0.913 and 91.3%).  An empty ``found_in`` means that
+    nothing on record holds the number.  ``page`` is a page or a reference to one.
+
+    This is an occurrence check: it does not tie a number to the metric or the
+    run its sentence names, and it does not look at short and round numbers at
+    all (:func:`number_report` lists those).  The evidence is indexed once per
+    call and kept between calls for as long as it does not change, so the check
+    stays quick on a project with many records.
     """
     if not isinstance(page, ResearchPage):
         page = project.page(str(page))
-    index = _evidence(project)
-    checks: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for raw in NUMBER.findall(page.body):
-        readings = number_readings(raw)
-        number, parts = readings[0], readings[1:]
-        if number in seen or not is_identifying(number):
-            continue
-        seen.add(number)
-        checks.append({"number": raw, "found_in": index.found_in(number, parts)})
-    return checks
+    return _look_up(project, _checked_text(page), page.relations.get("based_on", []))[0]
 
 
 def unverified_numbers(project: Project, page: ResearchPage | str) -> list[str]:
     """The numbers in a finding that no metric of a succeeded run, no source and no input
     file holds (see :func:`number_check`), as the page writes them."""
     return [check["number"] for check in number_check(project, page) if not check["found_in"]]
+
+
+def reportable_text(project: Project, page: ResearchPage | str) -> tuple[str, str, list[str]]:
+    """A finding as it may be handed on: ``(title, text, removed)``.
+
+    Every number of the title and the text that the number check finds nowhere
+    (:func:`unverified_numbers`) is replaced by ``NOT_ON_RECORD``, wherever it
+    occurs; ``removed`` lists those numbers as the page writes them.  Whether a
+    number that is on no record reaches a paper then no longer depends on a
+    writer obeying a sentence.  The page itself is not changed.
+    """
+    if not isinstance(page, ResearchPage):
+        page = project.page(str(page))
+    checks = _look_up(project, _checked_text(page), page.relations.get("based_on", []))[0]
+    removed = [check["number"] for check in checks if not check["found_in"]]
+    gone = {quoted.key for number in removed for quoted in _quoted_numbers(number)}
+
+    def without(text: str) -> str:
+        pieces: list[str] = []
+        at = 0
+        for quoted, start, end in _quoted_spans(text):
+            if quoted.key in gone:
+                pieces += [text[at:start], NOT_ON_RECORD]
+                at = end
+        return "".join([*pieces, text[at:]])
+
+    return without(page.title), without(page.body), removed
+
+
+# ---------------------------------------------------------------------------
+# What rests on an experiment
+# ---------------------------------------------------------------------------
+
+#: The states of a hypothesis that are a verdict on it.
+_VERDICTS = ("supported", "refuted", "inconclusive")
+
+
+def result_records(project: Project, ref: str) -> list[str]:
+    """The paths of the result records of the experiment's runs, in page order."""
+    page = _experiment(project, ref)
+    return [
+        result.path
+        for result in project.pages(kind="result")
+        if page.path in {project.resolve(target) for target in result.relations.get("run_of", [])}
+    ]
+
+
+def dependents(project: Project, ref: str) -> dict[str, Any]:
+    """What rests on an experiment, for saying so when the person rejects it::
+
+        {"experiment": "E1",
+         "results": ["wiki/results/E1-run1.md"],
+         "findings": [{"id": "F1", "path": ..., "title": ..., "review": "accepted",
+                       "only": True}],
+         "hypotheses": [{"id": "H1", "path": ..., "title": ..., "state": "supported",
+                         "through": ["F1"]}]}
+
+    ``findings`` are the findings (not rejected ones) whose ``based_on`` names a
+    result record of this experiment; ``only`` says that every record it names is
+    one of this experiment's, so that nothing else carries it.  ``hypotheses``
+    are the hypotheses with a verdict (supported, refuted, inconclusive) that
+    such a finding supports or refutes, with the findings the verdict came
+    ``through``.  Nothing is changed: a finding and a verdict are the person's to
+    revisit.  The records of a rejected experiment are no evidence for the
+    number check, and a paper does not report a finding that rests on nothing else.
+    """
+    page = _experiment(project, ref)
+    results = result_records(project, page.path)
+    own = set(results)
+    findings: list[dict[str, Any]] = []
+    verdicts: dict[str, dict[str, Any]] = {}
+    for finding in project.pages(kind="finding"):
+        based = [project.resolve(target) for target in finding.relations.get("based_on", [])]
+        if finding.review == "rejected" or not own.intersection(based):
+            continue
+        findings.append(
+            {
+                "id": finding.id,
+                "path": finding.path,
+                "title": finding.title,
+                "review": finding.review,
+                "only": all(path in own for path in based),
+            }
+        )
+        judged = [*finding.relations.get("supports", []), *finding.relations.get("refutes", [])]
+        for target in judged:
+            path = project.resolve(target)
+            hypothesis = project.page(path) if path else None
+            if hypothesis is None or hypothesis.kind != "hypothesis":
+                continue
+            if hypothesis.state not in _VERDICTS or hypothesis.review == "rejected":
+                continue
+            entry = verdicts.setdefault(
+                hypothesis.path,
+                {
+                    "id": hypothesis.id,
+                    "path": hypothesis.path,
+                    "title": hypothesis.title,
+                    "state": hypothesis.state,
+                    "through": [],
+                },
+            )
+            if finding.id not in entry["through"]:
+                entry["through"].append(finding.id)
+    return {
+        "experiment": str(page.id),
+        "results": results,
+        "findings": findings,
+        "hypotheses": list(verdicts.values()),
+    }

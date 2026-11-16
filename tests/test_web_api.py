@@ -349,10 +349,13 @@ def test_every_specified_endpoint_exists(client):
         for method in methods
     }
     assert set(SPECIFIED.split("\n")) - {""} <= served
-    # What was added to it: running an approved experiment now, and the worker's log.
+    # What was added to it: running an approved experiment now, the worker's log,
+    # forgetting a worker the server cannot verify, and the settings a project starts with.
     assert served - set(SPECIFIED.split("\n")) == {
         "POST /api/projects/{pid}/experiments/{eid}/run",
         "GET /api/projects/{pid}/worker/log",
+        "POST /api/projects/{pid}/worker/forget",
+        "GET /api/defaults",
     }
 
 
@@ -408,7 +411,7 @@ def test_render_previews_with_the_page_renderer(client, project):
 
 
 def test_a_project_is_created_from_the_composer_with_its_files(client, workspace):
-    assert client.get("/api/projects").json() == {"projects": []}
+    assert client.get("/api/projects").json() == {"projects": [], "unreadable": []}
     response = client.post(
         "/api/projects",
         data={
@@ -444,7 +447,9 @@ def test_a_project_is_created_from_the_composer_with_its_files(client, workspace
     assert [(row["id"], row["title"], row["status"]) for row in listed] == [
         (body["id"], "Warmup and batch size", "idle")
     ]
-    assert listed[0]["worker"] == "idle" and listed[0]["pending"] is None
+    # Nothing waits in a project that has only its idea: counted, not unknown.
+    assert listed[0]["worker"] == "idle" and listed[0]["pending"] == 0
+    assert listed[0]["counts"]["by_kind"]["idea"] == 1
     detail = client.get(f"/api/projects/{body['id']}").json()
     assert detail["id"] == body["id"] and detail["usage"] is None and detail["problems"] == []
 
@@ -669,7 +674,10 @@ def test_a_change_made_by_another_process_is_seen(client, project):
     assert client.get(url(project)).json()["title"] == "Renamed in a terminal"
 
 
-def test_the_library_reads_no_page(client, workspace, monkeypatch):
+def test_the_library_counts_what_waits_once_and_then_reads_no_page(client, workspace, monkeypatch):
+    """A row says what waits in its project now (the audit: the number of the last
+    checkpoint went stale and left edit proposals out).  Counting reads the pages of a
+    project; it is done once, and again only when its pages or proposals changed."""
     for number in range(40):
         made = Project.create(workspace / f"p{number:02}", title=f"Project {number}", brief="x")
         if number % 2:
@@ -678,16 +686,21 @@ def test_the_library_reads_no_page(client, workspace, monkeypatch):
                      "checkpoint": {"round": 2, "phase": "hypothesize", "summary": "Five waiting.",
                                     "pending": {"hypothesis": 5, "question": 1}}}  # fmt: skip
             (made.root / "state.json").write_text(json.dumps(state))
+            made.create_page("hypothesis", "One", "x", author="agent:theorist", round=2)
+            topic = made.create_page("topic", "Mine", "x", author="human")
+            made.propose_edit(topic.path, author="agent:analyst", summary="s", body="y", round=2)
 
-    def no_pages(self, *args, **kwargs):
-        raise AssertionError("the library must not read pages")
-
-    monkeypatch.setattr(Project, "_all_pages", no_pages)
-    monkeypatch.setattr(Project, "_load_page", no_pages)
+    monkeypatch.setattr(api_module, "_COUNT_SECONDS", 60.0)
     rows = client.get("/api/projects").json()["projects"]
     assert len(rows) == 40
     waiting = [row for row in rows if row["status"] == "checkpoint"]
-    assert len(waiting) == 20 and all(row["pending"] == 6 for row in waiting)
+    # One proposed page and one edit proposal, not the six of a checkpoint long ago.
+    assert len(waiting) == 20 and all(row["pending"] == 2 for row in waiting)
+    assert waiting[0]["counts"]["pending"] == {
+        "total": 2, "pages": 1, "proposals": 1, "by_kind": {"hypothesis": 1},
+    }  # fmt: skip
+    assert waiting[0]["counts"]["by_kind"]["topic"] == 1
+    assert all(row["pending"] == 0 for row in rows if row["status"] != "checkpoint")
     assert waiting[0]["checkpoint"]["summary"] == "Five waiting."
     assert waiting[0]["spent"] == {
         "model_usd": 1.5,
@@ -695,10 +708,42 @@ def test_the_library_reads_no_page(client, workspace, monkeypatch):
         "experiment_usd": 0.0,
     }
 
+    def no_pages(self, *args, **kwargs):
+        raise AssertionError("the library must not read pages again")
+
     opened = []
-    monkeypatch.setattr(Project, "reload", lambda self: opened.append(self.root))
-    client.get("/api/projects")
+    with monkeypatch.context() as patched:
+        patched.setattr(Project, "_all_pages", no_pages)
+        patched.setattr(Project, "_load_page", no_pages)
+        patched.setattr(Project, "reload", lambda self: opened.append(self.root))
+        again = client.get("/api/projects").json()["projects"]
     assert opened == []  # nothing changed, so nothing was read again
+    assert [row["pending"] for row in again] == [row["pending"] for row in rows]
+
+    # A decision changes what waits in that project, and the next listing says so.
+    decided = Project.open(workspace / "p01")
+    decided.review("H1", "accept")
+    after = {row["dir"]: row for row in client.get("/api/projects").json()["projects"]}
+    assert after["p01"]["pending"] == 1 and after["p03"]["pending"] == 2
+
+
+def test_counting_for_the_library_is_bounded_and_caught_up_by_the_next_listings(
+    client, workspace, monkeypatch
+):
+    for number in range(6):
+        made = Project.create(workspace / f"p{number}", title=f"Project {number}", brief="x")
+        made.create_page("hypothesis", "One", "x", author="agent:theorist", round=1)
+        state = {"status": "checkpoint", "round": 1, "phase": "hypothesize",
+                 "checkpoint": {"round": 1, "phase": "hypothesize", "summary": "s",
+                                "pending": {"hypothesis": 7}}}  # fmt: skip
+        (made.root / "state.json").write_text(json.dumps(state))
+    monkeypatch.setattr(api_module, "_COUNT_SECONDS", 0.0)  # no time for any counting
+    rows = client.get("/api/projects").json()["projects"]
+    # Not counted yet: the row says so and falls back on what the checkpoint counted.
+    assert all(row["counts"] is None and row["pending"] == 7 for row in rows)
+    monkeypatch.setattr(api_module, "_COUNT_SECONDS", 60.0)
+    rows = client.get("/api/projects").json()["projects"]
+    assert all(row["counts"]["pending"]["total"] == 1 and row["pending"] == 1 for row in rows)
 
 
 def test_a_copied_project_directory_is_still_reachable(client, workspace, project):
@@ -875,11 +920,53 @@ def test_editing_refuses_what_a_page_cannot_be(client, project):
     assert client.put(url(project, path), content=b"not json").status_code == 422
 
 
-def test_editing_an_agents_proposal_accepts_it_as_the_persons(client, project):
-    edited = client.put(url(project, "/pages/H1"), json={"body": "## Statement\n\nSharper.\n"})
+def test_editing_a_proposal_does_not_decide_it_and_save_and_accept_does(client, project):
+    """Changed for the audit (truth 14): a person's edit used to accept the page."""
+    kept = client.put(url(project, "/pages/H1"), json={"body": "Corrected, still open.\n"})
+    assert kept.status_code == 200
+    page = kept.json()["page"]
+    assert page["review"] == "proposed" and page["body"] == "Corrected, still open.\n"
+    assert "decided_by" not in page["meta"] and page["meta"]["updated_by"] == "human"
+
+    # A rejected page stays rejected however it is edited.
+    client.post(url(project, "/review"), json={"items": [{"ref": "E1", "decision": "reject"}]})
+    edited = client.put(url(project, "/pages/E1"), json={"body": "## Objective\n\nAgain.\n"})
+    assert edited.status_code == 200 and edited.json()["page"]["review"] == "rejected"
+
+    accepted = client.put(
+        url(project, "/pages/H1"),
+        json={"body": "Corrected and accepted.\n", "accept": True, "base_updated": page["updated"]},
+    )
+    assert accepted.status_code == 200
+    page = accepted.json()["page"]
+    assert page["review"] == "accepted" and page["meta"]["decided_by"] == "human"
+    assert page["body"] == "Corrected and accepted.\n"
+    last = client.get(url(project, "/activity?limit=1")).json()["events"][0]
+    assert last["type"] == "review.decided" and last["data"]["edited"] is True
+    # Saving and accepting a version that is no longer the one that was read is refused.
+    stale = client.put(
+        url(project, "/pages/E1"),
+        json={"body": "x\n", "accept": True, "base_updated": "2020-01-01T00:00:00Z"},
+    )
+    assert stale.status_code == 409
+    assert client.get(url(project, "/pages/E1")).json()["page"]["review"] == "rejected"
+
+
+def test_editing_a_page_of_ones_own_changes_nothing_about_its_review(client, project):
+    edited = client.put(
+        url(project, "/pages/topics/adaptive-optimisers"), json={"body": "Sharper.\n"}
+    )
     assert edited.status_code == 200
     page = edited.json()["page"]
-    assert page["review"] == "accepted" and page["meta"]["decided_by"] == "human"
+    assert page["review"] == "accepted" and page["author"] == "human"
+    # "Save and accept" on a page that is accepted already is a plain save.
+    again = client.put(
+        url(project, "/pages/topics/adaptive-optimisers"),
+        json={"body": "Sharper still.\n", "accept": True},
+    )
+    assert again.status_code == 200 and again.json()["page"]["review"] == "accepted"
+    last = client.get(url(project, "/activity?limit=1")).json()["events"][0]
+    assert last["type"] == "page.updated"
 
 
 def test_the_person_adds_and_deletes_pages(client, project):
@@ -1819,7 +1906,10 @@ class Stream:
             "raw_path": self.path.encode(),
             "query_string": self.query.encode(),
             "root_path": "",
-            "headers": [(k.encode(), v.encode()) for k, v in self.headers.items()],
+            "headers": [
+                (k.encode(), v if isinstance(v, bytes) else v.encode())
+                for k, v in self.headers.items()
+            ],
             "client": ("127.0.0.1", 50000),
             "server": ("127.0.0.1", 8600),
         }
@@ -2675,3 +2765,1030 @@ def test_logs_are_served_without_the_credentials_a_job_printed(real, project, mo
     # Offsets are those of the file: a client that follows the log misses nothing.
     assert followed.json()["next"] == (run_dir / "log.txt").stat().st_size
     assert "cloning https://[redacted]@git.example.invalid" in worker.json()["text"]
+
+
+# ---------------------------------------------------------------------------
+# The second round of the audit: what the API answers, whatever a project's files hold
+# (web 5, 6, 7, 8, 11, 12, 13; integrity 4, 10, 11; truth 12, 14)
+# ---------------------------------------------------------------------------
+
+FAKE_KEY = "sk-audit-FAKE-0123456789abcdefFAKE"
+
+
+def send(client, method: str, path: str, body: Any):
+    """A JSON request whose text is sent as written: escapes stay escapes, so half a
+    surrogate pair arrives the way a browser sends it."""
+    return client.request(
+        method,
+        path,
+        content=json.dumps(body).encode(),
+        headers={"content-type": "application/json"},
+    )
+
+
+def append_event(project: Project, **fields: Any) -> dict[str, Any]:
+    """An event as a worker of an earlier version wrote it: straight into the file."""
+    last = project.events()[-1]
+    event = {**last, "seq": last["seq"] + 1, "refs": [], "data": {}, **fields}
+    with (project.root / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+    return event
+
+
+def library(client) -> dict[str, str]:
+    """``{directory: id}`` as the library lists the projects."""
+    return {row["dir"]: row["id"] for row in client.get("/api/projects").json()["projects"]}
+
+
+def fresh_client(workspace: Path, tmp_path: Path, **options: Any) -> TestClient:
+    """A server that sees the workspace for the first time."""
+    app = create_app(
+        workspace, static_dir=tmp_path / "no-frontend", stop_workers_on_exit=True, **options
+    )
+    return TestClient(app, base_url=BASE_URL)
+
+
+def test_an_id_keeps_naming_the_directory_it_named(client, workspace, project):
+    """A copy whose name sorts before the original does not take the id over: a tab that
+    was open on the project goes on reading and writing that project."""
+    import shutil
+
+    assert client.get(url(project)).json()["dir"] == "warmup"
+    shutil.copytree(project.root, workspace / "a-branch-to-try-something")
+    ids = library(client)
+    assert ids["warmup"] == project.id
+    assert ids["a-branch-to-try-something"] not in (project.id, None)
+    assert client.get(url(project)).json()["dir"] == "warmup"
+
+    before = len(list((workspace / "a-branch-to-try-something" / "requests").glob("*")))
+    posted = client.post(url(project, "/requests"), json={"text": "typed in the tab on warmup"})
+    assert posted.status_code == 201
+    assert len(list((project.root / "requests").glob("*"))) == before + 1
+    assert len(list((workspace / "a-branch-to-try-something" / "requests").glob("*"))) == before
+
+    # The copy's own address holds as well, and a second copy does not move either.
+    shutil.copytree(project.root, workspace / "a-a-second-copy")
+    again = library(client)
+    assert again["warmup"] == project.id
+    assert again["a-branch-to-try-something"] == ids["a-branch-to-try-something"]
+    assert len(set(again.values())) == 3
+    copy = client.get(f"/api/projects/{ids['a-branch-to-try-something']}").json()
+    assert copy["dir"] == "a-branch-to-try-something" and copy["id"] != project.id
+
+
+def test_a_server_that_sees_a_project_and_its_copy_for_the_first_time_knows_the_original(
+    workspace, project, tmp_path
+):
+    import shutil
+
+    time.sleep(0.05)  # a copy is made after the project, however little
+    shutil.copytree(project.root, workspace / "a-backup-of-warmup")  # keeps the files' dates
+    with fresh_client(workspace, tmp_path) as client:
+        ids = library(client)
+        assert ids["warmup"] == project.id and ids["a-backup-of-warmup"] != project.id
+        assert client.get(url(project)).json()["dir"] == "warmup"
+
+
+def test_the_original_is_known_by_what_the_project_recorded_when_it_was_created(
+    workspace, project, tmp_path
+):
+    """The command line tells a project from its copy by ``Project.at_home`` (the directory
+    it was created as); the server goes by the same, before the dates of files."""
+    import shutil
+
+    shutil.copytree(project.root, workspace / "a-backup-of-warmup")
+    time.sleep(0.05)
+    brief = project.root / "inputs" / "brief.md"
+    brief.write_text(brief.read_text())  # the original's files are now the younger ones
+    assert project.at_home() is True
+    assert Project.open(workspace / "a-backup-of-warmup").at_home() is False
+    with fresh_client(workspace, tmp_path) as client:
+        ids = library(client)
+        assert ids["warmup"] == project.id and ids["a-backup-of-warmup"] != project.id
+
+
+def test_a_project_from_before_that_record_is_told_from_its_copy_by_its_files(
+    workspace, project, tmp_path
+):
+    import shutil
+
+    from paper_orchestra.research.project import HOME_KEY
+
+    file = project.root / "project.json"
+    data = json.loads(file.read_text())
+    del data[HOME_KEY]  # as a project of an earlier version has it
+    file.write_text(json.dumps(data))
+    time.sleep(0.05)  # a copy is made after the project, however little
+    shutil.copytree(project.root, workspace / "a-backup-of-warmup")  # keeps the files' dates
+    assert Project.open(project.root).at_home() is None
+    with fresh_client(workspace, tmp_path) as client:
+        ids = library(client)
+        assert ids["warmup"] == project.id and ids["a-backup-of-warmup"] != project.id
+
+
+def test_a_renamed_project_directory_keeps_its_id(client, workspace, project):
+    assert library(client) == {"warmup": project.id}
+    project.root.rename(workspace / "warmup-2026")
+    assert library(client) == {"warmup-2026": project.id}
+    assert client.get(url(project)).json()["dir"] == "warmup-2026"
+
+
+def test_a_project_that_cannot_be_opened_is_listed_with_the_reason(client, workspace, project):
+    Project.create(workspace / "second", title="Second", brief="x")
+    assert set(library(client)) == {"warmup", "second"}
+    file = project.root / "project.json"
+    text = file.read_text()
+    file.write_text(text[: len(text) // 2])  # cut short
+
+    listing = client.get("/api/projects").json()
+    assert [row["dir"] for row in listing["projects"]] == ["second"]
+    (unreadable,) = listing["unreadable"]
+    assert unreadable["dir"] == "warmup" and unreadable["id"] == project.id
+    assert "project.json" in unreadable["message"] and "Repair the file" in unreadable["message"]
+
+    refused = client.get(url(project))
+    assert refused.status_code == 422
+    assert error_of(refused)["code"] == "project_unreadable"
+    assert "Repair the file" in error_of(refused)["message"]
+    assert client.get(url(project, "/pages")).status_code == 422
+    assert client.get("/api/projects/p-000000000000").status_code == 404  # still "no such project"
+
+    file.write_text(text)  # repaired: the same address works again
+    assert client.get(url(project)).json()["dir"] == "warmup"
+    assert client.get("/api/projects").json()["unreadable"] == []
+
+
+def test_a_damaged_project_is_listed_by_a_server_that_never_saw_it_whole(
+    workspace, project, tmp_path
+):
+    (project.root / "project.json").write_text("{ not json")
+    with fresh_client(workspace, tmp_path) as client:
+        listing = client.get("/api/projects").json()
+        assert listing["projects"] == []
+        (unreadable,) = listing["unreadable"]
+        assert unreadable["dir"] == "warmup" and unreadable["id"] is None
+        assert "project.json" in unreadable["message"]
+    # A directory that holds no project at all is not one that cannot be opened.
+    (workspace / "notes").mkdir()
+    with fresh_client(workspace, tmp_path) as client:
+        assert [row["dir"] for row in client.get("/api/projects").json()["unreadable"]] == [
+            "warmup"
+        ]
+
+
+def test_a_project_whose_row_cannot_be_built_does_not_take_the_library_down(
+    client, workspace, project, monkeypatch
+):
+    Project.create(workspace / "second", title="Second", brief="x")
+    build = api_module._summary
+
+    def broken(context, key, opened):
+        if opened.root.name == "warmup":
+            raise TypeError("a value nobody thought of")
+        return build(context, key, opened)
+
+    monkeypatch.setattr(api_module, "_summary", broken)
+    listing = client.get("/api/projects").json()
+    assert [row["dir"] for row in listing["projects"]] == ["second"]
+    (unreadable,) = listing["unreadable"]
+    assert unreadable["dir"] == "warmup" and unreadable["id"] == project.id
+    assert "TypeError" in unreadable["message"] and "nobody thought of" not in unreadable["message"]
+
+
+def test_text_in_a_projects_files_that_cannot_be_sent_does_not_break_an_answer(
+    client, workspace, project
+):
+    """Half of a surrogate pair is valid in a JSON file and cannot be sent as UTF-8: one
+    such title must not cost the whole library."""
+    Project.create(workspace / "second", title="Second", brief="x")
+    file = project.root / "project.json"
+    data = json.loads(file.read_text())
+    data["title"] = "Warm\ud83dup"
+    file.write_text(json.dumps(data))  # written as an escape, as any JSON writer does
+    append_event(project, type="error", summary="cut \udc00 here", data={"error": "\ud800"})
+
+    listing = client.get("/api/projects")
+    assert listing.status_code == 200
+    titles = {row["dir"]: row["title"] for row in listing.json()["projects"]}
+    assert titles == {"warmup": "Warm�up", "second": "Second"}
+    assert client.get(url(project)).json()["title"] == "Warm�up"
+    last = client.get(url(project, "/activity?limit=1")).json()["events"][0]
+    assert last["summary"] == "cut � here" and last["data"] == {"error": "�"}
+
+
+def credential_in_the_records(project: Project, secret: str) -> None:
+    """What a worker of an earlier version left behind when a provider's error quoted
+    the key: the text in state.json, in an event and in a run record."""
+    error = f"401 Unauthorized for url 'https://api.example.invalid/v1/messages?key={secret}'"
+    state = {
+        "schema": 1, "status": "failed", "round": 1, "phase": "research",
+        "next_phase": "research", "error": error,
+        "phases": [{"round": 1, "phase": "research", "status": "failed", "error": error}],
+        "checkpoint": {"round": 1, "phase": "research", "summary": f"It failed: {error}",
+                       "pending": {}},
+    }  # fmt: skip
+    (project.root / "state.json").write_text(json.dumps(state))
+    append_event(project, type="error", summary=f"The research phase failed: {error}",
+                 data={"error": error, "nested": [{"deep": error}]})  # fmt: skip
+    run_dir = add_run(project, status="failed")
+    record = json.loads((run_dir / "run.json").read_text())
+    record.update(error=error, notes=[f"The backend said: {error}"])
+    (run_dir / "run.json").write_text(json.dumps(record))
+    usage = {"total": {"usd": 1.0}, "last_error": error}
+    (project.root / "usage.json").write_text(json.dumps(usage))
+
+
+def test_a_credential_in_a_projects_records_is_blanked_in_every_answer(
+    client, stream, project, monkeypatch
+):
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", FAKE_KEY)
+    credential_in_the_records(project, FAKE_KEY)
+    answers = {
+        "the project": client.get(url(project)),
+        "the library": client.get("/api/projects"),
+        "the activity": client.get(url(project, "/activity?limit=50")),
+        "the experiments": client.get(url(project, "/experiments")),
+        "the experiment": client.get(url(project, "/experiments/E1")),
+        "the run": client.get(url(project, "/experiments/E1/runs/1")),
+    }
+    for name, response in answers.items():
+        assert response.status_code == 200, name
+        assert FAKE_KEY not in response.text, name
+        assert "key=[redacted]" in response.text, name
+    assert answers["the project"].json()["state"]["error"].endswith("?key=[redacted]'")
+    assert answers["the library"].json()["projects"][0]["error"].endswith("?key=[redacted]'")
+
+    live = stream(url(project, "/events"))
+    wait_for(lambda: len(live.events()) == len(project.events()) and live.states())
+    sent = live._data.decode()
+    assert FAKE_KEY not in sent and sent.count("key=[redacted]") >= 4
+    assert live.events()[-1]["data"]["nested"][0]["deep"].endswith("?key=[redacted]'")
+    assert live.states()[0]["state"]["error"].endswith("?key=[redacted]'")
+    # An event without a credential is passed on as it was written, byte for byte.
+    first = (project.root / "events.jsonl").read_bytes().split(b"\n")[0]
+    assert first in live._data
+
+
+def test_the_token_of_the_repository_is_blanked_in_events_and_state_too(client, stream, project):
+    project.settings.update({"repo": {"path": PRIVATE_URL}})
+    project.save_settings()
+    said = f"fatal: could not read from {PRIVATE_URL}"
+    append_event(project, type="error", summary=said, data={"error": said})
+    (project.root / "state.json").write_text(json.dumps({"status": "failed", "error": said}))
+    for response in (
+        client.get(url(project)),
+        client.get("/api/projects"),
+        client.get(url(project, "/activity")),
+    ):
+        assert response.status_code == 200 and TOKEN not in response.text
+    live = stream(url(project, "/events"))
+    wait_for(lambda: len(live.events()) == len(project.events()) and live.states())
+    assert TOKEN not in live._data.decode()
+
+
+def test_a_log_piece_that_starts_inside_a_credential_shows_none_of_it(client, project, monkeypatch):
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", FAKE_KEY)
+    log = f"line one\nthe key {FAKE_KEY} was refused\nlast line\n".encode()
+    at = log.find(FAKE_KEY.encode())
+    (project.root / "worker.log").write_bytes(log)
+    (add_run(project) / "log.txt").write_bytes(log)
+    for path in ("/worker/log", "/experiments/E1/runs/1/log"):
+        for inside in (1, 3, len(FAKE_KEY) // 2, len(FAKE_KEY) - 1):
+            piece = client.get(url(project, f"{path}?offset={at + inside}")).json()
+            assert piece["text"] == "[redacted] was refused\nlast line\n", (path, inside)
+            # The offsets stay those of the file: a client that follows it misses nothing.
+            assert (piece["offset"], piece["next"]) == (at + inside, len(log))
+        whole = client.get(url(project, f"{path}?offset=0")).json()
+        assert whole["text"] == "line one\nthe key [redacted] was refused\nlast line\n"
+        after = client.get(url(project, f"{path}?offset={at + len(FAKE_KEY)}")).json()
+        assert after["text"] == " was refused\nlast line\n"
+
+
+def test_a_log_piece_that_ends_inside_a_credential_waits_for_the_rest(client, project, monkeypatch):
+    """A log is read while it is written: the end of the file may be the first half of a
+    key.  That half is not shown; it is shown, blanked, once the rest is there."""
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", FAKE_KEY)
+    log = project.root / "worker.log"
+    log.write_bytes(b"line one\nthe key " + FAKE_KEY[:20].encode())
+    piece = client.get(url(project, "/worker/log?offset=0")).json()
+    assert piece["text"] == "line one\nthe key " and piece["eof"] is True
+    assert piece["next"] == len(b"line one\nthe key ")
+    with log.open("ab") as handle:
+        handle.write(FAKE_KEY[20:].encode() + b" was refused\n")
+    rest = client.get(url(project, f"/worker/log?offset={piece['next']}")).json()
+    assert rest["text"] == "[redacted] was refused\n" and rest["next"] == log.stat().st_size
+
+    # Asking again before anything was added gives nothing, however often.
+    assert client.get(url(project, f"/worker/log?offset={rest['next']}")).json()["text"] == ""
+
+    # A key that ends the file is all there: nothing of it is waited for, and a client
+    # that asks again from where it is gets nothing more (the key here is one whose
+    # end reads like its own beginning, which must not look like a key just begun).
+    repeating = "abcabcabcabcabcabc"
+    monkeypatch.setenv("AUDIT_OTHER_TOKEN", repeating)
+    log.write_bytes(b"the token " + repeating.encode())
+    whole = client.get(url(project, "/worker/log?offset=0")).json()
+    assert whole["text"] == "the token [redacted]" and whole["next"] == log.stat().st_size
+    more = client.get(url(project, f"/worker/log?offset={whole['next']}")).json()
+    assert more["text"] == "" and more["next"] == whole["next"] and more["eof"] is True
+
+    # A piece cut at the size limit inside a key: neither half is shown by either piece.
+    run_log = add_run(project) / "log.txt"
+    filler = b"x" * (256 * 1024 - 10)
+    run_log.write_bytes(filler + FAKE_KEY.encode() + b"\nend\n")
+    first = client.get(url(project, "/experiments/E1/runs/1/log?offset=0")).json()
+    second = client.get(url(project, f"/experiments/E1/runs/1/log?offset={first['next']}")).json()
+    joined = first["text"] + second["text"]
+    assert not any(FAKE_KEY[i : i + 6] in joined for i in range(len(FAKE_KEY) - 5))
+    assert joined.endswith("[redacted]\nend\n") and second["next"] == run_log.stat().st_size
+
+
+def test_logs_are_not_read_through_a_link_that_leads_out_of_the_project(client, project, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "credentials").write_text("OUTSIDE-SECRET (stands for ~/.aws/credentials)\n")
+    (outside / "log.txt").write_text("OUTSIDE-SECRET in a directory elsewhere\n")
+    run_dir = add_run(project)
+    (run_dir / "log.txt").unlink()
+    (run_dir / "log.txt").symlink_to(outside / "credentials")
+    (project.root / "worker.log").symlink_to(outside / "credentials")
+    (project.experiment_dir("E1") / "runs" / "2").symlink_to(outside, target_is_directory=True)
+
+    for path in (
+        "/experiments/E1/runs/1",
+        "/experiments/E1/runs/1/log",
+        "/experiments/E1/runs/1/log?offset=-100",
+        "/experiments/E1/runs/2/log",
+        "/worker/log",
+        "/worker/log?offset=0",
+    ):
+        response = client.get(url(project, path))
+        assert response.status_code == 200, path
+        assert "OUTSIDE-SECRET" not in response.text, path
+    piece = client.get(url(project, "/worker/log")).json()
+    assert piece["text"] == "" and piece["eof"] is True and piece["size"] == 0
+    assert "worker.log" in piece["problem"] and "link" in piece["problem"]
+    assert "problem" in client.get(url(project, "/experiments/E1/runs/1")).json()["log"]
+
+    # A link that stays inside the project names a file of the project.
+    (project.root / "worker.log").unlink()
+    (project.root / "inputs" / "kept.log").write_text("kept inside\n")
+    (project.root / "worker.log").symlink_to(project.root / "inputs" / "kept.log")
+    inside = client.get(url(project, "/worker/log")).json()
+    assert inside["text"] == "kept inside\n" and "problem" not in inside
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+def test_a_log_that_is_not_a_file_is_not_waited_for(client, project):
+    os.mkfifo(project.root / "worker.log")
+    piece = client.get(url(project, "/worker/log")).json()  # would wait for a writer for ever
+    assert piece["text"] == "" and "not a file" in piece["problem"]
+
+
+def test_a_change_that_could_not_be_saved_is_not_kept_in_memory(client, project, monkeypatch):
+    def disk_full(self):
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Project, "_write_project_file", disk_full)
+        with pytest.raises(OSError):
+            client.patch(
+                url(project),
+                json={"title": "Never saved", "settings": {"limits": {"model_usd": 99.0}}},
+            )
+    seen = client.get(url(project)).json()
+    assert seen["title"] == "Warmup" and seen["settings"]["limits"]["model_usd"] != 99.0
+    assert client.get("/api/projects").json()["projects"][0]["title"] == "Warmup"
+    on_disk = json.loads((project.root / "project.json").read_text())
+    assert on_disk["title"] == "Warmup"
+
+
+LONE = "cut in the middle of an emoji \ud83d"
+
+
+def test_text_that_cannot_be_stored_is_refused_wherever_it_is_sent(client, project, launched):
+    cases = [
+        ("PATCH", url(project), {"title": LONE}),
+        ("PATCH", url(project), {"settings": {"research_cutoff": LONE}}),
+        ("POST", "/api/render", {"markdown": LONE}),
+        ("POST", "/api/render", {"markdown": "fine", "path": LONE}),
+        ("POST", url(project, "/pages"), {"kind": "topic", "title": LONE}),
+        ("POST", url(project, "/pages"), {"kind": "topic", "title": "x", "fields": {"n": [LONE]}}),
+        ("POST", url(project, "/pages"), {"kind": "topic", "title": "x", "fields": {LONE: 1}}),
+        ("PUT", url(project, "/pages/H1"), {"body": LONE}),
+        ("PUT", url(project, "/pages/H1"), {"relations": {"motivated_by": [LONE]}}),
+        ("POST", url(project, "/requests"), {"text": LONE}),
+        ("POST", url(project, "/review"),
+         {"items": [{"ref": "H1", "decision": "reject", "reason": LONE}]}),
+        ("POST", url(project, "/review"),
+         {"items": [{"ref": "H1", "decision": "accept", "edits": {"body": LONE}}]}),
+        ("PUT", url(project, "/experiments/E1/code/main.py"), {"text": LONE}),
+        ("POST", url(project, "/experiments/E1/approve"), {"gpu": LONE}),
+        ("POST", url(project, "/advance"), {"instruction": LONE}),
+        ("POST", url(project, "/paper"), {"template": LONE}),
+    ]  # fmt: skip
+    for method, path, body in cases:
+        response = send(client, method, path, body)
+        assert response.status_code == 422, (method, path, response.text)
+        error = error_of(response)
+        assert error["code"] == "invalid_request" and "cannot be stored" in error["message"], path
+    form = client.post(
+        "/api/projects", data={"brief": "x", "settings": json.dumps({"research_cutoff": LONE})}
+    )
+    assert form.status_code == 422 and "cannot be stored" in error_of(form)["message"]
+
+    # Nothing was changed or started, and every view still answers.
+    assert launched.calls == []
+    assert client.get("/api/projects").json()["projects"][0]["title"] == "Warmup"
+    assert client.get(url(project, "/pages/H1")).json()["page"]["review"] == "proposed"
+    assert len(client.get(url(project, "/requests")).json()["requests"]) == 1
+    assert (project.experiment_dir("E1") / "code" / "main.py").read_text() == "print('hello')\n"
+
+
+def test_an_upload_is_reported_under_the_name_it_has_in_inputs(client, workspace):
+    sent = {
+        "brief.md": b"my own notes, called brief",
+        "manifest.json": b'{"mine": true}',
+        "Brief.MD": b"and one that differs by case only",
+        "brief.md/inside.txt": b"a folder called like the brief",
+        "data.csv": b"a,b\n1,2\n",
+    }
+    response = client.post(
+        "/api/projects",
+        data={"title": "Names", "brief": "What is in the files?"},
+        files=[("files", (name, content, "text/plain")) for name, content in sent.items()],
+    )
+    assert response.status_code == 201, response.text
+    inputs = workspace / "names" / "inputs"
+    uploads = {entry["sent"]: entry["stored"] for entry in response.json()["uploads"]}
+    assert set(uploads) == set(sent)
+    for name, stored in uploads.items():
+        assert (inputs / stored).read_bytes() == sent[name], (name, stored)
+    assert uploads["data.csv"] == "data.csv" and uploads["brief.md"] != "brief.md"
+    assert sorted(uploads.values()) == sorted(a["name"] for a in response.json()["attachments"])
+    # The brief typed into the form and the manifest keep their names.
+    assert (inputs / "brief.md").read_text() == "What is in the files?"
+    assert "files" in json.loads((inputs / "manifest.json").read_text())
+
+
+def worker_elsewhere(project: Project) -> None:
+    """state.json as an engine on another machine that shares the directory writes it."""
+    from datetime import UTC, datetime
+
+    from paper_orchestra.research.model import format_stamp
+
+    state = {
+        "status": "running", "round": 1, "phase": "design",
+        "phases": [{"round": 1, "phase": "design", "status": "running"}],
+        "worker": {"pid": 4242, "host": "other-machine",
+                   "heartbeat": format_stamp(datetime.now(UTC))},
+    }  # fmt: skip
+    (project.root / "state.json").write_text(json.dumps(state))
+
+
+def test_a_worker_the_server_cannot_verify_is_shown_as_that_and_can_be_forgotten(
+    client, project, launched
+):
+    worker_elsewhere(project)
+    seen = client.get(url(project)).json()["worker"]
+    assert seen["state"] == "running" and seen["verified"] is False and seen["pid"] is None
+    assert "other-machine" in seen["note"]
+    row = client.get("/api/projects").json()["projects"][0]
+    assert row["worker"] == "running" and row["worker_verified"] is False
+
+    stop = client.post(url(project, "/stop"))
+    assert stop.status_code == 400 and error_of(stop)["code"] == "worker_failed"
+    start = client.post(url(project, "/advance"))
+    assert start.status_code == 409
+    body = start.json()
+    assert body["error"]["code"] == "worker_running" and body["worker"]["verified"] is False
+    assert "Nothing was started" in body["error"]["message"] and launched.calls == []
+
+    forgotten = client.post(url(project, "/worker/forget"))
+    assert forgotten.status_code == 200, forgotten.text
+    worker = forgotten.json()["worker"]
+    assert worker["state"] == "idle" and worker["last_exit"]["forgotten"] is True
+    after = client.get(url(project)).json()
+    assert after["worker"]["state"] == "idle" and after["state"]["status"] == "stopped"
+    row = client.get("/api/projects").json()["projects"][0]
+    assert row["worker"] == "idle" and row["worker_verified"] is None
+    assert client.post(url(project, "/worker/forget")).json()["worker"]["state"] == "idle"
+    assert client.post(url(project, "/advance")).status_code == 202  # it can go on
+
+
+def test_a_worker_this_server_started_is_stopped_not_forgotten(client, project):
+    client.post(url(project, "/advance"))
+    wait_for(lambda: (project.root / "ready").exists())
+    row = client.get("/api/projects").json()["projects"][0]
+    assert row["worker"] == "running" and row["worker_verified"] is True
+    refused = client.post(url(project, "/worker/forget"))
+    assert refused.status_code == 400 and error_of(refused)["code"] == "worker_failed"
+    assert "stop it" in error_of(refused)["message"]
+    assert client.get(url(project)).json()["worker"]["state"] == "running"
+
+
+def test_a_resume_point_that_is_no_number_is_ignored(stream, project):
+    past = project.events()
+    for value in ("٣", "²", "9" * 5000, "", "-1", "1e3"):
+        live = stream(url(project, "/events"), {"last-event-id": value})
+        wait_for(lambda live=live: len(live.events()) == len(past), message=repr(value))
+        assert live.status == 200
+    resumed = stream(url(project, "/events"), {"last-event-id": str(past[-2]["seq"])})
+    wait_for(lambda: len(resumed.events()) == 1)
+    assert resumed.events()[0]["seq"] == past[-1]["seq"]
+
+
+# ---------------------------------------------------------------------------
+# What the app needs for the rules of the loop (FIXES I and J on the API's side)
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_settings_are_served(client):
+    body = client.get("/api/defaults").json()
+    from paper_orchestra.research.model import ProjectSettings
+
+    assert body["settings"] == ProjectSettings().to_dict()
+    assert body["settings"]["compute"] == "local" and "model_usd" in body["settings"]["limits"]
+    assert body["phases"] == ["intake", "research", "hypothesize", "design", "run", "analyze"]
+    assert body["request_for"] == ["all", "scout", "theorist", "designer", "analyst"]
+
+
+def test_a_request_can_be_addressed_to_one_role(client, project):
+    posted = client.post(
+        url(project, "/requests"),
+        json={"text": "Use three seeds.", "for": "designer", "target": "E1"},
+    )
+    assert posted.status_code == 201, posted.text
+    request = posted.json()["request"]
+    assert request["for"] == "designer" and request["handled_in"] == []
+    assert request["target"] == "wiki/experiments/E1-variance-with-and-without-warmup.md"
+    plain = client.post(url(project, "/requests"), json={"text": "Read more."}).json()["request"]
+    assert plain["for"] == "all"
+    said = client.post(url(project, "/requests"), json={"text": "x", "for": "all"})
+    assert said.json()["request"]["for"] == "all"
+    listed = client.get(url(project, "/requests")).json()["requests"]
+    assert [item["for"] for item in listed] == ["all", "designer", "all", "all"]
+
+    refused = client.post(url(project, "/requests"), json={"text": "x", "for": "runner"})
+    assert refused.status_code == 422 and "designer" in error_of(refused)["message"]
+    assert len(client.get(url(project, "/requests")).json()["requests"]) == 4
+
+
+class Reporting(FakeServices):
+    """Services whose number report says what it was asked to check."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reported: list[ResearchPage] = []
+
+    def number_report(self, project, page):
+        self.reported.append(page)
+        return {
+            "checked": [{"number": "97.3", "found_in": [], "in_basis": False, "kinds": []}],
+            "skipped": ["5"], "elsewhere": [], "unverified": ["97.3"],
+            "summary": f"1 number was looked for in {page.title!r}.",
+        }  # fmt: skip
+
+
+def a_finding(project: Project) -> ResearchPage:
+    add_run(project)
+    result = project.write_record(
+        "result", "E1-run1", "E1 run 1", "| metric | value |\n|---|---|\n| accuracy | 0.91 |\n",
+        fields={"state": "succeeded"}, relations={"run_of": ["E1"]},
+    )  # fmt: skip
+    finding = project.create_page(
+        "finding",
+        "Warmup helps",
+        "Accuracy reached 0.91.\n",
+        author="human",
+        relations={"based_on": [result.path]},
+    )
+    return finding
+
+
+def test_a_suggested_edit_to_a_finding_comes_with_the_numbers_of_the_text_it_would_make(
+    workspace, project, launched, live, tmp_path
+):
+    services = Reporting()
+    finding = a_finding(project)
+    proposal = project.propose_edit(
+        finding.path,
+        author="agent:analyst",
+        summary="Report the better run",
+        body="Accuracy reached 97.3%, 41.8 points above the baseline.\n",
+        fields={"title": "Warmup helps a lot"},
+        round=1,
+    )
+    app = create_app(workspace, launcher=launched, services=services, live=live,
+                     static_dir=tmp_path / "none", stop_workers_on_exit=True)  # fmt: skip
+    with TestClient(app, base_url=BASE_URL) as client:
+        view = client.get(url(project, f"/pages/{finding.id}")).json()
+    (shown,) = view["proposals"]
+    assert shown["id"] == proposal.id
+    assert shown["number_report"]["unverified"] == ["97.3"]
+    assert shown["number_report"]["summary"] == "1 number was looked for in 'Warmup helps a lot'."
+    # What was checked for the proposal is the page as it would read with the edit applied:
+    # its text and title, with the records the finding is based on.
+    would_be = next(page for page in services.reported if page.title == "Warmup helps a lot")
+    assert would_be.body == "Accuracy reached 97.3%, 41.8 points above the baseline.\n"
+    assert would_be.relations["based_on"] == finding.relations["based_on"]
+    assert would_be.path == finding.path and would_be.kind == "finding"
+    # The page itself is reported as it reads today.
+    assert view["number_report"]["summary"] == "1 number was looked for in 'Warmup helps'."
+    assert view["page"]["body"] == "Accuracy reached 0.91.\n"
+
+
+def test_the_numbers_of_a_suggested_edit_are_checked_by_the_real_check(real, project):
+    finding = a_finding(project)
+    project.propose_edit(
+        finding.path,
+        author="agent:analyst",
+        summary="Report the better run",
+        body="Accuracy reached 0.91 in one run and 97.31% in another.\n",
+        round=1,
+    )
+    view = real.get(url(project, f"/pages/{finding.id}")).json()
+    report = view["proposals"][0]["number_report"]
+    assert report["unverified"] == ["97.31"]
+    found = {check["number"]: check for check in report["checked"]}
+    assert found["0.91"]["in_basis"] is True and found["97.31"]["found_in"] == []
+    assert "97.31" not in json.dumps(view["number_report"])  # the page does not say it yet
+    assert view["number_report"]["unverified"] == []
+    assert [check["number"] for check in view["number_check"]] == ["0.91"]
+    # An edit to a page that is no finding has no numbers to trace.
+    topic = real.get(url(project, "/pages/topics/adaptive-optimisers")).json()
+    assert "number_report" not in topic["proposals"][0] and "number_report" not in topic
+
+
+def test_a_report_that_cannot_be_made_is_said_not_hidden(client, project, services):
+    finding = a_finding(project)
+    project.propose_edit(finding.path, author="agent:analyst", summary="s", body="x 97.3\n")
+
+    def broken(project, page):
+        raise ProjectError("The evidence could not be read.")
+
+    services.number_report = broken
+    view = client.get(url(project, f"/pages/{finding.id}")).json()
+    assert view["number_report"] is None
+    assert view["number_report_error"] == "The evidence could not be read."
+    assert view["proposals"][0]["number_report"] is None
+    assert view["proposals"][0]["number_report_error"] == "The evidence could not be read."
+
+
+def test_a_record_the_person_edited_is_marked(real, project):
+    finding = a_finding(project)
+    result = finding.relations["based_on"][0]
+    assert real.get(url(project, f"/pages/{result}")).json()["edited_record"] is False
+    assert real.get(url(project, f"/pages/{finding.id}")).json()["edited_record"] is False
+    edited = real.put(
+        url(project, f"/pages/{result}"),
+        json={"body": "| metric | value |\n|---|---|\n| accuracy | 0.99 |\n"},
+    )
+    assert edited.status_code == 200 and edited.json()["edited_record"] is True
+    assert real.get(url(project, f"/pages/{result}")).json()["edited_record"] is True
+
+
+def test_rejecting_an_experiment_says_what_rests_on_it(real, project):
+    project.review("H1", "accept")
+    project.review("E1", "accept")
+    finding = a_finding(project)
+    project.update_page(finding.path, author="human", relations={"supports": ["H1"]})
+    project.set_state("H1", "testing", by="system")
+    project.set_state("H1", "supported", by="human")
+
+    answer = real.post(
+        url(project, "/review"),
+        json={"items": [
+            {"ref": "E1", "decision": "reject", "reason": "The setup was wrong."},
+            {"ref": "H1", "decision": "accept"},
+        ]},
+    ).json()  # fmt: skip
+    rejected, other = answer["results"]
+    assert rejected["ok"] is True and rejected["page"]["review"] == "rejected"
+    rests = rejected["dependents"]
+    assert rests["experiment"] == "E1" and rests["results"] == ["wiki/results/E1-run1.md"]
+    assert [(f["id"], f["only"]) for f in rests["findings"]] == [(finding.id, True)]
+    assert [(h["id"], h["state"], h["through"]) for h in rests["hypotheses"]] == [
+        ("H1", "supported", [finding.id])
+    ]
+    assert "dependents" not in other  # only a rejected experiment has something to say
+
+
+def running_without_a_worker(project: Project, services: FakeServices) -> None:
+    """E1 as a worker that was killed in the middle of its run left it."""
+    project.review("E1", "accept")
+    services.approve(project, "E1")
+    project.set_state("E1", "queued", by="system")
+    project.set_state("E1", "running", by="system")
+    add_run(project, status="running")
+
+
+def test_an_interrupted_run_is_shown_as_that_and_run_starts_it_again(
+    client, project, services, launched
+):
+    running_without_a_worker(project, services)
+    view = client.get(url(project, "/experiments/E1")).json()
+    assert view["page"]["state"] == "running" and view["interrupted"] is True
+    assert "interrupted" in view["interrupted_note"] and "Run it again" in view["interrupted_note"]
+    (row,) = client.get(url(project, "/experiments")).json()["experiments"]
+    assert row["interrupted"] is True
+
+    started = client.post(url(project, "/experiments/E1/run"))
+    assert started.status_code == 202, started.text
+    assert started.json()["worker"]["kind"] == "run"
+    assert launched.calls == [("run", {"experiments": ["E1"]})]
+    wait_for(lambda: (project.root / "ready").exists())
+    # With the worker at it, the run is not "interrupted", and a second start is refused.
+    view = client.get(url(project, "/experiments/E1")).json()
+    assert view["interrupted"] is False and view["interrupted_note"] is None
+    assert client.get(url(project, "/experiments")).json()["experiments"][0]["interrupted"] is False
+    again = client.post(url(project, "/experiments/E1/run"))
+    assert again.status_code == 409 and again.json()["error"]["code"] == "worker_running"
+
+
+def test_a_run_another_process_holds_is_neither_interrupted_nor_started(
+    client, project, services, launched
+):
+    fcntl = pytest.importorskip("fcntl")
+    running_without_a_worker(project, services)
+    lock = project.experiment_dir("E1") / ".run.lock"
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # what whoever runs the experiment holds
+        view = client.get(url(project, "/experiments/E1")).json()
+        assert view["page"]["state"] == "running" and view["interrupted"] is False
+        refused = client.post(url(project, "/experiments/E1/run"))
+        assert refused.status_code == 409 and error_of(refused)["code"] == "conflict"
+        assert "run lock" in error_of(refused)["message"] and launched.calls == []
+    assert client.get(url(project, "/experiments/E1")).json()["interrupted"] is True
+
+
+def test_an_experiment_that_is_not_running_is_never_interrupted(client, project):
+    view = client.get(url(project, "/experiments/E1")).json()
+    assert view["interrupted"] is False and view["interrupted_note"] is None
+    planned = client.post(url(project, "/experiments/E1/run"))
+    assert planned.status_code == 422 and "Approve it first" in error_of(planned)["message"]
+
+
+def test_the_project_view_says_what_is_wrong_with_the_projects_files(client, project):
+    assert client.get(url(project)).json()["problems"] == []
+    (project.root / "wiki" / "hypotheses" / "H7-by-hand.md").write_text(
+        "---\ntitle: By hand\ncites: [sources/nowhere]\n---\nText.\n"
+    )
+    problems = client.get(url(project)).json()["problems"]
+    assert any("nowhere" in problem["message"] for problem in problems)
+    assert all(set(problem) == {"path", "message"} for problem in problems)
+
+
+def test_no_record_of_a_project_is_read_through_a_link_that_leads_out_of_it(
+    client, stream, project, tmp_path
+):
+    """Siblings of the linked logs: the usage, the paper's state and the events are files
+    of the project too, and a project directory may come from somebody else."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.json").write_text(json.dumps({"OUTSIDE-SECRET": "a file of the person"}))
+    (outside / "private.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "note", "summary": "OUTSIDE-SECRET in a line"}) + "\n"
+    )
+    (project.root / "usage.json").symlink_to(outside / "private.json")
+    (project.root / "paper").symlink_to(outside, target_is_directory=True)
+    (outside / "state.json").write_text(json.dumps({"OUTSIDE-SECRET": "paper state"}))
+    events = project.root / "events.jsonl"
+    events.unlink()
+    events.symlink_to(outside / "private.jsonl")
+
+    for path in ("", "/paper", "/activity"):
+        response = client.get(url(project, path))
+        assert response.status_code == 200, path
+        assert "OUTSIDE-SECRET" not in response.text, path
+    assert client.get(url(project)).json()["usage"] is None
+    assert client.get(url(project, "/paper")).json()["state"] is None
+    assert client.get(url(project, "/activity")).json() == {"events": [], "has_more": False}
+    live = stream(url(project, "/events"))
+    wait_for(lambda: live.states())
+    time.sleep(0.1)  # a few looks at the file
+    assert live.events() == [] and b"OUTSIDE-SECRET" not in live._data
+
+
+def test_a_text_file_is_served_without_the_credentials_in_it(client, project, monkeypatch):
+    """The whole log of a run, and what a job wrote into an artifact, are opened as files:
+    a credential in them is blanked there as in every other answer."""
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", FAKE_KEY)
+    run_dir = add_run(project)
+    big = b"x" * (1 << 20)  # the key lies across the pieces the file is read in
+    (run_dir / "log.txt").write_bytes(big[:-7] + FAKE_KEY.encode() + b"\nlast line\n")
+    (run_dir / "artifacts" / "env.txt").write_text(f"AUDIT_FAKE_API_KEY={FAKE_KEY}\n")
+    (run_dir / "artifacts" / "clean.txt").write_text("nothing to hide\n")
+    (run_dir / "artifacts" / "model.bin").write_bytes(b"\x00" + FAKE_KEY.encode())
+
+    log = client.get(url(project, "/files/experiments/E1/runs/1/log.txt"))
+    assert log.status_code == 200 and FAKE_KEY.encode() not in log.content
+    assert log.content == big[:-7] + b"[redacted]\nlast line\n"
+    assert log.headers["content-type"] == "text/plain; charset=utf-8"
+    assert log.headers["content-disposition"] == 'inline; filename="log.txt"'
+    assert log.headers["content-security-policy"].endswith("sandbox")
+    env = client.get(url(project, "/files/experiments/E1/runs/1/artifacts/env.txt?download=1"))
+    assert env.text == "AUDIT_FAKE_API_KEY=[redacted]\n"
+    assert env.headers["content-disposition"] == 'attachment; filename="env.txt"'
+
+    # A file without one is served as before, with what a browser needs to resume it.
+    clean = client.get(url(project, "/files/experiments/E1/runs/1/artifacts/clean.txt"))
+    assert clean.text == "nothing to hide\n" and clean.headers["content-length"] == "16"
+    part = client.get(
+        url(project, "/files/experiments/E1/runs/1/artifacts/clean.txt"),
+        headers={"Range": "bytes=0-6"},
+    )
+    assert part.status_code == 206 and part.text == "nothing"
+    # What is not text is the job's own data and is handed over as it is.
+    binary = client.get(url(project, "/files/experiments/E1/runs/1/artifacts/model.bin"))
+    assert binary.content == b"\x00" + FAKE_KEY.encode()
+
+
+def test_the_stream_checks_the_resume_point_itself(workspace, project, live):
+    """The security layer drops a ``Last-Event-ID`` that is no number; the endpoint does
+    not rely on it (a superscript two passes ``isdigit`` and is no ``int``)."""
+    from fastapi import FastAPI
+
+    from paper_orchestra.web.workers import Workers
+
+    bare = FastAPI()  # the API alone, without the layer in front of it
+    bare.include_router(api_module.router)
+    bare.state.context = api_module.Context(
+        workspace=api_module.Workspace(workspace), workers=Workers(), live=live
+    )
+    past = project.events()
+    opened = []
+    try:
+        # The header as it arrives: bytes, which the framework reads as Latin-1.
+        for value in (b"\xb2", b"\xb9\xb2\xb3", b"9" * 30, b" 12abc"):
+            one = Stream(bare, url(project, "/events"), {"last-event-id": value})
+            opened.append(one)
+            wait_for(lambda one=one: len(one.events()) == len(past), message=repr(value))
+            assert one.status == 200
+        resumed = Stream(bare, url(project, "/events"), {"last-event-id": b"2"})
+        opened.append(resumed)
+        wait_for(lambda: len(resumed.events()) == len(past) - 2)
+    finally:
+        live.closing.set()
+        for made in opened:
+            made._hang_up.set()
+            made.ended.wait(10)
+
+
+def test_however_a_log_is_cut_into_pieces_no_part_of_a_credential_is_shown(tmp_path):
+    """Many logs, keys and piece sizes: followed from the start, a log reads as itself
+    with every key blanked, whatever the pieces were."""
+    import random
+
+    rng = random.Random(20261116)
+    path = tmp_path / "log.txt"
+    for case in range(300):
+        keys = ["".join(rng.choices("ABCDEFGH0123456789", k=rng.randint(12, 30)))
+                for _ in range(rng.randint(1, 3))]  # fmt: skip
+        if case % 5 == 0:
+            keys.append(keys[0][:6] * 3)  # one whose end reads like its beginning
+        parts = []
+        for _ in range(rng.randint(1, 8)):
+            parts.append("".join(rng.choices("abc é\n", k=rng.randint(0, 40))))
+            parts.append(rng.choice(keys))
+        parts.append("".join(rng.choices("abc\n", k=rng.randint(1, 20))))
+        text = "".join(parts)
+        path.write_bytes(text.encode())
+        limit = rng.randint(4, 64)  # a piece holds a whole character at least
+        shown, offset = [], 0
+        with path.open("rb") as handle:
+            for _ in range(10_000):
+                piece = api_module._read_log(handle, offset, limit, secrets=keys)
+                shown.append(piece["text"])
+                assert piece["offset"] == offset, (case, piece)
+                if piece["next"] == offset:
+                    break
+                offset = piece["next"]
+        joined = "".join(shown)
+        assert offset == len(text.encode()), (case, limit)
+        # Nothing of any key: their letters occur nowhere else in these logs.
+        assert not set(joined) & set("ABCDEFGH0123456789"), (case, limit, joined)
+        expected = text
+        for key in sorted(keys, key=len, reverse=True):
+            expected = expected.replace(key, "")
+        assert joined.replace("[redacted]", "") == expected, (case, limit)
+
+
+def test_however_a_file_is_read_in_pieces_every_credential_in_it_is_blanked(tmp_path):
+    import random
+
+    rng = random.Random(7)
+    path = tmp_path / "artifact.txt"
+    for case in range(200):
+        keys = sorted(
+            ("".join(rng.choices("ABCDEFGH0123456789", k=rng.randint(12, 30))) for _ in range(3)),
+            key=len,
+            reverse=True,
+        )
+        parts = []
+        for _ in range(rng.randint(0, 6)):
+            parts += ["".join(rng.choices("abc \n", k=rng.randint(0, 40))), rng.choice(keys)]
+        text = "".join(parts) + "".join(rng.choices("abc\n", k=rng.randint(0, 20)))
+        path.write_text(text)
+        needles = [key.encode() for key in keys]
+        piece = rng.randint(1, 48)
+        assert api_module._holds_any(path, needles, piece) is any(key in text for key in keys)
+        served = b"".join(api_module._blanked(path, needles, piece)).decode()
+        expected = text
+        for key in keys:
+            expected = expected.replace(key, "[redacted]")
+        assert served == expected, (case, piece)
+
+
+def test_a_refusal_is_as_presentable_as_an_answer(client, project, monkeypatch):
+    """What an error message quotes comes from the same files: a credential in it is
+    blanked, and half a surrogate pair does not turn the refusal into a 500."""
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", FAKE_KEY)
+
+    def refuse(self, ref, **changes):
+        raise ProjectError(f"The page quotes {FAKE_KEY} and a cut \ud83d character.")
+
+    monkeypatch.setattr(Project, "update_page", refuse)
+    refused = client.put(url(project, "/pages/H1"), json={"body": "x"})
+    assert refused.status_code == 422
+    assert error_of(refused)["message"] == "The page quotes [redacted] and a cut � character."
+    several = client.post(
+        url(project, "/review"),
+        json={"items": [{"ref": "H1", "decision": "accept", "edits": {"body": "x"}}]},
+    )
+    assert several.status_code == 200 and FAKE_KEY not in several.text
+
+
+def test_run_waits_until_what_a_dead_worker_left_is_settled(client, project, services, launched):
+    """The first look after a worker died sets the settling of its runs off; a Run that
+    arrives in that moment is decided on the page as it is once they are settled, not
+    refused because the settling holds the experiment."""
+    from datetime import UTC, datetime, timedelta
+
+    from paper_orchestra.research.model import format_stamp
+
+    fcntl = pytest.importorskip("fcntl")
+    running_without_a_worker(project, services)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    state = {
+        "status": "checkpoint", "round": 1, "phase": "design", "phases": [],
+        "worker": {"pid": gone.pid, "host": socket.gethostname(),
+                   "heartbeat": format_stamp(datetime.now(UTC) - timedelta(minutes=5))},
+    }  # fmt: skip
+    (project.root / "state.json").write_text(json.dumps(state))
+
+    workers = client.app.state.context.workers
+    settle, entered = workers._settle_runs, threading.Event()
+
+    def slow(root):
+        # As the recovery does, only slower: the experiment is held while it is settled.
+        with (project.experiment_dir("E1") / ".run.lock").open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            entered.set()
+            time.sleep(0.5)
+        return settle(root)
+
+    workers._settle_runs = slow
+    assert client.get(url(project)).json()["worker"]["state"] == "idle"  # the look
+    assert entered.wait(10)
+    started = client.post(url(project, "/experiments/E1/run"))
+    assert started.status_code == 202, started.text
+    assert launched.calls == [("run", {"experiments": ["E1"]})]
+    # The unfinished run was settled before the worker was started, not beside it.
+    view = client.get(url(project, "/experiments/E1")).json()
+    assert [(run["number"], run["status"]) for run in view["runs"]] == [(1, "failed")]
+    assert "worker stopped" in view["runs"][0]["error"]
+    assert view["page"]["state"] == "queued" and view["interrupted"] is False
+
+
+def test_a_credential_is_blanked_before_text_is_rendered(client, project, monkeypatch):
+    """Rendering escapes and marks up what it is given: a credential that holds such
+    characters would stand in the HTML in a form a search for it does not find."""
+    secret = "p&ss<w>*or*d-0123456789"
+    monkeypatch.setenv("AUDIT_FAKE_PASSWORD", secret)
+    said = f"The server answered that {secret} was refused.\n"
+    project.update_page("topics/adaptive-optimisers", author="human", body=said)
+    project.propose_edit(
+        "topics/adaptive-optimisers",
+        author="agent:analyst",
+        summary="Say it again",
+        body=said + f"\nAgain: {secret}.\n",
+        round=1,
+    )
+    project.update_page("E1", author="agent:designer", body=f"## Objective\n\nUse {secret}.\n")
+    stamp = project.history("topics/adaptive-optimisers")[0].stamp
+    answers = [
+        client.get(url(project, "/pages/topics/adaptive-optimisers")),
+        client.get(url(project, f"/pages/topics/adaptive-optimisers/versions/{stamp}")),
+        client.get(url(project, "/experiments/E1")),
+    ]
+    for response in answers:
+        assert response.status_code == 200
+        for piece in (secret, "p&amp;ss", "ss&lt;w&gt;", "<em>or</em>", "d-0123456789"):
+            assert piece not in response.text, piece
+    page = answers[0].json()
+    assert "that [redacted] was refused" in page["html"]
+    assert page["proposals"][-1]["marked_html"].count("[redacted]") == 2
+    assert "[redacted]" in page["proposals"][-1]["diff_html"]
+    assert "Use [redacted]." in answers[2].json()["html"]

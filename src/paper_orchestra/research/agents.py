@@ -7,8 +7,16 @@ proposes pages of the kinds its role may create, and suggests every other
 change with ``propose_edit``.  What a role adds here is its tools (the scout's
 ``verify_paper``, the designer's ``write_code`` and read-only view of the
 person's repository), the checks that code runs on what the model produced
-(an experiment must parse; a finding's numbers must be on record), and the
-bounded conversation in which the model is asked to put right what a check found.
+(an experiment must parse; a finding's numbers are looked for on record), and
+the bounded conversation in which the model is asked to put right what a check
+found.
+
+What a session is told beyond the index of the wiki: the person's requests that
+are addressed to its role and the ones for every agent, the undecided proposals
+of other sessions of the kinds it writes (by title and summary, so that nothing
+is proposed twice), what the person rejected (pages, and suggested edits with
+their reasons), and for the scout that follows intake the pages intake wrote,
+which it may read before the person has reviewed them.
 
 The engine calls these functions; they never decide what phase comes next.
 """
@@ -62,8 +70,11 @@ from paper_orchestra.research.access import (
     search_tool,
 )
 from paper_orchestra.research.model import (
+    FOR_ALL,
     IDEA_PATH,
+    REQUEST_ROLES,
     SECTIONS,
+    EditProposal,
     NotFound,
     ProjectError,
     Request,
@@ -73,9 +84,10 @@ from paper_orchestra.research.model import (
     kind_for_path,
     moved_on,
     role_author,
+    role_of,
 )
 from paper_orchestra.research.project import INPUTS_DIR, Project
-from paper_orchestra.research.sources import SourceVerifier, normalize_cutoff, verify_paper_tool
+from paper_orchestra.research.sources import SourceVerifier, project_cutoff, verify_paper_tool
 from paper_orchestra.utils.pdf import load_paper, page_count
 from paper_orchestra.utils.scholar import SemanticScholar
 
@@ -86,6 +98,7 @@ __all__ = [
     "Inputs",
     "RepairAnswer",
     "SessionStopped",
+    "addressee",
     "build_harness",
     "count_of",
     "describe_event",
@@ -125,6 +138,10 @@ WEB_SEARCHES = 40
 #: and the analyst what the check of its numbers found.
 DESIGN_REPAIRS = 2
 NUMBER_REPAIRS = 2
+#: How many pages, and how many suggested edits, of others a session is told about (the
+#: latest ones): enough to keep it from proposing something twice, without crowding out
+#: its task.
+MAX_TOLD = 60
 
 #: Attached files, as the intake session is shown them.
 MAX_FILE_CHARS = 40_000
@@ -228,9 +245,11 @@ class AgentContext:
     stop, or ``None``, and a turn it stopped ends where a stop request ends one.
     ``compute`` is a backend, or a
     callable choosing one for a plan, as ``research.experiments.run`` takes it.
-    ``produced`` fills with the paths of the pages this run of the phase created,
-    as they are created, so that an interrupted phase can still say what it left
-    behind.
+    ``handover`` names the roles whose undecided pages of this round the session
+    may read although the person has not reviewed them (the scout reads what
+    intake wrote right before it).  ``produced`` fills with the paths of the
+    pages this run of the phase created, as they are created, so that an
+    interrupted phase can still say what it left behind.
     """
 
     project: Project
@@ -245,6 +264,7 @@ class AgentContext:
     over_budget: Callable[[str, Usage], BaseException | None] = _within_budget
     scholar: SemanticScholar | None = None
     compute: ComputeBackend | Callable[[Any], ComputeBackend] | None = None
+    handover: Sequence[str] = ()
     produced: list[str] = field(default_factory=list)
     #: Why ``over_budget`` said the work must stop, once it has.
     _spent: BaseException | None = field(default=None, init=False, repr=False)
@@ -388,12 +408,15 @@ class _SessionBackend(ProjectMemoryBackend):
         *,
         caps: Mapping[str, int] | None = None,
         heed_stop: Callable[[], None] = _no_guard,
+        handover: Sequence[str] = (),
     ) -> None:
         super().__init__(project, role, round, session_id)
         self._caps = dict(caps or {})
         #: Called before every command of the memory tool, which is where a turn that
         #: reads and writes many pages can be ended between two model calls.
         self._heed_stop = heed_stop
+        #: Authors whose undecided pages of this round the session may read.
+        self._handover = frozenset(role_author(name) for name in handover)
 
     def proposed(self, kind: str | None = None) -> list[ResearchPage]:
         """Pages (of ``kind``) this session created, in this attempt or one it resumes."""
@@ -402,6 +425,54 @@ class _SessionBackend(ProjectMemoryBackend):
             for page in self.project.pages(kind=kind)
             if page.author == self.author and page.session == self.session_id
         ]
+
+    def _handed_over(self, page: ResearchPage) -> bool:
+        return (
+            page.review == "proposed" and page.author in self._handover and page.round == self.round
+        )
+
+    def handed_over(self) -> list[ResearchPage]:
+        """The undecided pages this session may read without their being its own."""
+        return [page for page in self.project.pages(review="proposed") if self._handed_over(page)]
+
+    def _mode(self, page: ResearchPage) -> str:
+        # Readable, and no more: what was handed over is not the session's to change.
+        return "full" if self._handed_over(page) else super()._mode(page)
+
+    def _refuse_change(self, page: ResearchPage, path: str) -> None:
+        if self._handed_over(page):
+            raise ToolError(
+                f"{page.id or path} was written by the {role_of(page.author)} agent and has "
+                "not been reviewed by the researcher yet. You can read it, but it is not "
+                "yours to change, and an edit cannot be suggested to a page that is still "
+                "undecided: write what you have to add in a page of your own."
+            )
+        super()._refuse_change(page, path)
+
+    def _index(self) -> str:
+        """The wiki's index, with what was handed over listed apart: it is no part of
+        what the person accepted."""
+        index = super()._index()
+        pages = self.handed_over()
+        if not pages:
+            return index
+        lines = [
+            "",
+            f"## not yet reviewed by the researcher ({len(pages)})",
+            "Written just before your session. You can open these pages; the researcher "
+            "may still edit or reject them.",
+        ]
+        for page in pages:
+            tags = ", ".join(tag for tag in (page.id, "not yet reviewed") if tag)
+            # (Another agent's words that nobody has reviewed: they stay a line of the index.)
+            summary = f": {prompts.inert_line(page.summary, 140)}" if page.summary else ""
+            title = prompts.inert_line(page.title, 100)
+            lines.append(f"- {page.path.removeprefix('wiki/')} [{tags}] {title}{summary}")
+        return index.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+
+    def index(self) -> str:
+        """The index a session of this backend is opened with."""
+        return self._index()
 
     def view(self, path: str, view_range: tuple[int, int] | None = None) -> str:
         self._heed_stop()
@@ -573,8 +644,8 @@ def describe_event(role: str, event: Mapping[str, Any]) -> tuple[str, list[str]]
         what = named(given["path"], 80) if given.get("path") else "the top level"
         verb = "listed" if name == "repo_list" else "read"
         return f"{who} {verb} {what} in your repository.", []
-    if name == "propose_edit":
-        return None
+    if name in ("propose_edit", "name_project"):
+        return None  # the project says what came of these itself
     return f"{who} used {named(name, 40)}.", []
 
 
@@ -597,12 +668,20 @@ class _Session:
         self.role = role
         project = ctx.project
         self.backend = _SessionBackend(
-            project, role, ctx.round, ctx.session_id(role), caps=caps, heed_stop=ctx.heed_stop
+            project,
+            role,
+            ctx.round,
+            ctx.session_id(role),
+            caps=caps,
+            heed_stop=ctx.heed_stop,
+            handover=ctx.handover,
         )
         if callable(tools):
             tools = tools(self.backend)
+        #: Edit proposals that were on file before this attempt: what comes after is its own.
+        self._known_edits = {proposal.id for proposal in project.proposals(review=None)}
         offered = [search_tool(project), propose_edit_tool(project, role, ctx.round), *tools]
-        index = project.index_text(role, session=self.backend.session_id)
+        index = self.backend.index()
         self._last = ""
         self._model = model_for(project, role)
         #: What the turn in flight has used, request by request.  The harness adds a
@@ -675,13 +754,30 @@ class _Session:
         """Paths of the pages this session created and that are still there."""
         return [page.path for page in self.backend.proposed()]
 
+    def suggested(self) -> list[EditProposal]:
+        """The edits this attempt of the session suggested and the person has not decided."""
+        return [
+            proposal
+            for proposal in self.ctx.project.proposals()
+            if proposal.author == self.backend.author and proposal.id not in self._known_edits
+        ]
+
 
 def _idea(project: Project) -> str:
     return project.page(IDEA_PATH).body
 
 
-def _request_items(ctx: AgentContext) -> list[dict[str, Any]]:
-    return [{"text": request.text, "target": request.target} for request in ctx.requests]
+def addressee(request: Request) -> str:
+    """The role a request of the person is addressed to, or ``all`` for every agent."""
+    return request.role if request.role in REQUEST_ROLES else FOR_ALL
+
+
+def _request_items(ctx: AgentContext, role: str) -> list[dict[str, Any]]:
+    """The requests the session is shown, each marked as addressed to its role or to all."""
+    return [
+        {"text": request.text, "target": request.target, "mine": addressee(request) == role}
+        for request in ctx.requests
+    ]
 
 
 def _item(page: ResearchPage) -> dict[str, Any]:
@@ -691,24 +787,65 @@ def _item(page: ResearchPage) -> dict[str, Any]:
         "title": page.title,
         "summary": page.summary,
         "reason": page.decision_reason,
+        "by": role_of(page.author),
+        "path": virtual_path(page.path),
     }
 
 
-def _earlier(ctx: AgentContext, role: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """What the role must not propose twice.
+def _rejected_edits(project: Project, role: str) -> list[dict[str, Any]]:
+    """The suggested edits the person turned down that this role should know of: its own,
+    and anyone's to a hypothesis or a finding (a verdict or a reading the person did
+    not accept concerns every role that builds on it)."""
+    author = role_author(role)
+    items = []
+    for proposal in project.proposals(review="rejected"):
+        path = project.resolve(proposal.target)
+        page = project.page(path) if path else None
+        kind = page.kind if page is not None else kind_for_path(proposal.target)
+        if proposal.author != author and kind not in ("hypothesis", "finding"):
+            continue
+        changes = [f"{name}: {_short(value, 80)}" for name, value in proposal.fields.items()]
+        items.append(
+            {
+                "kind": kind or "page",
+                "id": page.id if page is not None else None,
+                "title": page.title if page is not None else proposal.target,
+                "summary": proposal.summary,
+                "changes": changes,
+                "reason": proposal.decision_reason or "",
+                "by": role_of(proposal.author),
+            }
+        )
+    return items[-MAX_TOLD:]
 
-    The undecided proposals of its earlier sessions, which this session cannot read
-    because they belong to another one, and the rejected pages of the kinds it writes.
+
+def _earlier(
+    ctx: AgentContext, role: str, readable: Sequence[ResearchPage] = ()
+) -> dict[str, list[dict[str, Any]]]:
+    """What the role must not propose twice, as the keyword arguments of its message.
+
+    ``pending``: the undecided proposals of other sessions of the kinds this role
+    writes, whoever proposed them (the analyst's next steps are hypotheses and
+    experiments too).  The session cannot read them, because nothing should be
+    built on a page that may still be turned down, but it is told that they are
+    on the researcher's desk.  ``rejected``: the rejected pages of those kinds.
+    ``rejected_edits``: suggested edits the person turned down, with the reason.
+    ``readable`` are undecided pages the session may open; they are told apart.
     """
     author, own = role_author(role), ctx.session_id(role)
     kinds = creatable_kinds(role)
+    opened = {page.path for page in readable}
     pending = [
         _item(page)
         for page in ctx.project.pages(kind=kinds, review="proposed")
-        if page.author == author and page.session != own
+        if not (page.author == author and page.session == own) and page.path not in opened
     ]
     rejected = [_item(page) for page in ctx.project.pages(kind=kinds, review="rejected")]
-    return pending, rejected
+    return {
+        "pending": pending[-MAX_TOLD:],
+        "rejected": rejected[-MAX_TOLD:],
+        "rejected_edits": _rejected_edits(ctx.project, role),
+    }
 
 
 def _plural(count: int, noun: str) -> str:
@@ -977,15 +1114,13 @@ def run_intake(ctx: AgentContext) -> AgentReport:
     inputs = read_inputs(project, capabilities)
     untitled = project.title_is_provisional
     session = _Session(ctx, "intake", tools=[name_project_tool(ctx)] if untitled else ())
-    pending, rejected = _earlier(ctx, "intake")
     message = prompts.intake_message(
         idea=_idea(project),
         attached=inputs.attached,
         unread=inputs.unread,
         untitled=untitled,
-        pending=pending,
-        rejected=rejected,
-        requests=_request_items(ctx),
+        **_earlier(ctx, "intake"),
+        requests=_request_items(ctx, "intake"),
         instruction=ctx.instruction,
     )
     session.send([Text(message), *inputs.parts])
@@ -1014,8 +1149,14 @@ def run_intake(ctx: AgentContext) -> AgentReport:
 
 
 def run_scout(ctx: AgentContext) -> AgentReport:
-    """Find prior work, record what can be verified, synthesise it, ask what is open."""
+    """Find prior work, record what can be verified, synthesise it, ask what is open.
+
+    Raises ``sources.CutoffError`` before anything is asked of a model when the
+    project's research cutoff cannot be read: searching without the cutoff the
+    person set would look at exactly the work they meant to leave out.
+    """
     project = ctx.project
+    cutoff = project_cutoff(project)
     verifier = SourceVerifier(project, scholar=ctx.scholar, harness=ctx.harness, round=ctx.round)
     capabilities = ctx.harness.client_for(model_for(project, "scout")).capabilities
     session = _Session(
@@ -1024,16 +1165,16 @@ def run_scout(ctx: AgentContext) -> AgentReport:
         tools=[verify_paper_tool(verifier)],
         web_search=WebSearch(max_uses=WEB_SEARCHES),
     )
-    pending, rejected = _earlier(ctx, "scout")
+    handed_over = session.backend.handed_over()
     message = prompts.scout_message(
         idea=_idea(project),
-        cutoff=normalize_cutoff(project.settings.research_cutoff),
+        cutoff=cutoff,
         web_search=capabilities.web_search,
         sources=len(project.pages(kind="source", review=["accepted", "proposed"])),
         max_sources=int(project.settings.limits.max_sources),
-        pending=pending,
-        rejected=rejected,
-        requests=_request_items(ctx),
+        handed_over=[_item(page) for page in handed_over],
+        **_earlier(ctx, "scout", handed_over),
+        requests=_request_items(ctx, "scout"),
         instruction=ctx.instruction,
     )
     try:
@@ -1072,14 +1213,12 @@ def run_theorist(ctx: AgentContext) -> AgentReport:
     project = ctx.project
     limit = int(project.settings.limits.max_hypotheses)
     session = _Session(ctx, "theorist", caps={"hypothesis": limit})
-    pending, rejected = _earlier(ctx, "theorist")
     session.send(
         prompts.theorist_message(
             idea=_idea(project),
             max_hypotheses=limit,
-            pending=pending,
-            rejected=rejected,
-            requests=_request_items(ctx),
+            **_earlier(ctx, "theorist"),
+            requests=_request_items(ctx, "theorist"),
             instruction=ctx.instruction,
         )
     )
@@ -1381,7 +1520,7 @@ def _no_price(gpu: str) -> str:
     )
 
 
-def experiment_problems(ctx: AgentContext, page: ResearchPage) -> list[str]:
+def experiment_problems(ctx: AgentContext, page: ResearchPage, *, code: bool = True) -> list[str]:
     """What would stop the experiment ``page`` from being approved or run; empty when sound.
 
     Checked by code, never by running anything: the page names what it tests, its
@@ -1389,7 +1528,8 @@ def experiment_problems(ctx: AgentContext, page: ResearchPage) -> list[str]:
     project would use can run it, and a GPU it asks for has a price (a run whose
     cost cannot be estimated cannot be held to the project's cost limit).  A
     warning from the code check (something the person weighs at approval) is not
-    a problem here.
+    a problem here.  ``code=False`` leaves the code out of it: for a plan that is
+    proposed without code, which the designer writes once the plan is accepted.
     """
     problems: list[str] = []
     if not page.relations.get("tests"):
@@ -1403,7 +1543,8 @@ def experiment_problems(ctx: AgentContext, page: ResearchPage) -> list[str]:
     except ProjectError as exc:
         problems += _each_problem(str(exc))
     try:
-        problems += experiments.split_problems(experiments.check_code(ctx.project, str(page.id)))[0]
+        found = experiments.check_code(ctx.project, str(page.id)) if code else []
+        problems += experiments.split_problems(found)[0]
     except ProjectError as exc:
         problems.append(str(exc))
     backend = ctx.backend(plan) if plan is not None else None
@@ -1555,7 +1696,6 @@ def run_designer(ctx: AgentContext, *, spent: Mapping[str, float] | None = None)
         for page in project.pages(kind="experiment", review="accepted", state="planned")
         if _lacks_code(project, page)
     ]
-    pending, rejected = _earlier(ctx, "designer")
     session.send(
         prompts.designer_message(
             idea=_idea(project),
@@ -1564,9 +1704,8 @@ def run_designer(ctx: AgentContext, *, spent: Mapping[str, float] | None = None)
             compute=_compute_text(ctx),
             limits=_design_limits(project, spent or {}),
             repo=str(root) if root else None,
-            pending=pending,
-            rejected=rejected,
-            requests=_request_items(ctx),
+            **_earlier(ctx, "designer"),
+            requests=_request_items(ctx, "designer"),
             instruction=ctx.instruction,
         )
     )
@@ -1680,9 +1819,11 @@ def make_repair(
             if not isinstance(answer, RepairAnswer):
                 answer = RepairAnswer.model_validate(answer)
         except Exception as exc:  # the run has failed already; a failed repair must not hide that
-            # (An error can carry what the model answered: it is given as a quotation too.)
+            # (An error can carry what the model answered: it is given as a quotation too.
+            # It can also quote a credential of the request that failed: that is blanked.)
+            why = experiments.mask_credentials(project, str(exc))
             ctx.activity(
-                f"No repair of {experiment} was attempted: {said(exc, 200)}", agent="runner"
+                f"No repair of {experiment} was attempted: {said(why, 200)}", agent="runner"
             )
             return None
         files = _corrected(answer, current)
@@ -1725,51 +1866,180 @@ def _result_items(project: Project, results: Sequence[ResearchPage]) -> list[dic
     return items
 
 
-def _unsupported(ctx: AgentContext, session: _Session) -> dict[str, list[str]]:
-    """Numbers in the session's findings that no record, source or input holds, by finding."""
-    flagged: dict[str, list[str]] = {}
-    for finding in session.proposed("finding"):
-        numbers = experiments.unverified_numbers(ctx.project, finding)
-        if numbers:
-            flagged[str(finding.id)] = list(numbers)
-    return flagged
+@dataclass
+class _Numbers:
+    """What the number check made of one text the analyst wrote."""
+
+    #: How the text is named to the analyst and to the person: ``F1``, or
+    #: ``The edit suggested to F2 (ep-1a2b3c4d)``.
+    label: str
+    #: How many numbers were looked for.
+    checked: int
+    #: The ones found nowhere on record.
+    missing: list[str]
+    #: The ones found, but not in the records the finding names in ``based_on``.
+    elsewhere: list[str]
+    #: The text is a finding as a suggested edit would make it read, not a page.
+    edit: bool = False
 
 
-def _record_unsupported(
-    ctx: AgentContext, session: _Session, flagged: Mapping[str, list[str]]
-) -> list[str]:
-    """Flag what is still unsupported on each finding (``unverified``); notes for the checkpoint."""
+def _numbers_of(
+    project: Project, label: str, page: ResearchPage, *, edit: bool = False
+) -> _Numbers:
+    """The number check of ``page`` (a finding, or one as an edit would make it read)."""
+    report = experiments.number_report(project, page)
+    return _Numbers(
+        label, len(report["checked"]), list(report["unverified"]), list(report["elsewhere"]), edit
+    )
+
+
+def _as_edited(page: ResearchPage, proposal: EditProposal) -> ResearchPage:
+    """``page`` as it would read with the suggested edit applied."""
+    relations = {name: list(targets) for name, targets in page.relations.items()}
+    for name, added in proposal.relations_add.items():
+        have = relations.setdefault(name, [])
+        have += [target for target in added if target not in have]
+    fields = proposal.fields
+    return replace(
+        page,
+        title=str(fields.get("title") or page.title),
+        summary=str(fields.get("summary") or page.summary),
+        body=page.body if proposal.body is None else proposal.body,
+        relations=relations,
+        meta={**page.meta, **fields},
+    )
+
+
+def _edits_to_findings(
+    ctx: AgentContext, proposals: Iterable[EditProposal]
+) -> list[tuple[EditProposal, ResearchPage]]:
+    """Of ``proposals``, those that change what a finding says, each with the finding."""
+    found = []
+    for proposal in proposals:
+        path = ctx.project.resolve(proposal.target)
+        page = ctx.project.page(path) if path else None
+        says = proposal.body is not None or {"title", "summary"} & set(proposal.fields)
+        if page is not None and page.kind == "finding" and says:
+            found.append((proposal, page))
+    return found
+
+
+def _checked_numbers(
+    ctx: AgentContext, session: _Session, edits: Iterable[EditProposal]
+) -> list[_Numbers]:
+    """The number check of every finding the session proposed and of every finding as
+    one of ``edits`` would make it read; only those where something was not found
+    where it should be."""
+    project = ctx.project
+    checks = [
+        _numbers_of(project, str(finding.id), finding) for finding in session.proposed("finding")
+    ]
+    checks += [
+        _numbers_of(
+            project,
+            f"The edit suggested to {page.id or page.title} ({proposal.id})",
+            _as_edited(page, proposal),
+            edit=True,
+        )
+        for proposal, page in _edits_to_findings(ctx, edits)
+    ]
+    return [check for check in checks if check.missing or check.elsewhere]
+
+
+def _listed_numbers(numbers: Sequence[str]) -> str:
+    return ", ".join(numbers[:8]) + (" and more" if len(numbers) > 8 else "")
+
+
+def _were(count: int) -> str:
+    return "was" if count == 1 else "were"
+
+
+def _number_note(check: _Numbers) -> str:
+    """One sentence for the checkpoint that says what the check is and what it found."""
+    parts = []
+    if check.missing:
+        count = len(check.missing)
+        parts.append(f"{count} {_were(count)} not found ({_listed_numbers(check.missing)})")
+    if check.elsewhere:
+        count = len(check.elsewhere)
+        parts.append(
+            f"{count} {_were(count)} found only outside the records this finding is based on "
+            f"({_listed_numbers(check.elsewhere)})"
+        )
+    return (
+        f"{check.label}: {_plural(check.checked, 'number')} {_were(check.checked)} looked for "
+        f"in the run records, sources and your files: {_listed(parts)}; short and round "
+        "numbers are not checked."
+    )
+
+
+def _analyst_edits(ctx: AgentContext) -> list[EditProposal]:
+    """The undecided edits the analyst suggested in this round, in any of its sessions."""
+    author = role_author("analyst")
+    return [
+        proposal
+        for proposal in ctx.project.proposals()
+        if proposal.author == author and proposal.round == ctx.round
+    ]
+
+
+def _next_step_notes(ctx: AgentContext, session: _Session) -> list[str]:
+    """What the checkpoint says about the experiments the analyst proposed as next steps.
+
+    They are plans without code: the analyst has no tool to write any.  The person
+    should know that before they find an experiment they cannot approve, and what
+    is wrong with a plan (it names no hypothesis, its time limit is beyond the
+    project's) is listed on its page as it is for the designer's.
+    """
     notes: list[str] = []
-    for finding in session.proposed("finding"):
-        numbers = flagged.get(str(finding.id))
-        if numbers or finding.meta.get("unverified"):
+    for page in session.proposed("experiment"):
+        if not page.id:
+            continue
+        found = experiment_problems(ctx, page, code=False)
+        if found or page.meta.get("problems"):
             with contextlib.suppress(NotFound):
                 ctx.project.update_page(
-                    finding.path, author="system", fields={"unverified": numbers or None}
+                    page.path, author="system", fields={"problems": found or None}
                 )
-        if numbers:
-            notes.append(
-                f"{finding.id} states {_plural(len(numbers), 'number')} that no result record, "
-                f"source or input supports: {', '.join(numbers[:8])}"
-                + (" and more." if len(numbers) > 8 else ".")
+        notes.append(
+            f"{page.id} is a next step the analyst proposed as a plan, without code. Once "
+            "you accept it, the designer writes its code in the next design phase; its "
+            "run can be approved after that."
+            + (
+                f" Its page lists what else stands in the way: {_short(found[0], 200)}"
+                + (f" (and {len(found) - 1} more)" if found[1:] else "")
+                if found
+                else ""
             )
+        )
     return notes
 
 
-def run_analyst(ctx: AgentContext, *, results: Sequence[ResearchPage], journal: str) -> AgentReport:
+def run_analyst(
+    ctx: AgentContext,
+    *,
+    results: Sequence[ResearchPage],
+    journal: str,
+    spent: Mapping[str, float] | None = None,
+) -> AgentReport:
     """Interpret the new result records, propose verdicts and next steps, write the journal.
 
     ``results`` are the records not analysed yet; ``journal`` is the name of the
-    round's journal page (``round-2``).  Afterwards the numbers in each new finding
-    are checked against the records, and the same conversation is asked to correct
-    or remove what nothing supports, a bounded number of times; what remains is
-    written to the finding's ``unverified`` field and reported.
+    round's journal page (``round-2``); ``spent`` is what the project has spent on
+    experiments, so that a next step is planned within what is left.
+
+    Afterwards the numbers in each new finding, and in each finding as an edit
+    the session suggested would make it read, are looked for on record
+    (``research.experiments.number_report``), and the same conversation is asked
+    to correct or remove what was not found, a bounded number of times.  What
+    remains is said in the report's notes, computed here from the pages as they
+    stand: nothing about it is stored on a page, where it would go stale with
+    the next edit.
     """
     project = ctx.project
     limits = project.settings.limits
     caps = {"hypothesis": int(limits.max_hypotheses), "experiment": int(limits.max_experiments)}
     session = _Session(ctx, "analyst", caps=caps)
-    pending, rejected = _earlier(ctx, "analyst")
     journal_path = f"{SECTIONS['journal']}/{journal}.md"
     session.send(
         prompts.analyst_message(
@@ -1779,19 +2049,43 @@ def run_analyst(ctx: AgentContext, *, results: Sequence[ResearchPage], journal: 
             round=ctx.round,
             max_hypotheses=caps["hypothesis"],
             max_experiments=caps["experiment"],
-            pending=pending,
-            rejected=rejected,
-            requests=_request_items(ctx),
+            compute=_compute_text(ctx),
+            limits=_design_limits(project, spent or {}),
+            **_earlier(ctx, "analyst"),
+            requests=_request_items(ctx, "analyst"),
             instruction=ctx.instruction,
         )
     )
-    flagged = _unsupported(ctx, session)
+    flagged = _checked_numbers(ctx, session, session.suggested())
+    #: The suggested edits the session has been asked about.  An edit cannot be changed
+    #: once it is made, only replaced by another: asking about it again would be asking
+    #: for what cannot be done, at the price of a turn.  It is reported to the person.
+    told_of: set[str] = set()
     for attempt in range(NUMBER_REPAIRS):
-        if not flagged:
+        # A number found on record, though not in the finding's own records, may well be
+        # right (a value from a source): it is asked about once, not insisted on.
+        asked = [
+            check
+            for check in flagged
+            if (check.missing or attempt == 0) and check.label not in told_of
+        ]
+        if not asked:
             break
-        session.send(prompts.numbers_message(flagged, last=attempt == NUMBER_REPAIRS - 1))
-        flagged = _unsupported(ctx, session)
-    notes = _record_unsupported(ctx, session, flagged)
+        told_of |= {check.label for check in asked if check.edit}
+        told = [
+            {
+                "label": check.label,
+                "missing": check.missing,
+                "elsewhere": check.elsewhere if attempt == 0 else [],
+            }
+            for check in asked
+        ]
+        session.send(prompts.numbers_message(told, last=attempt == NUMBER_REPAIRS - 1))
+        flagged = _checked_numbers(ctx, session, session.suggested())
+    # For the person: every edit of the analyst's that awaits them, also one that an
+    # attempt before this one suggested.
+    notes = [_number_note(check) for check in _checked_numbers(ctx, session, _analyst_edits(ctx))]
+    notes += _next_step_notes(ctx, session)
     if not project.resolve(f"wiki/{journal_path}"):
         notes.append(f"The analyst wrote no journal page for round {ctx.round}.")
     produced = session.created()

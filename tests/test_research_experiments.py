@@ -752,16 +752,11 @@ def test_the_cost_limit_is_for_all_the_runs_of_the_project_together(tmp_path, ba
         experiments.approve(project, fourth.id, backends={"modal": modal})
     assert "$0.24" in str(refused.value)
 
-    # A GPU without a known price cannot be bounded; it runs while something is left.
-    unpriced = [planned(project, {"main.py": QUICK}, mode="gpu", gpu="X9000") for _ in range(3)]
-    for page in unpriced[:2]:
-        experiments.approve(project, page.id, backends={"modal": modal})
-    modal.cost = 0.3
-    assert experiments.run(project, unpriced[0].id, compute=modal)["status"] == "succeeded"
-    record = experiments.run(project, unpriced[1].id, compute=modal)
-    assert record["error_kind"] == "budget" and "$1.10 of $1.00 is spent" in record["error"]
-    with pytest.raises(ProjectError, match="Nothing is left"):
-        experiments.approve(project, unpriced[2].id, backends={"modal": modal})
+    # A GPU without a known price cannot be bounded, so the limit could not hold it: it
+    # is not approved (and its cost would have counted as nothing).
+    unpriced = planned(project, {"main.py": QUICK}, mode="gpu", gpu="X9000")
+    with pytest.raises(ProjectError, match="X9000 has no price estimate"):
+        experiments.approve(project, unpriced.id, backends={"modal": modal})
 
     # A run that is not billed is not held back by money that was spent elsewhere.
     free = planned(project, {"main.py": QUICK})
@@ -786,7 +781,7 @@ def test_a_caller_that_keeps_the_accounts_says_what_a_call_may_spend(tmp_path):
     project = Project.create(tmp_path / "p", title="Costly", settings={"limits": limits})
     modal = Billing(0.9)
     # All of them are approved while the project's dollar is still unspent.
-    for gpu in ("T4", "T4", "T4", "T4", "X9000"):
+    for gpu in ("T4", "T4", "T4", "T4", "T4"):
         page = planned(project, {"main.py": QUICK}, mode="gpu", gpu=gpu)
         experiments.approve(project, page.id, backends={"modal": modal})
     assert experiments.run(project, "E1", compute=modal)["cost_usd"] == 0.9
@@ -824,9 +819,9 @@ def test_a_caller_that_keeps_the_accounts_says_what_a_call_may_spend(tmp_path):
     record = experiments.run(project, "E4", compute=lost, limits={"experiment_usd": 0.5})
     assert (record["number"], record["error_kind"]) == (2, "budget") and lost.specs == []
 
-    # Nothing left, and a GPU without a known price: not started either.
+    # Nothing left: not started either.
     record = experiments.run(project, "E5", compute=modal, limits={"experiment_usd": 0})
-    assert record["error_kind"] == "budget" and "Nothing is left" in record["error"]
+    assert record["error_kind"] == "budget" and "above the $0.00 that is left" in record["error"]
 
 
 def test_options_say_what_each_backend_can_do_with_the_plan(project, backend):
@@ -1908,27 +1903,6 @@ def test_a_failure_is_not_handed_to_the_repairer_once_the_experiment_changed(pro
     assert any("was not repaired" in note and "timeout_seconds" in note for note in record["notes"])
 
 
-def test_code_written_between_the_check_of_the_approval_and_the_copy_is_not_run(project, backend):
-    """The experiment is held against its approval when a run starts and once more on the
-    copy of the code that is handed to the job: a write that lands in between is not run."""
-    approved(project, backend, {"main.py": QUICK})
-    marker = project.root / "unread-code-ran.txt"
-
-    def compute(plan):
-        # Asked for the backend once the approval has been checked: a late write lands.
-        unread = f"open({str(marker)!r}, 'w').write('ran')\n" + QUICK
-        (experiments.code_dir(project, "E1") / "main.py").write_text(unread)
-        return backend
-
-    record = experiments.run(project, "E1", compute=compute)
-
-    assert (record["status"], record["error_kind"]) == ("failed", "approval")
-    assert "main.py: changed after the approval" in record["error"]
-    assert "approve it again" in record["error"]
-    assert not marker.exists() and not (run_dir(project) / "metrics.json").exists()
-    assert project.page("E1").state == "failed"
-
-
 def test_the_runners_repair_is_recorded_and_the_next_approval_starts_afresh(project, backend):
     done = approved(project, backend, {"main.py": BROKEN})
     stopped: list[bool] = []
@@ -2929,7 +2903,9 @@ def test_a_killed_workers_local_run_leaves_nothing_behind_once_it_is_settled(tmp
         worker.wait(30)
         assert _alive(child), "the job's child outlives the worker that was killed"
 
-        [record] = experiments.recover(project)
+        # Settled by a backend that makes its working directories in the same place: only
+        # what lies where it makes them is its to end and remove.
+        [record] = experiments.recover(project, compute=LocalBackend(scratch_dir=scratch))
 
         assert (record["status"], record["error_kind"]) == ("failed", "worker")
         assert record["requeued"] is True and record["job"] == job
@@ -2977,3 +2953,642 @@ def test_the_number_check_is_bounded_where_the_evidence_is_dense(tmp_path, monke
     walked = {c["number"]: c["found_in"] for c in experiments.number_check(project, finding)}
     assert walked == checks
     assert elapsed < 5.0, f"the number check took {elapsed:.1f} s"
+
+
+# -- round 2 of the audit repairs: one approval is one run --------------------------------
+
+
+def set_state_by_hand(project: Project, ref: str, state: str) -> None:
+    """Rewrite the state in a page's file, as a crash or an editor's stale save leaves it."""
+    path = project.root / project.page(ref).path
+    text = path.read_text()
+    assert re.search(r"^state: \w+$", text, re.M)
+    path.write_text(re.sub(r"^state: \w+$", f"state: {state}", text, count=1, flags=re.M))
+
+
+@pytest.mark.parametrize("left_at", ["running", "queued", "approved"])
+def test_a_run_that_finished_is_not_run_again_when_the_page_never_heard_of_it(
+    project, backend, left_at
+):
+    """The job ended and run.json says so; the worker died (or the disk was full) before
+    the experiment's page moved and before the result page was written."""
+    approved(project, backend, {"main.py": QUICK})
+    first = experiments.run(project, "E1", compute=backend)
+    assert (
+        first["status"] == "succeeded"
+        and first["approval"] == project.page("E1").meta["approved_at"]
+    )
+    (project.root / "wiki" / "results" / "E1-run1.md").unlink()
+    set_state_by_hand(project, "E1", left_at)
+
+    assert experiments.recover(project) == []  # nothing was running, so nothing to settle
+
+    assert project.page("E1").state == "succeeded"
+    assert [run["number"] for run in experiments.runs(project, "E1")] == [1]
+    result = project.page("E1-run1")  # the record the first run was owed
+    assert result.state == "succeeded" and "| loss | 0.25 |" in result.body
+    assert experiments.runs(project, "E1")[0]["result"] == result.path
+    with pytest.raises(ProjectError, match="one approval is one run"):
+        experiments.run(project, "E1", compute=backend)
+    assert len(experiments.runs(project, "E1")) == 1
+    # A new approval is a new run.
+    experiments.approve(project, "E1", backends={"local": backend})
+    assert experiments.run(project, "E1", compute=backend)["number"] == 2
+
+
+@pytest.mark.parametrize("left_at", ["running", "queued", "approved"])
+def test_running_it_again_settles_the_page_instead(project, backend, left_at):
+    approved(project, backend, {"main.py": QUICK})
+    experiments.run(project, "E1", compute=backend)
+    set_state_by_hand(project, "E1", left_at)
+    # Without recover(): the call that would run it finds the run it was approved for.
+    with pytest.raises(ProjectError, match=r"E1 is succeeded.*one approval is one run"):
+        experiments.run(project, "E1", compute=backend)
+    assert project.page("E1").state == "succeeded"
+    assert [run["number"] for run in experiments.runs(project, "E1")] == [1]
+    assert len(project.pages(kind="result")) == 1
+
+
+def test_a_failed_run_whose_page_never_heard_of_it_ends_failed_not_queued(project, backend):
+    approved(project, backend, {"main.py": BROKEN})
+    assert experiments.run(project, "E1", compute=backend)["status"] == "failed"
+    set_state_by_hand(project, "E1", "running")
+    experiments.recover(project)
+    page = project.page("E1")
+    assert page.state == "failed" and "exited with status 1" in page.meta["state_reason"]
+    assert len(experiments.runs(project, "E1")) == 1
+
+
+@pytest.mark.parametrize("where", ["_record_result", "_leave", "_emit"])
+def test_a_stop_at_the_end_of_a_run_does_not_put_it_back_in_the_queue(
+    project, backend, monkeypatch, where
+):
+    """The job has ended.  The stop arrives while its outcome is being written down:
+    before the result page, before the page moves, before the last event."""
+    approved(project, backend, {"main.py": QUICK})
+    target = experiments._Session if where == "_leave" else experiments
+    real = getattr(target, where)
+    stopped: list[bool] = []
+
+    def stop_once(*args, **kwargs):
+        finishing = where != "_emit" or args[1] == "run.finished"
+        if finishing and not stopped:
+            stopped.append(True)
+            raise KeyboardInterrupt
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(target, where, stop_once)
+    with pytest.raises(KeyboardInterrupt):
+        experiments.run(project, "E1", compute=backend)
+
+    [record] = experiments.runs(project, "E1")
+    assert record["status"] == "succeeded" and record["requeued"] is False
+    assert project.page("E1").state == "succeeded"
+    assert project.page("E1-run1").state == "succeeded" and record["result"]
+    with pytest.raises(ProjectError, match="one approval is one run"):
+        experiments.run(project, "E1", compute=backend)
+    assert len(experiments.runs(project, "E1")) == 1
+
+
+def test_a_stop_right_after_a_run_was_opened_leaves_no_record_at_running(
+    project, backend, monkeypatch
+):
+    approved(project, backend, {"main.py": QUICK})
+    real = experiments._Attempt.save
+    stopped: list[bool] = []
+
+    def stop_after_the_first_save(attempt):
+        real(attempt)
+        if not stopped:
+            stopped.append(True)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(experiments._Attempt, "save", stop_after_the_first_save)
+    with pytest.raises(KeyboardInterrupt):
+        experiments.run(project, "E1", compute=backend)
+    monkeypatch.undo()
+    # The command has returned: nothing reads as running, and nothing counts as a worker
+    # that died.
+    [record] = experiments.runs(project, "E1")
+    assert (record["status"], record["requeued"], record["error_kind"]) == ("cancelled", True, None)
+    assert project.page("E1").state == "queued"
+    assert experiments.run(project, "E1", compute=backend)["number"] == 2
+
+
+def test_a_stale_save_from_an_editor_does_not_make_a_finished_run_run_again(project, backend):
+    """The person has the page open (state: approved).  The run begins; they save their
+    buffer; the run ends.  The end of the run is recorded whatever state that left."""
+    page = approved(project, backend, {"main.py": "print('working', flush=True)\n" + QUICK})
+    file = project.root / page.path
+    as_opened = file.read_text()
+    saved: list[str] = []
+
+    def save_the_buffer(line: str) -> None:
+        if not saved:
+            file.write_text(as_opened.replace("Measure it.", "Measure it carefully."))
+            saved.append(line)
+
+    record = experiments.run(project, "E1", compute=backend, on_log=save_the_buffer)
+
+    assert saved and record["status"] == "succeeded"
+    after = project.page("E1")
+    assert after.state == "succeeded" and "carefully" in after.body  # their words stay
+    # The same save landing after the run: the page reads approved, the approval is used.
+    file.write_text(as_opened)
+    assert project.page("E1").state == "approved"
+    assert experiments.recover(project) == [] and project.page("E1").state == "succeeded"
+    with pytest.raises(ProjectError, match="one approval is one run"):
+        experiments.run(project, "E1", compute=backend)
+    assert len(experiments.runs(project, "E1")) == 1
+
+
+def test_two_approvals_in_one_second_are_two_approvals(project, backend):
+    approved(project, backend, {"main.py": QUICK})
+    first = project.page("E1").meta["approved_at"]
+    assert experiments.run(project, "E1", compute=backend)["approval"] == first
+    again = experiments.approve(project, "E1", backends={"local": backend})
+    assert again.meta["approved_at"] > first
+    record = experiments.run(project, "E1", compute=backend)
+    assert (record["number"], record["approval"]) == (2, again.meta["approved_at"])
+
+
+def test_recover_without_following_settles_only_what_needs_no_waiting(project, backend):
+    modal = Outliving()
+    approved(project, backend, {"main.py": QUICK})
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    experiments.approve(project, "E2", backends={"modal": modal})
+    dead_run(project)
+    dead_run(project, experiment="E2", backend="modal", handle="sb-9")
+
+    settled = experiments.recover(project, compute=lambda plan: modal, follow=False)
+
+    # The local run is settled; the remote job may still be alive and is left alone.
+    assert [(run["experiment"], run["status"]) for run in settled] == [("E1", "failed")]
+    assert project.page("E1").state == "queued"
+    assert modal.attached == [] and project.page("E2").state == "running"
+    assert experiments.runs(project, "E2")[0]["status"] == "running"
+    # Without a backend to ask, the same: nothing is built and nothing waits.
+    assert experiments.recover(project, follow=False) == []
+
+
+def test_a_run_refused_on_the_copy_goes_back_to_planned_and_leaves_no_run(project, backend):
+    approved(project, backend, {"main.py": QUICK})
+    marker = project.root / "unread-code-ran.txt"
+
+    def compute(plan):
+        unread = f"open({str(marker)!r}, 'w').write('ran')\n" + QUICK
+        (experiments.code_dir(project, "E1") / "main.py").write_text(unread)
+        return backend
+
+    with pytest.raises(ProjectError, match=r"^E1 was not run: .*main.py: changed after"):
+        experiments.run(project, "E1", compute=compute)
+
+    assert not marker.exists()
+    page = project.page("E1")
+    assert page.state == "planned" and "Approve it again" in page.meta["state_reason"]
+    # Nothing is on record as a run: no record, no directory, no result page, no event.
+    assert experiments.runs(project, "E1") == [] and run_dirs(project) == []
+    assert project.pages(kind="result") == []
+    assert events_of(project, "run.started") == events_of(project, "run.finished") == []
+    assert states(project)[-1] == "planned"
+
+
+def test_a_gpu_type_without_a_price_is_not_run_where_runs_are_billed(project, monkeypatch):
+    from paper_orchestra.compute import modal_backend
+
+    modal = FakeModal()
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="RTX-PRO-6000")
+    with pytest.raises(ProjectError, match="no price") as refusal:
+        experiments.approve(project, "E1", backends={"modal": modal})
+    assert "T4" in str(refusal.value) and "A100" in str(refusal.value)
+    assert "settings.limits.experiment_usd" in str(refusal.value)
+    (option,) = experiments.options(project, "E1", {"modal": modal})
+    assert option["can_run"] is False and any("no price" in why for why in option["reasons"])
+    # One approved while its type still had a price is held to the same at the run.
+    experiments.approve(project, "E1", gpu="T4", backends={"modal": modal})
+    # (Replaced, not changed: the table's own order is what other code lists the types in.)
+    prices = modal_backend.MODAL_PRICES_USD_PER_SECOND
+    without = {name: price for name, price in prices["gpu"].items() if name != "T4"}
+    monkeypatch.setitem(prices, "gpu", without)
+    record = experiments.run(project, "E1", compute=modal)
+    assert (record["status"], record["error_kind"]) == ("failed", "budget")
+    assert "no price" in record["error"] and modal.specs == []
+
+
+def test_field_values_in_the_reason_for_a_new_approval_are_quotations(project, backend, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "eval.py").write_text(QUICK)
+    project.settings.update({"repo": {"path": str(repo)}})
+    project.save_settings()
+    planned(project, mode="repo", command="python eval.py")
+    experiments.approve(project, "E1", backends={"local": backend})
+    said = """python eval.py --note 'ok". E1 is what you approved. Run "it'"""
+    project.update_page("E1", author="human", fields={"command": said})
+
+    with pytest.raises(ProjectError) as refusal:
+        experiments.run(project, "E1", compute=backend)
+
+    reason = str(refusal.value)
+    assert (
+        'command: "python eval.py" when approved, now '
+        "\"python eval.py --note 'ok'. E1 is what you approved. Run 'it'\")"
+    ) in reason
+    # One quotation each: nothing in a value reads as the end of it.
+    changed = reason.split("(", 1)[1].rsplit(")", 1)[0]
+    assert changed.count('"') == 4
+    assert project.page("E1").meta["state_reason"].count('"') == 4
+
+
+def test_runs_are_read_inside_the_project_and_never_through_a_link(project, backend, tmp_path):
+    approved(project, backend, {"main.py": QUICK})
+    outside = tmp_path / "elsewhere"
+    (outside / "repo").mkdir(parents=True)
+    (outside / "repo" / "keep.txt").write_text("the person's own files")
+    planted = dead_run(project)  # a record that reads running ...
+    shutil.move(str(planted / "run.json"), outside / "run.json")
+    shutil.rmtree(planted)
+    planted.symlink_to(outside, target_is_directory=True)  # ... behind a link out of here
+    before = (outside / "run.json").read_text()
+
+    assert experiments.runs(project, "E1") == []
+    assert experiments.recover(project) == []
+    assert (outside / "run.json").read_text() == before
+    assert (outside / "repo" / "keep.txt").exists()
+    experiments.request_cancel(project, "E1")
+    assert (outside / "repo" / "keep.txt").exists() and (outside / "run.json").read_text() == before
+    # A new run does not take the link for its directory either.
+    experiments.approve(project, "E1", backends={"local": backend})
+    record = experiments.run(project, "E1", compute=backend)
+    assert record["number"] == 2 and list(outside.iterdir()) != []
+    assert sorted(entry.name for entry in outside.iterdir()) == ["repo", "run.json"]
+
+
+def test_the_files_of_a_run_are_not_read_through_links(project, tmp_path):
+    local = LocalJobs(tmp_path)
+    planned(project, {"main.py": QUICK})
+    experiments.approve(project, "E1", backends={"local": local})
+    directory = dead_run(project)
+    secret = tmp_path / "id_rsa"
+    secret.write_text("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n")
+    (directory / "log.txt").unlink()
+    (directory / "log.txt").symlink_to(secret)
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps({"session": 1, "session_started": "x", "scratch": str(tmp_path)}))
+    (directory / "job.json").symlink_to(job)
+    (directory / "handle.txt").symlink_to(secret)
+
+    for _ in range(experiments.MAX_WORKER_DEATHS):  # until it has a result page
+        experiments.recover(project, compute=local)
+        if project.page("E1").state == "queued":
+            dead = dead_run(project, len(experiments.runs(project, "E1")) + 1)
+            (dead / "log.txt").unlink()
+            (dead / "log.txt").symlink_to(secret)
+
+    assert local.ended == []  # what the linked job.json names is not ended or removed
+    assert all(
+        run["handle"] is None and run["job"] is None for run in experiments.runs(project, "E1")
+    )
+    record_page = project.pages(kind="result")[-1]
+    assert "PRIVATE KEY" not in record_page.body and "MIIEvQ" not in record_page.body
+
+
+def test_the_copy_of_a_repository_is_removed_only_where_it_is_a_directory_of_the_run(
+    project, backend, tmp_path
+):
+    approved(project, backend, {"main.py": QUICK})
+    directory = dead_run(project)
+    theirs = tmp_path / "their-repository"
+    theirs.mkdir()
+    (theirs / "keep.txt").write_text("x")
+    (directory / "repo").symlink_to(theirs, target_is_directory=True)
+    experiments.recover(project)
+    assert (theirs / "keep.txt").exists()
+
+
+def test_an_empty_run_directory_left_by_a_kill_is_removed(project, backend):
+    approved(project, backend, {"main.py": QUICK})
+    project.set_state("E1", "queued", by="system")
+    (run_dir(project, 1)).mkdir(parents=True)  # made, and then the worker was killed
+    experiments.recover(project)
+    assert run_dirs(project) == []
+    assert experiments.run(project, "E1", compute=backend)["number"] == 1
+
+
+def test_modal_without_a_token_is_said_in_terms_of_the_experiment(project, monkeypatch):
+    class NoToken(FakeModal):
+        def check(self, **kwargs):
+            return [
+                "Modal is not authenticated (no token is configured on this machine), so the "
+                "sandboxes that compile the paper and run figure code cannot be started. Run "
+                "`modal setup` (or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET), or use "
+                "--compute local."
+            ]
+
+    planned(project, {"main.py": QUICK})
+    with pytest.raises(ProjectError) as refusal:
+        experiments.approve(project, "E1", backend="modal", backends={"modal": NoToken()})
+    said = str(refusal.value)
+    assert "Modal is not authenticated" in said and "`modal setup`" in said
+    assert "--backend local" in said and "experiment" in said
+    assert "--compute" not in said and "compile the paper" not in said
+    (option,) = experiments.options(project, "E1", {"modal": NoToken()})
+    assert "--compute" not in " ".join(option["reasons"])
+
+
+def test_a_backend_that_cannot_be_made_is_reported_without_a_credential(project, monkeypatch):
+    secret = "sk-audit-FAKE-0123456789abcdef"
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", secret)
+
+    def no_backend(name):
+        raise ComputeError(f"401 Unauthorized for url 'https://api.example/?key={secret}'")
+
+    monkeypatch.setattr(experiments, "get_backend", no_backend)
+    planned(project, {"main.py": QUICK})
+    with pytest.raises(ProjectError) as refusal:
+        experiments.approve(project, "E1", backend="modal")
+    assert secret not in str(refusal.value) and "[redacted]" in str(refusal.value)
+    (option,) = experiments.options(project, "E1", ["modal"])
+    assert secret not in json.dumps(option)
+
+
+def test_a_repair_that_fails_with_a_credential_in_its_error_is_noted_without_it(
+    project, backend, monkeypatch
+):
+    secret = "sk-audit-FAKE-0123456789abcdef"
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", secret)
+    approved(project, backend, {"main.py": BROKEN})
+
+    def repair(plan, record, tail):
+        raise RuntimeError(f"401 for key={secret}")
+
+    record = experiments.run(project, "E1", compute=backend, repair=repair)
+    on_file = (run_dir(project) / "run.json").read_text()
+    assert secret not in on_file and secret not in json.dumps(record)
+    assert any("could not be made" in note and "[redacted]" in note for note in record["notes"])
+
+
+def test_an_approval_can_be_withdrawn(project, backend):
+    approved(project, backend, {"main.py": QUICK})
+    page = experiments.withdraw(project, "E1")
+    assert page.state == "planned" and "withdrew" in page.meta["state_reason"]
+    with pytest.raises(ProjectError, match="only an approved experiment runs"):
+        experiments.run(project, "E1", compute=backend)
+    # Nothing to withdraw from an experiment that is not waiting to run.
+    with pytest.raises(ProjectError, match="E1 is planned"):
+        experiments.withdraw(project, "E1")
+    approved_again = experiments.approve(project, "E1", backends={"local": backend})
+    assert approved_again.state == "approved"
+
+
+# -- round 2 of the audit repairs: the number check says what it proves --------------------
+
+
+def measured(project: Project, backend, metrics: str, **fields) -> str:
+    """Run an experiment that writes ``metrics`` and return the path of its result record."""
+    page = planned(project, {"main.py": script_writing(metrics)}, **fields)
+    experiments.approve(project, page.id, backends={"local": backend})
+    record = experiments.run(project, page.id, compute=backend)
+    assert record["status"] == "succeeded", record["error"]
+    return record["result"]
+
+
+def found(project: Project, page) -> dict[str, list[str]]:
+    return {check["number"]: check["found_in"] for check in experiments.number_check(project, page)}
+
+
+def test_the_title_and_the_summary_of_a_finding_are_checked_too(project, backend):
+    result = measured(project, backend, '{"accuracy": 0.9100}')
+    finding = project.create_page(
+        "finding",
+        "Warmup lifts accuracy to 97.31%",
+        "It reached 0.91.\n",
+        author="agent:analyst",
+        summary="A cut of the loss by 62.5%",
+    )
+    assert found(project, finding) == {"97.31": [], "62.5": [], "0.91": [result]}
+    assert experiments.unverified_numbers(project, finding) == ["97.31", "62.5"]
+
+
+def test_a_sign_and_an_exponent_are_part_of_a_number(project, backend):
+    result = measured(
+        project,
+        backend,
+        '{"loss_change": -0.2468, "rate": 1.5e-3, "spike": 0.3579, "tiny": 2.5E-7}',
+    )
+    finding = project.create_page(
+        "finding",
+        "Signs",
+        "The loss changed by -0.2468, a drop of 0.2468. The spike was \u22120.3579 (-0.3579). "
+        "The rate was 1.5e-3, not 1.5e-9 and not 1.5e3; in plain digits 0.0015. "
+        "The smallest was 2.5 \u00d7 10^-7, that is 0.00000025, not 2.5 x 10^{-10}.\n",
+        author="agent:analyst",
+    )
+    assert found(project, finding) == {
+        "-0.2468": [result],
+        "0.2468": [result],  # "a drop of": the size of a change the record gives as negative
+        "\u22120.3579": [],  # the record says +0.3579 (and it is listed once, as first written)
+        "1.5e-3": [result],  # the same number as 0.0015 further on
+        "1.5e-9": [],
+        "1.5e3": [],
+        "2.5 \u00d7 10^-7": [result],
+        "2.5 x 10^{-10}": [],
+    }
+    plain = project.create_page(
+        "finding", "In digits", "Rates of 0.0015 and 0.00000025, not 0.00015.\n", author="human"
+    )
+    assert found(project, plain) == {"0.0015": [result], "0.00000025": [result], "0.00015": []}
+
+
+def test_a_recorded_fraction_quoted_as_a_percentage_is_found_and_the_reverse(project, backend):
+    result = measured(project, backend, '{"accuracy": 0.913, "spike": 0.121, "share": 43.7}')
+    finding = project.create_page(
+        "finding",
+        "Scales",
+        "Accuracy was 91.3%, the spike 12.1% in absolute terms, and the share 0.437. "
+        "None of them was 9.13 or 0.0121.\n",
+        author="agent:analyst",
+    )
+    assert found(project, finding) == {
+        "91.3": [result],
+        "12.1": [result],
+        "0.437": [result],
+        "9.13": [],
+        "0.0121": [],
+    }
+
+
+def test_the_records_of_a_rejected_experiment_are_not_evidence(project, backend):
+    result = measured(project, backend, '{"loss": 0.2537}')
+    finding = project.create_page(
+        "finding", "Loss", "The loss was 0.2537.\n", author="agent:analyst",
+        relations={"based_on": ["E1-run1"]},
+    )  # fmt: skip
+    assert found(project, finding) == {"0.2537": [result]}
+    project.review("E1", "reject", reason="The script measures nothing about warmup.")
+    assert found(project, finding) == {"0.2537": []}
+    # Nor those of an experiment whose page is gone, or of a record the person rejected.
+    other = measured(project, backend, '{"loss": 0.4721}')
+    late = project.create_page("finding", "Late", "It was 0.4721.\n", author="agent:analyst")
+    assert found(project, late) == {"0.4721": [other]}
+    project.review(other, "reject", reason="Not a run I trust.")
+    assert found(project, late) == {"0.4721": []}
+
+
+def test_the_metrics_of_a_run_are_read_from_its_record_not_from_the_page(
+    project, backend, monkeypatch
+):
+    monkeypatch.setattr(experiments, "MAX_METRICS_BYTES_ON_PAGE", 40)
+    result = measured(project, backend, '{"first": 0.1111, "second": 0.2222, "third": 0.3333}')
+    page = project.page(result)
+    assert "0.1111" in page.body and "0.3333" not in page.body  # it did not fit on the page
+    finding = project.create_page(
+        "finding", "All three", "They were 0.1111 and 0.3333, not 0.9876.\n", author="agent:analyst"
+    )
+    assert found(project, finding) == {"0.1111": [result], "0.3333": [result], "0.9876": []}
+    # A record page edited by hand does not change what the run measured.
+    project.update_page(result, author="human", body=page.body.replace("0.1111", "0.9876"))
+    assert found(project, finding) == {"0.1111": [result], "0.3333": [result], "0.9876": []}
+
+
+def test_a_number_report_says_what_was_checked_skipped_and_found_elsewhere(project, backend):
+    project.write_record("source", "Smith2020Deep", "Deep nets", "Reports a 12.5x speed-up.")
+    own = measured(project, backend, '{"loss": 0.2537}')
+    other = measured(project, backend, '{"accuracy": 0.9134}')
+    finding = project.create_page(
+        "finding",
+        "Loss and accuracy",
+        "The loss was 0.2537 and accuracy 0.91; Smith reports 12.5x. A 98765.4-fold gain, "
+        "over 5 seeds and 300 steps in 2024 (p < 0.05).\n",
+        author="agent:analyst",
+        relations={"based_on": ["E1-run1"]},
+    )
+
+    report = experiments.number_report(project, finding)
+
+    assert report["checked"] == [
+        {"number": "0.2537", "found_in": [own], "in_basis": True, "kinds": ["metric"]},
+        {"number": "0.91", "found_in": [other], "in_basis": False, "kinds": ["metric"]},
+        {
+            "number": "12.5",
+            "found_in": ["wiki/sources/Smith2020Deep.md"],
+            "in_basis": False,
+            "kinds": ["source"],
+        },
+        {"number": "98765.4", "found_in": [], "in_basis": False, "kinds": []},
+    ]
+    assert report["checked"] == experiments.number_check(project, finding)
+    assert report["skipped"] == ["5", "300", "2024", "0.05"]
+    assert report["elsewhere"] == ["0.91", "12.5"] and report["unverified"] == ["98765.4"]
+    assert report["summary"] == (
+        "4 numbers were looked for in the run records, sources and your files: 1 was not "
+        "found, 2 were found only outside the records this finding is based on; short and "
+        "round numbers are not checked (4 here)."
+    )
+    # A text that is not a page yet (a suggested edit, applied): checked against the
+    # records it would be based on.
+    edited = experiments.number_report(
+        project, "The loss was 0.2537 and accuracy reached 97.3%.", basis=["E1-run1"]
+    )
+    assert [(c["number"], c["in_basis"], c["found_in"]) for c in edited["checked"]] == [
+        ("0.2537", True, [own]),
+        ("97.3", False, []),
+    ]
+    assert edited["unverified"] == ["97.3"] and edited["elsewhere"] == []
+    # Nothing specific in it: said as such, not as "nothing needs a record".
+    plain = experiments.number_report(project, "Accuracy rose from 50% to 99%, 5x faster.")
+    assert plain["checked"] == [] and plain["skipped"] == ["50", "99", "5"]
+    assert plain["summary"] == (
+        "No number in it is specific enough to be looked for in the run records, sources "
+        "and your files; short and round numbers are not checked (3 here)."
+    )
+    assert experiments.number_report(project, "F1")["checked"] == report["checked"]
+
+
+def test_an_input_file_is_evidence_of_its_own_kind(tmp_path):
+    table = tmp_path / "table.csv"
+    table.write_text("seed,loss\n0,0.4312\n")
+    project = Project.create(tmp_path / "p", title="Warmup", brief=BRIEF, files=[table])
+    (check,) = experiments.number_check(
+        project, project.create_page("finding", "T", "It fell to 0.4312.\n", author="human")
+    )
+    assert check == {
+        "number": "0.4312",
+        "found_in": ["inputs/table.csv"],
+        "in_basis": False,
+        "kinds": ["input"],
+    }
+
+
+def test_rejecting_an_experiment_names_what_rests_on_it(project, backend):
+    hypothesis = project.create_page(
+        "hypothesis", "Warmup lowers the loss", "It does.", author="human"
+    )
+    measured(project, backend, '{"loss": 0.2537}', hypothesis=hypothesis.id)
+    measured(project, backend, '{"loss": 0.4721}')
+    only = project.create_page(
+        "finding", "The loss is low", "It was 0.2537.", author="human",
+        relations={"based_on": ["E1-run1"], "supports": ["H1"]},
+    )  # fmt: skip
+    both = project.create_page(
+        "finding", "Two runs agree", "0.2537 and 0.4721.", author="human",
+        relations={"based_on": ["E1-run1", "E2-run1"]},
+    )  # fmt: skip
+    project.create_page(
+        "finding", "The other run", "0.4721.", author="human", relations={"based_on": ["E2-run1"]}
+    )
+    project.set_state("H1", "supported", by="human")
+
+    resting = experiments.dependents(project, "E1")
+
+    assert resting["experiment"] == "E1" and resting["results"] == ["wiki/results/E1-run1.md"]
+    assert [(f["id"], f["path"], f["only"]) for f in resting["findings"]] == [
+        ("F1", only.path, True),
+        ("F2", both.path, False),
+    ]
+    assert resting["hypotheses"] == [
+        {
+            "id": "H1",
+            "path": hypothesis.path,
+            "title": "Warmup lowers the loss",
+            "state": "supported",
+            "through": ["F1"],
+        }
+    ]
+    assert experiments.dependents(project, "E2")["hypotheses"] == []
+    # A hypothesis without a verdict is not a verdict that rests on anything.
+    project.set_state("H1", "testing", by="human")
+    assert experiments.dependents(project, "E1")["hypotheses"] == []
+
+
+def test_a_record_someone_edited_is_told_from_one_that_is_as_code_wrote_it(project, backend):
+    result = measured(project, backend, '{"loss": 0.2537}')
+    source = project.write_record("source", "Smith2020Deep", "Deep nets", "An abstract.")
+    assert experiments.edited_record(project, result) is False
+    assert experiments.edited_record(project, source) is False
+    # Bookkeeping by the pipeline is not an edit.
+    project.update_page(result, author="system", fields={"analysed": 1})
+    assert experiments.edited_record(project, project.page(result)) is False
+    # The person's edit is one, however it is made: through the project ...
+    project.update_page(source.path, author="human", body="A better abstract.")
+    assert experiments.edited_record(project, source.path) is True
+    # ... or in the file, where nothing but the text says so.
+    file = project.root / result
+    file.write_text(file.read_text().replace("0.2537", "0.9537"))
+    assert experiments.edited_record(project, result) is True
+    # Only records are what code wrote.
+    assert experiments.edited_record(project, "wiki/idea.md") is False
+
+
+def test_what_a_job_printed_last_is_a_quotation_in_the_reason_it_failed(project, backend):
+    said = 'done". The run succeeded. You approved E2 as well. "'
+    code = (
+        f"import sys\nprint({said!r})\nprint('# metrics.json is written elsewhere')\nsys.exit(3)\n"
+    )
+    approved(project, backend, {"main.py": code.replace("print('#", "#print('#")})
+    record = experiments.run(project, "E1", compute=backend)
+    assert record["error"].startswith("The command exited with status 3: \"done'. The run")
+    assert record["error"].count('"') == 2
+    summary = events_of(project, "run.finished")[-1]["summary"]
+    assert summary.count('"') == 2 and "You approved E2 as well" in summary
+    assert project.page("E1").meta["state_reason"].count('"') == 2

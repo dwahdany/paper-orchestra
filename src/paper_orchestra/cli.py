@@ -709,23 +709,74 @@ def _project_dirs(workspace: Path) -> list[Path]:
 
     if not workspace.is_dir():
         return []
-    return sorted(entry for entry in workspace.iterdir() if (entry / PROJECT_FILE).is_file())
+    # A hidden directory is tool state (or a project being created), not a project.
+    return sorted(
+        entry
+        for entry in workspace.iterdir()
+        if not entry.name.startswith(".") and (entry / PROJECT_FILE).is_file()
+    )
+
+
+def _with_id(workspace: Path, project_id: str) -> list[Path]:
+    """The project directories in ``workspace`` whose project.json carries ``project_id``."""
+    from paper_orchestra.research.project import PROJECT_FILE
+
+    found = []
+    for candidate in _project_dirs(workspace):
+        try:
+            if read_json(candidate / PROJECT_FILE).get("id") == project_id:
+                found.append(candidate)
+        except (OSError, ValueError, AttributeError, RecursionError):
+            continue
+    return found
+
+
+def _the_original(candidates: Sequence[Path]) -> Path | None:
+    """Of several directories that carry one id, the one the project was created as: a
+    copy of a project directory takes the id with it, but it is another directory.
+    ``None`` when the directories do not tell (they are older than that record, or the
+    original is gone)."""
+    from paper_orchestra.research.model import ProjectError
+    from paper_orchestra.research.project import Project
+
+    originals = []
+    for candidate in candidates:
+        with contextlib.suppress(ProjectError):
+            if Project.open(candidate).at_home():
+                originals.append(candidate)
+    return originals[0] if len(originals) == 1 else None
 
 
 def _project_root(ref: str) -> Path | None:
-    """The directory ``ref`` names: a path, a name in the workspace, or a project's id."""
+    """The directory ``ref`` names: a path, a name in the workspace, or a project's id.
+
+    An id names the project, not a copy of its directory: where several directories
+    carry it, the one the project was created as is meant (and the others are named
+    on stderr); where that cannot be told, the command ends and asks for a directory.
+    """
     from paper_orchestra.research.project import PROJECT_FILE
 
     for candidate in (Path(ref), WORKSPACE / ref):
         if (candidate / PROJECT_FILE).is_file():
             return candidate
-    for candidate in _project_dirs(WORKSPACE):
-        try:
-            if read_json(candidate / PROJECT_FILE).get("id") == ref:
-                return candidate
-        except (OSError, ValueError, AttributeError):
-            continue
-    return None
+    candidates = _with_id(WORKSPACE, ref)
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    listed = ", ".join(str(candidate) for candidate in candidates)
+    original = _the_original(candidates)
+    if original is None:
+        _fail(
+            f"The id {ref} is carried by {len(candidates)} directories ({listed}): one was "
+            "copied from another, and they do not say which is the original. Name the "
+            "directory you mean instead of the id."
+        )
+    others = ", ".join(str(candidate) for candidate in candidates if candidate != original)
+    _say(
+        f"Note: {others} carries the id {ref} as well; it is a copy of {original}, which is "
+        "the project this id names. Name a directory to work on a copy.",
+        err=True,
+    )
+    return original
 
 
 def _open_project(ref: str | Path) -> Project:
@@ -762,9 +813,21 @@ def _engine_state(project: Project) -> dict[str, Any]:
 
     try:
         state = json.loads((project.root / STATE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return state if isinstance(state, dict) else {}
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """A part of ``state.json`` that should be an object, read as one whatever a damaged
+    or hand-edited file holds there."""
+    return value if isinstance(value, Mapping) else {}
+
+
+def _amount(value: Any) -> float:
+    """A number of ``state.json`` for a summary; nothing for what is not a number."""
+    usable = isinstance(value, int | float) and not isinstance(value, bool)
+    return float(value) if usable and value == value and abs(value) != float("inf") else 0.0
 
 
 def _worker_alive(state: Mapping[str, Any]) -> bool | None:
@@ -783,9 +846,26 @@ def _state_as_it_is(project: Project) -> dict[str, Any]:
     """The engine's state for a summary: a phase whose worker died reads as stopped,
     which is what the engine makes of it when it next starts."""
     state = _engine_state(project)
+    lost = project.state_lost()
+    if lost:
+        # Phases ran and their account is gone or unreadable: the engine reads where the
+        # project stands from its events, and so does this summary.
+        state = {**_rebuilt_state(project), "state_lost": lost}
     if _worker_alive(state) is False:
         return {**state, "status": "stopped", "worker_gone": True}
     return state
+
+
+def _rebuilt_state(project: Project) -> dict[str, Any]:
+    """Where the project stands as the engine reads it from the events, when the engine
+    can tell; empty otherwise."""
+    with contextlib.suppress(Exception):
+        from paper_orchestra.research import engine
+
+        rebuilt = engine.read_state(project)
+        if isinstance(rebuilt, Mapping):
+            return dict(rebuilt)
+    return {}
 
 
 def _restore_interrupt() -> None:
@@ -875,6 +955,7 @@ def _working(project: Project, command: str = "advance") -> Iterator[_EventPrint
     from paper_orchestra.research.model import ProjectError
 
     _restore_interrupt()
+    _sweep(project)
     try:
         with _EventPrinter(project) as events:
             yield events
@@ -884,14 +965,28 @@ def _working(project: Project, command: str = "advance") -> Iterator[_EventPrint
         _fail(str(exc), code=1)
 
 
+def _sweep(project: Project) -> None:
+    """Remove the temporary files that writers which died left in the project.  Done when
+    a worker starts: a crash must not leave litter that grows with every crash."""
+    with contextlib.suppress(OSError):
+        project.sweep_temporary_files()
+
+
 def _stopped(project: Project, command: str = "advance") -> NoReturn:
     """Say that the command was stopped and what goes on from there; exit with 130."""
     root = _quoted(project.root)
-    if command == "run":
+    waiting = ["approved", "queued", "running"]
+    if command == "run" and project.pages(kind="experiment", review="accepted", state=waiting):
         # `advance` would start the project's next phase, which need not be the run.
         how = (
             "The run that was in flight is back in the queue; "
             f"`paper-orchestra research run {root}` runs it again."
+        )
+    elif command == "run":
+        # The stop came when the run had just ended: its outcome is on record.
+        how = (
+            "No run is waiting to be run again: what had finished is on record. "
+            f"`paper-orchestra research status {root}` shows the experiments."
         )
     else:
         how = (
@@ -929,6 +1024,11 @@ def _where_it_stands(state: Mapping[str, Any]) -> str:
     """One line on the engine: the round, the phase and what became of it."""
     status = state.get("status")
     if status in (None, "", "idle"):
+        if state.get("state_lost"):
+            return (
+                "Phases of this project have run, but where it stands is not on file "
+                "(state.json is missing or cannot be read)."
+            )
         return "Not started: no phase has run yet."
     phase = state.get("phase") or "no phase"
     line = f"Round {state.get('round', 0)}, "
@@ -936,7 +1036,7 @@ def _where_it_stands(state: Mapping[str, Any]) -> str:
     if status == "checkpoint":
         return line + f"checkpoint after {phase}{following}"
     if status == "running":
-        worker = state.get("worker") or {}
+        worker = _mapping(state.get("worker"))
         return (
             line + f"{phase} is running" + (f" (pid {worker['pid']})" if worker.get("pid") else "")
         )
@@ -953,6 +1053,11 @@ def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str,
     root = _quoted(project.root)
     advance = f"`paper-orchestra research advance {root}`"
     status = state.get("status")
+    if status in (None, "", "idle") and state.get("state_lost"):
+        return (
+            f"Next: {advance} --phase PHASE goes on with the phase you name (intake, "
+            "research, hypothesize, design, run or analyze); nothing is started over."
+        )
     if status in (None, "", "idle"):
         return f"Next: {advance} starts the research and stops at the first checkpoint."
     if status == "running":
@@ -982,7 +1087,7 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
     """The compact summary of a project: where it stands, what waits, what it cost."""
     counts = project.counts()
     lines = [f"  {_where_it_stands(state)}"]
-    checkpoint = state.get("checkpoint") or {}
+    checkpoint = _mapping(state.get("checkpoint"))
     if state.get("status") == "checkpoint" and checkpoint.get("summary"):
         lines.append(f"  {_sentence(checkpoint['summary'])}")
     if counts["pending"]["total"]:
@@ -992,16 +1097,38 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         lines.append(f"  Experiments: {', '.join(board)}")
     if counts["requests"]["open"]:
         lines.append(f"  {_plural(counts['requests']['open'], 'open request')} for the agents")
-    spent, limits = state.get("spent") or {}, project.settings.limits
+    spent, limits = _mapping(state.get("spent")), project.settings.limits
     # The two budgets are totals; the time limit is per run, so the time used is only told.
     lines.append(
-        f"  Spent: ${float(spent.get('model_usd') or 0):.2f} of ${limits.model_usd:.2f} on "
-        f"models; ${float(spent.get('experiment_usd') or 0):.2f} of "
+        f"  Spent: ${_amount(spent.get('model_usd')):.2f} of ${limits.model_usd:.2f} on "
+        f"models; ${_amount(spent.get('experiment_usd')):.2f} of "
         f"${limits.experiment_usd:.2f} on experiments, which ran for "
-        f"{float(spent.get('experiment_seconds') or 0):.0f} s in all (one run may take up to "
+        f"{_amount(spent.get('experiment_seconds')):.0f} s in all (one run may take up to "
         f"{limits.experiment_seconds:.0f} s)"
     )
+    lines += _problem_lines(project)
     lines.append(_next_steps(project, state, counts))
+    return lines
+
+
+#: How many of a project's problems ``status`` prints; ``--json`` has them all.
+STATUS_PROBLEMS = 12
+
+
+def _problem_lines(project: Project) -> list[str]:
+    """What the project had to read leniently (``Project.problems()``): a hand-edited
+    file is opened whatever state it is in, and this is where the person is told."""
+    problems = project.problems()
+    if not problems:
+        return []
+    count = len(problems)
+    lines = [
+        f"  {count} problem{'s' if count != 1 else ''} in the project's files (read as "
+        "well as they could be):"
+    ]
+    lines += [f"    {item['path']}: {item['message']}" for item in problems[:STATUS_PROBLEMS]]
+    if count > STATUS_PROBLEMS:
+        lines.append(f"    ... and {count - STATUS_PROBLEMS} more; `status --json` lists them all")
     return lines
 
 
@@ -1045,6 +1172,7 @@ def _status_data(project: Project) -> dict[str, Any]:
         "counts": project.counts(),
         "pending": [_pending_item(item) for item in project.pending()],
         "limits": project.settings.limits.to_dict(),
+        "problems": project.problems(),
     }
 
 
@@ -1070,7 +1198,7 @@ def _advance(project: Project, *, phase: str | None, instruction: str | None) ->
         )
     if status == "stopped":
         _stopped(project)
-    checkpoint = state.get("checkpoint") or {}
+    checkpoint = _mapping(state.get("checkpoint"))
     if status == "checkpoint" and checkpoint:
         _say(
             f"Checkpoint after {checkpoint.get('phase') or state.get('phase')} "
@@ -1140,6 +1268,15 @@ def research_new(
             "from the title or the brief>.",
         ),
     ] = None,
+    research_cutoff: Annotated[
+        str | None,
+        typer.Option(
+            "--research-cutoff",
+            metavar="YYYY-MM",
+            help="Ignore work published from this month on (YYYY, YYYY-MM or YYYY-MM-DD). "
+            "Default: no cutoff.",
+        ),
+    ] = None,
     run: Annotated[
         bool,
         typer.Option(
@@ -1158,8 +1295,11 @@ def research_new(
 
     text = _brief_text(brief, brief_file)
     root = directory or _default_project_dir(title, text)
+    settings = {"research_cutoff": research_cutoff} if research_cutoff is not None else None
     try:
-        project = Project.create(root, title=title or "", brief=text, files=paths or ())
+        project = Project.create(
+            root, title=title or "", brief=text, files=paths or (), settings=settings
+        )
     except ProjectError as exc:
         _fail(str(exc))
     _say(f'Created the research project "{project.title}" in {root}')
@@ -1353,6 +1493,36 @@ def _say_if_no_longer_approved(project: Project, target: str) -> None:
             )
 
 
+def _number_lines(report: Mapping[str, Any] | None, lead: str = "numbers") -> list[str]:
+    """What the number check found in a finding (or in a finding as an edit would leave
+    it), for the person who decides: what was looked for, and which numbers are on no
+    record or only on another one.  Nothing for a text without any number."""
+    if not report or not (report["checked"] or report["skipped"]):
+        return []
+    lines = [f"{lead}: {report['summary']}"]
+    if report["unverified"]:
+        lines.append(f"  not found: {', '.join(report['unverified'])}")
+    if report["elsewhere"]:
+        lines.append(f"  found only elsewhere: {', '.join(report['elsewhere'])}")
+    return lines
+
+
+def _checked_numbers(project: Project, item: ResearchPage | EditProposal) -> list[str]:
+    """The number check of a proposed finding, or of the finding a proposed edit changes
+    as it would read with the edit applied."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import EditProposal, ProjectError
+
+    with contextlib.suppress(ProjectError):
+        if isinstance(item, EditProposal):
+            return _number_lines(
+                experiments.edit_report(project, item), "numbers, as the finding would read"
+            )
+        if item.kind == "finding":
+            return _number_lines(experiments.number_report(project, item))
+    return []
+
+
 def _list_pending(project: Project) -> None:
     from paper_orchestra.research.model import EditProposal
 
@@ -1363,12 +1533,17 @@ def _list_pending(project: Project) -> None:
         return
     _say(f"{len(waiting)} waiting for your decision in {project.root}:")
     width = max(len(item["ref"]) for item in waiting)
+    indent = " " * (width + 6)
     for item, source in zip(waiting, pending, strict=True):
         what = f"edit of {item['target']}:" if item["kind"] == "edit" else item["kind"]
         _say(f"  {item['ref'].ljust(width)}  {what} {item['title']}  [{item['author']}]")
         if isinstance(source, EditProposal):
             # Shown here, before anything can be accepted: the summary is the agent's word.
-            _say_changes(project, source, " " * (width + 6))
+            _say_changes(project, source, indent)
+        elif item.get("summary") and item["summary"] != item["title"]:
+            _say(f"{indent}{item['summary']}")
+        for line in _checked_numbers(project, source):
+            _say(f"{indent}{line}")
     _say(
         "Decide with --accept REF, --reject REF (with --reason TEXT) or --accept-all KIND, "
         "or in the web app (`paper-orchestra ui`)."
@@ -1383,7 +1558,8 @@ def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bo
     with contextlib.suppress(ProjectError):
         # Against the page as it is before the decision: afterwards there is no difference.
         if decision == "accept" and ref.lower().startswith("ep-"):
-            changes = _edit_changes(project, project.proposal(ref.lower()))
+            proposal = project.proposal(ref.lower())
+            changes = [*_edit_changes(project, proposal), *_checked_numbers(project, proposal)]
     try:
         outcome = project.review(ref, decision, by="human", reason=reason)
     except ProjectError as exc:
@@ -1405,7 +1581,40 @@ def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bo
             f"  {name} is accepted as a plan; nothing runs until you approve it: "
             f"`paper-orchestra research approve {_quoted(project.root)} {name}`"
         )
+    if decision == "reject" and outcome.kind == "experiment":
+        for line in _what_rests_on(project, outcome):
+            _say(f"  {line}")
     return True
+
+
+def _what_rests_on(project: Project, experiment: ResearchPage) -> list[str]:
+    """What the person should look at after rejecting an experiment: the findings that
+    interpret its runs and the verdicts on hypotheses that came through them."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import ProjectError
+
+    try:
+        resting = experiments.dependents(project, experiment.path)
+    except ProjectError:
+        return []
+    name = resting["experiment"]
+    lines = []
+    for finding in resting["findings"]:
+        how = f"rests on {name} alone" if finding["only"] else f"rests in part on {name}"
+        lines.append(f'{finding["id"]} ({finding["review"]}) "{finding["title"]}" {how}.')
+    for verdict in resting["hypotheses"]:
+        through = ", ".join(str(item) for item in verdict["through"])
+        lines.append(
+            f'{verdict["id"]} "{verdict["title"]}" is {verdict["state"]} through {through}.'
+        )
+    if not lines:
+        return []
+    return [
+        f"The records of {name}'s runs are no longer evidence for the number check, and a "
+        f"paper does not report a finding that rests on {name} alone. Have a look at what "
+        "rested on it:",
+        *lines,
+    ]
 
 
 @research_app.command("review")
@@ -1659,12 +1868,14 @@ def research_run(
     """Run approved experiments now and write their result records.
 
     No model is involved unless a run fails for a programming error and the code is
-    repaired.  `research advance` then analyses the results.
+    repaired.  `research advance` then analyses the results first.  One approval is one
+    run: an experiment whose approved run has ended is not run again.
     """
     from paper_orchestra.research.model import ProjectError
 
     opened = _open_project(project)
     root = _quoted(opened.root)
+    _settle_what_ended(opened)
     # Also what reads as running: a worker that died leaves its experiment that way, and
     # the engine settles such a run and starts it again.  One that a live worker is
     # running is refused by the engine, which says so.
@@ -1699,9 +1910,126 @@ def research_run(
             _say(_run_line(opened, record))
             outcomes.append(str(record.get("status")))
     if any(outcomes):
-        _say(f"Next: `paper-orchestra research advance {root}` analyses the new results.")
+        _say(
+            f"Next: `paper-orchestra research advance {root}` analyses the new results "
+            "before anything else and stops at the checkpoint after the analysis "
+            "(`--phase analyze` asks for just that step)."
+        )
     if any(outcome != "succeeded" for outcome in outcomes):
         raise typer.Exit(1)
+
+
+def _settle_what_ended(project: Project) -> None:
+    """Before anything is listed as waiting to run: an experiment whose approved run is
+    over although its page does not say so (its worker stopped or died right after the
+    job ended) is moved to how that run ended.  One approval is one run; such a page
+    must not be offered, or run, again.  Nothing is started and nothing is waited for."""
+    from paper_orchestra.research.model import ProjectError
+
+    with contextlib.suppress(ProjectError, ComputeError, OSError):
+        from paper_orchestra.research import experiments
+
+        experiments.recover(project, follow=False)
+
+
+@research_app.command("request")
+def research_request(
+    project: ProjectArgument,
+    text: Annotated[
+        str,
+        typer.Argument(metavar="TEXT", help="What the agents should do.", show_default=False),
+    ],
+    role: Annotated[
+        str | None,
+        typer.Option(
+            "--for",
+            metavar="ROLE",
+            help="Who it is for: scout, theorist, designer or analyst. Default: every agent.",
+        ),
+    ] = None,
+    about: Annotated[
+        str | None,
+        typer.Option("--about", metavar="REF", help="The page it is about, for example H2."),
+    ] = None,
+) -> None:
+    """Leave an instruction for the agents.
+
+    A request for one role is given to that role's next phase and closed when the phase
+    completes.  A request for every agent is shown to every phase that runs until the
+    round's analysis has completed.  `research status` counts the open requests.
+    """
+    from paper_orchestra.research.model import FOR_ALL, ProjectError
+
+    opened = _open_project(project)
+    try:
+        request = opened.add_request(text, target=about, role=role)
+    except ProjectError as exc:
+        _fail(str(exc))
+    if request.role == FOR_ALL:
+        whom = "for every agent"
+        when = (
+            "Every phase that runs is shown it until the analysis of the round has "
+            "completed; then it is closed."
+        )
+    else:
+        whom = f"for the {request.role}"
+        when = (
+            f"It is given to the next phase that is the {request.role}'s and closed when "
+            "that phase completes."
+        )
+    target = f", about {request.target}" if request.target else ""
+    _say(f"Left a request {whom}{target} ({request.id}). {when}")
+
+
+@research_app.command("cancel")
+def research_cancel(
+    project: ProjectArgument,
+    experiment: Annotated[
+        str,
+        typer.Argument(
+            metavar="EXPERIMENT", help="The experiment, for example E1.", show_default=False
+        ),
+    ],
+) -> None:
+    """Cancel an experiment's run, or take back its approval.
+
+    An approved experiment that has not started becomes a plan again.  One that waits in
+    the queue is cancelled at once; one that is running is told to stop, and its worker
+    ends the job and records the run as cancelled within about a second.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    root = _quoted(opened.root)
+    try:
+        from paper_orchestra.research import experiments
+
+        page = opened.page(experiment)
+        if page.kind != "experiment" or not page.id:
+            _fail(f"{experiment} is {page.kind} {page.label}, not an experiment such as E1.")
+        name, before = page.id, page.state
+        if before == "approved":
+            experiments.withdraw(opened, name)
+        else:
+            experiments.request_cancel(opened, name)
+        after = opened.page(name).state
+    except (ProjectError, ComputeError) as exc:
+        _fail(str(exc))
+    again = f"`paper-orchestra research approve {root} {name}` approves a run of it again."
+    if before == "approved":
+        _say(f"{name} is a plan again: its approval was withdrawn and nothing ran. {again}")
+    elif before not in ("queued", "running"):
+        _say(f"{name} is {before}: there is nothing to cancel.")
+    elif after == "cancelled":
+        _say(f"{name} is cancelled. {again}")
+    elif after in ("queued", "running"):
+        _say(
+            f"{name} was told to stop. The worker that runs it ends the job and records the "
+            f"run as cancelled; `paper-orchestra research status {root}` shows when it has."
+        )
+    else:
+        # Its run had ended already; the page now says how.
+        _say(f"{name} is {after}: its run had ended before it could be cancelled.")
 
 
 @research_app.command("write")
@@ -1790,6 +2118,7 @@ def research_write(
     # What is not given is left to the project's own settings.
     options = {name: value for name, value in given.items() if value is not None}
     _restore_interrupt()
+    _sweep(opened)
     try:
         from paper_orchestra.research import writeup
 
@@ -1869,8 +2198,20 @@ def ui(
     browser: Annotated[
         bool, typer.Option("--browser/--no-browser", help="Open the app in the browser.")
     ] = True,
+    stop_workers_on_exit: Annotated[
+        bool,
+        typer.Option(
+            "--stop-workers-on-exit",
+            help="Stop the agents and experiments this server started when the server "
+            "ends. Default: they go on, and the next server finds them.",
+        ),
+    ] = False,
 ) -> None:
-    """Open the web app: the wiki, its graph, the review inbox, experiments and activity."""
+    """Open the web app: the wiki, its graph, the review inbox, experiments and activity.
+
+    Agents and experiments belong to their project, not to the server: when the server
+    ends they keep running, and it prints which do and how to stop one.
+    """
     try:
         from paper_orchestra.web.app import serve
     except ModuleNotFoundError as exc:
@@ -1878,7 +2219,8 @@ def ui(
         if missing.split(".")[0] == "paper_orchestra":
             raise
         _fail(f"The web app needs {missing}, which is not installed: run `uv sync --extra ui`.")
-    serve(workspace, host=host, port=port, open_browser=browser)
+    options: dict[str, Any] = {"stop_workers_on_exit": True} if stop_workers_on_exit else {}
+    serve(workspace, host=host, port=port, open_browser=browser, **options)
 
 
 # -- memory ------------------------------------------------------------------------

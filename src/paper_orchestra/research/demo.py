@@ -1614,7 +1614,8 @@ def _hypothesize(story: _Story) -> None:
     )  # fmt: skip
     story.wait(seconds=70)
     project.add_request(
-        "Keep the first experiments small enough to run on my laptop in under a minute."
+        "Keep the first experiments small enough to run on my laptop in under a minute.",
+        role="designer",
     )
 
 
@@ -1772,15 +1773,15 @@ def _analyze(story: _Story, experiments: Any, metrics: Mapping[str, Any]) -> Non
             relations={"based_on": ["E1-run1"], "refutes": ["H3"]},
         )  # fmt: skip
         # The check the engine makes after the analyst's session, with what it finds.
-        unsupported = experiments.unverified_numbers(project, second)
-        if unsupported:
-            project.update_page(second.path, author="system", fields={"unverified": unsupported})
-            numbers = ", ".join(unsupported)
-            notes.append(f"F2 states a number that no record supports: {numbers}.")
+        # Nothing is stored on the page: the check is made again wherever it is shown.
+        report = experiments.number_report(project, second)
+        if report["unverified"]:
+            numbers = ", ".join(report["unverified"])
+            notes.append(f"F2: {report['summary']} Not found: {numbers}.")
             story.say(
                 "analyst",
-                f"F2 quotes {numbers}, which is in no result record, source or input; "
-                "it is marked on the page.",
+                f"F2 quotes {numbers}, which is in no run record, source or input file; "
+                "the page and the checkpoint say so.",
                 after=30,
             )
         story.say("analyst", "E2 failed twice: the second failure is in the plan, not the code.")
@@ -1852,11 +1853,14 @@ def _review_analysis(story: _Story) -> None:
     story.wait(seconds=30)
     project.set_state("Q1", "answered", by="human", reason="F1: no spike at batch size 256.")
     story.wait(minutes=1)
-    project.add_request("Sweep the warmup length instead of fixing it at 100 steps.", target="H2")
+    project.add_request(
+        "Sweep the warmup length instead of fixing it at 100 steps.", target="H2", role="designer"
+    )
     story.wait(seconds=50)
     project.add_request(
         "Before I rely on this, try it on something closer to a real model than the toy.",
         target="H1",
+        role="designer",
     )
 
 
@@ -1886,7 +1890,7 @@ def _second_round(story: _Story, experiments: Any, pages: int | None) -> None:
     story.checkpoint("design", "Round 2, hypotheses: 1 proposed.")
 
     story.wait(minutes=2)
-    handled = project.requests()
+    handled = [request for request in project.requests() if request.role == "designer"]
     with story.phase(
         "design",
         round=2,
@@ -1932,10 +1936,13 @@ def _second_round(story: _Story, experiments: Any, pages: int | None) -> None:
     story.wait(seconds=25)
     experiments.approve(project, "E4", backend="local")
     story.wait(seconds=70)
+    # One for every agent, one for the role it concerns: both wait for the next phases.
     project.add_request("Also look at schedule-free optimisers.")
     story.wait(seconds=45)
     project.add_request(
-        "Can E3 finish on a T4 in under 20 minutes? If not, shrink the model first.", target="E3"
+        "Can E3 finish on a T4 in under 20 minutes? If not, shrink the model first.",
+        target="E3",
+        role="designer",
     )
 
 

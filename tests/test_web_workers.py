@@ -1991,10 +1991,70 @@ def test_a_run_that_may_still_have_its_remote_job_is_left_for_the_next_worker(pr
     assert Project.open(project.root).page(eid).state == "running"
 
 
-# Settling a run also cleans up after its job: recovery ends the process session the run's
-# record names and removes its working directory.  That record lies in the project
-# directory like every other file, and the server settles at a mere look.  So the server
-# settles only where nothing the record names is still there to be ended.
+def test_a_local_run_is_settled_in_a_project_that_also_has_a_remote_job(project):
+    """The server settles what needs no waiting (``recover(..., follow=False)``): a run
+    with a remote job no longer keeps the dead local runs of its project unsettled."""
+    from paper_orchestra.research import experiments
+
+    remote, remote_dir = run_left_by_a_dead_worker(project, backend="modal")
+    local, local_dir = run_left_by_a_dead_worker(project)
+    before = (remote_dir / "run.json").read_text()
+    [record] = workers_module.settle_stale_runs(project.root)
+    assert record["experiment"] == local and record["status"] == "failed"
+    assert json.loads((local_dir / "run.json").read_text())["status"] == "failed"
+    assert experiments.runs(project, local)[0]["status"] == "failed"
+    assert Project.open(project.root).page(local).state == "queued"
+    # The remote job may be alive: following it is a worker's part.
+    assert (remote_dir / "run.json").read_text() == before
+    assert Project.open(project.root).page(remote).state == "running"
+    assert workers_module.settle_stale_runs(project.root) == []
+
+
+def test_the_lock_of_any_file_is_looked_at_without_taking_it_from_its_holder(tmp_path):
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / ".run.lock"
+    assert workers_module.lock_held(path) is False  # no file: nobody ever held it
+    with path.open("w") as holder:
+        assert workers_module.lock_held(path) is False
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        assert workers_module.lock_held(path) is True
+        assert workers_module.lock_held(path) is True  # looking did not disturb the holder
+    assert workers_module.lock_held(path) is False
+    (tmp_path / "a-directory").mkdir()
+    assert workers_module.lock_held(tmp_path / "a-directory") is None
+    path.unlink()
+    path.symlink_to(tmp_path / "elsewhere")
+    assert workers_module.lock_held(path) is None  # a link is not the lock file
+
+
+# Settling a run also cleans up after its job: the local backend ends what the job
+# provably left behind (processes that carry the mark of a working directory the backend
+# made) and removes that directory.  A run's record lies in the project directory like
+# every other file, so nothing is ended because a record names it; and the server, which
+# settles at a mere look, settles only where the backend would end no process at all
+# (it asks the backend: ``LocalBackend.job_processes``).
+
+
+@pytest.fixture
+def backend_scratch():
+    """Makes working directories where the local backend makes its own (directly in the
+    system's temporary directory, with its prefix), and removes them afterwards."""
+    import shutil
+    import tempfile
+
+    from paper_orchestra.compute import local
+
+    made: list[Path] = []
+
+    def make(name: str) -> Path:
+        scratch = Path(tempfile.mkdtemp(prefix=f"{local.SCRATCH_PREFIX}{name}-"))
+        made.append(scratch)
+        return scratch
+
+    yield make
+    for scratch in made:
+        shutil.rmtree(scratch, ignore_errors=True)
+
 
 on_linux = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="what a job left running is found through /proc"
@@ -2041,16 +2101,19 @@ def test_a_run_record_that_names_somebody_elses_session_ends_nothing_at_a_look(
     assert workers.status(project.root)["state"] == "idle"
     assert workers.settled(project.root, timeout=60)
     assert victim.poll() is None and process_exists(victim.child)
-    # Nothing was settled either: the run is left for a worker, which the person starts.
-    assert (directory / "run.json").read_text() == before
-    assert experiments.runs(project, eid)[0]["status"] == "running"
+    # Changed with the backend's proof (FIXES K): a session that a record merely names is
+    # nothing the backend would end, so it holds nothing up either.  The run is settled
+    # as one whose worker stopped, and the session it named is untouched.
+    assert (directory / "run.json").read_text() != before
+    [run] = experiments.runs(project, eid)
+    assert run["status"] == "failed" and "worker stopped" in run["error"]
     assert workers_module.settle_stale_runs(project.root) == []
     assert victim.poll() is None and process_exists(victim.child)
 
 
 @on_linux
 def test_a_run_record_that_names_the_working_directory_of_a_live_job_ends_nothing(
-    project, tmp_path, monkeypatch
+    project, backend_scratch, monkeypatch
 ):
     # The working directories of jobs can be listed by anybody (they are made in the
     # temporary directory).  A record that names the one of a job that is running, of
@@ -2058,7 +2121,7 @@ def test_a_run_record_that_names_the_working_directory_of_a_live_job_ends_nothin
     from paper_orchestra.compute import local
 
     monkeypatch.setattr(workers_module, "_JOB_GONE_WAIT_SECONDS", 0.3, raising=False)
-    scratch = tmp_path / f"{local.SCRATCH_PREFIX}another"
+    scratch = backend_scratch("another")
     (scratch / "work").mkdir(parents=True)
     (scratch / "work" / "checkpoint.bin").write_text("hours of work")
     job = subprocess.Popen(
@@ -2084,10 +2147,23 @@ def test_a_run_record_that_names_the_working_directory_of_a_live_job_ends_nothin
 
 
 @on_linux
-def test_what_a_dead_job_left_behind_is_still_cleaned_up_when_its_run_is_settled(project, tmp_path):
+def test_what_a_dead_job_left_behind_is_still_cleaned_up_when_its_run_is_settled(
+    project, backend_scratch, tmp_path
+):
+    # Changed with the backend's proof (FIXES K): only a working directory where the
+    # backend makes them is the backend's to remove; one that a record names anywhere
+    # else is left alone, and the run's notes say so.
     from paper_orchestra.compute import local
 
-    scratch = tmp_path / f"{local.SCRATCH_PREFIX}left"
+    elsewhere = tmp_path / f"{local.SCRATCH_PREFIX}elsewhere"
+    elsewhere.mkdir()
+    _, other = run_left_by_a_dead_worker(project)
+    name_job(other, {"session": 0, "session_started": "", "scratch": str(elsewhere)},
+             where="job.json")  # fmt: skip
+    [left] = workers_module.settle_stale_runs(project.root)
+    assert left["status"] == "failed" and elsewhere.is_dir()
+
+    scratch = backend_scratch("left")
     (scratch / "work").mkdir(parents=True)
     gone = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
     record = session_record(gone.pid, str(scratch))
@@ -2100,15 +2176,23 @@ def test_what_a_dead_job_left_behind_is_still_cleaned_up_when_its_run_is_settled
 
 
 @on_linux
-def test_a_job_that_is_just_dying_with_its_worker_is_waited_for(project, monkeypatch):
+def test_a_job_that_is_just_dying_with_its_worker_is_waited_for(
+    project, backend_scratch, monkeypatch
+):
     # The job of a worker that was killed is killed with it, a moment later.
+    from paper_orchestra.compute import local
+
     monkeypatch.setattr(workers_module, "_JOB_GONE_WAIT_SECONDS", 120.0, raising=False)
+    scratch = backend_scratch("dying")
     dying = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(1.5)"], start_new_session=True
+        [sys.executable, "-c", "import time; time.sleep(1.5)"],
+        env={**os.environ, local.JOB_ENV: str(scratch)},  # the mark every job carries
+        start_new_session=True,
     )
     try:
         _, directory = run_left_by_a_dead_worker(project)
-        name_job(directory, session_record(dying.pid), where="record")
+        name_job(directory, session_record(dying.pid, str(scratch)), where="record")
+        assert local.LocalBackend.job_processes(session_record(dying.pid, str(scratch)))
         collected = threading.Thread(target=dying.wait, daemon=True)
         collected.start()  # as the system collects a job whose worker is gone
         [settled] = workers_module.settle_stale_runs(project.root)

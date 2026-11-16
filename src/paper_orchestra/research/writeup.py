@@ -6,8 +6,13 @@ The paper pipeline writes from an idea file, an experimental log and figures.
 
 Only what the person accepted reaches a paper.  Proposed and rejected pages are
 left out entirely, an experiment is described only once it has a run that
-succeeded, and every number of a run is copied from its result record, which code
-wrote from what the run produced.
+succeeded, and every number of a run is copied from the run's own record
+(``run.json``), which code wrote from what the run produced.  A finding that
+rests only on an experiment the person rejected is left out and named; a number
+of a finding that is on no record is taken out of the text the writers are
+given.  The literature starts from the wiki as well: the accepted sources are
+the papers the paper's literature stage begins with, the rejected ones are papers
+not to cite, and the accepted topic pages are background.
 """
 
 from __future__ import annotations
@@ -32,12 +37,21 @@ if TYPE_CHECKING:
     from paper_orchestra.config import PipelineConfig
     from paper_orchestra.research.project import Project
 
-__all__ = ["export_materials", "missing", "write_paper"]
+__all__ = ["Missing", "export_materials", "left_out", "missing", "write_paper"]
 
 IDEA_FILE = "idea.md"
 LOG_FILE = "experimental_log.md"
 FIGURES_DIR = "figures"
 FIGURES_INFO = "info.json"
+#: The papers the literature stage starts from and the ones it must not cite, as the
+#: wiki has them: ``{"version": 1, "papers": [...], "excluded": [...]}``.  A paper has
+#: the fields of ``agents.literature.PaperData``; an excluded one its citation key, its
+#: title and the person's reason.
+KNOWN_PAPERS_FILE = "known_papers.json"
+#: Most text of the accepted topic pages that is appended to the idea as background,
+#: and of one of them: the idea file is read whole by every stage of the paper pipeline.
+MAX_BACKGROUND_CHARS = 30_000
+MAX_TOPIC_CHARS = 8_000
 #: Where the paper pipeline looks for its inputs inside its run directory.
 MATERIALS_DIR = "raw_materials"
 
@@ -87,6 +101,25 @@ class _Materials:
     findings: list[ResearchPage]
     figures: list[str]
     provided: list[str]
+    #: Finding id -> the numbers that were taken out of its text: they are on no record.
+    numbers_removed: dict[str, list[str]]
+    #: Citation keys of the accepted sources the literature starts from, and of the
+    #: rejected ones it must not cite.
+    sources: list[str]
+    excluded: list[str]
+
+
+class Missing(str):
+    """What a project still lacks for a paper (``results`` or ``finding``), as
+    :func:`missing` returns it: the word, with ``detail`` saying which accepted findings
+    were not counted and why (empty when none was left out)."""
+
+    detail: str = ""
+
+    def __new__(cls, what: str, detail: str = "") -> Missing:
+        made = super().__new__(cls, what)
+        made.detail = detail
+        return made
 
 
 @dataclass(frozen=True)
@@ -139,11 +172,70 @@ def _succeeded_runs(project: Project) -> list[_Run]:
     return sorted(runs, key=lambda run: (parse_id(run.experiment.id) or ("", 0), run.number))
 
 
-def _unverified(project: Project, finding: ResearchPage) -> list[str]:
-    """Numbers in a finding that no result record, source or input file supports."""
-    from paper_orchestra.research import experiments
+def _stands(project: Project, target: str) -> bool:
+    """Whether a record a finding names is one a paper may rest on: an accepted result
+    record of an experiment that is there and that the person did not reject."""
+    path = project.resolve(target)
+    record = project.page(path) if path else None
+    if record is None or record.kind != "result" or record.review != "accepted":
+        return False
+    for owner in record.relations.get("run_of", []):
+        plan_path = project.resolve(owner)
+        plan = project.page(plan_path) if plan_path else None
+        if plan is not None and plan.kind == "experiment" and plan.review != "rejected":
+            return True
+    return False
 
-    return list(experiments.unverified_numbers(project, finding))
+
+def _named(project: Project, target: str) -> str:
+    """A record a finding names, as a message calls it."""
+    path = project.resolve(target)
+    return _called(project.page(path)) if path else str(target)
+
+
+def _sorted_out(project: Project) -> tuple[list[ResearchPage], list[dict[str, Any]]]:
+    """The accepted findings a paper may report, and the ones it may not, with the reason.
+
+    A finding interprets records.  One whose records all belong to experiments that
+    were rejected or are gone rests on nothing the person stands behind, and is
+    left out; one that names no record at all (the person's own reading of what
+    they attached) is theirs to make.
+    """
+    kept: list[ResearchPage] = []
+    left: list[dict[str, Any]] = []
+    for page in project.pages(kind="finding", review="accepted"):
+        based = page.relations.get("based_on", [])
+        if not based or any(_stands(project, target) for target in based):
+            kept.append(page)
+            continue
+        names = ", ".join(_named(project, target) for target in based)
+        left.append(
+            {
+                "id": page.id,
+                "path": page.path,
+                "title": page.title,
+                "reason": f"every record it is based on ({names}) belongs to an experiment "
+                "that was rejected or is gone",
+            }
+        )
+    return kept, left
+
+
+def left_out(project: Project) -> list[dict[str, Any]]:
+    """The accepted findings a paper would not report, each with why::
+
+        [{"id": "F1", "path": "wiki/findings/F1-...md", "title": "...",
+          "reason": "every record it is based on (E1 run 1) belongs to an experiment
+                     that was rejected or is gone"}]
+
+    For saying so before a write-up starts and when an experiment is rejected.
+    """
+    return _sorted_out(project)[1]
+
+
+def _left_out_text(left: Sequence[Mapping[str, Any]]) -> str:
+    """``F1: every record ...; F3: ...``."""
+    return "; ".join(f"{item['id'] or item['path']}: {item['reason']}" for item in left)
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +334,11 @@ def _idea_text(project: Project, runs: list[_Run]) -> str:
             "Each hypothesis is given with where it stands after the experiments. A refuted "
             "or inconclusive hypothesis is a result to report as such, not a claim to make.",
         ]
+    sorted_out = _sorted_out(project) if hypotheses else ([], [])
     for page in hypotheses:
         parts += [
             f"### {page.id}: {page.title} ({page.state})",
+            _unsupported_verdict(project, page, *sorted_out),
             _plain(project, _demoted(page.body, 2)),
         ]
     plans = list({run.experiment.path: run.experiment for run in runs}.values())
@@ -260,7 +354,140 @@ def _idea_text(project: Project, runs: list[_Run]) -> str:
             *([f"Tests: {tested}."] if tested else []),
             _plain(project, _demoted(plan.body, 2)),
         ]
+    parts += _background(project)
+    parts += _sources_text(project)
     return "\n\n".join(part for part in parts if part) + "\n"
+
+
+def _unsupported_verdict(
+    project: Project,
+    hypothesis: ResearchPage,
+    kept: Sequence[ResearchPage],
+    left: Sequence[Mapping[str, Any]],
+) -> str:
+    """What to say of a hypothesis whose verdict came only through findings that a paper
+    does not report (``left``: they rest on experiments that were rejected or are gone):
+    the verdict is the person's and stays on the page, but nothing reportable carries it."""
+    if hypothesis.state not in ("supported", "refuted", "inconclusive") or not left:
+        return ""
+
+    def judges(finding: ResearchPage) -> bool:
+        targets = [*finding.relations.get("supports", []), *finding.relations.get("refutes", [])]
+        return hypothesis.path in {project.resolve(target) for target in targets}
+
+    carried = [page for page in kept if judges(page)]
+    dropped = [str(item["id"]) for item in left if judges(project.page(item["path"]))]
+    if carried or not dropped:
+        return ""
+    which = ", ".join(dropped)
+    return (
+        f"_This verdict came through {which}, which {'is' if len(dropped) == 1 else 'are'} "
+        "not reported: every record behind it belongs to an experiment that was rejected or "
+        "is gone. Treat the hypothesis as open._"
+    )
+
+
+def _background(project: Project) -> list[str]:
+    """The accepted topic pages, as background for whoever writes the paper: what the
+    research phase found and the person accepted.  Bounded, with a line for what did
+    not fit."""
+    topics = project.pages(kind="topic", review="accepted")
+    if not topics:
+        return []
+    parts = [
+        "## Background from the research wiki",
+        "Syntheses of the literature that the researcher accepted. They are background "
+        "for the paper, not results of this project.",
+    ]
+    room = MAX_BACKGROUND_CHARS
+    for page in topics:
+        text = _plain(project, _demoted(page.body, 2)).strip()
+        take = min(len(text), MAX_TOPIC_CHARS, room)
+        if take <= 0:
+            parts.append(
+                f"_{page.title}: left out for lack of room; it is in the project's wiki "
+                f"({page.path})._"
+            )
+            continue
+        room -= take
+        parts += [f"### {page.title}", text[:take]]
+        if take < len(text):
+            parts.append(
+                f"_Cut after {take} of {len(text)} characters; the rest is in {page.path}._"
+            )
+    return parts
+
+
+def _abstract(page: ResearchPage) -> str:
+    """The abstract a source record quotes (its lines that start with ``>``)."""
+    quoted = [line[1:].strip() for line in page.body.splitlines() if line.startswith(">")]
+    return " ".join(" ".join(quoted).split())
+
+
+def _known_papers(project: Project) -> dict[str, Any]:
+    """The wiki's sources as the paper's literature stage can take them: the accepted
+    ones as papers it starts from (in the shape it keeps verified papers in), the
+    rejected ones as papers it must not cite."""
+    papers = []
+    for page in project.pages(kind="source", review="accepted"):
+        meta = page.meta
+        authors, year, cited = meta.get("authors"), meta.get("year"), meta.get("citations")
+        papers.append(
+            {
+                "citation_key": page.id or PurePosixPath(page.path).stem,
+                "title": page.title,
+                "authors": [str(name) for name in authors] if isinstance(authors, list) else [],
+                "venue": str(meta.get("venue") or ""),
+                "year": year if isinstance(year, int) and not isinstance(year, bool) else None,
+                "abstract": _abstract(page),
+                "citation_count": cited if isinstance(cited, int) and cited >= 0 else 0,
+                "found_in_section": "",
+                "sections": [],
+                "reason": "A source the researcher accepted in the project's research wiki.",
+                "journal": None,
+                "volume": None,
+                "pages": None,
+                "publication_date": None,
+                "link": str(meta.get("link") or ""),
+                "record": page.path,
+            }
+        )
+    excluded = [
+        {
+            "citation_key": page.id or PurePosixPath(page.path).stem,
+            "title": page.title,
+            "reason": page.decision_reason or "rejected by the researcher",
+        }
+        for page in project.pages(kind="source", review="rejected")
+    ]
+    return {"version": 1, "papers": papers, "excluded": excluded}
+
+
+def _sources_text(project: Project, known: Mapping[str, Any] | None = None) -> list[str]:
+    """What the idea file says about the literature: the sources to start from and the
+    papers not to cite, each by title, so that every stage that reads the idea knows."""
+    known = _known_papers(project) if known is None else known
+    parts: list[str] = []
+    if known["papers"]:
+        parts += [
+            "## Sources the researcher accepted",
+            "These papers were verified and accepted in the project's research wiki. The "
+            "paper's related work starts from them; more may be found and cited.",
+            "\n".join(
+                f"- {paper['citation_key']}: {paper['title']}"
+                + (f" ({', '.join(paper['authors'][:3])}" if paper["authors"] else " (")
+                + ("" if len(paper["authors"]) <= 3 else " and others")
+                + (f", {paper['year']})" if paper["year"] else ")")
+                for paper in known["papers"]
+            ).replace(" ()", ""),
+        ]
+    if known["excluded"]:
+        parts += [
+            "## Papers not to cite",
+            "The researcher rejected these as sources. They are not to be cited or relied on.",
+            "\n".join(f"- {paper['title']}: {paper['reason']}" for paper in known["excluded"]),
+        ]
+    return parts
 
 
 def _setup_value(name: str, value: Any) -> str:
@@ -307,36 +534,66 @@ def _setup(run: _Run) -> str:
     return "\n".join(facts)
 
 
+def _metrics_of(project: Project, run: _Run) -> str:
+    """The metrics of a run for the materials: from the run's own record, which code
+    wrote and nobody edits through the wiki, never from a result page that may have been
+    changed since.  Where the record is gone (run directories can be cleared), the page
+    stands in, as long as it is still what code wrote."""
+    from paper_orchestra.research import experiments
+
+    edited = experiments.edited_record(project, run.result)
+    table = experiments.metrics_table(run.record) if run.record else ""
+    if table:
+        note = (
+            "\n\n_The result page of this run was edited after code wrote it; the values "
+            "here are the run's own record._"
+            if edited
+            else ""
+        )
+        return table + note
+    if run.record:
+        return f"_The run recorded no metrics; see {run.result.path}._"
+    if edited:
+        return (
+            "_The record of this run is not on file any more and its result page was "
+            f"edited after code wrote it, so its metrics are not copied; see {run.result.path}._"
+        )
+    return _metrics_table(run.result.body) or (
+        f"_The result record has no metrics table; see {run.result.path}._"
+    )
+
+
 def _log_text(
     project: Project,
     runs: list[_Run],
     findings: list[ResearchPage],
     figures: Mapping[str, list[str]],
     provided: Sequence[_Provided] = (),
+    removed: dict[str, list[str]] | None = None,
 ) -> str:
     """Every succeeded run with its setup and metrics, what the person attached, then
-    the accepted findings."""
+    the accepted findings.  ``removed`` is filled with the numbers taken out of each
+    finding because they are on no record."""
+    from paper_orchestra.research import experiments
+
     parts = ["# Experimental log"]
     if runs:
         parts.append(
-            "Each run below succeeded. Its metrics table is copied from the result record, "
-            "which was written by code from the files the run produced."
+            "Each run below succeeded. Its metrics are the run's own record, written by "
+            "code from the files the run produced."
         )
     elif provided:
         parts.append(
-            "No experiment of this project has a run that succeeded. The results are the "
-            "material the researcher provided, below."
+            "No run of an experiment the researcher accepted is reported here. The results "
+            "are the material the researcher provided, below."
         )
     for run in runs:
-        table = _metrics_table(run.result.body) or (
-            f"_The result record has no metrics table; see {run.result.path}._"
-        )
         parts += [
             f"## {run.name}: {run.experiment.title}",
             "### Setup",
             _setup(run),
             "### Metrics",
-            table,
+            _metrics_of(project, run),
         ]
         if figures.get(run.result.path):
             parts += ["### Figures", "\n".join(f"- {name}" for name in figures[run.result.path])]
@@ -356,16 +613,23 @@ def _log_text(
             )
             if (names := _listed(project, page, relation))
         ]
+        # A number that is on no record does not reach the writers: it is taken out of
+        # the text here, whatever a model would make of a sentence asking it not to.
+        title, body, gone = experiments.reportable_text(project, page)
         parts += [
-            f"### {page.id}: {page.title}",
+            f"### {page.id}: {title}",
             " ".join(relations),
-            _plain(project, _demoted(page.body, 2)),
+            _plain(project, _demoted(body, 2)),
         ]
-        unsupported = _unverified(project, page)
-        if unsupported:
+        if gone:
+            if removed is not None:
+                removed[str(page.id or page.path)] = gone
+            count = f"{len(gone)} number{'s' if len(gone) != 1 else ''} of this finding"
             parts.append(
-                "Numbers in this finding that no result record, source or input file "
-                f"supports, and that are not to be reported: {', '.join(unsupported)}."
+                f"{count} {'was' if len(gone) == 1 else 'were'} found in no run record, "
+                "source or file of the researcher and "
+                f"{'is' if len(gone) == 1 else 'are'} replaced above by "
+                f"{experiments.NOT_ON_RECORD}. Do not supply a number in its place."
             )
     return "\n\n".join(part for part in parts if part) + "\n"
 
@@ -556,10 +820,19 @@ def export_materials(project: Project, dest: str | Path) -> Path:
 
     * ``idea.md``: the idea page, the accepted hypotheses with their state, and the
       method as the accepted experiments that ran describe it;
-    * ``experimental_log.md``: for each succeeded run its setup and the metrics
-      table copied verbatim from the result record, then the text files the person
-      attached to the project as they are (bounded in size), then the accepted
-      findings;
+    * ``idea.md``, further: the accepted topic pages as background, the accepted
+      sources by title as the papers the related work starts from, and the
+      rejected sources as papers not to cite;
+    * ``experimental_log.md``: for each succeeded run its setup and its metrics
+      from the run's own record (``run.json``, not the result page, which can be
+      edited), then the text files the person attached to the project as they are
+      (bounded in size), then the accepted findings.  A finding whose records all
+      belong to experiments that were rejected or are gone is left out
+      (:func:`left_out` names it); in the text of the others, a number that the
+      number check finds nowhere is replaced by "[a number not on record]";
+    * ``known_papers.json``: the accepted sources in the shape the paper
+      pipeline's literature stage keeps its verified papers in, and the rejected
+      ones as an exclusion list;
     * ``figures/``: the image artifacts of those runs and the images the person
       attached, with ``info.json`` (``[{"name", "caption"}]``).  An earlier
       ``figures/`` is replaced.
@@ -567,12 +840,17 @@ def export_materials(project: Project, dest: str | Path) -> Path:
     Proposed and rejected pages are never used, and neither is an experiment
     without a succeeded run.  Nothing in the project is changed.
     """
-    return _export(project, Path(dest), *_reportable(project)).dest
+    runs, findings, _ = _reportable(project)
+    return _export(project, Path(dest), runs, findings).dest
 
 
-def _reportable(project: Project) -> tuple[list[_Run], list[ResearchPage]]:
-    """What a paper may report: the runs that succeeded and the accepted findings."""
-    return _succeeded_runs(project), project.pages(kind="finding", review="accepted")
+def _reportable(
+    project: Project,
+) -> tuple[list[_Run], list[ResearchPage], list[dict[str, Any]]]:
+    """What a paper may report: the runs that succeeded and the accepted findings that
+    rest on something; and the accepted findings that do not, with the reason."""
+    findings, left = _sorted_out(project)
+    return _succeeded_runs(project), findings, left
 
 
 def _export(
@@ -580,42 +858,70 @@ def _export(
 ) -> _Materials:
     provided = _provided(project)
     figures = _export_figures(project, runs, dest / FIGURES_DIR, provided)
+    known = _known_papers(project)
+    removed: dict[str, list[str]] = {}
     write_text(dest / IDEA_FILE, _idea_text(project, runs))
-    write_text(dest / LOG_FILE, _log_text(project, runs, findings, figures, provided))
+    write_text(dest / LOG_FILE, _log_text(project, runs, findings, figures, provided, removed))
+    write_json(dest / KNOWN_PAPERS_FILE, known)
     names = [name for listed in figures.values() for name in listed]
-    return _Materials(dest, runs, findings, names, [item.name for item in provided])
+    return _Materials(
+        dest,
+        runs,
+        findings,
+        names,
+        [item.name for item in provided],
+        removed,
+        [paper["citation_key"] for paper in known["papers"]],
+        [paper["citation_key"] for paper in known["excluded"]],
+    )
 
 
-def missing(project: Project) -> str | None:
+def missing(project: Project) -> Missing | None:
     """What the project still lacks for a paper: ``"results"`` (no accepted experiment
     has a run that succeeded, and nothing the person attached can be reported),
-    ``"finding"`` (no finding is accepted), or ``None`` when a paper can be written.
+    ``"finding"`` (no accepted finding can be reported), or ``None`` when a paper
+    can be written.
 
     The rule :func:`write_paper` applies, for a caller that wants to say so before
-    the person starts a write-up.
+    the person starts a write-up.  What is returned is the word (a ``str``); its
+    ``detail`` names the accepted findings that do not count because every record
+    they are based on belongs to a rejected or missing experiment, and why.
     """
-    runs, findings = _reportable(project)
+    runs, findings, left = _reportable(project)
+    detail = _left_out_text(left)
     if not runs and not _provided(project):
-        return "results"
-    return None if findings else "finding"
+        return Missing("results", detail)
+    return None if findings else Missing("finding", detail)
 
 
-def _check_ready(project: Project, runs: list[_Run], findings: list[ResearchPage]) -> None:
+def _check_ready(
+    project: Project,
+    runs: list[_Run],
+    findings: list[ResearchPage],
+    left: Sequence[Mapping[str, Any]] = (),
+) -> None:
     """Raise unless the project holds what a paper reports: results (a succeeded run, or
     results the person attached) and an accepted finding that says what they mean."""
+    not_counted = (
+        f" Not counted: {_left_out_text(left)}. Accept the experiment again, or base the "
+        "finding on a record that stands."
+        if left
+        else ""
+    )
     if not runs and not _provided(project):
         raise ProjectError(
             "There is nothing to write a paper from yet: no accepted experiment has a run "
             "that succeeded, and no results were attached to the project. Approve an "
             "experiment and run it (`paper-orchestra research approve`, then `research "
-            "run`), then start the write-up again."
+            f"run`), then start the write-up again.{not_counted}"
         )
     if not findings:
+        none = "no accepted finding can be reported" if left else "no finding is accepted"
         raise ProjectError(
-            "There is nothing to write a paper from yet: no finding is accepted. The "
-            "results are in, but a paper reports what they mean: accept a finding (in the "
-            "review inbox, or with `paper-orchestra research review`), or write one "
-            "yourself, then start the write-up again."
+            f"There is nothing to write a paper from yet: {none}. The results are in, but "
+            "a paper reports what they mean: accept a finding (in the review inbox, or "
+            "with `paper-orchestra research review`), or write one yourself, then start "
+            f"the write-up again.{not_counted}"
         )
 
 
@@ -632,6 +938,14 @@ def _paper_config(project: Project, template: str, options: Mapping[str, Any]) -
             f"write_paper got {', '.join(unknown)}; the options are: {', '.join(sorted(allowed))}."
         )
     settings, models = project.settings, project.settings.models
+    unreadable = settings.cutoff_problem()
+    if unreadable and options.get("research_cutoff") is None:
+        # Not "no cutoff": the paper would cite work the person meant to leave out.
+        raise ProjectError(
+            f"{unreadable}. Correct it in the project's settings (in the app, or in "
+            "project.json), or give the write-up a cutoff of its own (--research-cutoff "
+            "YYYY-MM); until then no paper is written."
+        )
     everywhere = options.get("model")
     chosen: dict[str, Any] = {
         "writer_model": everywhere or models.reasoning,
@@ -672,6 +986,34 @@ def _as_the_worker(project: Project) -> Iterator[None]:
         yield
 
 
+def _count(number: int, what: str) -> str:
+    return f"{number} {what}{'s' if number != 1 else ''}"
+
+
+def _started_summary(template: str, made: _Materials, left: Sequence[Mapping[str, Any]]) -> str:
+    """What the person is told when a write-up starts: what it is written from, which
+    accepted findings are not in it and why, and which numbers were taken out."""
+    said = (
+        f"Writing a paper from the wiki with the {Path(template).name} template: "
+        f"{_count(len(made.runs), 'succeeded run')}, "
+        f"{_count(len(made.findings), 'accepted finding')}"
+        + (f", {_count(len(made.provided), 'attached file')}." if made.provided else ".")
+    )
+    if left:
+        verb = "is" if len(left) == 1 else "are"
+        said += (
+            f" {_count(len(left), 'accepted finding')} {verb} left out ({_left_out_text(left)})."
+        )
+    removed = sum(len(numbers) for numbers in made.numbers_removed.values())
+    if removed:
+        which = "; ".join(
+            f"{name}: {', '.join(numbers)}" for name, numbers in made.numbers_removed.items()
+        )
+        verb = "that is on no record was" if removed == 1 else "that are on no record were"
+        said += f" {_count(removed, 'number')} {verb} taken out ({which})."
+    return said
+
+
 def _relative(project: Project, path: Path | None) -> str:
     if path is None:
         return ""
@@ -694,18 +1036,20 @@ def write_paper(project: Project, *, template: str, **options: Any) -> PaperResu
     settings.  A run that was interrupted is continued by calling this again.
 
     Refuses with ``ProjectError`` when no accepted experiment has a succeeded run
-    or no finding is accepted, and when the project has a worker at work (the
+    or no accepted finding can be reported (the message names the findings that
+    rest only on rejected or missing experiments), when the project's research
+    cutoff cannot be read, and when the project has a worker at work (the
     write-up holds the project's worker lock while it runs: one worker at a time);
     raises ``FileNotFoundError`` for an unknown template and ``TypeError`` for an
     unknown option.  Emits ``paper.started`` and ``paper.finished`` on the project.
     As with ``pipeline.run_paper``, a paper that could not be written is a result
     with ``success=False``, and an interrupt is passed on after it was recorded.
     """
-    runs, findings = _reportable(project)
-    _check_ready(project, runs, findings)
+    runs, findings, left = _reportable(project)
+    _check_ready(project, runs, findings, left)
     cfg = _paper_config(project, template, options)
     with _as_the_worker(project):
-        return _write(project, template, cfg, runs, findings)
+        return _write(project, template, cfg, runs, findings, left)
 
 
 def _write(
@@ -714,20 +1058,14 @@ def _write(
     cfg: PipelineConfig,
     runs: list[_Run],
     findings: list[ResearchPage],
+    left: Sequence[Mapping[str, Any]] = (),
 ) -> PaperResult:
     """Export the materials and run the pipeline on them, telling the project about it."""
     made = _export(project, cfg.base_dir / MATERIALS_DIR, runs, findings)
     prepare_run_dir(cfg, None)
     project.emit(
         "paper.started",
-        f"Writing a paper from the wiki with the {Path(template).name} template: "
-        f"{len(made.runs)} succeeded run{'s' if len(made.runs) != 1 else ''}, "
-        f"{len(made.findings)} accepted finding{'s' if len(made.findings) != 1 else ''}"
-        + (
-            f", {len(made.provided)} attached file{'s' if len(made.provided) != 1 else ''}."
-            if made.provided
-            else "."
-        ),
+        _started_summary(template, made, left),
         refs=[_relative(project, made.dest / IDEA_FILE), _relative(project, made.dest / LOG_FILE)],
         data={
             "template": template,
@@ -736,6 +1074,10 @@ def _write(
             "findings": [page.path for page in made.findings],
             "figures": made.figures,
             "provided": made.provided,
+            "left_out": [dict(item) for item in left],
+            "numbers_removed": made.numbers_removed,
+            "sources": made.sources,
+            "excluded_sources": made.excluded,
         },
     )
     try:

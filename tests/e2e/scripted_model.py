@@ -8,7 +8,9 @@ is given, slowly enough (``PAPER_ORCHESTRA_E2E_PAUSE`` seconds between steps) fo
 to watch the pages arrive and to stop a phase in the middle.
 
 It never calls ``verify_paper`` or the web search: those would reach Semantic Scholar and
-the web.  The scout writes a topic and a question from the brief instead.
+the web.  The scout writes a topic and a question from the brief instead.  Intake names a
+project the person left untitled (``name_project`` is offered only then), so that a
+browser can watch the title change.
 """
 
 from __future__ import annotations
@@ -107,8 +109,18 @@ def _created_id(result: str) -> str | None:
     return found.group(1) if found else None
 
 
+def _title(request: FakeRequest) -> str:
+    """A title for an untitled project: not the idea's first line, which it shows already."""
+    idea = re.search(r"<idea>\n(.*?)\n</idea>", request.text or "", re.S)
+    words = re.findall(r"[\w'-]+", idea.group(1) if idea else "")[:6]
+    return ("Scripted study: " + " ".join(words or ["an untitled idea"]))[:80].rstrip()
+
+
 def intake(request: FakeRequest) -> str:
     _pause()
+    if "name_project" in request.tools:
+        request.call_tool("name_project", {"title": _title(request)})
+        _pause()
     if not _has(request, "what-the-files-say"):
         request.memory.create(
             "/memories/wiki/topics/what-the-files-say.md",

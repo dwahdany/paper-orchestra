@@ -208,7 +208,7 @@ class ProjectMemoryBackend:
         return {page.path: page for page in self.project.pages() if self._mode(page) != "none"}
 
     def _revisable(self, page: ResearchPage) -> bool:
-        """Its own page, from this session, that no person has decided or acted on."""
+        """Its own page, from this session, that no person has decided, edited or acted on."""
         return (
             not page.is_record
             and page.author == self.author
@@ -216,6 +216,7 @@ class ProjectMemoryBackend:
             and page.review != "rejected"
             and not page.decided_by
             and not moved_on(page)
+            and not self.project.edited_by_person(page)
         )
 
     def _refuse_change(self, page: ResearchPage, path: str) -> None:
@@ -247,6 +248,11 @@ class ProjectMemoryBackend:
             raise ToolError(
                 f"{name} is {page.state}, so it stays as it was when that was decided; "
                 "propose an edit with propose_edit."
+            )
+        if self.project.edited_by_person(page):
+            raise ToolError(
+                f"{name} was edited by the person while it waits for their decision, so it "
+                "stays as they left it; propose an edit with propose_edit."
             )
         raise ToolError(
             f"{name} is your page from an earlier session and can no longer be edited "

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+
 import pytest
 from rapidfuzz import fuzz
 
@@ -11,9 +14,11 @@ from paper_orchestra.memory.cache import KeyValueCache
 from paper_orchestra.memory.harness import ContextHarness
 from paper_orchestra.research.project import Project
 from paper_orchestra.research.sources import (
+    CutoffError,
     NotVerified,
     SourceVerifier,
     normalize_cutoff,
+    project_cutoff,
     verify_paper_tool,
 )
 from paper_orchestra.utils.scholar import SemanticScholar
@@ -129,7 +134,10 @@ def test_a_verified_paper_becomes_a_source_record_written_by_code(project, verif
     assert "Vaswani" in page.summary and "2017" in page.summary
     assert "> We propose the Transformer, based solely on attention mechanisms." in page.body
     assert "<https://arxiv.org/abs/1706.03762>" in page.body
-    assert "Semantic Scholar" in page.body
+    today = datetime.now(UTC).date().isoformat()
+    assert f"Semantic Scholar record fetched on {today}." in page.body
+    assert page.meta["verified_by"] == "semantic-scholar"
+    assert page.meta["verified_at"].startswith(today) and "verified_from" not in page.meta
     assert verifier.recorded == [page.path]
 
 
@@ -168,6 +176,53 @@ def test_a_cutoff_given_as_a_year_means_before_that_year():
     assert normalize_cutoff("2024") == "2024-01"
     assert normalize_cutoff("2024-06") == "2024-06"
     assert normalize_cutoff("2024-06-15") == "2024-06-15"
+
+
+def test_a_cutoff_is_read_as_it_was_meant_or_not_at_all():
+    # A year typed as a number, a month typed with one digit: what is meant is plain.
+    assert normalize_cutoff(2024) == "2024-01"
+    assert normalize_cutoff("2024-6") == "2024-06"
+    assert normalize_cutoff(" 2024-06 ") == "2024-06"
+    # Anything else is not guessed at, and above all is not read as "no cutoff".
+    for unreadable in ("June 2024", "2024/06", "2024-13", "2024-00", "24-06", True, 20245, 2024.5):
+        with pytest.raises(ValueError, match="research_cutoff"):
+            normalize_cutoff(unreadable)
+
+
+def edited_by_hand(tmp_path, cutoff) -> Project:
+    """A project whose ``project.json`` got its cutoff from an editor, not from the app."""
+    project = Project.create(tmp_path / "edited", title="Attention", brief="Is attention enough?")
+    path = project.root / "project.json"
+    data = json.loads(path.read_text())
+    data["settings"]["research_cutoff"] = cutoff
+    path.write_text(json.dumps(data))
+    return Project.open(project.root)
+
+
+@pytest.mark.parametrize("cutoff", ["2017/06", "June 2017", "2017-13", ["2017-06"]])
+def test_a_cutoff_that_cannot_be_read_stops_every_lookup(tmp_path, session, cutoff):
+    project = edited_by_hand(tmp_path, cutoff)
+
+    with pytest.raises(CutoffError, match="research cutoff cannot be read"):
+        project_cutoff(project)
+    verifier = SourceVerifier(project, scholar=scholar(session))
+    for title in ("Attention Is All You Need", "Deep Residual Learning for Image Recognition"):
+        with pytest.raises(NotVerified, match="research cutoff cannot be read") as refusal:
+            verifier.verify(title)
+        assert "settings.research_cutoff" in str(refusal.value)
+    # Not read as "no cutoff": nothing was asked for and nothing is on record.
+    assert session.queries == [] and project.pages(kind="source") == []
+
+
+@pytest.mark.parametrize("cutoff", [2017, "2017-1", "2017"])
+def test_a_cutoff_typed_into_the_file_in_a_plain_form_is_applied(tmp_path, session, cutoff):
+    project = edited_by_hand(tmp_path, cutoff)
+
+    assert project_cutoff(project) == "2017-01"
+    verifier = SourceVerifier(project, scholar=scholar(session))
+    with pytest.raises(NotVerified, match="not published before"):
+        verifier.verify("Attention Is All You Need", 2017)
+    assert verifier.verify("Deep Residual Learning for Image Recognition").created
 
 
 def test_the_same_paper_is_recorded_once_whatever_title_it_is_asked_by(project, verifier, session):
@@ -254,6 +309,158 @@ def test_the_cross_run_cache_answers_without_a_lookup(project, tmp_path, session
 
     assert source.created and offline.queries == []
     assert other.page(source.key).meta["link"] == "https://arxiv.org/abs/1706.03762"
+
+
+def at(day: str):
+    """A clock that stands at noon of ``day``."""
+    return lambda: datetime.fromisoformat(f"{day}T12:00:00").replace(tzinfo=UTC)
+
+
+def cached_by_another_project(tmp_path, session, day: str) -> ContextHarness:
+    """A harness whose cache holds the paper as another project fetched it on ``day``."""
+    harness = ContextHarness(cache=KeyValueCache(tmp_path / "cache"))
+    first = Project.create(tmp_path / "first", title="First", brief="An earlier idea")
+    SourceVerifier(first, scholar=scholar(session), harness=harness, now=at(day)).verify(
+        "Attention Is All You Need"
+    )
+    assert "fetched on " + day in first.page("Vaswani2017AttentionAll").body
+    return harness
+
+
+def test_a_record_from_the_cache_says_when_the_service_returned_it(project, tmp_path, session):
+    harness = cached_by_another_project(tmp_path, session, "2026-10-20")
+    asked = len(session.queries)
+
+    source = SourceVerifier(
+        project, scholar=scholar(session), harness=harness, now=at("2026-11-10")
+    ).verify("Attention Is All You Need")
+
+    page = project.page(source.key)
+    assert len(session.queries) == asked  # the cache answered
+    # The record is dated by the day the service returned it, not by the day it was copied.
+    assert page.meta["verified_at"].startswith("2026-10-20")
+    assert "Semantic Scholar record fetched on 2026-10-20" in page.body
+    assert "cache" in page.body and "was not asked again" in page.body
+    assert "2026-11-10" not in page.body and "Verified against" not in page.body
+    assert page.meta["verified_from"] == "cache"
+    assert "when the record was fetched" in page.body
+
+
+def test_a_cached_entry_older_than_thirty_days_is_asked_for_again(project, tmp_path, session):
+    harness = cached_by_another_project(tmp_path, session, "2026-09-01")
+    asked = len(session.queries)
+
+    source = SourceVerifier(
+        project, scholar=scholar(session), harness=harness, now=at("2026-11-10")
+    ).verify("Attention Is All You Need")
+
+    page = project.page(source.key)
+    assert len(session.queries) == asked + 1
+    assert page.meta["verified_at"].startswith("2026-11-10")
+    assert "Semantic Scholar record fetched on 2026-11-10." in page.body
+    assert "cache" not in page.body and "verified_from" not in page.meta
+    # What came back is what the cache now holds, for the projects after this one.
+    entry = harness.cache.get(CACHE_NAMESPACE, "attentionisallyouneed")
+    assert entry["paper"]["fetched_at"].startswith("2026-11-10")
+
+
+def test_an_old_entry_is_used_when_the_service_cannot_be_reached_and_the_record_says_so(
+    project, tmp_path, session
+):
+    harness = cached_by_another_project(tmp_path, session, "2026-09-01")
+    offline = FakeS2Session(down=True)
+    verifier = SourceVerifier(
+        project, scholar=scholar(offline), harness=harness, now=at("2026-11-10")
+    )
+
+    source = verifier.verify("Attention Is All You Need")
+
+    page = project.page(source.key)
+    assert offline.queries == ["Attention Is All You Need"]  # it was tried
+    assert source.created and verifier.rejected == []
+    assert page.meta["verified_at"].startswith("2026-09-01")
+    assert "Semantic Scholar could not be reached" in page.body
+    assert "the service returned on 2026-09-01" in page.body
+    assert page.meta["verified_from"] == "cache"
+    # A paper the cache does not hold is still refused while the service is away.
+    with pytest.raises(NotVerified, match="could not be asked"):
+        verifier.verify("Deep Residual Learning for Image Recognition")
+
+
+def test_an_entry_that_does_not_say_when_it_was_fetched_is_asked_for_again(
+    project, tmp_path, session
+):
+    cache = KeyValueCache(tmp_path / "cache")
+    # Put there by anything but a lookup of this module: a paper the service never returned.
+    invented = {
+        "title": "Guaranteed Accuracy Through Scheduled Warmup Alone",
+        "authors": [{"name": "Real Author"}],
+        "venue": "NeurIPS",
+        "year": 2023,
+        "abstract": "We prove that warmup guarantees 99.9% accuracy.",
+        "link": "https://arxiv.org/abs/2301.00001",
+    }
+    key = "guaranteedaccuracythroughscheduledwarmupalone"
+    cache.put(CACHE_NAMESPACE, key, {"cutoff": None, "paper": invented})
+    harness = ContextHarness(cache=cache)
+    verifier = SourceVerifier(project, scholar=scholar(session), harness=harness)
+    assert verifier._cache.get(invented["title"]) is not None  # the entry is the paper's
+
+    with pytest.raises(NotVerified, match="No paper with this title"):
+        verifier.verify(invented["title"])
+
+    assert session.queries == [invented["title"]]
+    assert project.pages(kind="source") == []
+
+
+@pytest.mark.parametrize("fetched_at", [None, "2027-03-01T00:00:00Z", "yesterday", 5])
+def test_an_entry_without_a_time_that_has_passed_is_no_lookup_when_the_service_is_down(
+    project, tmp_path, fetched_at
+):
+    cache = KeyValueCache(tmp_path / "cache")
+    # A paper the service never returned, put there by anything but a lookup: without a
+    # date, with one that has not come yet, with one that cannot be read.
+    invented = {
+        "title": "Guaranteed Accuracy Through Scheduled Warmup Alone",
+        "authors": [{"name": "Real Author"}],
+        "venue": "NeurIPS",
+        "year": 2023,
+        "abstract": "We prove that warmup guarantees 99.9% accuracy.",
+        "link": "https://arxiv.org/abs/2301.00001",
+    }
+    if fetched_at is not None:
+        invented["fetched_at"] = fetched_at
+    key = "guaranteedaccuracythroughscheduledwarmupalone"
+    cache.put(CACHE_NAMESPACE, key, {"cutoff": None, "paper": invented})
+    offline = FakeS2Session(down=True)
+    verifier = SourceVerifier(
+        project,
+        scholar=scholar(offline),
+        harness=ContextHarness(cache=cache),
+        now=at("2026-11-10"),
+    )
+
+    # The service cannot be asked, and the entry is no record of what it once returned:
+    # the paper is not put on record as verified.
+    with pytest.raises(NotVerified, match="could not be asked"):
+        verifier.verify(invented["title"])
+
+    assert offline.queries == [invented["title"]]
+    assert project.pages(kind="source") == []
+
+
+def test_an_entry_dated_in_the_future_is_asked_for_again(project, tmp_path, session):
+    harness = cached_by_another_project(tmp_path, session, "2026-12-24")
+    asked = len(session.queries)
+
+    source = SourceVerifier(
+        project, scholar=scholar(session), harness=harness, now=at("2026-11-10")
+    ).verify("Attention Is All You Need")
+
+    page = project.page(source.key)
+    assert len(session.queries) == asked + 1
+    assert page.meta["verified_at"].startswith("2026-11-10")
+    assert "cache" not in page.body and "verified_from" not in page.meta
 
 
 def test_the_cache_does_not_let_a_paper_past_a_later_cutoff(project, tmp_path, session):

@@ -99,6 +99,7 @@ __all__ = [
     "WorkerError",
     "Workers",
     "default_command",
+    "lock_held",
     "settle_stale_runs",
 ]
 
@@ -550,23 +551,24 @@ def _has_open(pid: int, path: Path) -> bool:
     return False
 
 
-def _lock_held(root: Path) -> bool | None:
-    """Whether some process holds the project's worker lock.
+def lock_held(path: Path) -> bool | None:
+    """Whether some process holds the kernel lock on the lock file ``path``.
 
-    ``True``: somebody is at work in this directory.  ``False``: nobody is, whatever
-    the files in it say (the kernel drops the lock with its holder, however that
-    died, and a copy of the directory is another file that nobody locked).
-    ``None``: it cannot be told here (no such locks on this system or file system,
-    or the file cannot be opened).
+    ``True``: somebody does.  ``False``: nobody does, whatever the files next to it
+    say (the kernel drops a lock with its holder, however that died, and a copy of
+    the file is another file that nobody locked).  ``None``: it cannot be told here
+    (no such locks on this system or file system, or the file cannot be opened).
 
-    The lock is tried without waiting and as a shared one, so that two servers
-    looking at once do not see each other, and given back at once.
+    This is how the engine's lock on a project (``.worker.lock``) and the lock of
+    whoever runs an experiment (``.run.lock`` in its directory) are looked at
+    from outside.  The lock is tried without waiting and as a shared one, so that
+    two servers looking at once do not see each other, and given back at once.
     """
     if fcntl is None:  # pragma: no cover - Windows
         return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        descriptor = os.open(root / WORKER_LOCK_FILE, flags)
+        descriptor = os.open(path, flags)
     except FileNotFoundError:
         return False
     except OSError:
@@ -584,6 +586,12 @@ def _lock_held(root: Path) -> bool | None:
         return None  # no kernel locks here: the engine then goes by the file itself
     finally:
         os.close(descriptor)
+
+
+def _lock_held(root: Path) -> bool | None:
+    """Whether some process holds the project's worker lock: somebody is at work in
+    this directory (see :func:`lock_held`)."""
+    return lock_held(root / WORKER_LOCK_FILE)
 
 
 def _is_worker_of(pid: int, root: Path, expected: Sequence[str] | None = None) -> bool:
@@ -785,23 +793,22 @@ def _take_name_off(root: Path, pid: int | None) -> None:
 def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
     """Settle the runs of experiments that a worker which died left at ``running``.
 
-    Goes through the experiments module's recovery (``experiments.recover``),
-    which starts nothing: a run nobody is running any more is recorded as ended
-    because its worker stopped, and its experiment goes back to the queue (or is
-    failed after several such deaths), so that the app no longer shows a run in
-    progress with a log that never moves.  Experiments a live process is running
-    are left alone.
+    Goes through the experiments module's recovery (``experiments.recover`` with
+    ``follow=False``), which starts nothing and waits for nothing: a run nobody
+    is running any more is recorded as ended because its worker stopped, and its
+    experiment goes back to the queue (or is failed after several such deaths),
+    so that the app no longer shows a run in progress with a log that never
+    moves.  Experiments a live process is running are left alone, and so is a
+    run that has a job on a remote backend: that job may still be alive, and
+    following it to its end is a worker's part.  The other runs of the same
+    project are settled all the same.
 
-    A run on a remote backend may still have its job, which recovery would
-    follow to its end for as long as that takes; that is a worker's to do, so a
-    project with such a run is left for the next worker.
-
-    Recovery also cleans up after a local job: it ends the processes of the
-    session the run's record names and removes its working directory.  That
-    record is a file of the project directory, which may have come from anywhere,
-    and the server settles at a mere look.  It ends nothing on the word of a
-    file: when a process is still running that a record names, the project's
-    runs are left as they are, for the next worker or the person's Cancel.  The
+    Recovery also cleans up after a local job: the backend ends the processes that
+    are provably what the job left behind (they carry the mark of a working
+    directory the backend made, which a file cannot fake) and removes that
+    directory.  The server settles at a mere look, and it ends no process at a
+    look: while such processes are still running, the project's runs are left as
+    they are, for the next worker (the person's Run) or the person's Cancel.  The
     job of a worker that was killed is killed with it, a moment later, and is
     waited for that long.
 
@@ -817,15 +824,6 @@ def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
         if not page.id:
             continue
         running = [run for run in experiments.runs(project, page.id) if _is_running(run)]
-        if any(run.get("backend") != "local" for run in running):
-            log.info(
-                "A run of %s in %s may still have its job on %s; it is left for the next "
-                "worker to pick up.",
-                page.id,
-                project.root,
-                running[0].get("backend") or "its backend",
-            )
-            return []
         if running:
             jobs += [run.get("job") for run in running]
             jobs += _job_files(project.experiment_dir(page.id) / experiments.RUNS_DIR)
@@ -840,7 +838,7 @@ def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
             project.root,
         )
         return []
-    return list(experiments.recover(project))
+    return list(experiments.recover(project, follow=False))
 
 
 def _is_running(run: Any) -> bool:
@@ -860,58 +858,23 @@ def _job_files(runs: Path) -> list[Any]:
     return [_read_json(entry / experiments.JOB_FILE, follow_links=True) for entry in directories]
 
 
-def _job_claims(job: Any, depth: int = 3) -> list[tuple[int, str]]:
-    """``(process session, working directory)`` as a job record names them, also where it
-    holds them one level down under ``"job"``; ``0`` and ``""`` for what it does not name."""
-    if not isinstance(job, Mapping) or depth <= 0:
-        return []
-    session, scratch = job.get("session"), job.get("scratch")
-    if isinstance(session, bool) or not isinstance(session, int | float | str):
-        session = 0
-    try:
-        number = int(session)
-    except (ValueError, OverflowError):
-        number = 0
-    claims = [(number, scratch if isinstance(scratch, str) else "")]
-    return claims + _job_claims(job.get("job"), depth - 1)
-
-
-def _names_live_process(jobs: Sequence[Any], proc: Path = Path("/proc")) -> bool:
-    """Whether a process is running that one of the job records names: one of the
-    session it names, or one that carries the mark of the working directory it names
-    in its environment (how the local backend finds what a job left behind).
-
-    Linux only, as the backend's own clean-up: elsewhere it ends no process.
-    """
-    from paper_orchestra.compute import local
-
-    claims = [claim for job in jobs for claim in _job_claims(job)]
-    sessions = {session for session, _ in claims if session > 1}
-    marks = {f"{local.JOB_ENV}={scratch}".encode() for _, scratch in claims if scratch}
-    if not (sessions or marks) or not sys.platform.startswith("linux"):
-        return False
-    try:
-        entries = [entry.name for entry in os.scandir(proc) if entry.name.isdigit()]
-    except OSError:
-        return False
-    for name in entries:
-        try:
-            stat_ = (proc / name / "stat").read_bytes().rsplit(b")", 1)[1].split()
-            if stat_[0] == b"Z":
-                continue  # it only waits to be collected: there is nothing left to end
-            if int(stat_[3]) in sessions:
-                return True
-            if marks and marks.intersection((proc / name / "environ").read_bytes().split(b"\0")):
-                return True
-        except (OSError, ValueError, IndexError):
-            continue  # gone meanwhile, or not ours to read (and then not ours to end)
-    return False
-
-
 def _job_still_running(jobs: Sequence[Any]) -> bool:
-    """Whether what the job records name is still running once it had a moment to go."""
+    """Whether processes are still running that recovery would end for one of the job
+    records, once they had a moment to go.
+
+    What that is, is the local backend's to say (``LocalBackend.job_processes``: what
+    its ``end_job`` would end), so that the server's look and the backend's clean-up
+    cannot disagree: processes that carry the mark of a working directory the
+    backend made and nobody holds any more.  A session or a directory that a record
+    merely names is nothing to wait for, and nothing the backend would touch.
+    """
+    from paper_orchestra.compute.local import LocalBackend
+
+    def running() -> bool:
+        return any(LocalBackend.job_processes(job) for job in jobs if job is not None)
+
     deadline = time.monotonic() + _JOB_GONE_WAIT_SECONDS
-    while _names_live_process(jobs):
+    while running():
         if time.monotonic() >= deadline:
             return True
         time.sleep(_POLL_SECONDS)

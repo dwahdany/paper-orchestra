@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import hashlib
 import json
 import mimetypes
@@ -24,13 +25,18 @@ import os
 import re
 import secrets
 import shutil
+import stat
+import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import unquote
 
+from paper_orchestra import doctor
 from paper_orchestra.memory.lock import WikiLock
 from paper_orchestra.memory.wiki import (
     INDEX_FILE,
@@ -44,9 +50,12 @@ from paper_orchestra.memory.wiki import (
     slugify,
     split_front_matter,
 )
+from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import (
     APPROVAL_FIELDS,
+    EDITED_BY_PERSON,
     EVENT_TYPES,
+    FOR_ALL,
     HUMAN,
     ID_PREFIXES,
     IDEA_PATH,
@@ -88,6 +97,8 @@ from paper_orchestra.research.model import (
     page_problems,
     parse_id,
     parse_stamp,
+    quotable,
+    request_role,
     role_author,
     role_of,
     section_path,
@@ -140,6 +151,36 @@ _RUN_STATES = ("approved", "queued", "running")
 _APPROVAL_RECORD = APPROVAL_FIELDS - {"backend"}
 #: What ``record_approval`` writes: the options of the approved run and its record.
 _APPROVAL_WRITES = APPROVAL_FIELDS | {"gpu", "timeout_seconds", "network"}
+#: Fields of an experiment that say which repository it copies or clones and runs.  The
+#: person names it, on the page or in the project's settings; no edit proposal does.
+_REPOSITORY_FIELDS = frozenset({"repo", "repo_ref"})
+#: A file a writer of this package leaves when it dies between writing and renaming:
+#: ``.<name>.<pid>.<8 hex digits>.tmp`` (``utils.common.write_text``, the wiki layer).
+_TEMPORARY_NAME = re.compile(r"^\..+\.(\d{1,10})\.[0-9a-f]{8}\.tmp$")
+#: How old such a file has to be before it is taken for litter, in seconds: one being
+#: written lives for milliseconds.
+TEMPORARY_FILE_AGE = 60.0
+#: Where a project is built before it is moved into place: a hidden directory next to
+#: it, named with the process that builds it.
+_BUILD_PREFIX = ".paper-orchestra-new-"
+#: The top-level names a new project consists of, besides project.json and the lock.
+_PROJECT_NAMES = frozenset(
+    {
+        WIKI_DIR,
+        NOTES_DIR,
+        TRANSCRIPTS_DIR,
+        INPUTS_DIR,
+        PROPOSALS_DIR,
+        HISTORY_DIR,
+        REQUESTS_DIR,
+        EXPERIMENTS_DIR,
+        EVENTS_FILE,
+        INDEX_FILE,
+    }
+)
+#: Key of project.json: the inode of the directory the project was created as.  A copy
+#: of the directory carries the key and not the inode, which tells it from the original.
+HOME_KEY = "home"
 _HOW_TO_APPROVE = (
     "A run is approved with `paper-orchestra research approve`, or with Approve in the app: "
     "that records what may run, and nothing else moves an experiment to approved, queued or "
@@ -271,7 +312,7 @@ def _read_json(path: Path) -> Any:
     """The JSON in ``path``, or ``None`` when it is missing or not JSON."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
 
 
@@ -349,9 +390,18 @@ def _whose(author: str) -> str:
 
 
 def _what(page: ResearchPage) -> str:
-    """``hypothesis H2 "Warmup reduces variance"``."""
-    title = _clip(page.title, 80).rstrip(".")
+    """``hypothesis H2 "Warmup reduces variance"``.
+
+    The title is whoever wrote the page's: it stands as one quotation, cut, with
+    nothing in it that could read as the quotation's end.
+    """
+    title = quotable(page.title, 80).rstrip(".")
     return f'{page.kind} {page.id} "{title}"' if page.id else f'{page.kind} "{title}"'
+
+
+def _said(text: Any, limit: int = 200) -> str:
+    """An agent's own words (the summary of an edit) as a quotation in an event's sentence."""
+    return f'"{quotable(text, limit).rstrip(".")}"'
 
 
 def _name(page: ResearchPage) -> str:
@@ -365,8 +415,8 @@ def _approval_sentence(by: str, page: ResearchPage, fields: Mapping[str, Any]) -
     if fields.get("approved_digest"):
         limit = fields.get("timeout_seconds")
         how = [
-            f"on {fields['backend']}" if fields.get("backend") else "",
-            f"with a {fields['gpu']} GPU" if fields.get("gpu") else "",
+            f"on {quotable(fields['backend'], 40)}" if fields.get("backend") else "",
+            f"with a {quotable(fields['gpu'], 40)} GPU" if fields.get("gpu") else "",
             f"for up to {limit:g} s" if isinstance(limit, int | float) else "",
             ("with network access" if fields["network"] else "without network access")
             if "network" in fields
@@ -479,9 +529,50 @@ def _entries(root: Path) -> list[str]:
     return [name for name in os.listdir(root) if name != LOCK_FILE]
 
 
-def _clear(root: Path) -> None:
-    """Remove everything in ``root`` but the lock file (which the caller holds)."""
-    for name in _entries(root):
+def _builder(name: str) -> int | None:
+    """The process that builds a project in the hidden directory ``name``, or ``None``
+    when ``name`` is not the name of such a directory."""
+    pid = name[len(_BUILD_PREFIX) :].split("-", 1)[0] if name.startswith(_BUILD_PREFIX) else ""
+    return int(pid) if pid.isdigit() else None
+
+
+def _sweep_unfinished(parent: Path) -> None:
+    """Remove what a creation that died left next to where its project was to be: the
+    hidden directory it was building in, once the process that made it is gone."""
+    try:
+        entries = [entry for entry in parent.iterdir() if _builder(entry.name) is not None]
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if _process_is_gone(_builder(entry.name) or 0) and _older_than(entry, TEMPORARY_FILE_AGE):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+def _unfinished_creation(root: Path, names: Sequence[str]) -> bool:
+    """Whether what ``root`` holds is only what a creation that died there left behind:
+    the hidden directory it built in and, of the project's own top-level names, the ones
+    it had already moved into place.  ``ProjectError`` when the process that builds
+    there is still at work."""
+    builds = [name for name in names if _builder(name) is not None]
+    for name in builds:
+        pid = _builder(name) or 0
+        if not _process_is_gone(pid):
+            raise ProjectError(
+                f"A project is being created in {root} right now (by process {pid}). Wait "
+                "for it, or choose another directory."
+            )
+    return bool(builds) and all(name in _PROJECT_NAMES for name in names if name not in builds)
+
+
+def _clear_unfinished(root: Path) -> None:
+    """Remove from ``root`` what a creation that died there left (see
+    :func:`_unfinished_creation`), so that the directory is empty again."""
+    names = _entries(root)
+    if not names or (root / PROJECT_FILE).exists() or not _unfinished_creation(root, names):
+        return
+    for name in names:
         entry = root / name
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry, ignore_errors=True)
@@ -490,15 +581,144 @@ def _clear(root: Path) -> None:
                 entry.unlink()
 
 
-def _abandon(root: Path, *, made: bool) -> None:
-    """Leave no trace of a project that did not come to be: no lock file, and no directory
-    if it was ``made`` for the project.  A directory that holds anything is left alone:
-    another process may have started a project of its own there."""
-    with contextlib.suppress(OSError):
-        if not _entries(root):
-            (root / LOCK_FILE).unlink(missing_ok=True)
-            if made:
-                root.rmdir()
+def _already_there(root: Path) -> ProjectError:
+    if (root / PROJECT_FILE).exists():
+        return ProjectError(
+            f"{root} already holds a research project. Open it, or choose another directory."
+        )
+    return ProjectError(
+        f"{root} is not an empty directory. A project needs a directory of its own."
+    )
+
+
+def _move_into_place(built: Path, root: Path) -> None:
+    """Make the finished project in ``built`` the new directory ``root``, in one step: a
+    rename.  If something came to be there meanwhile (a project another process
+    finished), it is left as it is and ``ProjectError`` says so."""
+    try:
+        if os.path.lexists(root):
+            raise FileExistsError(errno.EEXIST, "something is there", str(root))
+        os.rename(built, root)
+    except OSError as exc:
+        if os.path.lexists(root):
+            raise _already_there(root) from None
+        raise ProjectError(
+            f"The project could not be put in place at {root} ({exc}). Nothing was created; "
+            "choose a place you can write to."
+        ) from exc
+
+
+def _move_contents(built: Path, root: Path, own: str) -> None:
+    """Move the finished project in ``built`` into the existing, empty directory ``root``.
+
+    The directory itself stays the one it was (a shell may be standing in it), so its
+    entries are moved, ``project.json`` last: until that one is there, what ``root``
+    holds is an unfinished creation, which the next attempt recognises by the build
+    directory ``own`` and clears.  Done under the lock of ``root``, so that two
+    creations never move into each other.
+    """
+    with _lock_for(root):
+        others = [name for name in _entries(root) if name != own]
+        if others:
+            raise _already_there(root)
+        names = sorted(os.listdir(built), key=lambda name: name == PROJECT_FILE)
+        moved: list[Path] = []
+        try:
+            for name in names:
+                if name == LOCK_FILE:
+                    continue  # ``root`` has its own, and it is held
+                os.rename(built / name, root / name)
+                moved.append(root / name)
+        except OSError as exc:
+            for entry in moved:  # the directory is left as empty as it was found
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
+            raise ProjectError(
+                f"The project could not be put in place at {root} ({exc}). Nothing was "
+                "created; choose a place you can write to."
+            ) from exc
+
+
+def _texts(value: Any) -> Iterator[str]:
+    """Every text in a value that is about to be written: itself, or what a list or an
+    object holds, keys included."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            yield from _texts(key)
+            yield from _texts(item)
+    elif isinstance(value, list | tuple | set):
+        for item in value:
+            yield from _texts(item)
+
+
+def _check_storable(what: str, *values: Any) -> None:
+    """Raise ``ProjectError`` when a text among ``values`` cannot be written to a file:
+    it holds half of a surrogate pair, which is no character.  Checked before anything
+    is written, so that a refusal leaves nothing behind."""
+    for value in values:
+        for text in _texts(value):
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ProjectError(
+                    f"{what} cannot be stored: the text holds half of a surrogate pair at "
+                    f"position {exc.start}, which is not a character. Remove it and try again."
+                ) from None
+
+
+def _open_for_append(path: Path) -> Any:
+    """``path`` opened for reading and appending, created if needed: the file itself,
+    never what a symbolic link there points at, and only a regular file.
+
+    A project directory can come from anywhere.  An event stream that is a link would
+    have every event of the project written into a file of the person's elsewhere.
+    """
+    refused = ProjectError(
+        f"{path} is a symbolic link or not a regular file, so no event is written to it. "
+        "Remove it (or put the project's own events.jsonl back); the project then starts "
+        "a new one."
+    )
+    if path.is_symlink():  # where the system has no O_NOFOLLOW this is the whole check
+        raise refused
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags, 0o644)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.EISDIR) or path.is_dir():
+            raise refused from None
+        raise
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise refused
+    return os.fdopen(descriptor, "ab+")
+
+
+def _process_is_gone(pid: int) -> bool:
+    """Whether no process of this machine has the id ``pid``.  Where that cannot be asked
+    without a side effect (on Windows signal 0 is Ctrl-C), the answer is no: what a
+    process may still be writing is left alone."""
+    if pid <= 0 or os.name != "posix":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False  # it exists and is someone else's
+    return False
+
+
+def _older_than(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.lstat().st_mtime > seconds
+    except OSError:
+        return False
 
 
 def _own_copy(value: Any) -> Any:
@@ -642,6 +862,13 @@ class Project:
         and creates ``wiki/idea.md`` from the brief as the person's own page.
         ``settings`` may be partial; what it leaves out gets the defaults.  An
         empty ``title`` is taken from the first line of the brief.
+
+        Creating is all or nothing: ``root`` holds the whole project when this
+        returns, and is as it was (absent, or the empty directory it was) when it
+        raises.  When the process dies in the middle, a new ``root`` is still
+        absent, and an existing one holds at most what the next attempt recognises
+        as an unfinished creation and clears; a hidden build directory next to (or
+        in) it is removed by the next creation there.
         """
         root = Path(root)
         cls._check_free(root)
@@ -650,50 +877,59 @@ class Project:
         given = _one_line(title)
         title = given or _clip(brief.strip().split("\n", 1)[0], 80) or "Untitled project"
         chosen, skipped = _gather_inputs(files)
-        made = not root.exists()
+        # All or nothing: the project is built in a hidden directory and put in place
+        # when it is whole.  A new directory appears in one step (a rename).  An empty
+        # directory that exists stays the directory it is and gets the entries moved in,
+        # project.json last; what a creation that died there left is recognised by the
+        # next one and cleared.  Either way nothing is ever at ``root`` that a command
+        # refuses as "not empty" or lists as a project without its idea page.
+        existed = root.is_dir()
+        home = root if existed else root.parent
         try:
-            root.mkdir(parents=True, exist_ok=True)
+            home.mkdir(parents=True, exist_ok=True)
+            if existed:
+                _clear_unfinished(root)
+            _sweep_unfinished(home)
+            workshop = Path(tempfile.mkdtemp(prefix=f"{_BUILD_PREFIX}{os.getpid()}-", dir=home))
         except OSError as exc:
             raise ProjectError(
                 f"The directory {root} could not be created ({exc}). Choose a place you can "
                 "write to."
             ) from exc
+        built = workshop / "project"
         try:
-            project = cls(root, clock=clock)
+            built.mkdir()
+            project = cls(built, clock=clock)
             project.id = f"p-{secrets.token_hex(6)}"
             project.title = title
             project.settings = typed
             if not given:
                 project._extra[TITLE_FROM_BRIEF] = True
+            # The directory the project will be: a rename keeps the inode.
+            project._extra[HOME_KEY] = {"inode": (root if existed else built).stat().st_ino}
             project._title_on_file = title
-            with project._lock:
-                # Once more, now that no other writer can be at work in this directory: two
-                # requests to create the same project must not write into each other.
-                cls._check_free(root)
-                try:
-                    project.created = project._clock.now()
-                    project._start(brief, chosen, skipped)
-                except BaseException:
-                    # Half a project would be refused as "not empty" by the next attempt.
-                    # The directory was empty when the lock was taken, so all of it is ours.
-                    _clear(root)
-                    raise
-        except BaseException:
-            _abandon(root, made=made)
-            raise
-        return project
+            project.created = project._clock.now()
+            project._start(brief, chosen, skipped)
+            if existed:
+                _move_contents(built, root, workshop.name)
+            else:
+                _move_into_place(built, root)
+        finally:
+            # After the move it is empty; after a failure it holds what was built so far.
+            shutil.rmtree(workshop, ignore_errors=True)
+            with _LOCKS_GUARD:
+                _LOCKS.pop(built.resolve(), None)
+        return cls.open(root, clock=clock)
 
     @staticmethod
     def _check_free(root: Path) -> None:
-        """Raise unless ``root`` is free for a new project: absent, or an empty directory."""
-        if (root / PROJECT_FILE).exists():
-            raise ProjectError(
-                f"{root} already holds a research project. Open it, or choose another directory."
-            )
-        if root.exists() and (not root.is_dir() or _entries(root)):
-            raise ProjectError(
-                f"{root} is not an empty directory. A project needs a directory of its own."
-            )
+        """Raise unless ``root`` is free for a new project: absent, an empty directory,
+        or a directory that holds nothing but what a creation that died there left."""
+        if (root / PROJECT_FILE).exists() or (root.exists() and not root.is_dir()):
+            raise _already_there(root)
+        left = _entries(root) if root.is_dir() else []
+        if left and not _unfinished_creation(root, left):
+            raise _already_there(root)
 
     @staticmethod
     def _typed_settings(settings: ProjectSettings | Mapping[str, Any] | None) -> ProjectSettings:
@@ -752,10 +988,14 @@ class Project:
 
     @classmethod
     def open(cls, root: str | Path, *, clock: Callable[[], datetime] | None = None) -> Project:
-        """Open the project in ``root``.  Reads only; nothing on disk is touched.
+        """Open the project in ``root``.
 
         Pages written by hand, an older ``project.json`` and unknown settings are
-        all accepted; :meth:`problems` says what was read leniently.
+        all accepted; :meth:`problems` says what was read leniently.  Nothing on
+        disk is touched, with one exception: a project whose idea page is missing
+        (its creation by an earlier version died half way, or the file was removed)
+        gets it written again from ``inputs/brief.md``, because nothing can be done
+        with a project that has no idea page.
         """
         root = Path(root)
         if not (root / PROJECT_FILE).is_file():
@@ -765,16 +1005,60 @@ class Project:
             )
         project = cls(root, clock=clock)
         project.reload()
+        project._restore_idea()
         return project
+
+    def _restore_idea(self) -> None:
+        """Write the idea page again from the brief on file, where the page is missing."""
+        brief = self.inputs_dir / BRIEF_FILE
+        if (self.root / IDEA_PATH).exists() or brief.is_symlink() or not brief.is_file():
+            return
+        # A project that cannot be written to (or locked) just now is opened all the same;
+        # ``problems`` then says that the idea page is missing.
+        with contextlib.suppress(ProjectError, OSError, UnicodeDecodeError), self._lock:
+            if (self.root / IDEA_PATH).exists():
+                return  # another process was quicker
+            text = brief.read_text(encoding="utf-8")
+            meta = {"title": self.title, "kind": "idea", "review": "accepted", "author": HUMAN}
+            meta["round"] = 0
+            page = self._write(
+                IDEA_PATH, meta, text, editor=HUMAN, stamp=self._next_stamp(IDEA_PATH)
+            )
+            self._changed()
+            self._page_event(
+                "page.created",
+                f"The idea page was missing and was written again from {INPUTS_DIR}/{BRIEF_FILE}.",
+                page,
+                SYSTEM,
+                restored=True,
+            )
+
+    def at_home(self) -> bool | None:
+        """Whether this directory is the one the project was created as: ``False`` for a
+        copy of it (and for one moved to another file system), ``None`` when the project
+        does not say where it was created (it is older than this record).
+
+        Two directories with one id are a project and its copy; this tells which is
+        which, so that the id goes on naming the project and not the copy.
+        """
+        home = self._extra.get(HOME_KEY)
+        inode = home.get("inode") if isinstance(home, dict) else None
+        if not isinstance(inode, int) or isinstance(inode, bool):
+            return None
+        try:
+            return self.root.stat().st_ino == inode
+        except OSError:
+            return None
 
     def reload(self) -> None:
         """Read ``project.json`` again: another process may have changed title or settings."""
         path = self.root / PROJECT_FILE
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
+            said = "it is nested too deeply" if isinstance(exc, RecursionError) else exc
             raise ProjectError(
-                f"{path} cannot be read as JSON ({exc}). Repair the file or restore it "
+                f"{path} cannot be read as JSON ({said}). Repair the file or restore it "
                 "from a copy; the wiki pages themselves are untouched."
             ) from exc
         if not isinstance(data, dict):
@@ -818,21 +1102,31 @@ class Project:
     def save_settings(self) -> None:
         """Write ``title`` and ``settings`` to ``project.json``.
 
-        Refuses invalid settings with every problem named; the file is left as it was.
+        Refuses invalid settings with every problem named; the file is left as it was,
+        and so is this object: when the save is refused or fails, ``title`` and
+        ``settings`` are read back from the file.
         """
-        self.settings.validate()
-        title = _one_line(self.title)
-        if not title:
-            raise ProjectError("A project needs a title.")
-        with self._lock:
-            self.title = title
-            if title != self._title_on_file:
-                self._extra.pop(TITLE_FROM_BRIEF, None)  # someone chose this one
-            self._write_project_file()
-            self._title_on_file = title
-            self._file_problems = []
-            self.wiki.name = title
-            self._changed()
+        try:
+            self.settings.validate()
+            title = _one_line(self.title)
+            if not title:
+                raise ProjectError("A project needs a title.")
+            _check_storable("The project's title or settings", title, self.settings.to_dict())
+            with self._lock:
+                self.title = title
+                if title != self._title_on_file:
+                    self._extra.pop(TITLE_FROM_BRIEF, None)  # someone chose this one
+                self._write_project_file()
+                self._title_on_file = title
+                self._file_problems = []
+                self.wiki.name = title
+                self._changed()
+        except BaseException:
+            # What could not be saved is not kept in memory: whoever holds this object
+            # would go on showing, and working with, settings the project does not have.
+            with contextlib.suppress(ProjectError):
+                self.reload()
+            raise
 
     @property
     def title_is_provisional(self) -> bool:
@@ -854,6 +1148,7 @@ class Project:
             raise ProjectError(
                 f"A project's title is one line of at most {TITLE_LIMIT} characters."
             )
+        _check_storable("The project's title", title)
         with self._lock:
             self.reload()
             if by != HUMAN and not self.title_is_provisional:
@@ -896,6 +1191,36 @@ class Project:
         manifest = _read_json(self.inputs_dir / MANIFEST_FILE)
         files = manifest.get("files") if isinstance(manifest, dict) else None
         return [dict(entry) for entry in files or [] if isinstance(entry, dict)]
+
+    def sweep_temporary_files(self) -> list[str]:
+        """Remove the temporary files that writers which died left in the project, and
+        return their project-relative paths.
+
+        Every file of the project is written under a temporary name and renamed into
+        place (``.<name>.<pid>.<random>.tmp``); a writer killed in between leaves the
+        temporary file for good.  One is removed when the process named in it is gone
+        and it is older than ``TEMPORARY_FILE_AGE`` seconds.  The person's ``inputs/``
+        and anything behind a symbolic link are not looked at.  Called when a worker
+        starts on the project.
+        """
+        removed: list[str] = []
+        for folder, dirs, names in os.walk(self.root):
+            here = Path(folder)
+            dirs[:] = [
+                name
+                for name in dirs
+                if not (here / name).is_symlink() and (here != self.root or name != INPUTS_DIR)
+            ]
+            for name in names:
+                match = _TEMPORARY_NAME.match(name)
+                file = here / name
+                if match is None or file.is_symlink():
+                    continue
+                if _process_is_gone(int(match.group(1))) and _older_than(file, TEMPORARY_FILE_AGE):
+                    with contextlib.suppress(OSError):
+                        file.unlink()
+                        removed.append(file.relative_to(self.root).as_posix())
+        return sorted(removed)
 
     # -- time and engine state ---------------------------------------------------
 
@@ -1109,6 +1434,7 @@ class Project:
         which the caller has archived (``stamp`` comes from :meth:`_supersede`)."""
         stamped = {**meta, "updated": stamp, "updated_by": editor}
         stamped.setdefault("created", (previous.created if previous else "") or stamp)
+        _check_storable(path, stamped, body)
         try:
             with self._clock.at(stamp):
                 written = self.wiki.write(path, body, ordered_meta(stamped), force=True)
@@ -1239,9 +1565,9 @@ class Project:
         """Raise ``NotAllowed`` unless ``author`` may change ``page`` directly.
 
         The person may change anything.  An agent may change only a page of its
-        own that no person has decided yet and that is still in its first state: a
-        plan the person approved, or a hypothesis under test, stays what it was
-        when that happened.  Pipeline code writes records, may set fields anywhere,
+        own that no person has decided or edited yet and that is still in its first
+        state: a plan the person approved, or a hypothesis under test, stays what it
+        was when that happened.  Pipeline code writes records, may set fields anywhere,
         and rewrites or removes the text of a page only while no person wrote it
         or decided on it (``text`` says whether the body is touched).
         """
@@ -1281,6 +1607,11 @@ class Project:
                     f"{name} is {page.state}, so it stays as it was when that was decided; "
                     "propose an edit with propose_edit."
                 )
+            if self.edited_by_person(page):
+                raise NotAllowed(
+                    f"{name} was edited by the person while it waits for their decision, so "
+                    "it stays as they left it; propose an edit with propose_edit."
+                )
             return
         if page.is_record or not text:
             return
@@ -1290,6 +1621,14 @@ class Project:
                 "pipeline code may set fields on it but does not rewrite its text. "
                 "Propose the change with propose_edit."
             )
+
+    @staticmethod
+    def edited_by_person(page: ResearchPage) -> bool:
+        """Whether the person edited ``page`` themselves, a page someone else wrote
+        (``update_page`` notes it on the page).  Such a page is no longer its author's
+        to rewrite, also while the decision on it is still open.  A decision, an
+        approval or a state the person set is not an edit."""
+        return bool(page.meta.get(EDITED_BY_PERSON))
 
     def _created_after(self, earlier: Sequence[EditProposal | Request]) -> str:
         """A creation stamp later than those of ``earlier``, so "oldest first" is the order
@@ -1455,6 +1794,7 @@ class Project:
         fields: Mapping[str, Any] | None = None,
         relations: Mapping[str, Any] | None = None,
         base_updated: str | None = None,
+        accept: bool = False,
     ) -> ResearchPage:
         """Change a page directly and return the new version.
 
@@ -1470,28 +1810,44 @@ class Project:
         message that says where a run is approved.  The person may still take an
         approval back (``state: planned``).
 
-        A page the person edits becomes accepted.  An agent may change only its
-        own page that no person has decided; anything else is ``NotAllowed`` and
-        goes through :meth:`propose_edit`.
+        Editing is not deciding.  A proposed page the person edits stays proposed
+        and a rejected one stays rejected, with their corrections in it; ``accept``
+        (the person's "save and accept") is the explicit decision, the same as
+        :meth:`review` with these changes as its ``edits``, and only the person can
+        make it.  A page that was accepted without review becomes the person's
+        decision once they edit it.  An agent may change only its own page that no
+        person has decided or edited; anything else is ``NotAllowed`` and goes
+        through :meth:`propose_edit`.
         """
         author = normalize_author(author)
+        if accept and author != HUMAN:
+            raise NotAllowed(
+                f"Only the person accepts a page; {author} can edit its own proposal and "
+                "waits for the decision."
+            )
         with self._lock:
             page, text = self._fresh(ref)
             self._check_base(page, base_updated)
+            settled = page.review == "accepted" and (bool(page.decided_by) or page.author == HUMAN)
+            if accept and not settled:
+                given = {"body": body, "fields": fields, "relations": relations}
+                edits = {name: value for name, value in given.items() if value is not None}
+                return self._decide_page(page.path, "accept", None, edits, base_updated)
             self._check_may_modify(page, author, text=body is not None)
             meta, new_body = self._apply_changes(
                 page, by=author, body=body, fields=fields, relations=relations
             )
             if meta == page.meta and new_body == page.body:
                 return page
+            _check_storable(page.path, meta, new_body)
             stamp = self._supersede(page, text)
-            if author == HUMAN and (page.author != HUMAN or page.review != "accepted"):
-                # Editing is deciding: what the person rewrote is accepted, and theirs.  That
-                # holds for a page of their own that a hand-written file marked otherwise.
-                if page.review != "accepted" or not page.decided_by:
-                    meta["decided_at"] = stamp
-                    meta.pop("decision_reason", None)
-                meta.update({"review": "accepted", "decided_by": HUMAN})
+            if author == HUMAN and page.review == "accepted" and not page.decided_by:
+                # It was accepted without a look; now it holds what the person wrote, and
+                # from here on its author proposes changes like everyone else.  (Nothing
+                # is decided by this: the page was accepted already.)
+                meta.update({"decided_by": HUMAN, "decided_at": stamp})
+            if author == HUMAN and page.author != HUMAN:
+                meta[EDITED_BY_PERSON] = stamp
             new = self._write(page.path, meta, new_body, editor=author, stamp=stamp, previous=page)
             self._changed()
             verb = "edited" if author == HUMAN else "revised" if is_agent(author) else "updated"
@@ -1666,6 +2022,8 @@ class Project:
                 # A rejected plan must not be picked up by the next run phase.
                 meta["state"] = "planned"
         stamp = self._supersede(page, text)
+        if edited and page.author != HUMAN:
+            meta[EDITED_BY_PERSON] = stamp
         meta.update(
             {
                 "review": "accepted" if choice == "accept" else "rejected",
@@ -1744,6 +2102,13 @@ class Project:
                     "what was approved are the person's to decide when they approve the "
                     "experiment, and cannot be proposed."
                 )
+            if key in _REPOSITORY_FIELDS and page.kind == "experiment":
+                raise NotAllowed(
+                    f"'{key}' names the repository an experiment copies or clones and runs. "
+                    "That is the person's choice, made on the page or in the project's "
+                    "settings (settings.repo), and cannot be proposed. Say in the text of "
+                    "your edit which repository you think it should be."
+                )
             if key != "state":
                 continue
             if page.kind == "experiment":
@@ -1776,10 +2141,12 @@ class Project:
         ``relations_add``).  Refused for records (their content comes from data,
         not from suggestions), for managed fields, for the state of an
         experiment, which only the person's approval and the run itself change,
-        and for the record of an approval (``backend``, ``approved_digest``,
-        ``approved_at``, ``repaired_digest``).  Other fields of an experiment's
-        plan may be proposed; accepting such an edit after the run was approved
-        means the experiment needs a new approval before it runs.
+        for the record of an approval (``backend``, ``approved_digest``,
+        ``approved_at``, ``repaired_digest``) and for the repository an experiment
+        runs in (``repo``, ``repo_ref``), which only the person names.  Other
+        fields of an experiment's plan may be proposed; accepting such an edit
+        after the run was approved means the experiment needs a new approval
+        before it runs.
         """
         author = normalize_author(author)
         summary = _one_line(summary)
@@ -1805,6 +2172,7 @@ class Project:
                 raise ProjectError(
                     "An edit proposal changes something: give a body, fields or relations."
                 )
+            _check_storable("The edit proposal", summary, body, changes, relation_changes)
             proposal = EditProposal(
                 id=f"ep-{secrets.token_hex(4)}",
                 target=page.path,
@@ -1820,7 +2188,7 @@ class Project:
             write_json(self._proposal_path(proposal.id), proposal.to_dict())
             self.emit(
                 "proposal.created",
-                _sentence(f"{_who(author)} proposed an edit to {_what(page)}: {summary}"),
+                _sentence(f"{_who(author)} proposed an edit to {_what(page)}: {_said(summary)}"),
                 agent=role_of(author) or "",
                 refs=[page.path, f"{PROPOSALS_DIR}/{proposal.id}.json"],
                 data={"proposal": proposal.id, "path": page.path, "id": page.id, "by": author},
@@ -1858,6 +2226,13 @@ class Project:
                 f"{proposal.id} asks to set {', '.join(carried)} of {_name(page)}, which "
                 "belong to the record of an approval. Only the person's approval of the "
                 "experiment writes them; reject this proposal."
+            )
+        named = sorted(_REPOSITORY_FIELDS & proposal.fields.keys())
+        if named and page.kind == "experiment" and "fields" not in edits:
+            raise NotAllowed(
+                f"{proposal.id} asks to set {', '.join(named)} of {_name(page)}: the "
+                "repository an experiment runs in. Only the person names it, on the page "
+                "or in the project's settings; reject this proposal."
             )
         # The person's own text was written looking at the page as it is; the agent's was
         # written against the text of an earlier version.  A page that already reads as
@@ -1940,12 +2315,14 @@ class Project:
     def _close_proposal(self, proposal: EditProposal, page: ResearchPage | None) -> EditProposal:
         write_json(self._proposal_path(proposal.id), proposal.to_dict())
         verb = "accepted" if proposal.review == "accepted" else "rejected"
-        what = _what(page) if page is not None else proposal.target
+        what = _what(page) if page is not None else quotable(proposal.target, 120)
+        # The reason is the person's own; the summary is what an agent called its edit.
         tail = proposal.decision_reason if verb == "rejected" and proposal.decision_reason else ""
         self.emit(
             "review.decided",
             _sentence(
-                f"You {verb} {_whose(proposal.author)} edit to {what}: {tail or proposal.summary}"
+                f"You {verb} {_whose(proposal.author)} edit to {what}: "
+                f"{tail or _said(proposal.summary)}"
             ),
             refs=[proposal.target, f"{PROPOSALS_DIR}/{proposal.id}.json"],
             data={
@@ -2194,11 +2571,21 @@ class Project:
             raise NotFound(f"There is no request {request_id!r}.")
         return Request.from_dict(data)
 
-    def add_request(self, text: str, *, target: str | None = None) -> Request:
-        """Leave an instruction for the agents, optionally about one page."""
+    def add_request(
+        self, text: str, *, target: str | None = None, role: str | None = None
+    ) -> Request:
+        """Leave an instruction for the agents, optionally about one page.
+
+        ``role`` says who it is for: one of ``model.REQUEST_ROLES`` (``designer``),
+        whose next phase is then given it and closes it, or nothing (``all``) for
+        every agent: it is then shown to every phase that runs until the round's
+        analysis has completed.  Who was given it is kept on it (``handled_in``).
+        """
         text = str(text or "").strip()
         if not text:
             raise ProjectError("A request needs some text: what should the agents do?")
+        addressee = request_role(role)
+        _check_storable("The request", text)
         with self._lock:
             path = None
             if target:
@@ -2210,13 +2597,15 @@ class Project:
                 text=text,
                 target=path,
                 created=self._created_after(self.requests(state=None)),
+                role=addressee,
             )
             write_json(self._request_path(request.id), request.to_dict())
+            whom = "the agents" if addressee == FOR_ALL else f"the {addressee}"
             self.emit(
                 "request.created",
-                _sentence(f"You asked the agents: {_clip(text, 160)}"),
+                _sentence(f"You asked {whom}: {_clip(text, 160)}"),
                 refs=[f"{REQUESTS_DIR}/{request.id}.json", *([path] if path else [])],
-                data={"request": request.id, "target": path},
+                data={"request": request.id, "target": path, "for": addressee},
             )
         return request
 
@@ -2232,12 +2621,29 @@ class Project:
                     found.append(request)
         return sorted(found, key=lambda request: (request.created, request.id))
 
-    def close_request(self, request_id: str, *, round: int, phase: str) -> None:
-        """Mark a request as handled by the phase that received it."""
+    def note_request(
+        self, request_id: str, *, round: int, phase: str, close: bool = False
+    ) -> Request:
+        """Note on a request that ``phase`` of ``round`` was given it, and return it.
+
+        ``handled_in`` lists every phase that was, in order and each once.  With
+        ``close`` the request is done as well: nobody else is to be shown it.  What
+        else its file holds is kept.
+        """
         with self._lock:
             request = self._request(request_id)
-            done = replace(request, state="done", handled_in={"round": int(round), "phase": phase})
-            write_json(self._request_path(request.id), done.to_dict())
+            entry = {"round": int(round), "phase": str(phase)}
+            given = [*request.handled_in, *([] if entry in request.handled_in else [entry])]
+            noted = replace(request, handled_in=given, state="done" if close else request.state)
+            if noted != request:
+                on_file = _read_json(self._request_path(request.id))
+                extra = on_file if isinstance(on_file, dict) else {}
+                write_json(self._request_path(request.id), {**extra, **noted.to_dict()})
+        return noted
+
+    def close_request(self, request_id: str, *, round: int, phase: str) -> None:
+        """Mark a request as done with the phase that was given it last."""
+        self.note_request(request_id, round=round, phase=phase, close=True)
 
     def delete_request(self, request_id: str) -> None:
         """Withdraw a request the person no longer wants handled."""
@@ -2247,30 +2653,26 @@ class Project:
 
     # -- events ------------------------------------------------------------------
 
-    def _last_seq(self, path: Path) -> int:
-        """The ``seq`` of the last complete event in the file (0 when there is none)."""
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return 0
+    def _last_seq(self, handle: Any, size: int) -> int:
+        """The ``seq`` of the last complete event in the open stream of ``size`` bytes
+        (0 when there is none)."""
         if size == self._tail[0]:
             return self._tail[1]
-        with path.open("rb") as handle:
-            window = 1 << 16
-            while True:
-                handle.seek(max(0, size - window))
-                lines = handle.read().split(b"\n")
-                # The first piece of a window may be the tail of a longer line.
-                for raw in reversed(lines[1:] if window < size else lines):
-                    try:
-                        seq = json.loads(raw)["seq"]
-                    except (ValueError, KeyError, TypeError):
-                        continue
-                    if isinstance(seq, int):
-                        return seq
-                if window >= size:
-                    return 0
-                window *= 8
+        window = 1 << 16
+        while True:
+            handle.seek(max(0, size - window))
+            lines = handle.read().split(b"\n")
+            # The first piece of a window may be the tail of a longer line.
+            for raw in reversed(lines[1:] if window < size else lines):
+                try:
+                    seq = json.loads(raw)["seq"]
+                except (ValueError, KeyError, TypeError, RecursionError):
+                    continue
+                if isinstance(seq, int):
+                    return seq
+            if window >= size:
+                return 0
+            window *= 8
 
     def emit(
         self,
@@ -2289,41 +2691,83 @@ class Project:
         allocated under the project's lock: it grows by exactly one per event
         whichever process writes.  ``round`` and ``phase`` default to what the
         engine's ``state.json`` says is running.
+
+        The values of this process's credentials (the rule of ``paper-orchestra
+        doctor``) and the password or token in the address of the project's
+        repository are blanked out of ``summary`` and of every text in ``data``
+        before the event is written: an error that quotes a key is kept without
+        it.  The stream is appended to as the regular file it is; an
+        ``events.jsonl`` that is a symbolic link (or anything else) is refused
+        with ``ProjectError``.
         """
         if type not in EVENT_TYPES:
             raise ProjectError(
                 f"{type!r} is not an event type; the types are: {', '.join(EVENT_TYPES)}."
             )
         path = self.root / EVENTS_FILE
-        with self._lock:
+        secrets_known = self._secrets()
+        with self._lock, _open_for_append(path) as handle:
+            size = handle.seek(0, os.SEEK_END)
             event = {
-                "seq": self._last_seq(path) + 1,
+                "seq": self._last_seq(handle, size) + 1,
                 "ts": self._clock.now(),
                 "type": type,
                 "phase": phase or self._running_phase(),
                 "round": self.current_round() if round is None else int(round),
                 "agent": agent,
-                "summary": _one_line(summary),
+                # Blanked here, at the source: the stream is read by the app, by later
+                # agent sessions and by whoever is given the project directory.
+                "summary": doctor.scrub(_one_line(summary), secrets_known),
                 "refs": [str(ref) for ref in refs],
-                "data": dict(data or {}),
+                "data": doctor.scrub(dict(data or {}), secrets_known),
             }
-            line = json.dumps(event, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
-            with path.open("ab+") as handle:
-                size = handle.seek(0, os.SEEK_END)
-                if size:
-                    # A writer that died mid-line must not have the next event glued on.
-                    handle.seek(size - 1)
-                    if handle.read(1) != b"\n":
-                        line = b"\n" + line
-                handle.write(line)
-                handle.flush()
-                self._tail = (handle.tell(), event["seq"])
+            line = self._event_line(event)
+            for secret in secrets_known:
+                # Also where a value was not a string until it was written (a path, an
+                # exception): nothing of the line that is kept holds a credential.
+                if secret.encode("utf-8", errors="replace") in line:
+                    event = doctor.scrub(json.loads(line), secrets_known)
+                    line = self._event_line(event)
+                    break
+            if size:
+                # A writer that died mid-line must not have the next event glued on.
+                handle.seek(size - 1)
+                if handle.read(1) != b"\n":
+                    line = b"\n" + line
+            handle.write(line)
+            handle.flush()
+            self._tail = (handle.tell(), event["seq"])
         return event
+
+    @staticmethod
+    def _event_line(event: Mapping[str, Any]) -> bytes:
+        """One event as a line of the stream.  What cannot be written as it is (half of a
+        surrogate pair in something a model or a job said) is written as an escape: an
+        event that cannot be recorded would hide what happened."""
+        try:
+            text = json.dumps(event, ensure_ascii=False, default=str)
+            return text.encode("utf-8") + b"\n"
+        except UnicodeEncodeError:
+            return json.dumps(event, ensure_ascii=True, default=str).encode("ascii") + b"\n"
+
+    def _secrets(self) -> list[str]:
+        """What must never be written into the event stream, longest first: the
+        credentials in this process's environment and what the address of the
+        project's repository carries."""
+        found = set(doctor.secret_values(os.environ))
+        given = self.settings.repo
+        carried = repositories.userinfo(given.path) if given else None
+        if carried:
+            # git prints either form of a password that needed escaping in the URL.
+            found.update(text for text in (carried, unquote(carried)) if len(text) >= 4)
+        return sorted(found, key=len, reverse=True)
 
     def events(self, *, after: int = 0) -> list[dict[str, Any]]:
         """Events with ``seq`` greater than ``after``, in order."""
         path = self.root / EVENTS_FILE
         found: list[dict[str, Any]] = []
+        if path.is_symlink():
+            return []  # what a link points at is not this project's stream
         try:
             with path.open("rb") as handle:
                 for raw in handle:
@@ -2331,7 +2775,7 @@ class Project:
                         break  # still being written
                     try:
                         event = json.loads(raw)
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         continue
                     seq = event.get("seq") if isinstance(event, dict) else None
                     if isinstance(seq, int) and seq > after:
@@ -2541,16 +2985,42 @@ class Project:
 
     # -- diagnosis ---------------------------------------------------------------
 
+    def state_lost(self) -> str | None:
+        """What to say when the engine's ``state.json`` is missing, cannot be read or
+        holds no record of a phase although phases have run (their events are on file);
+        ``None`` otherwise.  Such a project is not "not started"."""
+        state = _read_json(self.root / STATE_FILE)
+        if isinstance(state, dict) and isinstance(state.get("phases"), list) and state["phases"]:
+            return None
+        try:
+            with (self.root / EVENTS_FILE).open("rb") as handle:
+                ran = any(
+                    b'"type": "phase.' in line or b'"type": "checkpoint"' in line for line in handle
+                )
+        except OSError:
+            ran = False
+        if not ran:
+            return None
+        return (
+            "state.json is missing or cannot be read, although phases of this project have "
+            "run. The project is not started over: where it stands is read from "
+            "events.jsonl, and the engine writes the file again when it next works on it."
+        )
+
     def problems(self) -> list[dict[str, str]]:
         """What was read leniently: ``[{"path": ..., "message": ...}]``, empty when clean.
 
         A project edited by hand opens whatever state it is in; this says what a
-        person may want to repair: settings replaced by defaults, pages with
-        missing or unknown front matter, ids used twice, relations that point at
-        nothing or at the wrong kind of page, proposal and request files that are
-        not valid JSON.
+        person may want to repair: settings replaced by defaults (and a research
+        cutoff that cannot be read, which stops the research until it is corrected),
+        an engine state that was lost, pages with missing or unknown front matter,
+        ids used twice, relations that point at nothing or at the wrong kind of
+        page, proposal and request files that are not valid JSON.
         """
         found = [{"path": PROJECT_FILE, "message": message} for message in self._file_problems]
+        lost = self.state_lost()
+        if lost:
+            found.append({"path": STATE_FILE, "message": lost})
         pages = self._all_pages()
         resolver = _Resolver(self.wiki, pages)
         if IDEA_PATH not in resolver.pages:

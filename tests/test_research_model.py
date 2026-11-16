@@ -500,7 +500,8 @@ def test_invalid_settings_load_with_defaults_and_say_so():
     assert settings.limits.max_sources == 12
     assert settings.review["hypothesis"] == "review" and settings.review["topic"] == "auto"
     assert settings.models.effort == "high" and settings.models.fast == "claude-fable-5-2"
-    assert settings.lab_memory is True and settings.research_cutoff is None
+    # The one value that is not replaced by its default: that would mean "no cutoff".
+    assert settings.lab_memory is True and settings.research_cutoff == "last year"
     report = "\n".join(settings.load_problems)
     for needle in (
         "compute",
@@ -517,7 +518,9 @@ def test_invalid_settings_load_with_defaults_and_say_so():
         "YYYY-MM",
     ):
         assert needle in report
-    assert settings.problems() == []
+    assert [problem.split(" is ")[0] for problem in settings.problems()] == [
+        "settings.research_cutoff"
+    ]
 
 
 def test_whole_numbers_written_as_floats_are_read_as_whole_numbers():
@@ -645,12 +648,13 @@ def test_a_request_has_the_documented_shape():
         "target": None,
         "created": "2026-11-15T12:00:00Z",
         "state": "open",
-        "handled_in": None,
+        "for": "all",
+        "handled_in": [],
     }
     done = Request.from_dict(
-        {**request.to_dict(), "state": "done", "handled_in": {"round": 2, "phase": "hypothesize"}}
+        {**request.to_dict(), "state": "done", "handled_in": [{"round": 2, "phase": "hypothesize"}]}
     )
-    assert done.state == "done" and done.handled_in == {"round": 2, "phase": "hypothesize"}
+    assert done.state == "done" and done.handled_in == [{"round": 2, "phase": "hypothesize"}]
 
 
 def test_stamps():
@@ -704,3 +708,78 @@ def test_code_takes_an_approval_back_but_never_gives_one():
             model.check_transition("experiment", current, "planned", "agent:designer")
     with pytest.raises(NotAllowed):
         model.check_transition("experiment", "planned", "approved", "system")
+
+
+# -- round 2 of the audit repairs -----------------------------------------------
+
+
+def test_a_request_says_who_it_is_for_and_every_phase_that_was_given_it():
+    request = Request(id="rq-0a1b2c3d", text="Use three seeds", created="2026-11-15T12:00:00Z")
+    assert request.role == "all" and request.for_all and request.handled_in == []
+    assert request.to_dict()["for"] == "all" and request.to_dict()["handled_in"] == []
+    for_designer = Request.from_dict({**request.to_dict(), "for": "agent:Designer"})
+    assert for_designer.role == "designer" and not for_designer.for_all
+    assert Request.from_dict(for_designer.to_dict()) == for_designer
+    seen = [{"round": 1, "phase": "hypothesize"}, {"round": 1, "phase": "design"}]
+    given = Request.from_dict({**request.to_dict(), "handled_in": seen})
+    assert given.handled_in == seen and given.to_dict()["handled_in"] == seen
+    # A file of an earlier version names one phase, as an object.
+    earlier = Request.from_dict({"id": "rq-1", "text": "x", "handled_in": seen[0]})
+    assert earlier.handled_in == [seen[0]] and earlier.role == "all"
+    # A role this version does not know: shown to everyone rather than lost.
+    assert Request.from_dict({"id": "rq-1", "text": "x", "for": "reviewer"}).role == "all"
+    assert model.request_role(None) == model.request_role("") == "all"
+    with pytest.raises(ProjectError, match="scout, theorist, designer, analyst"):
+        model.request_role("runner")
+
+
+@pytest.mark.parametrize(
+    ("written", "read"),
+    [(2024, "2024"), (2024.0, "2024"), ("2024-6", "2024-06"), (" 2024-06-3 ", "2024-06-03")],
+)
+def test_a_cutoff_whose_meaning_is_plain_is_read_as_it_was_meant(written, read):
+    settings = ProjectSettings.from_dict({"research_cutoff": written})
+    assert settings.research_cutoff == read
+    assert settings.load_problems == [] and settings.cutoff_problem() is None
+    changed = ProjectSettings()
+    changed.update({"research_cutoff": written})
+    assert changed.research_cutoff == read
+
+
+@pytest.mark.parametrize("written", ["2024/06", "June 2024", "2024-13", ["2024-06"], True, 20245])
+def test_a_cutoff_that_cannot_be_read_is_never_no_cutoff(written):
+    settings = ProjectSettings.from_dict({"research_cutoff": written, "compute": "cloud"})
+    # Everything else falls back to its default; the cutoff stays what was written.
+    assert settings.compute == "local"
+    assert settings.research_cutoff == written and settings.research_cutoff is not None
+    assert "settings.research_cutoff" in (settings.cutoff_problem() or "")
+    (problem,) = [text for text in settings.load_problems if "research_cutoff" in text]
+    assert "not read as 'no cutoff'" in problem and "default" not in problem
+    assert settings.to_dict()["research_cutoff"] == written  # written back as it was
+    with pytest.raises(ProjectError, match="research_cutoff"):
+        settings.validate()
+    with pytest.raises(ProjectError, match="research_cutoff") as refusal:
+        ProjectSettings().update({"research_cutoff": written})
+    assert "no cutoff'" not in str(refusal.value)  # nothing was kept: it was refused
+
+
+def test_a_summary_taken_from_the_text_carries_no_link_markup():
+    body = "See [[topics/warmup|the warmup page]], [[H2]] and [[sources/Smith2020Deep#abstract]].\n"
+    page = model.parse_page("wiki/topics/t.md", f"---\ntitle: T\n---\n{body}")
+    assert page.summary == "See the warmup page, H2 and Smith2020Deep."
+    # A summary the author wrote is theirs, as written.
+    kept = model.parse_page("wiki/topics/t.md", "---\ntitle: T\nsummary: About [[H2]]\n---\nx\n")
+    assert kept.summary == "About [[H2]]"
+    assert model.plain_links("[[a/b.md]] and [[c|]]") == "b and c"
+
+
+@pytest.mark.parametrize("left_by_a_hand_edit", ["approved", "queued"])
+def test_the_end_of_a_run_can_be_recorded_whatever_state_the_page_was_left_in(
+    left_by_a_hand_edit,
+):
+    for end in ("succeeded", "failed", "cancelled"):
+        model.check_transition("experiment", left_by_a_hand_edit, end, "system")
+    with pytest.raises(NotAllowed):
+        model.check_transition("experiment", left_by_a_hand_edit, "succeeded", "agent:designer")
+    with pytest.raises(ProjectError):
+        model.check_transition("experiment", "planned", "succeeded", "system")

@@ -1387,8 +1387,14 @@ def test_demo_reports_a_directory_it_cannot_use(workspace, monkeypatch):
 def test_ui_serves_the_workspace_on_loopback_by_default(workspace, monkeypatch):
     served: list[tuple[Any, ...]] = []
 
-    def serve(workspace: Path, host: str, port: int, open_browser: bool) -> None:
-        served.append((workspace, host, port, open_browser))
+    def serve(
+        workspace: Path,
+        host: str,
+        port: int,
+        open_browser: bool,
+        stop_workers_on_exit: bool = False,
+    ) -> None:
+        served.append((workspace, host, port, open_browser, stop_workers_on_exit))
 
     stand_in(monkeypatch, "paper_orchestra.web.app", serve=serve)
 
@@ -1396,11 +1402,16 @@ def test_ui_serves_the_workspace_on_loopback_by_default(workspace, monkeypatch):
     chosen = runner.invoke(
         cli.app, ["ui", "--workspace", "w", "--host", "0.0.0.0", "--port", "9000", "--no-browser"]
     )
+    stopping = runner.invoke(cli.app, ["ui", "--no-browser", "--stop-workers-on-exit"])
 
-    assert default.exit_code == chosen.exit_code == 0, default.output + chosen.output
+    assert default.exit_code == chosen.exit_code == stopping.exit_code == 0, (
+        default.output + chosen.output + stopping.output
+    )
+    # The server's end leaves the workers running, unless the person asks otherwise.
     assert served == [
-        (Path("research"), "127.0.0.1", 8600, True),
-        (Path("w"), "0.0.0.0", 9000, False),
+        (Path("research"), "127.0.0.1", 8600, True, False),
+        (Path("w"), "0.0.0.0", 9000, False, False),
+        (Path("research"), "127.0.0.1", 8600, False, True),
     ]
 
 
@@ -1434,6 +1445,7 @@ def test_the_research_commands_are_the_ones_the_specification_lists():
 
     assert result.exit_code == 0
     commands = {"new", "status", "advance", "review", "approve", "run", "write", "demo"}
+    commands |= {"request", "cancel"}
     assert commands <= _first_words(result.output)
 
     top = runner.invoke(cli.app, ["--help"], env={"COLUMNS": "200"})
@@ -1462,3 +1474,272 @@ def test_the_command_line_starts_without_the_research_modules_or_the_web_app():
     )
     assert finished.returncode == 0, finished.stderr
     assert finished.stdout.strip() == "[]"
+
+
+# -- round 2 of the audit repairs -----------------------------------------------------
+
+
+def edit_project_file(project: Project, **settings: Any) -> None:
+    """Change settings in project.json the way an editor does: no check, no event."""
+    data = read_json(project.root / "project.json")
+    data["settings"].update(settings)
+    write_json(project.root / "project.json", data)
+
+
+def test_status_reports_what_was_read_leniently(project):
+    edit_project_file(project, research_cutoff="June 2024", compute="cloud")
+
+    result = invoke("status", str(project.root))
+    as_json = invoke("status", str(project.root), "--json")
+
+    assert result.exit_code == as_json.exit_code == 0, result.output
+    out = flat(result.stdout)
+    assert "2 problems in the project's files" in out
+    assert "project.json: settings.research_cutoff is 'June 2024'" in out
+    assert "not read as 'no cutoff'" in out and "settings.compute is 'cloud'" in out
+    problems = json.loads(as_json.stdout)["problems"]
+    assert [item["path"] for item in problems] == ["project.json", "project.json"]
+    assert any("research_cutoff" in item["message"] for item in problems)
+    # A project without any says nothing about it.
+    edit_project_file(project, research_cutoff=None, compute="local")
+    assert "problem" not in invoke("status", str(project.root)).stdout
+    assert json.loads(invoke("status", str(project.root), "--json").stdout)["problems"] == []
+
+
+def test_status_survives_a_state_file_with_values_of_the_wrong_type(project):
+    write_json(
+        project.root / "state.json",
+        checkpoint_state(
+            spent={"model_usd": "lots", "experiment_usd": None, "experiment_seconds": [1]},
+            checkpoint="soon",
+            worker="me",
+            round="one",
+            next_phase=["design"],
+        ),
+    )
+    result = invoke("status", str(project.root))
+    assert result.exit_code == 0, result.output
+    assert "Spent: $0.00 of $25.00 on models" in flat(result.stdout)
+    for spent in ("not a mapping", {"model_usd": float("nan")}):
+        write_json(project.root / "state.json", checkpoint_state(spent=spent))
+        result = invoke("status", str(project.root))
+        assert result.exit_code == 0 and "Spent: $0.00" in flat(result.stdout), result.output
+
+
+def test_status_of_a_project_whose_state_file_is_lost_does_not_read_as_not_started(project):
+    project.emit("phase.started", "The research phase started.", phase="research", round=1)
+    project.emit("phase.finished", "The research phase finished.", phase="research", round=1)
+    assert not (project.root / "state.json").exists()
+
+    result = invoke("status", str(project.root))
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout)
+    assert "Not started" not in out and "starts the research" not in out
+    assert "state.json is missing or cannot be read" in out
+
+
+def test_new_takes_a_research_cutoff(workspace, engine):
+    result = invoke(
+        "new", "--brief", "Does warmup matter?", "--research-cutoff", "2024-6", "--no-run",
+        "--dir", "cut",
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert Project.open(workspace / "cut").settings.research_cutoff == "2024-06"
+
+    refused = invoke(
+        "new", "--brief", "Does warmup matter?", "--research-cutoff", "June 2024", "--no-run",
+        "--dir", "other",
+    )  # fmt: skip
+    assert refused.exit_code == 2
+    assert "research_cutoff is 'June 2024'" in flat(refused.stderr)
+    assert not (workspace / "other").exists()
+
+
+def test_request_leaves_an_instruction_for_one_role_or_for_every_agent(project):
+    project.review("E1", "accept")
+    own = invoke(
+        "request", str(project.root), "Use batch size 8 and three seeds.", "--for", "designer",
+        "--about", "E1",
+    )  # fmt: skip
+    shared = invoke("request", str(project.root), "Keep every run under a minute.")
+
+    assert own.exit_code == shared.exit_code == 0, own.output + shared.output
+    first, second = project.requests()
+    assert (first.text, first.role, first.target) == (
+        "Use batch size 8 and three seeds.",
+        "designer",
+        project.page("E1").path,
+    )
+    assert (second.role, second.target) == ("all", None)
+    assert "for the designer" in flat(own.stdout) and first.id in own.stdout
+    assert "next phase that is the designer's" in flat(own.stdout)
+    assert "for every agent" in flat(shared.stdout)
+
+    for args, message in (
+        (("Run it.", "--for", "runner"), "scout, theorist, designer, analyst"),
+        (("About nothing.", "--about", "H9"), "No page matches 'H9'"),
+        (("   ",), "needs some text"),
+    ):
+        refused = invoke("request", str(project.root), *args)
+        assert refused.exit_code == 2 and message in flat(refused.stderr), refused.output
+    assert len(project.requests()) == 2
+
+
+def test_cancel_withdraws_an_approval_or_cancels_a_run_that_waits(approved):
+    withdrawn = invoke("cancel", str(approved.root), "E1")
+    assert withdrawn.exit_code == 0, withdrawn.output
+    assert approved.page("E1").state == "planned"
+    assert "E1 is a plan again" in flat(withdrawn.stdout)
+    assert f"paper-orchestra research approve {approved.root} E1" in flat(withdrawn.stdout)
+
+    approved.set_state("E1", "approved", by="human")
+    approved.set_state("E1", "queued", by="system")
+    cancelled = invoke("cancel", str(approved.root), "e1")
+    assert cancelled.exit_code == 0, cancelled.output
+    assert approved.page("E1").state == "cancelled"
+    assert "E1 is cancelled" in flat(cancelled.stdout)
+
+    nothing = invoke("cancel", str(approved.root), "E2")
+    assert nothing.exit_code == 0 and "E2 is planned" in flat(nothing.stdout)
+    assert "nothing to cancel" in flat(nothing.stdout)
+    unknown = invoke("cancel", str(approved.root), "E9")
+    assert unknown.exit_code == 2 and "E9" in flat(unknown.stderr)
+
+
+def a_run_of_e1(project: Project, loss: str = "0.2537") -> None:
+    """E1 accepted, with the record of a run that succeeded (as the run module leaves it)."""
+    project.review("E1", "accept")
+    directory = project.root / "experiments" / "E1" / "runs" / "1"
+    directory.mkdir(parents=True)
+    record = run_record("E1", 1, "succeeded", metrics={"loss": float(loss)})
+    write_json(directory / "run.json", {**record, "metrics_text": {"loss": loss}})
+    project.write_record(
+        "result", "E1-run1", "E1 run 1", f"## Metrics\n\n| metric | value |\n|---|---|\n| loss | {loss} |\n",
+        fields={"state": "succeeded"}, relations={"run_of": ["E1"]},
+    )  # fmt: skip
+
+
+def test_review_shows_the_summary_and_the_number_check_of_what_is_waiting(project):
+    a_run_of_e1(project)
+    project.create_page(
+        "finding",
+        "Warmup lowers the loss to 0.2537",
+        "The loss was 0.2537, a 37.5% improvement over 5 seeds.\n",
+        author="agent:analyst",
+        summary="The loss falls by 37.5%",
+        relations={"based_on": ["E1-run1"]},
+    )
+
+    out = invoke("review", str(project.root)).stdout
+
+    assert "The loss falls by 37.5%" in out
+    assert "numbers: 2 numbers were looked for in the run records" in flat(out)
+    assert "1 was not found" in flat(out) and "not found: 37.5" in flat(out)
+
+
+def test_review_checks_the_numbers_of_a_suggested_edit_as_the_text_would_read(project):
+    a_run_of_e1(project)
+    finding = project.create_page(
+        "finding", "The loss is low", "The loss was 0.2537.\n", author="human",
+        relations={"based_on": ["E1-run1"]},
+    )  # fmt: skip
+    proposal = project.propose_edit(
+        finding.path,
+        author="agent:analyst",
+        summary="Add the accuracy",
+        body="The loss was 0.2537 and accuracy reached 97.3%, 41.8 points above the baseline.\n",
+    )
+
+    listing = flat(invoke("review", str(project.root)).stdout)
+    assert "as the finding would read: 3 numbers were looked for" in listing
+    assert "not found: 97.3, 41.8" in listing
+
+    accepted = flat(invoke("review", str(project.root), "--accept", proposal.id).stdout)
+    assert "not found: 97.3, 41.8" in accepted
+
+
+def test_rejecting_an_experiment_says_what_rests_on_it(project):
+    a_run_of_e1(project)
+    project.review("H1", "accept")
+    project.create_page(
+        "finding", "The loss is low", "The loss was 0.2537.\n", author="human",
+        relations={"based_on": ["E1-run1"], "supports": ["H1"]},
+    )  # fmt: skip
+    project.set_state("H1", "supported", by="human")
+
+    result = invoke("review", str(project.root), "--reject", "E1", "--reason", "Wrong problem.")
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout)
+    assert "Rejected E1" in out
+    assert "F1" in out and "rests on E1 alone" in out
+    assert "H1" in out and "supported" in out and "through F1" in out
+    assert "no longer evidence" in out
+
+
+def test_run_says_what_advance_does_next(approved, engine):
+    engine.runs = {"E1": run_record("E1", 1, "succeeded")}
+    out = flat(invoke("run", str(approved.root)).stdout)
+    assert (
+        f"Next: `paper-orchestra research advance {approved.root}` analyses the new results "
+        "before anything else and stops at the checkpoint after the analysis"
+    ) in out
+    assert "--phase analyze" in out
+
+
+def test_a_stopped_run_is_said_to_be_back_in_the_queue_only_when_it_is(approved, engine):
+    engine.runs = {"E1": KeyboardInterrupt()}
+    approved.set_state("E1", "queued", by="system")
+    assert "back in the queue" in flat(invoke("run", str(approved.root)).stderr)
+    # Stopped when its run had just ended: nothing waits to run again.
+    approved.set_state("E1", "running", by="system")
+    approved.set_state("E1", "succeeded", by="system")
+    result = invoke("run", str(approved.root), "E1")
+    assert result.exit_code == 130
+    assert "back in the queue" not in flat(result.stderr)
+    assert "No run is waiting" in flat(result.stderr)
+
+
+def test_an_id_names_the_project_and_not_a_copy_of_its_directory(project, workspace):
+    import shutil
+
+    shutil.copytree(project.root, workspace / "research" / "backup-warmup")  # sorts first
+    by_id = invoke("status", project.id, "--json")
+    assert by_id.exit_code == 0, by_id.output
+    assert Path(json.loads(by_id.stdout)["project"]["root"]).resolve() == project.root.resolve()
+    assert "backup-warmup" in flat(by_id.stderr) and "copy" in flat(by_id.stderr)
+    # Projects that do not say where they were created: the id is not guessed at.
+    for name in ("warmup", "backup-warmup"):
+        file = workspace / "research" / name / "project.json"
+        data = read_json(file)
+        del data["home"]
+        write_json(file, data)
+    unsure = invoke("status", project.id)
+    assert unsure.exit_code == 2
+    message = flat(unsure.stderr)
+    assert "research/backup-warmup" in message and "research/warmup" in message
+    assert "Name the directory" in message
+    assert invoke("status", "warmup").exit_code == 0  # by name there is no doubt
+
+
+def test_the_workspace_listing_leaves_hidden_directories_out(project, workspace):
+    import shutil
+
+    shutil.copytree(project.root, workspace / "research" / ".trash")
+    listing = invoke("status")
+    assert listing.exit_code == 0 and ".trash" not in listing.stdout
+    assert len([line for line in listing.stdout.splitlines() if line.strip()]) == 1
+
+
+def test_a_worker_sweeps_the_temporary_files_that_dead_writers_left(project, engine):
+    gone = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        check=True, capture_output=True, text=True,
+    )  # fmt: skip
+    litter = project.root / "wiki" / f".idea.md.{int(gone.stdout)}.0a1b2c3d.tmp"
+    litter.write_text("half a page")
+    os.utime(litter, (time.time() - 3600, time.time() - 3600))
+
+    assert invoke("advance", str(project.root)).exit_code == 0
+    assert not litter.exists()

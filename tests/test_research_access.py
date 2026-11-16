@@ -1046,3 +1046,27 @@ def test_an_agent_cannot_propose_where_a_run_goes(project):
         with pytest.raises(ToolError, match=f"'{field}' is part of the record of an approval"):
             tool.handler({"target": exp.id, "summary": "Tidy", "fields": {field: "local"}})
     assert project.proposals() == [] and project.page(exp.id) == exp
+
+
+# -- round 2 of the audit repairs -----------------------------------------------
+
+
+def test_a_proposal_the_person_corrected_is_no_longer_its_sessions_to_rewrite(project, theorist):
+    path = "/memories/wiki/hypotheses/warmup.md"
+    theorist.create(path, HYPOTHESIS)
+    page = project.page("H1")
+    project.update_page("H1", author="human", body="## Statement\n\nMy wording.")
+    # Still a proposal, still readable by the session that wrote it ...
+    assert project.page("H1").review == "proposed"
+    where = f"/memories/{page.path}"
+    assert "My wording." in theorist.view(where)
+    # ... and not replaced by it: the person's correction stands until they decide.
+    for change in (
+        lambda: theorist.str_replace(where, "My wording.", "Mine again."),
+        lambda: theorist.create(where, HYPOTHESIS),
+        lambda: theorist.insert(where, 0, "More."),
+        lambda: theorist.delete(where),
+    ):
+        with pytest.raises(ToolError, match=r"edited by the person.*propose_edit"):
+            change()
+    assert project.page("H1").body.endswith("My wording.\n")

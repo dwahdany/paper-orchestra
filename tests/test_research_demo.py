@@ -362,11 +362,15 @@ def test_the_finding_that_waits_has_one_number_no_record_supports(demo):
     assert experiments.unverified_numbers(demo, finding) == ["1840"]
     traced = [check for check in experiments.number_check(demo, finding) if check["found_in"]]
     assert len(traced) >= 4
-    # It is flagged where the person decides: on the page and at the checkpoint.
-    assert finding.meta["unverified"] == ["1840"]
+    # It is said where the person decides, in words that say what the check is: at the
+    # checkpoint, and wherever the page is shown (the check is made anew there).  Nothing
+    # is stored on a page, where it would go stale with the next edit.
     told = [e["summary"] for e in demo.events() if e["type"] == "checkpoint" and e["round"] == 1]
-    assert "F2 states a number that no record supports: 1840." in told[-1]
-    assert "unverified" not in demo.page("F1").meta
+    report = experiments.number_report(demo, finding)
+    assert f"F2: {report['summary']} Not found: 1840." in told[-1]
+    assert "were looked for in the run records, sources and your files" in report["summary"]
+    assert "1 was not found" in report["summary"]
+    assert not [page.path for page in demo.pages() if "unverified" in page.meta]
 
 
 def test_a_build_that_breaks_off_does_not_read_as_running(tmp_path, monkeypatch):
@@ -456,16 +460,21 @@ def test_the_analysts_verdict_on_a_hypothesis_waits_and_earlier_ones_were_decide
 
 def test_requests_are_open_and_handled(demo):
     waiting = demo.requests()
-    assert [request.text for request in waiting] == [
-        "Also look at schedule-free optimisers.",
-        "Can E3 finish on a T4 in under 20 minutes? If not, shrink the model first.",
+    assert [(request.text, request.role) for request in waiting] == [
+        ("Also look at schedule-free optimisers.", "all"),
+        (
+            "Can E3 finish on a T4 in under 20 minutes? If not, shrink the model first.",
+            "designer",
+        ),
     ]
     assert waiting[1].target == demo.page("E3").path
+    assert [request.handled_in for request in waiting] == [[], []]
+    # A request for one role is closed by that role's phase; the phase is on the request.
     handled = [request for request in demo.requests(state=None) if request.state == "done"]
-    assert [request.handled_in for request in handled] == [
-        {"round": 1, "phase": "design"},
-        {"round": 2, "phase": "design"},
-        {"round": 2, "phase": "design"},
+    assert [(request.role, request.handled_in) for request in handled] == [
+        ("designer", [{"round": 1, "phase": "design"}]),
+        ("designer", [{"round": 2, "phase": "design"}]),
+        ("designer", [{"round": 2, "phase": "design"}]),
     ]
 
 
@@ -515,3 +524,30 @@ def test_pages_fills_the_wiki_with_generated_pages_for_layout_tests(tmp_path):
     # The story itself is untouched.
     assert project.page("F1").review == "accepted"
     assert read_json(project.root / "state.json")["status"] == "checkpoint"
+
+
+def test_the_demonstration_follows_the_rules_of_a_real_project(demo):
+    # An approval is a record of what may run, and the experiment still is that.
+    waiting = demo.page("E4")
+    standing = experiments.approval(demo, "E4")
+    assert waiting.state == "approved" and standing["matches"] is True
+    assert standing["digest"] == waiting.meta["approved_digest"]
+    # One approval is one run: the runs that took place carry the stamp of theirs, and
+    # nothing reads as waiting to run again.
+    for ref in ("E1", "E2"):
+        page, last = demo.page(ref), experiments.runs(demo, ref)[-1]
+        assert last["approval"] == page.meta["approved_at"] and last["requeued"] is False
+        assert page.state == last["status"]
+    assert experiments.recover(demo, follow=False) == []
+    assert [demo.page(ref).state for ref in ("E1", "E2", "E4")] == [
+        "succeeded",
+        "failed",
+        "approved",
+    ]
+    # It is the directory it was created as, and no record on it is an edited one.
+    assert demo.at_home() is True
+    assert not [
+        page.path
+        for page in demo.pages(kind=("result", "source"))
+        if experiments.edited_record(demo, page)
+    ]

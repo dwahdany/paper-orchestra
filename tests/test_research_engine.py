@@ -28,6 +28,7 @@ from paper_orchestra.research.engine import (
     Engine,
     EngineError,
     WorkerBusy,
+    as_worker,
     read_state,
     worker_alive,
 )
@@ -72,6 +73,7 @@ PHASE_KEYS = {
     "error",
     "produced",
     "instruction",
+    "requests",
 }
 
 
@@ -301,6 +303,48 @@ def wiki(project: Project) -> list[tuple[str, str]]:
     return sorted((page.kind, page.title) for page in project.pages())
 
 
+def ask(project: Project, text: str, *, role: str | None = None, target: str | None = None):
+    """A request as the person leaves it: for one role, or (without one) for every agent."""
+    options = {"role": role} if role else {}
+    return project.add_request(text, target=target, **options)
+
+
+def on_file(project: Project, request) -> dict:
+    """A request as its file holds it."""
+    return json.loads((project.root / "requests" / f"{request.id}.json").read_text())
+
+
+def handled(project: Project, request) -> list[tuple[int, str]]:
+    """The phases that were given a request, in order."""
+    return [(item["round"], item["phase"]) for item in on_file(project, request)["handled_in"]]
+
+
+def requests_block(text: str) -> str:
+    """What a session was told about the person's requests."""
+    found = re.search(r"The researcher left.*?(?=\n\n[A-Z]|\Z)", text, re.S)
+    return found.group(0) if found else ""
+
+
+def to_analysis_checkpoint(project: Project, team: Team, backend: FakeBackend) -> dict:
+    """A whole first round: E1 ran, its finding and the verdict it suggests are accepted."""
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    state = advance(project, team, backend)
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "analyze",
+        "hypothesize",
+    )
+    accept_all(project)
+    for proposal in project.proposals():
+        project.review(proposal.id, "accept")
+    return state
+
+
+class Killed(BaseException):
+    """Nothing the engine handles: the process is gone before it can write anything more."""
+
+
 # ---------------------------------------------------------------------------
 # A round
 # ---------------------------------------------------------------------------
@@ -431,6 +475,7 @@ def test_state_json_has_exactly_the_documented_shape(project, team, backend):
         assert set(record) == PHASE_KEYS
         assert record["status"] == "completed" and record["attempts"] == 1
         assert record["error"] is None and record["instruction"] is None
+        assert record["requests"] == []
         assert record["started"] <= record["finished"] and record["seconds"] >= 0
     intake, research = state["phases"]
     assert intake["produced"] == [
@@ -714,9 +759,6 @@ def test_a_phase_whose_worker_was_killed_is_resumed_by_the_next_one(
     advance(project, team, backend)
     accept_all(project)
 
-    class Killed(BaseException):
-        """Nothing the engine handles: the process is gone before it can write anything."""
-
     def die() -> None:
         raise Killed
 
@@ -788,8 +830,9 @@ DEAD_WORKER = {"pid": 2**22 + 12345, "host": "gone", "started": "", "heartbeat":
 
 
 @pytest.mark.parametrize("marked_by_the_server", [False, True])
+@pytest.mark.parametrize("announced", [True, False])
 def test_a_worker_that_died_before_writing_its_checkpoint_still_owes_the_pause(
-    project, team, backend, marked_by_the_server
+    project, team, backend, marked_by_the_server, announced
 ):
     state = advance(project, team, backend)
     assert (state["status"], state["phase"]) == ("checkpoint", "research")
@@ -798,7 +841,13 @@ def test_a_worker_that_died_before_writing_its_checkpoint_still_owes_the_pause(
     if marked_by_the_server:
         state.update(status="stopped", worker=None, error="The worker was killed.")
     (project.root / "state.json").write_text(json.dumps(state))
-    calls, checkpoints = len(team.calls), len(events(project, "checkpoint"))
+    if not announced:
+        # The worker died before the checkpoint's event was written, not after it.
+        log = project.root / "events.jsonl"
+        lines = log.read_text().splitlines(keepends=True)
+        assert json.loads(lines[-1])["type"] == "checkpoint"
+        log.write_text("".join(lines[:-1]))
+    calls = len(team.calls)
 
     state = advance(project, team, backend)
 
@@ -814,7 +863,9 @@ def test_a_worker_that_died_before_writing_its_checkpoint_still_owes_the_pause(
     assert summary.startswith("The worker stopped right after the research phase had finished.")
     assert "2 questions and 2 topics await your review." in summary
     assert state["checkpoint"]["pending"] == {"topic": 2, "question": 2}
-    assert len(events(project, "checkpoint")) == checkpoints + 1
+    # One event for one pause: the one the dead worker had written counts.
+    assert len(events(project, "checkpoint")) == 1
+    assert state["checkpoint"]["at"] == events(project, "checkpoint")[0]["ts"]
     assert [(p["phase"], p["status"]) for p in state["phases"]] == [
         ("intake", "completed"),
         ("research", "completed"),
@@ -824,6 +875,79 @@ def test_a_worker_that_died_before_writing_its_checkpoint_still_owes_the_pause(
     state = advance(project, team, backend)
     assert team.calls[calls:] == ["hypothesize.theorist"]
     assert (state["status"], state["phase"]) == ("checkpoint", "hypothesize")
+
+
+def test_a_worker_killed_between_the_checkpoints_event_and_its_state_announces_it_once(
+    project, team, backend
+):
+    engine = make_engine(project, team, backend)
+    save = engine._save
+
+    def die_at_the_checkpoint() -> None:
+        if engine._state["status"] == "checkpoint":
+            raise Killed
+        save()
+
+    engine._save = die_at_the_checkpoint
+    with pytest.raises(Killed):
+        engine.advance()
+    left = read_state(project)
+    assert left["status"] == "running" and left["checkpoint"] is None
+    assert len(events(project, "checkpoint")) == 1
+    calls = len(team.calls)
+
+    state = advance(project, team, backend)
+
+    assert team.calls[calls:] == []
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "research",
+        "hypothesize",
+    )
+    assert len(events(project, "checkpoint")) == 1
+    assert len(events(project, "phase.finished")) == 2
+
+
+def test_a_worker_killed_right_after_a_phase_completed_leaves_its_bookkeeping_to_the_next(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    own = ask(project, "Consider a batch size of 8 as well", role="theorist")
+    shared = ask(project, "Keep every run under a minute")
+    engine = make_engine(project, team, backend)
+
+    def die(record, summary=None) -> None:
+        raise Killed  # the record says completed; nothing was closed or announced yet
+
+    engine._announce = die
+    with pytest.raises(Killed):
+        engine.advance()
+    left = read_state(project)
+    assert (left["phases"][-1]["phase"], left["phases"][-1]["status"]) == (
+        "hypothesize",
+        "completed",
+    )
+    assert [r.id for r in project.requests()] == [own.id, shared.id]
+    assert [e["phase"] for e in events(project, "phase.finished")] == ["intake", "research"]
+    calls = len(team.calls)
+
+    state = advance(project, team, backend)
+
+    # The pause the dead worker owed, and with it what it had not got round to.
+    assert team.calls[calls:] == [] and state["status"] == "checkpoint"
+    assert [r.id for r in project.requests()] == [shared.id]
+    assert handled(project, own) == handled(project, shared) == [(1, "hypothesize")]
+    finished = [e for e in events(project, "phase.finished") if e["phase"] == "hypothesize"]
+    assert len(finished) == 1 and len(finished[0]["data"]["produced"]) == 2
+
+    # The designer is not handed what the theorist was asked and has dealt with.
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    advance(project, team, backend)
+    told = team.texts["design.designer"][0]
+    assert "Keep every run under a minute" in told and "batch size of 8" not in told
+    assert len([e for e in events(project, "phase.finished") if e["phase"] == "hypothesize"]) == 1
 
 
 def test_a_state_file_that_does_not_say_what_is_next_goes_on_from_its_records(
@@ -857,6 +981,360 @@ def test_a_state_file_that_does_not_say_what_is_next_goes_on_from_its_records(
     accept_all(project)
     state = advance(project, team, backend)
     assert team.calls[calls:] == ["hypothesize.theorist", "design.designer"]
+
+
+@pytest.mark.parametrize("ended_by", ["interrupt", "stop", "failure"])
+def test_a_resumed_phase_runs_under_the_instruction_it_was_started_with(
+    project, team, backend, ended_by
+):
+    advance(project, team, backend)
+    accept_all(project)
+    word = "Only hypotheses about batch size 16 (marker-7731)"
+    engine = make_engine(project, team, backend)
+    if ended_by == "interrupt":
+        team.interrupt = "hypothesize.theorist"
+        with pytest.raises(KeyboardInterrupt):
+            engine.advance(instruction=word)
+    elif ended_by == "stop":
+        team.during["hypothesize.theorist"] = engine.stop
+        assert engine.advance(instruction=word)["status"] == "stopped"
+        del team.during["hypothesize.theorist"]
+    else:
+        team.failures["hypothesize.theorist"] = 2
+        assert engine.advance(instruction=word)["status"] == "failed"
+    assert read_state(project)["phases"][-1]["instruction"] == word
+
+    # Continue, as the app and the command line resume a phase: no instruction is given.
+    state = advance(project, team, backend)
+
+    record = state["phases"][-1]
+    assert (record["phase"], record["status"], record["instruction"]) == (
+        "hypothesize",
+        "completed",
+        word,
+    )
+    assert f"<instruction>\n{word}\n</instruction>" in team.texts["hypothesize.theorist"][-1]
+    assert any(
+        "goes on under the instruction it was started with: “Only hypotheses about" in line
+        for line in activity(project)
+    )
+
+
+def test_an_instruction_given_on_resume_replaces_the_one_the_phase_was_started_with(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    team.interrupt = "hypothesize.theorist"
+    with pytest.raises(KeyboardInterrupt):
+        advance(project, team, backend, instruction="Only hypotheses about batch size 16")
+
+    state = advance(project, team, backend, instruction="Batch size 32 after all")
+
+    told = team.texts["hypothesize.theorist"][-1]
+    assert "Batch size 32 after all" in told and "batch size 16" not in told
+    assert state["phases"][-1]["instruction"] == "Batch size 32 after all"
+    # A phase that starts afresh has no instruction unless one is given.
+    project.review("H1", "accept")
+    state = advance(project, team, backend)
+    assert state["phases"][-1]["instruction"] is None
+    assert "<instruction>" not in team.texts["design.designer"][-1]
+
+
+# ---------------------------------------------------------------------------
+# A state file that is lost or damaged
+# ---------------------------------------------------------------------------
+
+
+def lose_state(project: Project, how: str) -> None:
+    path = project.root / "state.json"
+    if how == "deleted":
+        path.unlink()
+    elif how == "cut short":
+        path.write_text(path.read_text()[:200])
+    elif how == "binary":
+        path.write_bytes(b"\xff\xfe\x00garbage")
+    elif how == "no phases":
+        state = json.loads(path.read_text())
+        state.update(phases="x", status=5, round="two", next_phase=7, checkpoint="yes")
+        path.write_text(json.dumps(state))
+    else:
+        path.write_text(how)
+
+
+@pytest.mark.parametrize("how", ["deleted", "cut short", "binary", "[]", "null", "", "no phases"])
+def test_a_lost_state_file_is_rebuilt_from_the_events_and_intake_is_not_run_again(
+    project, team, backend, how
+):
+    advance(project, team, backend)
+    accept_all(project)
+    before = advance(project, team, backend)
+    assert engine_module.state_problem(project) is None
+    lose_state(project, how)
+
+    # Whoever looks is told where the project stands, and that this is read from the events.
+    state = read_state(project)
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "hypothesize",
+        "design",
+    )
+    assert [(p["phase"], p["status"], p["attempts"]) for p in state["phases"]] == [
+        ("intake", "completed", 1),
+        ("research", "completed", 1),
+        ("hypothesize", "completed", 1),
+    ]
+    assert state["phases"][-1]["produced"] == before["phases"][-1]["produced"]
+    assert state["checkpoint"]["pending"] == {"hypothesis": 2}
+    assert "2 hypotheses await your review." in state["checkpoint"]["summary"]
+    assert state["spent"]["model_usd"] == before["spent"]["model_usd"] > 0
+    problem = engine_module.state_problem(project)
+    assert "state.json" in problem and "events.jsonl" in problem
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    calls = len(team.calls)
+
+    state = advance(project, team, backend)
+
+    # Not intake and research a second time: the phase that was next.
+    assert team.calls[calls:] == ["design.designer"]
+    assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 1, "design")
+    assert [(p["round"], p["phase"], p["status"]) for p in state["phases"]] == [
+        (1, "intake", "completed"),
+        (1, "research", "completed"),
+        (1, "hypothesize", "completed"),
+        (1, "design", "completed"),
+    ]
+    assert state["spent"]["model_usd"] > before["spent"]["model_usd"]
+    # The file is the engine's again, and the feed says what happened to it.
+    assert engine_module.state_problem(project) is None
+    assert json.loads((project.root / "state.json").read_text())["phases"] == state["phases"]
+    (said,) = [e for e in events(project, "error") if "state.json" in e["summary"]]
+    assert "rebuilt" in said["summary"] and "events.jsonl" in said["summary"]
+
+
+def test_a_state_rebuilt_after_an_interrupted_phase_resumes_that_phase(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    team.interrupt = "hypothesize.theorist"
+    with pytest.raises(KeyboardInterrupt):
+        advance(project, team, backend, instruction="Only what one seed can show")
+    (project.root / "state.json").unlink()
+
+    state = read_state(project)
+
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "stopped",
+        "hypothesize",
+        "hypothesize",
+    )
+    record = state["phases"][-1]
+    assert (record["phase"], record["status"], record["attempts"]) == (
+        "hypothesize",
+        "interrupted",
+        1,
+    )
+    # The events carry the word the phase was started with, so the resumed part has it too.
+    assert record["instruction"] == "Only what one seed can show"
+
+    state = advance(project, team, backend)
+
+    assert team.sessions[-2:] == ["r1-hypothesize-theorist"] * 2
+    assert "Only what one seed can show" in team.texts["hypothesize.theorist"][-1]
+    assert [(p["phase"], p["status"], p["attempts"]) for p in state["phases"]] == [
+        ("intake", "completed", 1),
+        ("research", "completed", 1),
+        ("hypothesize", "completed", 2),
+    ]
+    assert len(project.pages(kind="hypothesis")) == 2
+
+
+def test_a_state_rebuilt_from_the_events_lists_a_resumed_phase_where_the_engine_does(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    team.interrupt = "design.designer"
+    with pytest.raises(KeyboardInterrupt):
+        advance(project, team, backend)
+    own_experiment(project, backend)
+    advance(project, team, backend)  # the run and its analysis come in between
+    accept_all(project, "finding")
+    state = advance(project, team, backend)  # the design phase is resumed and completes
+    order = [(p["round"], p["phase"], p["status"]) for p in state["phases"]]
+    assert order[-3:] == [
+        (1, "run", "completed"),
+        (1, "analyze", "completed"),
+        (1, "design", "completed"),
+    ]
+
+    (project.root / "state.json").unlink()
+
+    # What comes after the design phase is read from the order of the records.
+    rebuilt = read_state(project)
+    assert [(p["round"], p["phase"], p["status"]) for p in rebuilt["phases"]] == order
+    assert rebuilt["next_phase"] == "run"
+
+
+def test_a_phase_that_failed_reads_as_failed_from_the_events(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    team.failures["hypothesize.theorist"] = 2
+    advance(project, team, backend)
+    (project.root / "state.json").write_text("{}")
+
+    state = read_state(project)
+
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "failed",
+        "hypothesize",
+        "hypothesize",
+    )
+    assert state["error"] == "RuntimeError: the provider had a bad moment"
+    assert (state["phases"][-1]["status"], state["phases"][-1]["attempts"]) == ("failed", 2)
+
+
+def test_a_worker_that_starts_removes_the_temporary_files_dead_writers_left(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    gone = 2**22 + 12345  # no process has this id
+    litter = [
+        project.root / f".state.json.{gone}.0a1b2c3d.tmp",
+        project.root / "wiki" / "topics" / f".what-the-notes-say.md.{gone}.deadbeef.tmp",
+    ]
+    mine = project.root / f".usage.json.{os.getpid()}.0a1b2c3d.tmp"  # of a live process
+    fresh = project.root / f".events.jsonl.{gone}.12345678.tmp"  # just now: maybe in use
+    for file in (*litter, mine, fresh):
+        file.write_text("{")
+    for file in (*litter, mine):
+        os.utime(file, (time.time() - 3600, time.time() - 3600))
+
+    advance(project, team, backend)
+
+    assert not any(file.exists() for file in litter)
+    assert mine.exists() and fresh.exists()
+
+
+def test_something_else_in_the_place_of_the_state_file_is_named_before_any_work(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    path = project.root / "state.json"
+    path.unlink()
+    path.mkdir()
+    calls = len(team.calls)
+
+    with pytest.raises(EngineError, match="is not a file") as refusal:
+        advance(project, team, backend)
+
+    assert str(path) in str(refusal.value) and team.calls[calls:] == []
+    # Any other worker of the project (the write-up) says the same before it begins.
+    with pytest.raises(EngineError, match="is not a file"), as_worker(project, kind="write"):
+        raise AssertionError("the worker began")
+    # Once it is out of the way, the state is rebuilt and the project goes on.
+    path.rmdir()
+    state = advance(project, team, backend)
+    assert team.calls[calls:] == ["hypothesize.theorist"]
+    assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 1, "hypothesize")
+
+
+def test_without_state_and_without_events_the_engine_asks_which_phase_to_run(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    (project.root / "state.json").unlink()
+    (project.root / "events.jsonl").unlink()
+    calls = len(team.calls)
+
+    problem = engine_module.state_problem(project)
+    assert "cannot tell where the project stands" in problem
+    with pytest.raises(EngineError, match="--phase") as refusal:
+        advance(project, team, backend)
+
+    # Nothing was started from the beginning, and nothing was spent finding that out.
+    assert "cannot tell where the project stands" in str(refusal.value)
+    # The file is named as it was found, not as the worker that refused left it.
+    assert str(refusal.value).startswith("state.json is missing and events.jsonl holds no")
+    assert team.calls[calls:] == []
+    with pytest.raises(EngineError, match="--phase"):
+        advance(project, team, backend)
+
+    state = advance(project, team, backend, phase="hypothesize")
+    assert team.calls[calls:] == ["hypothesize.theorist"]
+    assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 1, "hypothesize")
+    assert engine_module.state_problem(project) is None
+
+
+def test_a_project_the_person_wrote_into_before_its_first_run_starts_at_the_beginning(
+    project, team, backend
+):
+    # Pages beyond the idea, but none an agent wrote and no phase on record: never started.
+    accepted_own = project.create_page(
+        "hypothesis", "My own hunch", "## Statement\n\nWarmup helps.\n", author="human"
+    )
+    assert accepted_own.review == "accepted"
+    assert engine_module.state_problem(project) is None
+    assert read_state(project)["status"] == "idle"
+
+    state = advance(project, team, backend)
+
+    assert team.calls == ["intake.intake", "research.scout"]
+    assert (state["status"], state["phase"]) == ("checkpoint", "research")
+
+
+WRONG_TYPES = [
+    {"status": 5},
+    {"status": "bogus"},
+    {"phases": {"a": 1}},
+    {"phases": [{"phase": "research"}, {"phase": 7, "round": "x", "status": "completed"}]},
+    {"round": "two"},
+    {"round": -3},
+    {"round": 10**9},
+    {"spent": []},
+    {"spent": {"model_usd": "lots"}},
+    {"checkpoint": "yes"},
+    {"checkpoint": {"pending": {"question": "many"}, "summary": 5}},
+    {"worker": "me"},
+    {"worker": {"pid": "x", "heartbeat": 5}, "status": "running"},
+    {"next_phase": 7},
+    {"next_phase": "paper"},
+    {"phase": ["x"], "status": "running"},
+    {"error": {"a": 1}, "status": "failed"},
+]
+
+
+@pytest.mark.parametrize("damage", WRONG_TYPES, ids=lambda damage: json.dumps(damage)[:40])
+def test_a_state_file_with_values_of_the_wrong_type_is_read_as_far_as_it_goes(
+    project, team, backend, damage
+):
+    advance(project, team, backend)
+    accept_all(project)
+    path = project.root / "state.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), **damage}))
+    calls = len(team.calls)
+
+    state = read_state(project)
+
+    assert state["status"] in ("idle", "running", "checkpoint", "stopped", "failed")
+    assert isinstance(state["round"], int) and state["round"] >= 0
+    assert state["phase"] in (None, *PHASES) and state["next_phase"] in (None, *PHASES)
+    assert state["checkpoint"] is None or isinstance(state["checkpoint"]["summary"], str)
+    assert state["worker"] is None or isinstance(state["worker"], dict)
+    assert state["error"] is None or isinstance(state["error"], str)
+    assert all(p["phase"] in PHASES and isinstance(p["round"], int) for p in state["phases"])
+    assert [p["phase"] for p in state["phases"]] == ["intake", "research"]
+
+    state = advance(project, team, backend)
+
+    # Whatever the file said, the project went on from where it stood.
+    assert team.calls[calls:] == ["hypothesize.theorist"]
+    assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 1, "hypothesize")
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +1401,83 @@ def test_a_failure_that_trying_again_cannot_help_is_not_retried(project, team, b
 
     assert state["status"] == "failed" and state["phases"][-1]["attempts"] == 1
     assert team.calls.count("hypothesize.theorist") == 1
+
+
+def test_a_credential_in_an_error_is_blanked_before_it_is_written_anywhere(
+    project, team, backend, monkeypatch
+):
+    secret = "sk-audit-FAKE-0123456789abcdefFAKE"
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", secret)
+    advance(project, team, backend)
+    accept_all(project)
+    # A library that quotes the request it failed with, key and all.
+    team.error = RuntimeError(f"401 Unauthorized for url 'https://api.example/v1?key={secret}'")
+    team.failures["hypothesize.theorist"] = 2
+
+    state = advance(project, team, backend)
+
+    assert state["status"] == "failed"
+    expected = "RuntimeError: 401 Unauthorized for url 'https://api.example/v1?key=[redacted]'"
+    assert state["error"] == expected == state["phases"][-1]["error"]
+    (failed,) = events(project, "phase.failed")
+    assert failed["data"]["error"] == expected and "[redacted]" in failed["summary"]
+    assert any("trying it once more" in line and "[redacted]" in line for line in activity(project))
+    # Neither file that the app, the command line and later sessions read holds the value.
+    for name in ("state.json", "events.jsonl"):
+        assert secret not in (project.root / name).read_text()
+
+
+def test_a_credential_in_a_backends_error_does_not_reach_the_checkpoint(project, team, monkeypatch):
+    secret = "tok-audit-FAKE-0123456789abcdef"
+    monkeypatch.setenv("AUDIT_FAKE_TOKEN", secret)
+    backend = FakeBackend()
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+
+    def choose(plan):
+        if plan is not None and plan.id == "E1":
+            raise ComputeError(f"The backend refused the token {secret} it was started with.")
+        return backend
+
+    client = FakeLLM(team)
+    engine = Engine(project, compute=choose, client_for=lambda _: client, scholar=make_scholar())
+
+    state = engine.advance()
+
+    summary = state["checkpoint"]["summary"]
+    assert "E1 could not be run: The backend refused the token [redacted]" in summary
+    for name in ("state.json", "events.jsonl"):
+        assert secret not in (project.root / name).read_text()
+
+
+def test_a_cutoff_that_cannot_be_read_stops_the_research_phase(tmp_path, team, backend):
+    project = make_project(tmp_path)
+    path = project.root / "project.json"
+    data = json.loads(path.read_text())
+    data["settings"]["research_cutoff"] = "June 2024"  # typed into the file by hand
+    path.write_text(json.dumps(data))
+    project = Project.open(project.root)
+
+    state = advance(project, team, backend)
+
+    # Not "no cutoff": the scout was not started, and trying again would not help.
+    assert team.calls == ["intake.intake"]
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "failed",
+        "research",
+        "research",
+    )
+    record = state["phases"][-1]
+    assert (record["status"], record["attempts"]) == ("failed", 1)
+    assert "research cutoff cannot be read" in state["error"]
+    assert "settings.research_cutoff is 'June 2024'" in state["error"]
+    assert project.pages(kind="source") == []
+
+    data["settings"]["research_cutoff"] = "2024-06"
+    path.write_text(json.dumps(data))
+    state = advance(project, team, backend)
+    assert (state["status"], state["phase"]) == ("checkpoint", "research")
+    assert "The research cutoff is 2024-06" in team.texts["research.scout"][-1]
 
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +1685,54 @@ def test_a_phase_that_ends_past_the_model_budget_says_so_at_its_checkpoint(tmp_p
     assert "hypothesize.theorist" not in team.calls
 
 
+@pytest.mark.parametrize("how", ["deleted", "not json", "empty ledger"])
+def test_spending_never_goes_down_when_the_usage_ledger_is_lost(project, team, backend, how):
+    spent = advance(project, team, backend)["spent"]["model_usd"]
+    assert spent > 0
+    accept_all(project)
+    ledger = project.root / "usage.json"
+    if how == "deleted":
+        ledger.unlink()
+    else:
+        ledger.write_text("{" if how == "not json" else json.dumps({"by_label": []}))
+
+    state = advance(project, team, backend)
+
+    # What the theorist used came on top of what the state file had recorded.
+    assert state["spent"]["model_usd"] > spent
+    (warning,) = events(project, "budget.warning")
+    assert warning["data"]["limit"] == "model_usd"
+    assert warning["data"]["carried"] == pytest.approx(spent, abs=1e-4)
+    assert "usage.json" in warning["summary"] and f"${spent:.2f}" in warning["summary"]
+    usage = json.loads(ledger.read_text())
+    assert usage["carried_usd"] == pytest.approx(spent, abs=1e-4)
+    assert usage["estimated_cost_usd"] == pytest.approx(state["spent"]["model_usd"], abs=1e-4)
+    assert [row["label"] for row in usage["by_label"]] == ["hypothesize.theorist"]
+
+    # The amount stays carried, and is not announced again.
+    project.review("H1", "accept")
+    after = advance(project, team, backend)
+    assert after["spent"]["model_usd"] > state["spent"]["model_usd"]
+    assert len(events(project, "budget.warning")) == 1
+    assert json.loads(ledger.read_text())["carried_usd"] == pytest.approx(spent, abs=1e-4)
+
+
+def test_the_model_budget_holds_when_the_usage_ledger_is_lost(project, team, backend):
+    spent = advance(project, team, backend)["spent"]["model_usd"]
+    accept_all(project)
+    project.settings.update({"limits": {"model_usd": round(spent / 2, 4)}})
+    project.save_settings()
+    (project.root / "usage.json").unlink()
+
+    state = advance(project, team, backend)
+
+    # The limit means the project's total, also after the ledger is gone.
+    assert "hypothesize.theorist" not in team.calls
+    assert state["phases"][-1]["status"] == "interrupted"
+    assert "The model budget is used up" in state["checkpoint"]["summary"]
+    assert state["spent"]["model_usd"] == pytest.approx(spent, abs=1e-4)
+
+
 def two_approved_experiments(
     project: Project, team: Team, backend: FakeBackend, *, name: str = "local"
 ) -> None:
@@ -1334,96 +1937,198 @@ def test_a_model_without_a_known_price_is_named_at_the_checkpoint(tmp_path, team
 # ---------------------------------------------------------------------------
 
 
-def test_open_requests_go_to_the_phase_that_runs_and_are_closed_when_it_completes(
+def test_a_request_for_a_role_waits_for_that_role_and_is_closed_by_its_phase(
     project, team, backend
 ):
     advance(project, team, backend)
     accept_all(project)
-    request = project.add_request("Consider a batch size of 8 as well", target="Q1")
-    team.failures["hypothesize.theorist"] = 2
-
-    advance(project, team, backend)
-    # A phase that did not complete has not handled anything.
-    assert [r.id for r in project.requests()] == [request.id]
-
-    advance(project, team, backend)
-    told = team.texts["hypothesize.theorist"][-1]
-    assert (
-        "- Consider a batch size of 8 as well (about wiki/questions/Q1-why-4000-steps.md)" in told
+    # Left at the research checkpoint, where the theorist works next.
+    request = ask(
+        project,
+        "Use batch size 8 and three seeds, and keep every run under a minute",
+        role="designer",
     )
-    assert project.requests() == []
-    (done,) = project.requests(state="done")
-    assert done.handled_in == {"round": 1, "phase": "hypothesize"}
+    about = ask(project, "Design an experiment for this one first", role="designer", target="Q1")
 
-
-def test_a_request_for_more_literature_waits_for_the_research_phase(project, team, backend):
     advance(project, team, backend)
-    accept_all(project)
-    asked = project.add_request("Please look up prior work on label smoothing")
 
-    # Hypotheses were next; the request sends the scout out first.
-    state = advance(project, team, backend)
-    assert (state["phase"], state["next_phase"], state["round"]) == ("research", "hypothesize", 1)
-    assert "label smoothing" in team.texts["research.scout"][-1]
-    assert project.requests(state="done")[0].id == asked.id
-    # A second run of the phase is a session of its own, not a resumed one.
-    assert team.sessions[-2:] == ["r1-research-scout", "r1-research-2-scout"]
+    # The theorist was not handed what was written for the designer, and closed nothing.
+    assert "batch size 8" not in team.texts["hypothesize.theorist"][-1]
+    assert [r.id for r in project.requests()] == [request.id, about.id]
+    assert handled(project, request) == []
 
-    state = advance(project, team, backend)
-    assert state["phase"] == "hypothesize"
-
-
-def test_a_request_is_never_kept_from_the_phase_that_runs(project, team, backend):
-    advance(project, team, backend)
-    accept_all(project)
-    advance(project, team, backend)
     project.review("H1", "accept")
     project.review("H2", "reject", reason="Too vague to test")
-    # Meant for the designer; "papers" also reads as a wish for more of the literature.
-    meant_for_design = project.add_request("Set E1 up the way the two papers did")
-    plain = project.add_request("Keep every run under a minute")
-    withdrawn = project.add_request("Use a batch size of 8")
-    team.during["design.designer"] = lambda: project.delete_request(withdrawn.id)
+    advance(project, team, backend)
 
-    state = advance(project, team, backend)
+    told = requests_block(team.texts["design.designer"][0])
+    assert "addressed to you, the designer" in told
+    assert "- Use batch size 8 and three seeds, and keep every run under a minute" in told
+    assert "(about wiki/questions/Q1-why-4000-steps.md)" in told
+    assert project.requests() == []
+    assert handled(project, request) == handled(project, about) == [(1, "design")]
+    assert on_file(project, request)["state"] == "done"
+    # The record of the phase names what it was given.
+    record = read_state(project)["phases"][-1]
+    assert (record["phase"], record["requests"]) == ("design", [request.id, about.id])
 
-    told = team.texts["design.designer"][0]
-    assert "Set E1 up the way the two papers did" in told
-    assert "Keep every run under a minute" in told
-    assert (state["status"], state["phase"]) == ("checkpoint", "design")
-    # The designer's phase closes what only it was asked; the other stays open, so that
-    # the next round begins with the literature, as the words may have meant.
-    assert [request.id for request in project.requests()] == [meant_for_design.id]
-    assert [request.id for request in project.requests(state="done")] == [plain.id]
+
+def test_a_request_for_everyone_is_shown_to_every_phase_until_the_rounds_analysis(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    request = ask(project, "For H1, rerun E1 to the end before judging it")
+
+    advance(project, team, backend)
+    told = requests_block(team.texts["hypothesize.theorist"][-1])
+    assert "for every agent" in told and "- For H1, rerun E1 to the end" in told
+    # Shown, and still open for the roles that follow.
+    assert [r.id for r in project.requests()] == [request.id]
+    assert handled(project, request) == [(1, "hypothesize")]
+
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    advance(project, team, backend)
+    assert "- For H1, rerun E1 to the end" in team.texts["design.designer"][0]
+    assert [r.id for r in project.requests()] == [request.id]
 
     accept_all(project)
     approve_all(project)
-    state = advance(project, team, backend)
-    assert (state["phase"], state["next_phase"]) == ("analyze", "research")
-    assert "Set E1 up the way the two papers did" in team.texts["analyze.analyst"][0]
-    state = advance(project, team, backend)
-    assert (state["round"], state["phase"]) == (2, "research")
-    assert "Set E1 up the way the two papers did" in team.texts["research.scout"][-1]
+    advance(project, team, backend)
+    assert "- For H1, rerun E1 to the end" in team.texts["analyze.analyst"][0]
+    # The analysis ends the round, and with it the request.
     assert project.requests() == []
-    done = {request.id: request.handled_in for request in project.requests(state="done")}
-    assert done[meant_for_design.id] == {"round": 2, "phase": "research"}
+    assert handled(project, request) == [(1, "hypothesize"), (1, "design"), (1, "analyze")]
 
 
-def test_the_journal_can_send_the_next_round_back_to_the_literature(project, team, backend):
+def test_a_request_for_everyone_left_after_the_rounds_analysis_waits_for_the_next_round(
+    project, team, backend
+):
+    to_analysis_checkpoint(project, team, backend)
+    # Left at the checkpoint that ended round 1, where the person also has E1 run once more.
+    request = ask(project, "In the next round, vary the batch size as well")
+    approve(project, "E1", backend)
+
+    state = advance(project, team, backend)
+
+    # The analysis of that run was shown the request.  It did not end a round (the
+    # round's own analysis had), so the request is still open for the roles of round 2.
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "analyze", "hypothesize")
+    assert "- In the next round, vary the batch size as well" in team.texts["analyze.analyst"][-1]
+    assert [r.id for r in project.requests()] == [request.id]
+    assert handled(project, request) == [(1, "analyze")]
+
+    accept_all(project)
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"]) == (2, "hypothesize")
+    assert "- In the next round, vary the batch size" in team.texts["hypothesize.theorist"][-1]
+    project.review("H3", "accept")
+    project.review("H4", "reject", reason="Too vague to test")
+    advance(project, team, backend)
+    accept_all(project)
+    approve_all(project)
+    advance(project, team, backend)
+
+    # Round 2's own analysis closes it.
+    assert project.requests() == []
+    assert handled(project, request) == [
+        (1, "analyze"),
+        (2, "hypothesize"),
+        (2, "design"),
+        (2, "analyze"),
+    ]
+
+
+def test_a_request_for_the_scout_is_said_to_wait_for_a_phase_that_is_asked_for(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    request = ask(project, "Look up prior work on label smoothing", role="scout")
+
+    state = advance(project, team, backend)
+
+    # Research does not come round by itself, so the request would wait unnoticed: the
+    # checkpoint says so, and how to have it acted on.
+    assert [r.id for r in project.requests()] == [request.id]
+    summary = state["checkpoint"]["summary"]
+    assert "1 request for the scout waits for the research phase" in summary
+    assert f"research advance {project.root} --phase research" in summary
+    assert summary.endswith("Next: designing experiments for the hypotheses you accepted.")
+
+    state = advance(project, team, backend, phase="research")
+    assert project.requests() == [] and handled(project, request) == [(1, "research")]
+    assert "for the scout" not in state["checkpoint"]["summary"]
+
+
+def test_a_phase_that_did_not_complete_has_not_handled_anything(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    request = ask(project, "Consider a batch size of 8 as well", role="theorist")
+    team.failures["hypothesize.theorist"] = 2
+
+    advance(project, team, backend)
+    assert [r.id for r in project.requests()] == [request.id] and handled(project, request) == []
+
+    advance(project, team, backend)
+    assert "- Consider a batch size of 8 as well" in team.texts["hypothesize.theorist"][-1]
+    assert project.requests() == [] and handled(project, request) == [(1, "hypothesize")]
+
+
+def test_a_request_does_not_change_which_phase_runs_next(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    # Words that used to be read as a wish for more of the literature.
+    asked = ask(project, "Base the hypotheses on what the papers and sources disagree about")
+    withdrawn = ask(project, "Use a batch size of 8")
+
+    def withdraw() -> None:
+        del team.during["hypothesize.theorist"]
+        project.delete_request(withdrawn.id)  # while the phase that was given it runs
+
+    team.during["hypothesize.theorist"] = withdraw
+
+    state = advance(project, team, backend)
+
+    # The checkpoint said hypotheses were next, and hypotheses it was: the theorist read it.
+    assert (state["phase"], state["next_phase"], state["round"]) == ("hypothesize", "design", 1)
+    assert team.calls.count("research.scout") == 1
+    assert "what the papers and sources disagree about" in team.texts["hypothesize.theorist"][-1]
+    assert [r.id for r in project.requests()] == [asked.id]
+    # More research is asked for by naming the phase; a request for the scout waits for it.
+    for_scout = ask(project, "Look up prior work on label smoothing", role="scout")
+    state = advance(project, team, backend, phase="research")
+    assert (state["phase"], state["next_phase"], state["round"]) == ("research", "hypothesize", 1)
+    assert "label smoothing" in team.texts["research.scout"][-1]
+    assert handled(project, for_scout) == [(1, "research")]
+    assert handled(project, asked) == [(1, "hypothesize"), (1, "research")]
+    # A second run of the phase is a session of its own, not a resumed one.
+    assert team.sessions[-1] == "r1-research-2-scout"
+
+
+def test_the_journal_recommends_more_research_and_the_checkpoint_repeats_it(project, team, backend):
     to_design_checkpoint(project, team, backend)
     approve_all(project)
     team.journal_meta = "next: research\n"
 
     state = advance(project, team, backend)
 
-    assert (state["phase"], state["next_phase"]) == ("analyze", "research")
-    assert state["checkpoint"]["summary"].endswith("Next: research into what is already known.")
+    # A recommendation, said where the person decides: what runs next is not changed by it.
+    assert (state["phase"], state["next_phase"]) == ("analyze", "hypothesize")
+    summary = state["checkpoint"]["summary"]
+    assert "recommends another look at the literature" in summary
+    assert "research advance" in summary and "--phase research" in summary
+    assert summary.endswith("Next: proposing hypotheses from what you accepted.")
+    assert events(project, "checkpoint")[-1]["data"]["next"] == "hypothesize"
+
     state = advance(project, team, backend)
-    assert (state["round"], state["phase"], state["next_phase"]) == (2, "research", "hypothesize")
+    assert (state["round"], state["phase"]) == (2, "hypothesize")
+    assert team.calls.count("research.scout") == 1
 
 
 @pytest.mark.parametrize("decision", ["accept", "reject", "none"])
-def test_only_an_accepted_journal_page_sends_a_round_back_to_the_literature(
+def test_a_journal_page_never_sends_a_round_anywhere_whatever_its_review(
     tmp_path, team, backend, decision
 ):
     # The person reviews journal pages themselves here.
@@ -1436,40 +2141,17 @@ def test_only_an_accepted_journal_page_sends_a_round_back_to_the_literature(
 
     journal = project.page("wiki/journal/round-1.md")
     assert (journal.review, journal.meta["next"]) == ("proposed", "research")
-    # What the analyst wrote is a suggestion: unreviewed, it sends the round nowhere.
     assert (state["phase"], state["next_phase"]) == ("analyze", "hypothesize")
-    summary = state["checkpoint"]["summary"]
-    assert "asks for another look at the literature" in summary
-    assert "accept it and the next round starts with research" in summary
-    assert summary.endswith("Next: proposing hypotheses from what you accepted.")
+    assert "recommends another look at the literature" in state["checkpoint"]["summary"]
 
     if decision != "none":
         project.review(journal.path, decision, reason="Not now" if decision == "reject" else None)
     state = advance(project, team, backend)
 
-    expected = "research" if decision == "accept" else "hypothesize"
-    assert (state["round"], state["phase"]) == (2, expected)
-    if decision == "accept":
-        # Once, not for ever: after the research the round goes on to its hypotheses.
-        state = advance(project, team, backend)
-        assert (state["round"], state["phase"]) == (2, "hypothesize")
-
-
-def test_a_journal_page_rejected_after_the_checkpoint_no_longer_sends_the_round_back(
-    project, team, backend
-):
-    to_design_checkpoint(project, team, backend)
-    approve_all(project)
-    team.journal_meta = "next: research\n"
-    state = advance(project, team, backend)
-    # Journal pages are accepted on creation in this project, so the checkpoint said research.
-    assert (state["phase"], state["next_phase"]) == ("analyze", "research")
-
-    project.review("wiki/journal/round-1.md", "reject", reason="The literature is covered")
-    state = advance(project, team, backend)
-
     assert (state["round"], state["phase"]) == (2, "hypothesize")
-    assert team.calls.count("research.scout") == 1
+    # The person follows the recommendation by naming the phase.
+    state = advance(project, team, backend, phase="research")
+    assert (state["round"], state["phase"], state["next_phase"]) == (2, "research", "hypothesize")
 
 
 # ---------------------------------------------------------------------------
@@ -1910,11 +2592,13 @@ def test_unsupported_numbers_are_flagged_at_the_checkpoint(project, team, backen
 
     state = advance(project, team, backend)
 
-    assert project.page("F1").meta["unverified"] == ["53.85"]
+    # Said where the person decides, in words that say what the check is; nothing about
+    # it is stored on the page, where it would outlive the text it was true of.
+    assert "unverified" not in project.page("F1").meta
     assert (
-        "F1 states 1 number that no result record, source or input supports: 53.85."
-        in state["checkpoint"]["summary"]
-    )
+        "F1: 2 numbers were looked for in the run records, sources and your files: 1 was "
+        "not found (53.85); short and round numbers are not checked."
+    ) in state["checkpoint"]["summary"]
     assert team.calls.count("analyze.analyst") == 3
 
 
@@ -1946,6 +2630,423 @@ def test_one_experiment_can_be_run_outside_the_order_of_the_phases(project, team
         "No experiment was waiting to run; 1 result of earlier runs had not been analysed yet."
     )
     assert project.page("F1").relations["based_on"] == ["results/E1-run1"]
+
+
+def own_experiment(project: Project, backend: FakeBackend, *, approved: bool = True) -> str:
+    """An experiment the person wrote themselves, with its code, for H1."""
+    plan = EXPERIMENT.format(tests="H1", mode="script").split("---\n", 2)[2]
+    page = project.create_page(
+        "experiment", "My own check", plan, author="human", relations={"tests": ["H1"]}
+    )
+    experiments.write_code(project, page.id, {"main.py": GOOD_CODE}, author="human")
+    if approved:
+        approve(project, page.id, backend)
+    return str(page.id)
+
+
+def test_advance_first_runs_what_is_approved_and_analyses_it(project, team, backend):
+    to_analysis_checkpoint(project, team, backend)
+    # At the checkpoint after the analysis the person has E1 run once more.
+    approve(project, "E1", backend)
+    calls = len(team.calls)
+
+    state = advance(project, team, backend)
+
+    # Not the hypotheses of the next round: the run, its analysis, and the pause after it.
+    assert team.calls[calls:] == ["analyze.analyst"]
+    assert len(backend.jobs) == 2 and project.page("E1-run2").meta["analysed"] == 1
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "analyze",
+        "hypothesize",
+    )
+    assert "1 experiment ran: E1 succeeded." in state["checkpoint"]["summary"]
+    assert [(p["round"], p["phase"]) for p in state["phases"][-2:]] == [(1, "run"), (1, "analyze")]
+    # A second analysis of the round is a session and a journal page of its own.
+    assert team.sessions[-1] == "r1-analyze-2-analyst"
+    assert project.page("wiki/journal/round-1-2.md").author == "agent:analyst"
+
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"]) == (2, "hypothesize")
+
+
+def test_advance_analyses_results_nobody_has_analysed_before_it_goes_on(project, team, backend):
+    to_analysis_checkpoint(project, team, backend)
+    # As `research run` leaves it: a run outside the phases, its record without analysis.
+    approve(project, "E1", backend)
+    experiments.run(project, "E1", compute=backend)
+    assert "analysed" not in project.page("E1-run2").meta
+    calls = len(team.calls)
+
+    state = advance(project, team, backend)
+
+    assert team.calls[calls:] == ["analyze.analyst"]
+    assert project.page("E1-run2").meta["analysed"] == 1
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "analyze", "hypothesize")
+    assert state["phases"][-1]["phase"] == "analyze" and len(backend.jobs) == 2
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"]) == (2, "hypothesize")
+
+
+def test_an_approved_experiment_runs_before_the_phase_that_was_next(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    mine = own_experiment(project, backend)
+    assert read_state(project)["next_phase"] == "design"
+    calls = len(team.calls)
+
+    state = advance(project, team, backend, instruction="Only experiments under a minute")
+
+    # What the person approved ran and was analysed; the design phase is still what is next.
+    assert team.calls[calls:] == ["analyze.analyst"]
+    assert project.page(mine).state == "succeeded" and len(backend.jobs) == 1
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "analyze",
+        "design",
+    )
+    summary = state["checkpoint"]["summary"]
+    assert f"1 experiment ran: {mine} succeeded." in summary
+    assert summary.endswith("Next: designing experiments for the hypotheses you accepted.")
+    # The word given with this run went to the phase the run led to, and the checkpoint
+    # says that the phase which is still next has not had it.
+    assert "Only experiments under a minute" in team.texts["analyze.analyst"][-1]
+    assert (
+        "The instruction you gave with this run (“Only experiments under a minute”) was "
+        "handed to the analysis. The design phase, which comes next, has not had it"
+    ) in summary
+    assert project.requests() == []
+
+    accept_all(project)
+    state = advance(project, team, backend)
+
+    # The round goes on where it was: no new round began with the analysis in between.
+    assert team.calls[calls + 1 :] == ["design.designer"]
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "design", "run")
+    assert state["phases"][-1]["instruction"] is None
+    assert "<instruction>" not in team.texts["design.designer"][-1]
+
+
+def test_a_run_that_was_not_the_rounds_own_still_returns_after_its_analysis_failed(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    own_experiment(project, backend)
+    team.failures["analyze.analyst"] = 2
+
+    state = advance(project, team, backend)
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "failed",
+        "analyze",
+        "analyze",
+    )
+
+    state = advance(project, team, backend)
+
+    # The analysis completes in a later call, and the design phase is still what follows.
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "analyze",
+        "design",
+    )
+    accept_all(project)
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"]) == (1, "design")
+
+
+def test_an_interrupted_phase_is_resumed_in_its_own_record_after_a_run_in_between(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    team.interrupt = "design.designer"
+    with pytest.raises(KeyboardInterrupt):
+        advance(project, team, backend, instruction="Only experiments under a minute")
+    mine = own_experiment(project, backend)
+
+    state = advance(project, team, backend)
+
+    assert project.page(mine).state == "succeeded"
+    assert (state["phase"], state["next_phase"]) == ("analyze", "design")
+    accept_all(project, "finding")
+    state = advance(project, team, backend)
+
+    # One record for the design phase, resumed under the word it was started with.
+    design = [p for p in state["phases"] if p["phase"] == "design"]
+    assert [(p["status"], p["attempts"], p["instruction"]) for p in design] == [
+        ("completed", 2, "Only experiments under a minute")
+    ]
+    assert team.sessions[-1] == "r1-design-designer"
+    resumed = [text for text in team.texts["design.designer"] if "<idea>" in text][-1]
+    assert "<instruction>\nOnly experiments under a minute\n</instruction>" in resumed
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "design", "run")
+
+
+def test_what_is_approved_while_an_analysis_is_unfinished_runs_before_it_is_resumed(
+    project, team, backend
+):
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    team.failures["analyze.analyst"] = 2
+    state = advance(project, team, backend)
+    assert (state["status"], state["phase"]) == ("failed", "analyze")
+    mine = own_experiment(project, backend)
+
+    state = advance(project, team, backend)
+
+    # The approved experiment ran first; the analysis then read both records, in the
+    # record and the session it was begun in.
+    assert len(backend.jobs) == 2 and project.page(mine).state == "succeeded"
+    told = team.texts["analyze.analyst"][-1]
+    assert "wiki/results/E1-run1.md" in told and f"wiki/results/{mine}-run1.md" in told
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "analyze",
+        "hypothesize",
+    )
+    analyses = [p for p in state["phases"] if p["phase"] == "analyze"]
+    assert [(p["status"], p["attempts"]) for p in analyses] == [("completed", 3)]
+    assert team.sessions[-1] == "r1-analyze-analyst"
+    assert state["phases"][-1]["phase"] == "analyze"
+    assert f"1 experiment ran: {mine} succeeded." in state["checkpoint"]["summary"]
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"]) == (2, "hypothesize")
+
+
+def test_an_approved_experiment_that_cannot_run_does_not_keep_the_next_phase_from_running(
+    project, team
+):
+    backend = FakeBackend()
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    mine = own_experiment(project, backend)
+
+    def choose(plan):
+        if plan is not None and plan.id == mine:
+            raise ComputeError(f"The backend chosen for {mine} is not installed here.")
+        return backend
+
+    client = FakeLLM(team)
+    engine = Engine(project, compute=choose, client_for=lambda _: client, scholar=make_scholar())
+    calls = len(team.calls)
+
+    state = engine.advance()
+
+    # Nothing ran, so there is nothing to pause for: the design phase follows in the same
+    # call, and its checkpoint says what became of the approved experiment.
+    assert team.calls[calls:] == ["design.designer"]
+    assert (state["status"], state["phase"], state["next_phase"]) == ("checkpoint", "design", "run")
+    summary = state["checkpoint"]["summary"]
+    assert f"{mine} could not be run: The backend chosen for {mine} is not installed" in summary
+    assert project.page(mine).state == "approved"
+    assert len(events(project, "checkpoint")) == 3
+
+
+def test_an_experiment_the_budget_does_not_cover_does_not_keep_the_next_phase_from_running(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    mine = own_experiment(project, backend)
+    project.update_page(mine, author="human", fields={"est_usd": 50})
+    calls = len(team.calls)
+
+    state = advance(project, team, backend)
+
+    assert team.calls[calls:] == ["design.designer"] and backend.jobs == []
+    assert (state["status"], state["phase"]) == ("checkpoint", "design")
+    assert f"The experiment cost budget does not cover {mine}" in state["checkpoint"]["summary"]
+    assert events(project, "budget.warning")[-1]["data"]["limit"] == "experiment_usd"
+
+
+@pytest.mark.parametrize("obstacle", ["budget", "backend"])
+def test_what_cannot_run_after_the_rounds_analysis_does_not_keep_the_next_round_from_beginning(
+    project, team, obstacle
+):
+    backend = FakeBackend()
+    to_analysis_checkpoint(project, team, backend)
+    # At the checkpoint that ended round 1 the person has E1 run once more.
+    approve(project, "E1", backend)
+    if obstacle == "budget":
+        project.update_page("E1", author="human", fields={"est_usd": 50})
+
+    def choose(plan):
+        if obstacle == "backend":
+            raise ComputeError("The backend chosen for E1 is not installed here.")
+        return backend
+
+    client = FakeLLM(team)
+    engine = Engine(project, compute=choose, client_for=lambda _: client, scholar=make_scholar())
+    calls = len(team.calls)
+
+    state = engine.advance()
+
+    # Nothing ran, so the hypotheses of round 2 follow in the same call, and it is round
+    # 2 they belong to: the round's own analysis had completed before the approval.
+    assert team.calls[calls:] == ["hypothesize.theorist"] and len(backend.jobs) == 1
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        2,
+        "hypothesize",
+        "design",
+    )
+    assert team.sessions[-1] == "r2-hypothesize-theorist"
+    said = (
+        "The experiment cost budget does not cover E1"
+        if obstacle == "budget"
+        else ("E1 could not be run: The backend chosen for E1 is not installed")
+    )
+    assert said in state["checkpoint"]["summary"]
+
+
+def test_a_run_before_any_phase_goes_back_to_intake_also_after_its_analysis_failed(
+    project, team, backend
+):
+    # Before the agents have done anything the person adds a hypothesis and an experiment
+    # of their own and approves its run.
+    body = HYPOTHESIS.format(motivated_by="idea").split("---\n", 2)[2]
+    project.create_page("hypothesis", "Warmup lowers the variance", body, author="human")
+    mine = own_experiment(project, backend)
+    team.failures["analyze.analyst"] = 2
+
+    state = advance(project, team, backend)
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "failed",
+        "analyze",
+        "analyze",
+    )
+    assert project.page(mine).state == "succeeded"
+
+    state = advance(project, team, backend)
+
+    # No earlier record says where the round was: with only runs and analyses on record
+    # the project is where it started, and intake is still what comes next.
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "analyze",
+        "intake",
+    )
+    accept_all(project)
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "research", "hypothesize")
+    assert team.calls[-2:] == ["intake.intake", "research.scout"]
+
+
+def test_a_named_phase_runs_as_named_whatever_is_approved(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    mine = own_experiment(project, backend)
+    calls = len(team.calls)
+
+    state = advance(project, team, backend, phase="design")
+
+    assert team.calls[calls:] == ["design.designer"] and backend.jobs == []
+    assert (state["phase"], project.page(mine).state) == ("design", "approved")
+
+
+def test_a_run_phase_asked_for_by_name_pauses_also_when_nothing_ran(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    calls = len(team.calls)
+
+    state = advance(project, team, backend, phase="run")
+
+    # The person asked for the run phase, not for the design phase the round is at: no
+    # agent starts, and the checkpoint says that nothing ran and what is still next.
+    assert team.calls[calls:] == [] and backend.jobs == []
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "run",
+        "design",
+    )
+    summary = state["checkpoint"]["summary"]
+    assert summary.startswith("There is no experiment to run.")
+    assert summary.endswith("Next: designing experiments for the hypotheses you accepted.")
+
+    state = advance(project, team, backend)
+    assert team.calls[calls:] == ["design.designer"]
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "design", "run")
+
+
+def test_the_scout_reads_what_intake_wrote_in_the_same_advance(project, team, backend):
+    seen: dict[str, str] = {}
+    original = team.research_scout
+
+    def scout(request: FakeRequest) -> str:
+        seen["system"] = request.system
+        seen["text"] = request.text
+        seen["topic"] = request.memory.view("/memories/wiki/topics/what-the-notes-say.md")
+        seen["question"] = request.memory.view("/memories/wiki/questions/Q1-why-4000-steps.md")
+        seen["listing"] = request.memory.view("/memories/wiki/topics")
+        # Reading is all: what intake wrote is intake's, and the researcher's to decide.
+        with pytest.raises(Exception, match="not yours to change"):
+            request.memory.str_replace(
+                "/memories/wiki/topics/what-the-notes-say.md", "4000", "8000"
+            )
+        return original(request)
+
+    team.research_scout = scout
+
+    state = advance(project, team, backend)
+
+    assert state["status"] == "checkpoint"
+    assert "warmup of 4000 steps was used" in seen["topic"]
+    assert "The notes do not say." in seen["question"]
+    assert "what-the-notes-say.md" in seen["listing"]
+    # Told in the message and in the index, each time as not yet reviewed.
+    assert "not reviewed" in seen["text"] and "What the notes say" in seen["text"]
+    assert "/memories/wiki/topics/what-the-notes-say.md" in seen["text"]
+    assert "topics/what-the-notes-say.md" in seen["system"]
+    assert "not yet reviewed" in seen["system"]
+    assert project.page("wiki/topics/what-the-notes-say.md").review == "proposed"
+    assert "4000" in project.page("wiki/topics/what-the-notes-say.md").body
+
+    # A later session of another role still cannot open what the person has not decided.
+    project.review("Q1", "accept")
+    hidden: dict[str, object] = {}
+
+    def look() -> None:
+        hidden["done"] = True
+
+    team.during["hypothesize.theorist"] = look
+    original_theorist = team.hypothesize_theorist
+
+    def theorist(request: FakeRequest) -> str:
+        with pytest.raises(Exception, match="does not exist"):
+            request.memory.view("/memories/wiki/topics/what-the-notes-say.md")
+        return original_theorist(request)
+
+    team.hypothesize_theorist = theorist
+    advance(project, team, backend)
+    assert hidden["done"]
 
 
 def test_limits_can_be_replaced_for_one_run_only(project, team, backend):
@@ -2091,6 +3192,29 @@ def test_a_worker_is_alive_while_it_beats_or_its_process_exists():
     assert not worker_alive({"worker": None}, now=now)
 
 
+def test_a_heartbeat_from_the_future_is_no_sign_of_life():
+    now = engine_module.parse_stamp("2026-11-15T12:00:00Z")
+    host = os.uname().nodename
+    gone = 2**22 + 12345
+
+    def worker(pid: int, heartbeat: str, host: str = host) -> dict:
+        return {"worker": {"pid": pid, "host": host, "started": heartbeat, "heartbeat": heartbeat}}
+
+    # The clock was set back after the worker was killed: its last beat lies two hours
+    # ahead, and would otherwise count as fresh for two hours and a minute.
+    assert not worker_alive(worker(gone, "2026-11-15T14:00:00Z"), now=now)
+    assert not worker_alive(worker(gone, "2026-11-15T12:00:30Z"), now=now)
+    assert not worker_alive(worker(os.getpid(), "2026-11-15T14:00:00Z", host="elsewhere"), now=now)
+    # Two clocks that differ by a few seconds are still two clocks of one worker.
+    assert worker_alive(worker(gone, "2026-11-15T12:00:03Z"), now=now)
+    # A worker on another machine beats by that machine's clock, which may differ by
+    # more: up to a minute ahead is still a sign of life there, as the web server has it.
+    assert worker_alive(worker(gone, "2026-11-15T12:00:30Z", host="elsewhere"), now=now)
+    assert not worker_alive(worker(gone, "2026-11-15T12:01:30Z", host="elsewhere"), now=now)
+    # On this machine the process decides, whatever its heartbeat says.
+    assert worker_alive(worker(os.getpid(), "2026-11-15T14:00:00Z"), now=now)
+
+
 def test_models_that_cannot_use_the_wiki_are_refused_before_anything_is_spent(tmp_path):
     project = make_project(tmp_path, settings={"models": {"research": "gpt-5.5"}})
     plain = FakeLLM("x", capabilities=Capabilities(tools=True, memory_tool=False))
@@ -2122,3 +3246,76 @@ def test_the_brief_is_the_persons_and_stays_as_it_was(project, team, backend):
     idea = project.page("wiki/idea.md")
     assert idea.body.strip() == BRIEF and idea.author == "human"
     assert project.history("wiki/idea.md") == []
+
+
+# ---------------------------------------------------------------------------
+# The scripted model of the browser test
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scripted(monkeypatch):
+    """``tests/e2e/scripted_model.py``, without its pauses."""
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "e2e"))
+    import scripted_model
+
+    monkeypatch.setattr(scripted_model, "PAUSE", 0.0)
+    return scripted_model
+
+
+def test_the_scripted_model_of_the_browser_test_carries_a_project_through_a_round(
+    tmp_path, scripted
+):
+    notes = tmp_path / "notes.md"
+    notes.write_text("Warmup of 4000 steps was used in the first runs.\n")
+    # As the composer of the web app starts one: an idea, no title.
+    project = Project.create(tmp_path / "p", title="", brief=BRIEF, files=[notes])
+    assert project.title_is_provisional and project.title.startswith("Does learning-rate")
+    client = scripted.client()
+
+    def go(**options) -> dict:
+        engine = Engine(project, client_for=lambda _: client, scholar=make_scholar())
+        return engine.advance(**options)
+
+    state = go()
+    project.reload()
+    # Intake named the project, so the browser sees the title change.
+    assert project.title == "Scripted study: Does learning-rate warmup reduce the variance"
+    assert not project.title_is_provisional
+    assert any("named the project" in line for line in activity(project))
+    assert (state["status"], state["phase"]) == ("checkpoint", "research")
+    assert state["checkpoint"]["pending"] == {"topic": 2, "question": 2}
+    accept_all(project)
+
+    # An instruction that asks for it makes the phase fail, twice; without it the phase runs.
+    failing = ask(project, f"{scripted.FAILURE_MARK} make the next phase fail")
+    state = go()
+    assert (state["status"], state["phase"]) == ("failed", "hypothesize")
+    assert "scripted failure" in state["error"]
+    project.delete_request(failing.id)
+    state = go()
+    assert (state["status"], state["phase"]) == ("checkpoint", "hypothesize")
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="One is enough here")
+
+    state = go()
+    assert (state["status"], state["phase"]) == ("checkpoint", "design")
+    assert "problems" not in project.page("E1").meta
+    project.review("E1", "accept")
+    experiments.approve(project, "E1")
+
+    # The run is a real one, on this machine; its record is read and a finding proposed.
+    state = go()
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "analyze",
+        "hypothesize",
+    )
+    assert project.page("E1").state == "succeeded"
+    assert experiments.runs(project, "E1")[0]["metrics"] == {"steps": 5, "loss": 0.25}
+    assert project.page("F1").relations["based_on"] == ["results/E1-run1"]
+    assert project.page("wiki/journal/round-1.md").author == "agent:analyst"
+    assert not any("were looked for" in note for note in [state["checkpoint"]["summary"]])
+
+    state = go()
+    assert (state["round"], state["phase"]) == (2, "hypothesize")

@@ -13,6 +13,7 @@ front matter appear exactly as the model should read them.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -24,6 +25,7 @@ __all__ = [
     "designer_message",
     "designer_repair_message",
     "file_block",
+    "inert_line",
     "intake_message",
     "numbers_message",
     "repair_message",
@@ -108,8 +110,19 @@ only through propose_edit.
 The index at the end of this prompt lists what you can build on: the accepted pages and \
 the pages you proposed in this session. Pages the researcher rejected appear by title and \
 reason only, so that the same thing is not proposed again; do not build on them. Proposals \
-of other sessions that the researcher has not decided on yet are not shown to you, because \
-nothing should be built on a page that may still be turned down.
+of other sessions that the researcher has not decided on yet are not in the index and \
+cannot be opened, because nothing should be built on a page that may still be turned down. \
+The user message names them by title and summary, so that you do not propose the same \
+thing a second time.
+
+## Requests
+
+The researcher can leave requests for the agents. A request is either addressed to one \
+role or meant for every agent, and the user message shows you both kinds and says which is \
+which. A request addressed to your role is shown to nobody else and is closed when your \
+phase completes, so it is yours to act on now. A request for every agent is shown to each \
+role in turn until the analysis that ends the round has completed: act on what concerns \
+your role, and leave the rest to the role it concerns, which is shown it as well.
 
 ## What a page may say
 
@@ -152,9 +165,11 @@ INTAKE = """\
 Yours is the first session of the project. The researcher has written down an idea and may \
 have attached files: notes, drafts, papers, descriptions of data, figures. The agents that \
 come after you (who search the literature, form hypotheses and design experiments) do not \
-have these files in front of them the way you do; they work from the wiki. Your job is to \
-put into the wiki what the attachments contribute, so that nothing the researcher handed \
-over is lost, and nothing is attributed to their material that it does not say.
+have these files in front of them the way you do; they work from the wiki. The scout, who \
+searches the literature right after you, reads your pages at once, marked as not yet \
+reviewed; every other agent sees them once the researcher has accepted them. Your job is \
+to put into the wiki what the attachments contribute, so that nothing the researcher \
+handed over is lost, and nothing is attributed to their material that it does not say.
 
 Write a topic page for each attachment that has something to contribute (or one page per \
 subject, where several files are about the same thing). Say what the file is, what it adds \
@@ -202,6 +217,13 @@ you cannot point to the text, leave the claim out or mark it as unverified.
 Finally write question pages for what the literature leaves open and what matters for the \
 idea, with `about` naming the idea or a topic. These questions are what the theorist will \
 turn into hypotheses, so make them precise enough that an answer would be recognisable.
+
+When the user message lists pages that intake wrote just before your session, read them \
+first. They say what the researcher's attached files contribute, which you cannot see \
+otherwise where a file is a PDF or an image. The researcher has not reviewed them yet, so \
+take them as a description that may still be corrected: let them guide what you search for, \
+name the file (`inputs/<name>`) and not the page for anything you take from them, and do \
+not ask again a question intake has already asked.
 
 Work in proportion to the idea: a dozen sources that bear on it directly serve the \
 researcher better than fifty that are loosely related. If a research cutoff is given, work \
@@ -286,8 +308,10 @@ has a contract with the system that runs it:
 
 - It writes `metrics.json` in its working directory: one flat object mapping a metric name \
 to a number or a short string. These values are copied into the result record exactly as \
-written, and the analyst may only report numbers that appear there, so write every number \
-the success criteria refer to.
+written, and they are what counts as measured: the numbers of a finding are looked for \
+among the metrics of the runs that succeeded (and in the sources and the researcher's \
+files), and the researcher is told which were not found. What the code only prints is not \
+on record. So write every number the success criteria refer to as a metric.
 - It may write figures (PNG) and tables (CSV) under `artifacts/`.
 - It prints its progress to standard output, so that a long run can be followed.
 - It is deterministic given its seed: set the seeds, and put the seed in the metrics.
@@ -322,13 +346,21 @@ small sample, a proxy metric, a confound). Name the records in `based_on`, for e
 speaks for or against it. A run that failed or was cancelled is a result too: say what it \
 does and does not show, and do not read a verdict into it.
 
-Every number in a finding is checked by code. A number is on record when it is a metric of \
-a run that succeeded, as the metrics table of its result record shows it, or when it \
-stands in a source or in one of the researcher's files; any other number is flagged to \
-the researcher as unsupported. What a log printed, what a failed run left behind and what \
-the title of a plan says are not measurements. So quote numbers exactly as the metrics \
-show them, without rounding or recomputing. If the argument needs a derived quantity, say \
-in words how it follows from the recorded values and give those values.
+The numbers of a finding are looked for by code, in its title, its summary and its text. \
+A number is on record when it is a metric of a run that succeeded, as the metrics table of \
+its result record shows it, or when it stands in a source or in one of the researcher's \
+files. It counts as found when it stands there as written, rounded to the digits you give, \
+or as the percentage of a recorded fraction (0.913 as 91.3%). Short and round numbers \
+(5, 50%, 0.9) are not looked at, because they would be found almost anywhere. The \
+researcher is told which numbers were not found, and which were found only outside the \
+result records the finding names in `based_on`. What a log printed, what a failed run left \
+behind and what the title of a plan says are not measurements. An edit you suggest to a \
+finding is checked the same way, as the page would read with it.
+
+The check finds numbers; it cannot tell whether a number means what your sentence says. \
+That part is yours: name the metric, give its value as the record shows it, and name the \
+record in `based_on`. If the argument needs a derived quantity (a difference, a ratio), \
+say in words how it follows from the recorded values and give those values.
 
 Whether a hypothesis is supported, refuted or inconclusive is the researcher's verdict. \
 Propose it with propose_edit on the hypothesis, setting its `state`, and say in the summary \
@@ -337,16 +369,29 @@ claim, and "inconclusive, because ..." is often the accurate reading.
 
 Propose next steps where the findings call for them: a question, a hypothesis or an \
 experiment, each with `follows` naming the finding it comes from. They are proposals like \
-any other page. An experiment you propose is a plan for the designer to turn into code: \
-say what it would test and measure. Where it runs and whether it may use the network are \
+any other page.
+
+An experiment you propose is a plan without code: you have no tool to write code, and a \
+run cannot be approved before the code is there. Once the researcher accepts the plan, the \
+designer writes its code in the next design phase. Write the page so that the designer \
+and the researcher can work from it: the headings `## Objective` (which prediction is \
+tested), `## Method`, `## Metrics and success criteria` (which numbers the run reports \
+and which values would count for or against the hypothesis) and `## Resources`, and in \
+the front matter `tests` (the hypotheses it tests, for example `tests: [H2]`), `follows`, \
+`mode` (`script` for self-contained Python on a CPU, `gpu` for the same on a GPU, `repo` \
+for a command inside the researcher's repository), `timeout_seconds` within the limit the \
+user message gives, and `gpu` only as one of the types listed there. A `command` belongs \
+to `repo` mode only; a `script` or `gpu` experiment is always started as \
+`python <entrypoint>`. Where an experiment runs and whether it may use the network are \
 decided by the researcher when they approve a run, not by a field on the page.
 
 Finally write the journal page for this round at the path the user message gives: what was \
 run, what was found, what you proposed and what is still open, in a few short paragraphs \
 with links. The journal is how the researcher catches up after being away. If the findings \
 show that the literature needs another look before new hypotheses make sense, put \
-`next: research` in the journal page's front matter and say in the page what to look for; \
-once the journal page is accepted, the next round starts with research."""
+`next: research` in the journal page's front matter and say in the page what to look for. \
+That is a recommendation: the checkpoint repeats it to the researcher, and whether the \
+research phase runs next is theirs to decide."""
 
 RUNNER_SYSTEM = """\
 You repair the code of an experiment whose run failed. The experiment belongs to a research \
@@ -423,23 +468,66 @@ def _idea(idea: str) -> str:
     return _block("idea", text)
 
 
-def _requests(requests: Sequence[Mapping[str, Any]], instruction: str | None) -> list[str]:
-    """What the researcher asked for: their standing requests, and this run's instruction."""
+def _request_lines(requests: Sequence[Mapping[str, Any]]) -> str:
+    return "\n".join(
+        f"- {item['text']}" + (f" (about {item['target']})" if item.get("target") else "")
+        for item in requests
+    )
+
+
+def _requests(
+    requests: Sequence[Mapping[str, Any]], instruction: str | None, role: str
+) -> list[str]:
+    """What the researcher asked for: their standing requests, and this run's instruction.
+
+    A request is marked ``mine`` when it is addressed to this role; the others are
+    for every agent.  The text says who else sees each kind and when it is closed,
+    because that decides what the session has to do about it now.
+    """
     blocks: list[str] = []
-    if requests:
-        lines = [
-            f"- {item['text']}" + (f" (about {item['target']})" if item.get("target") else "")
-            for item in requests
+    mine = [item for item in requests if item.get("mine")]
+    shared = [item for item in requests if not item.get("mine")]
+    if mine or shared:
+        parts = [
+            "The researcher left requests for the agents. They are the researcher's own "
+            "words and come before your own plan."
         ]
-        blocks.append(
-            "The researcher left these requests for the agents. They are the researcher's "
-            "own words and come before your own plan wherever they concern your role; what "
-            "does not concern your role is left to the others.\n"
-            + _block("requests", "\n".join(lines))
-        )
+        if mine:
+            parts.append(
+                f"These are addressed to you, the {role}. No other agent is shown them, and "
+                "they are closed when this phase completes, so act on them now:\n"
+                + _block("requests_for_you", _request_lines(mine))
+            )
+        if shared:
+            parts.append(
+                "These are for every agent. Each role is shown them until the analysis that "
+                "ends the round has completed: act on what concerns your role, and leave "
+                "the rest to the role it concerns.\n"
+                + _block("requests_for_everyone", _request_lines(shared))
+            )
+        blocks.append("\n".join(parts))
     if instruction and instruction.strip():
         blocks.append("For this phase the researcher added:\n" + _block("instruction", instruction))
     return blocks
+
+
+#: Where a tag begins.  "p < 0.05" and "a<b" are not tags and stay as they are.
+_TAG_START = re.compile(r"<(?=[/!?]?[A-Za-z_])")
+
+
+def inert_line(text: Any, limit: int = 300) -> str:
+    """Words of a page or of a suggested edit, as one entry of a list that stands inside
+    a block of a prompt: on one line, cut to ``limit`` characters, and with nothing
+    in them that begins a tag.
+
+    A session is told about pages and edits of other sessions that the researcher
+    has not decided on.  Their titles and summaries are a model's words, and a
+    summary that held ``</awaiting_review>`` could end the block it is listed in
+    and go on as if the researcher spoke.  The angle bracket that would begin a
+    tag is replaced, so the words stay an entry of the list.
+    """
+    line = _TAG_START.sub("‹", " ".join(str(text if text is not None else "").split()))
+    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
 
 
 def _page_lines(pages: Sequence[Mapping[str, Any]], *, reasons: bool = False) -> str:
@@ -449,21 +537,44 @@ def _page_lines(pages: Sequence[Mapping[str, Any]], *, reasons: bool = False) ->
         tail = page.get("reason") if reasons else page.get("summary")
         if reasons:
             tail = tail or "no reason given"
-        lines.append(f'- {label} "{page["title"]}"' + (f": {tail}" if tail else ""))
+        by = f" (proposed by the {page['by']})" if page.get("by") and not reasons else ""
+        lines.append(
+            f'- {label} "{inert_line(page["title"], 160)}"{by}'
+            + (f": {inert_line(tail)}" if tail else "")
+        )
+    return "\n".join(lines)
+
+
+def _edit_lines(edits: Sequence[Mapping[str, Any]]) -> str:
+    lines = []
+    for edit in edits:
+        label = f"{edit['kind']} {edit['id']}" if edit.get("id") else str(edit["kind"])
+        by = f", suggested by the {edit['by']}" if edit.get("by") else ""
+        listed = "; ".join(inert_line(change, 120) for change in edit.get("changes") or [])
+        changes = f" ({listed})" if listed else ""
+        lines.append(
+            f'- to {label} "{inert_line(edit["title"], 160)}"{by}: '
+            f"{inert_line(edit['summary'])}{changes}. "
+            f"Reason: {inert_line(edit.get('reason')) or 'no reason given'}"
+        )
     return "\n".join(lines)
 
 
 def _earlier(
-    pending: Sequence[Mapping[str, Any]], rejected: Sequence[Mapping[str, Any]]
+    pending: Sequence[Mapping[str, Any]],
+    rejected: Sequence[Mapping[str, Any]],
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
 ) -> list[str]:
-    """What must not be proposed twice: undecided proposals of earlier sessions, rejections."""
+    """What must not be proposed twice: the undecided proposals of other sessions, the
+    pages the researcher rejected and the edits they turned down, with the reasons."""
     blocks: list[str] = []
     if pending:
         blocks.append(
-            "Earlier sessions in your role proposed the pages below, and the researcher has "
-            "not decided on them yet. They are not in your index and you cannot open them, "
-            "but they are already on the researcher's desk: do not propose the same thing "
-            "again.\n" + _block("awaiting_review", _page_lines(pending))
+            "Other sessions proposed the pages below (earlier ones in your role, and other "
+            "agents that write pages of the same kinds), and the researcher has not decided "
+            "on them yet. They are not in your index and you cannot open them, but they are "
+            "already on the researcher's desk: do not propose the same thing again.\n"
+            + _block("awaiting_review", _page_lines(pending))
         )
     if rejected:
         blocks.append(
@@ -471,7 +582,33 @@ def _earlier(
             "them again; where the thought is still worth pursuing, a new page has to "
             "answer the reason.\n" + _block("rejected", _page_lines(rejected, reasons=True))
         )
+    if rejected_edits:
+        blocks.append(
+            "The researcher turned down the suggested edits below, for the reasons given. "
+            "Do not suggest them again; where a change still seems right, say what is "
+            "different now that answers the reason.\n"
+            + _block("rejected_edits", _edit_lines(rejected_edits))
+        )
     return blocks
+
+
+def _handed_over(pages: Sequence[Mapping[str, Any]]) -> list[str]:
+    """What the scout is told about the pages intake wrote right before its session."""
+    if not pages:
+        return []
+    lines = "\n".join(
+        f'- {inert_line(page["path"], 200)}: {page["kind"]} "{inert_line(page["title"], 160)}"'
+        + (f": {inert_line(page['summary'])}" if page.get("summary") else "")
+        for page in pages
+    )
+    return [
+        "Intake wrote the pages below just before your session, from the idea and the "
+        "researcher's attached files. The researcher has not reviewed them yet and may "
+        "still edit or reject them. You can open them at the paths given (they are listed "
+        "apart in the index, and wiki_search does not find them): read them before you "
+        "search, so that you know what the researcher handed over and what was already "
+        "asked.\n" + _block("not_yet_reviewed", lines)
+    ]
 
 
 def _join(parts: Sequence[str]) -> str:
@@ -490,6 +627,7 @@ def intake_message(
     unread: Sequence[tuple[str, str]],
     pending: Sequence[Mapping[str, Any]] = (),
     rejected: Sequence[Mapping[str, Any]] = (),
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
     requests: Sequence[Mapping[str, Any]] = (),
     instruction: str | None = None,
     untitled: bool = False,
@@ -510,8 +648,8 @@ def intake_message(
             "These files could not be read in this session. Do not describe their content; "
             "a page may mention that they exist and were not read.\n" + _block("unread", lines)
         )
-    parts += _earlier(pending, rejected)
-    parts += _requests(requests, instruction)
+    parts += _earlier(pending, rejected, rejected_edits)
+    parts += _requests(requests, instruction, "intake")
     if untitled:
         parts.append(
             "The researcher gave the project no title, so it shows the first line of the "
@@ -535,8 +673,10 @@ def scout_message(
     web_search: bool,
     sources: int,
     max_sources: int,
+    handed_over: Sequence[Mapping[str, Any]] = (),
     pending: Sequence[Mapping[str, Any]] = (),
     rejected: Sequence[Mapping[str, Any]] = (),
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
     requests: Sequence[Mapping[str, Any]] = (),
     instruction: str | None = None,
 ) -> str:
@@ -568,8 +708,9 @@ def scout_message(
             _idea(idea),
             search,
             f"{scope} {limit}",
-            *_earlier(pending, rejected),
-            *_requests(requests, instruction),
+            *_handed_over(handed_over),
+            *_earlier(pending, rejected, rejected_edits),
+            *_requests(requests, instruction, "scout"),
             task,
         ]
     )
@@ -581,6 +722,7 @@ def theorist_message(
     max_hypotheses: int,
     pending: Sequence[Mapping[str, Any]] = (),
     rejected: Sequence[Mapping[str, Any]] = (),
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
     requests: Sequence[Mapping[str, Any]] = (),
     instruction: str | None = None,
 ) -> str:
@@ -590,8 +732,32 @@ def theorist_message(
         "when fewer are worth testing."
     )
     return _join(
-        [_idea(idea), *_earlier(pending, rejected), *_requests(requests, instruction), task]
+        [
+            _idea(idea),
+            *_earlier(pending, rejected, rejected_edits),
+            *_requests(requests, instruction, "theorist"),
+            task,
+        ]
     )
+
+
+def _can_run(compute: str, limits: Mapping[str, Any]) -> str:
+    """The compute backend and the limits an experiment has to fit, as two blocks."""
+    limit_items = [
+        f"- at most {limits['max_experiments']} new experiments in this phase",
+        f"- one run may take at most {limits['experiment_seconds']:.0f} seconds: "
+        "`timeout_seconds` cannot be more, and a longer run is stopped",
+        f"- compute cost still available to the project, for all runs together: "
+        f"${limits['usd_left']:.2f} of ${limits['experiment_usd']:.2f}",
+    ]
+    if limits.get("priced_gpus"):
+        limit_items.append(
+            "- a GPU experiment names one of the GPU types that have a price estimate: "
+            f"{', '.join(limits['priced_gpus'])}. For any other type nothing says what a run "
+            "would cost, so it could not be held to the cost limit, and the check of your "
+            "experiments reports it as a problem"
+        )
+    return _block("compute", compute) + "\n" + _block("limits", "\n".join(limit_items))
 
 
 def designer_message(
@@ -604,6 +770,7 @@ def designer_message(
     repo: str | None,
     pending: Sequence[Mapping[str, Any]] = (),
     rejected: Sequence[Mapping[str, Any]] = (),
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
     requests: Sequence[Mapping[str, Any]] = (),
     instruction: str | None = None,
 ) -> str:
@@ -638,27 +805,7 @@ def designer_message(
             "propose_edit instead of quietly implementing something else. The researcher "
             "reads the code when they approve the run.\n" + _block("plans_without_code", lines)
         )
-    limit_items = [
-        f"- at most {limits['max_experiments']} new experiments in this phase",
-        f"- one run may take at most {limits['experiment_seconds']:.0f} seconds: "
-        "`timeout_seconds` cannot be more, and a longer run is stopped",
-        f"- compute cost still available to the project, for all runs together: "
-        f"${limits['usd_left']:.2f} of ${limits['experiment_usd']:.2f}",
-    ]
-    if limits.get("priced_gpus"):
-        limit_items.append(
-            "- a GPU experiment names one of the GPU types that have a price estimate: "
-            f"{', '.join(limits['priced_gpus'])}. For any other type nothing says what a run "
-            "would cost, so it could not be held to the cost limit, and the check of your "
-            "experiments reports it as a problem"
-        )
-    limit_lines = "\n".join(limit_items)
-    parts.append(
-        "What the project can run:\n"
-        + _block("compute", compute)
-        + "\n"
-        + _block("limits", limit_lines)
-    )
+    parts.append("What the project can run:\n" + _can_run(compute, limits))
     if repo:
         parts.append(
             f"The researcher's repository for `repo` mode experiments is {repo}. Use the "
@@ -671,8 +818,8 @@ def designer_message(
             "The project has no repository of the researcher's, so `repo` mode is not "
             "available; design in `script` or `gpu` mode."
         )
-    parts += _earlier(pending, rejected)
-    parts += _requests(requests, instruction)
+    parts += _earlier(pending, rejected, rejected_edits)
+    parts += _requests(requests, instruction, "designer")
     parts.append(
         "For each experiment: create the page, write the code with write_code, and fix "
         "what the tool reports. When you are done, the project checks every experiment "
@@ -711,11 +858,16 @@ def analyst_message(
     round: int,
     max_hypotheses: int,
     max_experiments: int,
+    compute: str | None = None,
+    limits: Mapping[str, Any] | None = None,
     pending: Sequence[Mapping[str, Any]] = (),
     rejected: Sequence[Mapping[str, Any]] = (),
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
     requests: Sequence[Mapping[str, Any]] = (),
     instruction: str | None = None,
 ) -> str:
+    """``compute`` and ``limits`` (as the designer is given them) say what an experiment
+    proposed as a next step has to fit."""
     parts = [_idea(idea)]
     if results:
         lines = []
@@ -741,34 +893,66 @@ def analyst_message(
         f"proposals: at most {max_hypotheses} hypotheses and {max_experiments} experiments "
         "in this phase."
     )
-    parts += _earlier(pending, rejected)
-    parts += _requests(requests, instruction)
+    if compute and limits:
+        parts.append(
+            "An experiment you propose as a next step is a plan the designer writes the "
+            "code for later. It has to fit what the project can run:\n" + _can_run(compute, limits)
+        )
+    parts += _earlier(pending, rejected, rejected_edits)
+    parts += _requests(requests, instruction, "analyst")
     return _join(parts)
 
 
-def numbers_message(unverified: Mapping[str, Sequence[str]], *, last: bool) -> str:
-    """Asks the analyst's own conversation about numbers no record supports."""
-    lines = "\n".join(
-        f"- {finding}: {', '.join(numbers)}" for finding, numbers in unverified.items()
-    )
+def numbers_message(checks: Sequence[Mapping[str, Any]], *, last: bool) -> str:
+    """Asks the analyst's own conversation about numbers the check did not find where
+    they should be.
+
+    Each item of ``checks`` names a text (``label``: a finding, or a finding as a
+    suggested edit would make it read) with its numbers that were found nowhere
+    (``missing``) and those found only outside the records the finding is based on
+    (``elsewhere``).
+    """
+
+    def lines(key: str) -> str:
+        return "\n".join(
+            f"- {check['label']}: {', '.join(check[key])}" for check in checks if check.get(key)
+        )
+
+    missing, elsewhere = lines("missing"), lines("elsewhere")
     closing = (
-        "This is the last check: a number that is still unsupported after it is flagged "
-        "on the page and shown to the researcher as such."
+        "This is the last check: what is still not found after it is reported to the "
+        "researcher with the finding."
         if last
         else "The findings are checked again after your reply."
     )
-    return _join(
-        [
-            "The project compared the numbers in your findings with the metrics of the runs "
-            "that succeeded, the sources and the researcher's files. These numbers occur in "
-            "none of them:",
-            _block("unsupported_numbers", lines),
-            "For each one: if it was misread or rounded, replace it with the value as the "
+    parts = [
+        "The project looked for the numbers of your findings (title, summary and text) among "
+        "the metrics of the runs that succeeded, the sources and the researcher's files. "
+        "Short and round numbers were not looked at."
+    ]
+    if missing:
+        parts += [
+            "These numbers were found in none of them:\n" + _block("unsupported_numbers", missing),
+            "For each one: if it was misread or miscopied, replace it with the value as the "
             "record shows it. If it is derived from recorded values, say in words how, and "
             "give the recorded values instead. If nothing on record supports it, remove "
-            "the claim that needs it. " + closing,
+            "the claim that needs it.",
         ]
+    if elsewhere:
+        parts += [
+            "These numbers were found on record, but not in the result records the finding "
+            "names in `based_on`:\n" + _block("found_elsewhere", elsewhere),
+            "For each one: if it is the result of a run, the finding has to say which run "
+            "and name that run's record in `based_on`. If it comes from a source or from "
+            "one of the researcher's files, say so in the sentence. If it is a coincidence "
+            "(the number you meant is not on record), treat it as not found.",
+        ]
+    parts.append(
+        "A finding of this session is corrected with the memory tool. A suggested edit "
+        "cannot be changed once it is made: suggest the corrected edit and say in its "
+        "summary that it replaces the earlier one. " + closing
     )
+    return _join(parts)
 
 
 def repair_message(

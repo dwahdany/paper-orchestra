@@ -65,7 +65,7 @@ def metric_rows(result_body: str, metrics: dict[str, Any]) -> str:
 # -- export ----------------------------------------------------------------------------
 
 
-def test_export_writes_the_three_things_the_paper_pipeline_reads(project, exported, tmp_path):
+def test_export_writes_what_the_paper_pipeline_reads(project, exported, tmp_path):
     assert exported == tmp_path / "materials"
     assert sorted(p.relative_to(exported).as_posix() for p in exported.rglob("*")) == [
         "experimental_log.md",
@@ -74,6 +74,7 @@ def test_export_writes_the_three_things_the_paper_pipeline_reads(project, export
         "figures/info.json",
         "figures/provided-loss_curves.png",
         "idea.md",
+        "known_papers.json",
     ]
     # Exporting reads the project; it changes nothing in it.
     assert not project.paper_dir.exists()
@@ -110,7 +111,9 @@ def test_nothing_the_person_did_not_accept_reaches_the_materials(project, export
     for page in (rejected, proposed, project.page("F2"), project.page("E3"), project.page("Q6")):
         assert page.title not in plain, page.path
         assert flat(page.body)[:80] not in plain, page.path
-    for word in ("RAdam", "Transformer", "1840", "gives back what it gained"):
+    # (RAdam and the Transformer are named in accepted topic pages, which are background
+    # for the paper now.)
+    for word in ("1840", "gives back what it gained"):
         assert word not in everything, word
     # Experiments that did not produce a result are not described as done.
     for ref in ("E2", "E4"):
@@ -190,20 +193,6 @@ def test_a_link_to_a_page_that_is_not_accepted_keeps_only_the_name_it_was_writte
     written = rejected.link.rsplit("/", 1)[-1]
     assert f"Next is Q6, not {written}; {answered.title} is settled." in log
     assert waiting.title not in log and rejected.title not in log
-
-
-def test_a_finding_with_unsupported_numbers_carries_a_warning_once_it_is_accepted(
-    project, tmp_path
-):
-    project.review("F2", "accept")
-
-    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
-
-    assert "### F2: After the warmup ends" in log
-    assert (
-        "Numbers in this finding that no result record, source or input file supports, and "
-        "that are not to be reported: 1840." in flat(log)
-    )
 
 
 def test_a_page_rejected_later_leaves_the_materials(project, tmp_path):
@@ -329,6 +318,8 @@ def test_only_the_table_under_the_metrics_heading_is_taken_for_the_metrics(proje
     assert writeup._metrics_table(with_table) == table
     assert writeup._metrics_table(record.format(metrics="")) == ""
 
+    # Only where the run's own record is gone is the page read at all.
+    shutil.rmtree(project.root / "experiments" / "E1" / "runs")
     project.write_record(
         "result", "E1-run1", "E1 run 1", record.format(metrics=""),
         fields={"state": "succeeded"}, relations={"run_of": ["E1"]},
@@ -392,6 +383,7 @@ def test_write_paper_runs_the_pipeline_in_the_projects_paper_directory(project, 
         "figures/info.json",
         "figures/provided-loss_curves.png",
         "idea.md",
+        "known_papers.json",
     ]
     # The figures are what the runs produced: they are used, and kept if more are generated.
     assert cfg.use_plotting is False and cfg.keep_provided_figures is True
@@ -481,6 +473,10 @@ def test_write_paper_tells_the_project_when_it_starts_and_how_it_ended(project, 
         "findings": [project.page("F1").path],
         "figures": ["E1-run1-loss_curve.png", "provided-loss_curves.png"],
         "provided": ["notes.md", "prior_run.csv", "loss_curves.png"],
+        "left_out": [],
+        "numbers_removed": {},
+        "sources": [page.id for page in project.pages(kind="source", review="accepted")],
+        "excluded_sources": [],
     }
     assert finished["type"] == "paper.finished"
     assert finished["summary"] == "The paper is written: paper/final_paper.pdf."
@@ -551,8 +547,9 @@ def test_a_run_whose_plan_was_rejected_is_not_a_run_to_report(project, tmp_path)
 
     log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
 
-    assert "E1 run 1" not in log.split("## Findings")[0]
-    assert "No experiment of this project has a run that succeeded." in log
+    assert "E1 run 1" not in log and "## Findings" not in log
+    # (Its run did succeed; what is true is that none is reported.)
+    assert "No run of an experiment the researcher accepted is reported here." in log
 
 
 def test_results_the_person_brought_are_what_a_paper_reports_when_nothing_was_run(
@@ -784,3 +781,212 @@ def test_the_setup_of_a_run_is_what_ran_not_what_the_page_says_today(project, tm
     assert "torch" not in setup and "timeout seconds: 5" not in setup
     assert "ghp_FAKETOKEN123" not in log
     assert "- repo: https://***@git.example.invalid/me/private.git" in setup
+
+
+# -- round 2 of the audit repairs -----------------------------------------------------
+
+
+def test_a_finding_that_rests_only_on_a_rejected_experiment_is_not_reported(project, tmp_path):
+    assert writeup.left_out(project) == []
+    project.review("E1", "reject", reason="The script measures nothing about warmup.")
+
+    (left,) = writeup.left_out(project)
+    assert (left["id"], left["path"]) == ("F1", project.page("F1").path)
+    assert left["reason"] == (
+        "every record it is based on (E1 run 1) belongs to an experiment that was rejected "
+        "or is gone"
+    )
+    out = writeup.export_materials(project, tmp_path / "out")
+    everything = text_of(out / "experimental_log.md") + text_of(out / "idea.md")
+    assert "## Findings" not in everything and project.page("F1").title not in everything
+    # What is said about the runs is true: one succeeded, and is not reported.
+    assert "No experiment of this project has a run that succeeded" not in everything
+    assert "No run of an experiment the researcher accepted is reported" in everything
+    # A finding that also rests on a record that stands is reported.
+    missing = writeup.missing(project)
+    assert missing == "finding" and "F1" in missing.detail and "rejected" in missing.detail
+
+
+def test_the_refusal_names_the_findings_that_were_left_out_and_why(project, pipeline):
+    project.review("E1", "reject", reason="The script measures nothing about warmup.")
+    with pytest.raises(ProjectError) as refusal:
+        writeup.write_paper(project, template="cvpr2025")
+    said = str(refusal.value)
+    assert "no accepted finding can be reported" in said and "F1" in said
+    assert "belongs to an experiment that was rejected or is gone" in said
+    assert pipeline.configs == []
+
+
+def test_a_finding_based_on_a_record_that_stands_is_reported_with_the_others_named(
+    project, tmp_path, pipeline
+):
+    # A second finding of the person's own, on the records of a run that is then rejected
+    # and one with no records at all.
+    project.create_page("finding", "Mine, on nothing", "A hunch.\n", author="human")
+    orphan = project.create_page(
+        "finding", "On a record that is gone", "It was low.\n", author="human",
+        relations={"based_on": ["E9-run1"]},
+    )  # fmt: skip
+    assert [item["id"] for item in writeup.left_out(project)] == [orphan.id]
+    writeup.write_paper(project, template="cvpr2025")
+    started = next(e for e in project.events() if e["type"] == "paper.started")
+    assert started["data"]["left_out"] == [
+        {
+            "id": orphan.id,
+            "path": orphan.path,
+            "title": "On a record that is gone",
+            "reason": "every record it is based on (E9-run1) belongs to an experiment that "
+            "was rejected or is gone",
+        }
+    ]
+    assert f"1 accepted finding is left out ({orphan.id}:" in started["summary"]
+    assert orphan.path not in started["data"]["findings"]
+    log = text_of(project.paper_dir / "raw_materials" / "experimental_log.md")
+    assert "Mine, on nothing" in log and "On a record that is gone" not in log
+
+
+def test_a_number_found_nowhere_is_taken_out_of_what_the_writer_is_given(project, pipeline):
+    project.review("F2", "accept")
+    writeup.write_paper(project, template="cvpr2025")
+
+    log = text_of(project.paper_dir / "raw_materials" / "experimental_log.md")
+    section = log.split("### F2: ")[1]
+    assert "1840" not in log and "[a number not on record]" in section
+    assert "1 number of this finding was found in no run record" in flat(section)
+    # The page itself is not changed, and the event says what was taken out of which.
+    assert "1840" in project.page("F2").body
+    started = next(e for e in project.events() if e["type"] == "paper.started")
+    assert started["data"]["numbers_removed"] == {"F2": ["1840"]}
+    assert "1 number that is on no record was taken out (F2: 1840)" in started["summary"]
+
+
+def test_a_number_in_the_title_of_a_finding_is_checked_like_any_other(project, tmp_path):
+    project.create_page("finding", "Warmup cuts the loss by 62.5%", "It does.\n", author="human")
+    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
+    assert "Warmup cuts the loss by [a number not on record]%" in log and "62.5" not in log
+
+
+def test_the_metrics_in_the_materials_are_the_runs_own_whatever_the_page_says(project, tmp_path):
+    result = project.page("results/E1-run1")
+    record = experiments.runs(project, "E1")[0]
+    name, value = next(iter(record["metrics"].items()))
+    row = f"| {name} | {record['metrics_text'][name]} |"
+    assert row in result.body
+    project.update_page(
+        result.path, author="human", body=result.body.replace(row, f"| {name} | 0.999999 |")
+    )
+
+    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
+
+    assert row in log and "0.999999" not in log and str(value) in log
+    assert "edited after code wrote it" in log
+
+
+def test_a_run_whose_record_is_gone_is_reported_from_the_page_code_wrote(project, tmp_path):
+    shutil.rmtree(project.root / "experiments" / "E1" / "runs")  # cleared to save space
+    result = project.page("results/E1-run1")
+    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
+    assert writeup._metrics_table(result.body) in log
+    # Not from a page somebody edited: nothing vouches for its numbers any more.
+    project.update_page(result.path, author="human", body=result.body.replace("0.", "9."))
+    log = text_of(writeup.export_materials(project, tmp_path / "again") / "experimental_log.md")
+    assert "its metrics are not copied" in log and "| metric | value |" not in log
+
+
+def test_the_literature_starts_from_the_sources_the_person_accepted(project, exported):
+    project.write_record(
+        "source",
+        "Aaa2020Warmup",
+        "Warmup, measured",
+        "- **Venue:** ICML\n\n> We measure warmup\n> at small batch sizes.\n\nQuoted as returned.\n",
+        fields={"authors": ["A. Aaa", "B. Bbb"], "year": 2020, "venue": "ICML", "citations": 12},
+    )
+    turned_down = project.pages(kind="source", review="accepted")[-1]
+    project.review(turned_down.path, "reject", reason="Not about warmup at all.")
+    accepted = project.pages(kind="source", review="accepted")
+    rejected = project.pages(kind="source", review="rejected")
+    assert accepted and [page.id for page in rejected] == [turned_down.id]
+    exported = writeup.export_materials(project, exported.parent / "again")
+    known = read_json(exported / "known_papers.json")
+
+    assert known["version"] == 1
+    assert [paper["citation_key"] for paper in known["papers"]] == [page.id for page in accepted]
+    first, page = known["papers"][0], accepted[0]
+    assert first["title"] == page.title and first["authors"] == page.meta["authors"]
+    assert first["year"] == page.meta["year"] and first["venue"] == page.meta["venue"]
+    assert (first["citation_key"], first["citation_count"]) == ("Aaa2020Warmup", 12)
+    assert first["abstract"] == "We measure warmup at small batch sizes."
+    assert set(first) >= {
+        "citation_key", "title", "authors", "venue", "year", "abstract", "citation_count",
+        "found_in_section", "sections", "reason", "journal", "volume", "pages",
+        "publication_date",
+    }  # fmt: skip
+    # The shape the paper pipeline's literature stage keeps its verified papers in.
+    from paper_orchestra.agents.literature import PaperData
+
+    assert [PaperData.model_validate(paper).title for paper in known["papers"]] == [
+        page.title for page in accepted
+    ]
+    assert known["excluded"] == [
+        {
+            "citation_key": page.id,
+            "title": page.title,
+            "reason": page.decision_reason or "rejected by the researcher",
+        }
+        for page in rejected
+    ]
+    # And said to the writers, who read the idea file: what to start from, what not to cite.
+    idea = text_of(exported / "idea.md")
+    assert "## Sources the researcher accepted" in idea and "## Papers not to cite" in idea
+    for page in accepted:
+        assert f"- {page.id}: " in idea and page.title in idea
+    for page in rejected:
+        assert page.title in idea.split("## Papers not to cite")[1]
+
+
+def test_the_accepted_syntheses_are_background_for_the_paper(project, exported):
+    idea = text_of(exported / "idea.md")
+    background = idea.split("## Background from the research wiki")[1]
+    topics = project.pages(kind="topic", review="accepted")
+    assert topics
+    for page in topics:
+        assert f"### {page.title}" in background
+    for page in project.pages(kind="topic", review=("proposed", "rejected")):
+        assert f"### {page.title}" not in idea
+    # After the idea, the hypotheses and the method; headings nest under the file's own.
+    assert idea.index("## Hypotheses") < idea.index("## Background from the research wiki")
+    assert "[[" not in background
+
+
+def test_the_background_is_bounded(project, tmp_path, monkeypatch):
+    monkeypatch.setattr(writeup, "MAX_BACKGROUND_CHARS", 600)
+    idea = text_of(writeup.export_materials(project, tmp_path / "out") / "idea.md")
+    background = idea.split("## Background from the research wiki")[1].split("\n## ")[0]
+    assert len(background) < 2000 and "left out for lack of room" in background
+
+
+def test_a_cutoff_that_cannot_be_read_stops_the_write_up(project, pipeline):
+    data = read_json(project.root / "project.json")
+    data["settings"]["research_cutoff"] = "June 2024"
+    write_json(project.root / "project.json", data)
+    reopened = Project.open(project.root)
+    with pytest.raises(ProjectError, match="research_cutoff is 'June 2024'"):
+        writeup.write_paper(reopened, template="cvpr2025")
+    assert pipeline.configs == []
+
+
+def test_a_verdict_that_came_through_a_finding_that_is_left_out_is_said_to_be_open(
+    project, tmp_path
+):
+    idea = text_of(writeup.export_materials(project, tmp_path / "before") / "idea.md")
+    assert "is not reported" not in idea
+    project.review("E1", "reject", reason="The script measures nothing about warmup.")
+
+    idea = text_of(writeup.export_materials(project, tmp_path / "after") / "idea.md")
+
+    supported = idea.split("### H1: ")[1].split("\n### ")[0]
+    assert "(supported)" in supported.splitlines()[0]
+    assert "came through F1, which is not reported" in flat(supported)
+    assert "Treat the hypothesis as open" in flat(supported)
+    # One whose verdict was never given has nothing to qualify.
+    assert "not reported" not in idea.split("### H2: ")[1].split("\n### ")[0]

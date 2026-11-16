@@ -12,6 +12,7 @@ that enforces these rules on disk is :mod:`paper_orchestra.research.project`.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -306,17 +307,22 @@ _EITHER = _PERSON | _CODE
 #: Every legal move of an experiment and who makes it.  Approval is the person's alone, from
 #: any state: it is what spends their money.  Code only carries an approved experiment
 #: through its run, puts an interrupted one back in the queue, and takes an approval back
-#: when the experiment is no longer what was approved (never the other way round).
+#: when the experiment is no longer what was approved (never the other way round).  The
+#: end of a run is recorded from ``approved`` and ``queued`` as well as from ``running``:
+#: a page saved from an editor while its run was under way must not read as waiting to run
+#: once that run is over.
 _EXPERIMENT_MOVES: dict[tuple[str, str], frozenset[str]] = {
     ("planned", "approved"): _PERSON,
     ("planned", "cancelled"): _PERSON,
     ("approved", "planned"): _EITHER,
     ("approved", "queued"): _CODE,
     ("approved", "running"): _CODE,
+    ("approved", "succeeded"): _CODE,
     ("approved", "failed"): _CODE,
     ("approved", "cancelled"): _EITHER,
     ("queued", "planned"): _EITHER,
     ("queued", "running"): _CODE,
+    ("queued", "succeeded"): _CODE,
     ("queued", "failed"): _CODE,
     ("queued", "cancelled"): _EITHER,
     ("running", "queued"): _CODE,
@@ -340,6 +346,40 @@ def actor_class(by: str) -> str:
     if author in (SYSTEM, agent_author("runner")):
         return "code"
     return "agent"
+
+
+#: What a reader can take for a quotation mark besides the marks themselves (the Unicode
+#: categories Pi and Pf): straight marks and the accents typed for them, low marks, primes,
+#: modifier letters, Hebrew and CJK marks, ornaments.
+_LIKE_QUOTATION_MARKS = frozenset(
+    "\"'`\u00b4\u201a\u201e"
+    "\u2032\u2033\u2034\u2035\u2036\u2037\u2057"
+    "\u02b9\u02ba\u02bb\u02bc\u02bd\u02c8\u02ca\u02cb\u02dd\u02ee"
+    "\u05f3\u05f4\u3003\u301d\u301e\u301f"
+    "\u275b\u275c\u275d\u275e\u275f\u2760\u2e42\uff02\uff07"
+    "\U0001f676\U0001f677\U0001f678"
+)
+_APOSTROPHES = re.compile("'{2,}")
+
+
+def quotable(text: Any, limit: int = 120) -> str:
+    """Words someone else chose (an agent's title, a summary, a field value), made safe
+    to stand between quotation marks in a sentence the project says: on one line, cut
+    to ``limit`` characters, whatever reads as a quotation mark made a plain apostrophe,
+    and characters that are not shown (or that change the order of what is shown) left
+    out.  The caller adds the marks; inside them nothing can look like their end, so
+    the words read as a quotation and never as a further sentence."""
+    visible = "".join(
+        " " if ch.isspace() else ch
+        for ch in str(text if text is not None else "")
+        if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co")
+    )
+    plain = "".join(
+        "'" if ch in _LIKE_QUOTATION_MARKS or unicodedata.category(ch) in ("Pi", "Pf") else ch
+        for ch in visible
+    )
+    line = " ".join(_APOSTROPHES.sub("'", plain).split())
+    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
 
 
 def with_article(kind: str) -> str:
@@ -533,6 +573,11 @@ def clean_relations(kind: str, relations: Mapping[str, Any] | None) -> dict[str,
 # Front matter
 # ---------------------------------------------------------------------------
 
+#: Front-matter field of a page someone else wrote: when the person last edited it
+#: themselves (a stamp).  From then on the page is not its author's to rewrite, also
+#: while the decision on it is open; on a record it says that the page is no longer
+#: only what code wrote.
+EDITED_BY_PERSON = "edited_by_person"
 #: Fields the project sets itself.  They are never taken from the ``fields`` a caller
 #: passes, and an edit proposal may not carry them.
 MANAGED_FIELDS: frozenset[str] = frozenset(
@@ -548,6 +593,7 @@ MANAGED_FIELDS: frozenset[str] = frozenset(
         "decided_by",
         "decided_at",
         "decision_reason",
+        EDITED_BY_PERSON,
     }
 )
 #: The fields of an experiment page that decide what a run executes, where and for how
@@ -596,6 +642,7 @@ _FIELD_ORDER: tuple[str, ...] = (
     "decided_by",
     "decided_at",
     "decision_reason",
+    EDITED_BY_PERSON,
     "approved_at",
     "approved_digest",
     "repaired_digest",
@@ -788,6 +835,10 @@ def page_from_parts(
         stated = str(meta.get("state") or "")
         state = stated if stated in states else INITIAL_STATE.get(kind)
     relations = {name: targets for name in RELATIONS if (targets := as_targets(meta.get(name)))}
+    summary = wiki_page.summary
+    if not str(meta.get("summary") or "").strip():
+        # Taken from the first sentence of the text, where a link is markup, not words.
+        summary = plain_links(summary)
     updated = str(meta.get("updated") or "")
     if file_stamp and parse_stamp(updated) is None:
         updated = file_stamp
@@ -796,7 +847,7 @@ def page_from_parts(
         kind=kind,
         id=_id_of(kind, path, meta),
         title=wiki_page.title,
-        summary=wiki_page.summary,
+        summary=summary,
         review=review,
         state=state,
         author=author,
@@ -807,6 +858,22 @@ def page_from_parts(
         meta=dict(meta),
         body=body,
     )
+
+
+#: ``[[target#anchor|label]]`` as a page's text writes a link to another page.
+_WIKI_LINK = re.compile(r"\[\[([^\[\]|#\n]*)(?:#[^\[\]|\n]*)?(?:\|([^\[\]\n]*))?\]\]")
+
+
+def plain_links(text: str) -> str:
+    """``text`` with every wiki link replaced by what it is read as: its label, or else
+    the name of the page it leads to (``[[topics/warmup]]`` -> ``warmup``, ``[[H2]]`` ->
+    ``H2``).  For one-line summaries, which are shown where links are not rendered."""
+
+    def name(match: re.Match[str]) -> str:
+        label = (match.group(2) or "").strip()
+        return label or PurePosixPath(match.group(1).strip()).name.removesuffix(".md")
+
+    return " ".join(_WIKI_LINK.sub(name, text).split())
 
 
 def moved_on(page: ResearchPage) -> bool:
@@ -986,6 +1053,34 @@ class EditProposal:
 
 
 REQUEST_STATES: tuple[str, ...] = ("open", "done")
+#: A request that is for every agent, as opposed to one for a single role.
+FOR_ALL = "all"
+#: The roles a request can be addressed to: those whose phases act on instructions.
+REQUEST_ROLES: tuple[str, ...] = ("scout", "theorist", "designer", "analyst")
+
+
+def request_role(value: Any) -> str:
+    """Who a request is for, from how it was said: ``all`` (also for nothing given) or one
+    of ``REQUEST_ROLES`` (``designer`` or ``agent:designer``).  ``ProjectError`` for
+    anything else, naming the choices."""
+    text = str(value or "").strip().lower().removeprefix(AGENT_PREFIX)
+    if text in ("", FOR_ALL, "everyone"):
+        return FOR_ALL
+    if text not in REQUEST_ROLES:
+        raise ProjectError(
+            f"A request is for {FOR_ALL} (every agent) or for one of: "
+            f"{', '.join(REQUEST_ROLES)}; not for {value!r}."
+        )
+    return text
+
+
+def _handled(value: Any) -> list[dict[str, Any]]:
+    """The phases a request was given to, however the file lists them (one object, as
+    earlier versions wrote it, or a list of them)."""
+    items = [value] if isinstance(value, Mapping) else value
+    if not isinstance(items, list | tuple):
+        return []
+    return [dict(item) for item in items if isinstance(item, Mapping) and item.get("phase")]
 
 
 @dataclass(frozen=True)
@@ -997,8 +1092,15 @@ class Request:
     target: str | None = None
     created: str = ""
     state: str = "open"
-    #: ``{"round": 2, "phase": "hypothesize"}`` once a phase that received it completed.
-    handled_in: dict[str, Any] | None = None
+    #: Who it is for: ``all`` (every phase that runs until the round's analysis) or one
+    #: of ``REQUEST_ROLES`` (that role's next phase).  Written as ``for`` in the file.
+    role: str = FOR_ALL
+    #: Every phase that was given it, in order: ``[{"round": 2, "phase": "hypothesize"}]``.
+    handled_in: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def for_all(self) -> bool:
+        return self.role == FOR_ALL
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1007,20 +1109,27 @@ class Request:
             "target": self.target,
             "created": self.created,
             "state": self.state,
-            "handled_in": dict(self.handled_in) if self.handled_in else None,
+            "for": self.role,
+            "handled_in": [dict(item) for item in self.handled_in],
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Request:
+        """Tolerant of what a hand-written or older file holds: a request for a role this
+        version does not know is for everyone, so that it is shown rather than lost."""
         state = data.get("state")
-        handled = data.get("handled_in")
+        try:
+            role = request_role(data.get("for", data.get("role")))
+        except ProjectError:
+            role = FOR_ALL
         return cls(
             id=str(data.get("id") or ""),
             text=str(data.get("text") or ""),
             target=_optional_text(data.get("target")),
             created=str(data.get("created") or ""),
             state=state if state in REQUEST_STATES else "open",
-            handled_in=dict(handled) if isinstance(handled, Mapping) else None,
+            role=role,
+            handled_in=_handled(data.get("handled_in")),
         )
 
 
@@ -1062,6 +1171,30 @@ EVENT_TYPES: tuple[str, ...] = (
 EFFORTS: tuple[str, ...] = get_args(Effort)
 COMPUTE_BACKENDS: tuple[str, ...] = ("local", "modal")
 _CUTOFF = re.compile(r"^\d{4}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?$")
+#: A cutoff as people type it into a file: the month or the day with one digit.
+_CUTOFF_AS_TYPED = re.compile(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$")
+#: Said of a cutoff that cannot be read, wherever the settings were loaded leniently.
+CUTOFF_STOPS_RESEARCH = (
+    "it is kept as written and is not read as 'no cutoff': no paper is looked up or "
+    "recorded and no paper is written until it is corrected"
+)
+
+
+def as_cutoff(value: Any) -> Any:
+    """A research cutoff in its usual form where what was meant is plain: a year given
+    as a number (``2024``) and a month or day written with one digit (``2024-6``).
+    Anything else is returned as it is, for the check to judge."""
+    text = value
+    if isinstance(text, float) and text.is_integer():
+        text = int(text)
+    if isinstance(text, int) and not isinstance(text, bool):
+        text = str(text)
+    match = _CUTOFF_AS_TYPED.match(text.strip()) if isinstance(text, str) else None
+    if match is None:
+        return value
+    year, month, day = match.groups()
+    typed = year + (f"-{int(month):02d}" if month else "") + (f"-{int(day):02d}" if day else "")
+    return typed if _CUTOFF.match(typed) else value
 
 
 def default_review_policy() -> dict[str, str]:
@@ -1271,12 +1404,15 @@ class ProjectSettings:
 
     ``from_dict`` loads whatever is there (an older or hand-edited file): missing
     values get their defaults, invalid ones too and are listed in
-    ``load_problems``, unknown keys are kept.  ``validate`` is the strict check
-    made before settings are saved.
+    ``load_problems``, unknown keys are kept.  One value is not replaced by its
+    default: a ``research_cutoff`` that cannot be read stays as it was written
+    (:meth:`cutoff_problem` says what is wrong), because its default is "no
+    cutoff".  ``validate`` is the strict check made before settings are saved.
     """
 
     models: ModelSettings = field(default_factory=ModelSettings)
-    #: Ignore work published after this month (``YYYY-MM``); ``None`` for no cutoff.
+    #: Ignore work published after this month (``YYYY-MM``); ``None`` for no cutoff.  After
+    #: a lenient load it can hold a value that is neither: see :meth:`cutoff_problem`.
     research_cutoff: str | None = None
     compute: str = "local"
     #: kind -> ``auto`` (an agent's page is accepted on creation) or ``review``.
@@ -1314,14 +1450,23 @@ class ProjectSettings:
 
     # -- checking ----------------------------------------------------------------
 
+    def cutoff_problem(self) -> str | None:
+        """What is wrong with ``research_cutoff``, as a sentence, or ``None`` when it can
+        be applied.  A cutoff that cannot be read is never "no cutoff": whoever looks
+        up literature for the project stops with this message instead."""
+        cutoff = self.research_cutoff
+        if cutoff is None or (isinstance(cutoff, str) and _CUTOFF.match(cutoff)):
+            return None
+        return (
+            f"settings.research_cutoff is {cutoff!r}; it must be a date such as 2024-06 "
+            "(YYYY, YYYY-MM or YYYY-MM-DD), or null for no cutoff"
+        )
+
     def _own_problems(self) -> dict[str, str]:
         wrong: dict[str, str] = {}
-        cutoff = self.research_cutoff
-        if cutoff is not None and not (isinstance(cutoff, str) and _CUTOFF.match(cutoff)):
-            wrong["research_cutoff"] = (
-                f"is {cutoff!r}; it must be a date such as 2024-06 (YYYY, YYYY-MM or "
-                "YYYY-MM-DD), or null for no cutoff"
-            )
+        cutoff = self.cutoff_problem()
+        if cutoff:
+            wrong["research_cutoff"] = cutoff.removeprefix("settings.research_cutoff ")
         if self.compute not in COMPUTE_BACKENDS:
             wrong["compute"] = (
                 f"is {self.compute!r}; it must be one of: {', '.join(COMPUTE_BACKENDS)}"
@@ -1378,8 +1523,15 @@ class ProjectSettings:
         for name in ("research_cutoff", "compute", "lab_memory", "repo"):
             if name in raw:
                 setattr(settings, name, raw[name])
+        settings.research_cutoff = as_cutoff(settings.research_cutoff)
         defaults = cls()
         for name, message in settings._own_problems().items():
+            if name == "research_cutoff":
+                # Fail closed: the default would be "no cutoff", which lets in exactly
+                # the work the person meant to leave out.
+                kept = "" if strict else f"; {CUTOFF_STOPS_RESEARCH}"
+                problems.append(f"settings.{name} {message}{kept}")
+                continue
             default = getattr(defaults, name)
             problems.append(f"settings.{name} {message}; the default ({default!r}) is used")
             setattr(settings, name, default)
