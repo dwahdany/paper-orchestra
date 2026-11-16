@@ -1315,7 +1315,17 @@ def test_python_dash_m_runs_the_cli(tmp_path):
 
 
 def test_importing_the_cli_loads_no_agent_and_no_provider_sdk(tmp_path):
-    heavy = ("paper_orchestra.agents.", "anthropic", "modal", "openai", "google.genai", "streamlit")
+    heavy = (
+        "paper_orchestra.agents.",
+        "paper_orchestra.research",
+        "paper_orchestra.web",
+        "anthropic",
+        "modal",
+        "openai",
+        "google.genai",
+        "fastapi",
+        "uvicorn",
+    )
     code = (
         "import sys, paper_orchestra.cli\n"
         f"print(sorted(m for m in sys.modules if m.startswith({heavy!r})))"

@@ -34,7 +34,10 @@ _PACKAGES = (
     "typer",
     "rich",
     "pymupdf",
-    "streamlit",
+    "fastapi",
+    "uvicorn",
+    "markdown-it-py",
+    "python-multipart",
 )
 #: Optional providers: the SDK module that must be importable, per provider.
 _PROVIDER_SDKS = {"anthropic": "anthropic", "gemini": "google.genai", "openai": "openai"}
@@ -44,7 +47,7 @@ _NOT_A_SECRET_SUFFIX = ("_FILE", "_PATH", "_DIR", "_ID")
 _MIN_SECRET_LENGTH = 12
 
 
-def _secret_values(environ: Mapping[str, str]) -> list[str]:
+def secret_values(environ: Mapping[str, str]) -> list[str]:
     """Values of environment variables that hold credentials, longest first."""
     values = {
         value
@@ -56,16 +59,16 @@ def _secret_values(environ: Mapping[str, str]) -> list[str]:
     return sorted(values, key=len, reverse=True)
 
 
-def _scrub(value: Any, secrets: Sequence[str]) -> Any:
+def scrub(value: Any, secrets: Sequence[str]) -> Any:
     """Blank out any credential value that found its way into the report."""
     if isinstance(value, str):
         for secret in secrets:
             value = value.replace(secret, REDACTED)
         return value
     if isinstance(value, Mapping):
-        return {str(key): _scrub(item, secrets) for key, item in value.items()}
+        return {str(key): scrub(item, secrets) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [_scrub(item, secrets) for item in value]
+        return [scrub(item, secrets) for item in value]
     return value
 
 
@@ -213,7 +216,7 @@ def collect(model: str | None = None) -> dict[str, Any]:
         "packages": _package_versions(),
         "ok": bool(provider["usable"]),
     }
-    return _scrub(report, _secret_values(environ))
+    return scrub(report, secret_values(environ))
 
 
 def _details(info: Mapping[str, Any], skip: Sequence[str] = ()) -> str:

@@ -42,7 +42,7 @@ from markdown_it.token import Token
 
 # The same pattern decides what the graph counts as a link (``Page.links``); a copy
 # here could drift from it and show links the graph does not have.
-from paper_orchestra.memory.wiki import _WIKILINK, slugify
+from paper_orchestra.memory.wiki import WIKILINK, slugify
 from paper_orchestra.web.security import FILE_AREAS
 
 if TYPE_CHECKING:
@@ -341,7 +341,7 @@ def _wikilink(state: StateInline, silent: bool) -> bool:
     """Inline rule: ``[[target]]``, ``[[target|label]]``, ``[[target#anchor|label]]``."""
     if not state.src.startswith("[[", state.pos) or state.linkLevel > 0:
         return False
-    match = _WIKILINK.match(state.src, state.pos)
+    match = WIKILINK.match(state.src, state.pos)
     if match is None or match.end() > state.posMax:
         return False
     if not silent:

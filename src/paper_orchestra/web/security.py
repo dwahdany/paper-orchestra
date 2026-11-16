@@ -221,9 +221,9 @@ def mask_secrets(text: str) -> str:
     The rule for what counts as a credential is the one ``paper-orchestra doctor``
     applies to its own report.
     """
-    from paper_orchestra.doctor import _scrub, _secret_values
+    from paper_orchestra.doctor import scrub, secret_values
 
-    return str(_scrub(text, _secret_values(os.environ)))
+    return str(scrub(text, secret_values(os.environ)))
 
 
 # ---------------------------------------------------------------------------

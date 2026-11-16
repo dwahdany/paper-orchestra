@@ -29,7 +29,7 @@ jobs:
       - name: Check the environment
         run: >-
           uv run --no-sync python -c
-          "import sys, modal, openai, streamlit, google.genai;
+          "import sys, modal, openai, fastapi, uvicorn, markdown_it, google.genai;
           assert '%d.%d' % sys.version_info[:2] == '${{ matrix.python-version }}', sys.version"
       - name: Lint
         run: |
