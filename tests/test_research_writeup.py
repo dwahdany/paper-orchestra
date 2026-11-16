@@ -8,6 +8,7 @@ figure, runs that failed, experiments that never ran.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -639,11 +640,14 @@ def test_a_write_up_is_the_projects_one_worker_while_it_runs(project, monkeypatc
 
     refusals: list[Exception] = []
 
+    named: list[dict[str, Any]] = []
+
     class Busy(Pipeline):
         """A pipeline during which someone tries to start more work on the project."""
 
         def __call__(self, cfg: PipelineConfig, **kwargs: Any) -> PaperResult:
             if not self.configs:  # only the write-up that got to run tries
+                named.append(read_json(project.root / "state.json")["worker"])
                 for start in (
                     lambda: writeup.write_paper(project, template="cvpr2025"),
                     lambda: Engine(project).run_experiment("E4"),
@@ -664,6 +668,15 @@ def test_a_write_up_is_the_projects_one_worker_while_it_runs(project, monkeypatc
     assert isinstance(engine, WorkerBusy)
     assert len(stub.configs) == 1 and len(paper_events(project)) == 2
     assert project.page("E4").state == "approved" and experiments.runs(project, "E4") == []
+    # While it ran, the write-up was on file as the project's worker, the way an engine
+    # is, so that the web server shows it and starts nothing beside it.
+    (worker,) = named
+    assert worker["pid"] == os.getpid() and worker["kind"] == "write"
+    assert worker["host"] and worker["started"] and worker["heartbeat"]
+    after = read_json(project.root / "state.json")
+    assert after["worker"] is None
+    # Being the worker changes nothing else of the engine's state.
+    assert (after["status"], after["round"], after["next_phase"]) == ("checkpoint", 2, "run")
     # The lock goes with the write-up: afterwards the project is free again.
     assert writeup.write_paper(project, template="cvpr2025").success
 

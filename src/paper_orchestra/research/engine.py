@@ -59,6 +59,7 @@ __all__ = [
     "Engine",
     "EngineError",
     "WorkerBusy",
+    "as_worker",
     "read_state",
     "worker_alive",
 ]
@@ -265,6 +266,51 @@ class _Heartbeat(threading.Thread):
     def stop(self) -> None:
         self._done.set()
         self.join(timeout=5.0)
+
+
+@contextlib.contextmanager
+def as_worker(project: Project, *, kind: str) -> Iterator[None]:
+    """Be the project's one worker for work that is not a phase of the engine.
+
+    The write-up of the paper uses this.  It holds the worker lock and names
+    this process under ``state.json["worker"]`` with a heartbeat and its
+    ``kind``, as an engine does, so that the web server shows the worker and
+    nothing else starts beside it.  The rest of the state is left as it is.
+    Raises ``WorkerBusy`` when the project has a worker.
+    """
+    lock = _WorkerLock(project.root)
+    with lock:
+        if not lock.acquired:
+            if lock.error:
+                raise WorkerBusy(
+                    f"The project at {project.root} could not be locked for a worker "
+                    f"({lock.error}). Check that the directory can be written."
+                )
+            raise WorkerBusy(
+                "Another worker is at work on this project: its agents, a run of an "
+                "experiment, or a write-up that was started before. Wait for it to "
+                "finish, or stop it, then start again; a project has one worker at a time."
+            )
+        path = project.root / STATE_FILE
+        started = _now()
+        mine = {"pid": os.getpid(), "host": socket.gethostname(), "started": started}
+        written = threading.Lock()
+
+        def name(*, gone: bool = False) -> None:
+            # Holding the lock makes this process the only worker that writes the file.
+            with written:
+                state = read_state(project)
+                state["worker"] = None if gone else {**mine, "heartbeat": _now(), "kind": kind}
+                write_json(path, state)
+
+        name()
+        beat = _Heartbeat(name, Engine.HEARTBEAT_SECONDS)
+        beat.start()
+        try:
+            yield
+        finally:
+            beat.stop()
+            name(gone=True)
 
 
 class _Compute:

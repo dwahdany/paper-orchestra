@@ -22,7 +22,6 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from paper_orchestra.compute.base import ComputeError, safe_relative
-from paper_orchestra.memory.lock import WikiLock
 from paper_orchestra.pipeline import FIGURE_SUFFIXES, PaperResult, prepare_run_dir, run_paper
 from paper_orchestra.research.model import IDEA_PATH, ProjectError, ResearchPage, parse_id
 from paper_orchestra.utils.common import write_json, write_text
@@ -39,10 +38,9 @@ FIGURES_DIR = "figures"
 FIGURES_INFO = "info.json"
 #: Where the paper pipeline looks for its inputs inside its run directory.
 MATERIALS_DIR = "raw_materials"
-#: The file whose kernel lock makes a process the project's one worker (spec 10.4).
-WORKER_LOCK_FILE = ".worker.lock"
 
-#: ``[[target#anchor|label]]``, the wiki's link syntax (``memory.wiki`` keeps its pattern private).
+#: ``[[target#anchor|label]]``, the wiki's link syntax as in ``memory.wiki.WIKILINK``, with the
+#: label captured without its bar.
 _WIKI_LINK = re.compile(r"\[\[([^\[\]|#\n]+)(?:#[^\[\]|\n]*)?(?:\|([^\[\]\n]*))?\]\]")
 _HEADING = re.compile(r"^(#{1,6})(\s+\S.*)$")
 _FENCE = re.compile(r"^\s*(```|~~~)")
@@ -619,35 +617,19 @@ def _paper_config(project: Project, template: str, options: Mapping[str, Any]) -
     )
 
 
-class _WorkerLock(WikiLock):
-    """The project's worker lock, which the engine holds while it advances the project
-    or runs an experiment.  It never waits: a project that has a worker is busy."""
-
-    def __init__(self, root: Path) -> None:
-        super().__init__(root, wait_seconds=0.0, poll=0.05)
-        self.path = Path(root) / WORKER_LOCK_FILE
-
-
 @contextlib.contextmanager
 def _as_the_worker(project: Project) -> Iterator[None]:
     """Be the project's one worker for the length of the write-up.
 
     Two write-ups at once would run two pipelines in the same ``paper`` directory,
-    each replacing the other's materials, state and usage.
+    each replacing the other's materials, state and usage.  The write-up is on
+    file as the project's worker like an engine is, so the web app shows one that
+    was started from a terminal and starts nothing beside it.
     """
-    with _WorkerLock(project.root) as lock:
-        if not lock.acquired and lock.error:
-            raise ProjectError(
-                f"The project at {project.root} could not be locked for the write-up "
-                f"({lock.error}). Check that the directory can be written."
-            )
-        if not lock.acquired:
-            raise ProjectError(
-                "Another worker is at work on this project: its agents, a run of an "
-                "experiment, or a write-up that was started before. Wait for it to "
-                "finish, or stop it, then start the write-up again; a project has one "
-                "worker at a time."
-            )
+    # Imported here: the engine brings the agents and the model layer with it.
+    from paper_orchestra.research.engine import as_worker
+
+    with as_worker(project, kind="write"):
         yield
 
 

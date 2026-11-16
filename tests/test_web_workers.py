@@ -782,6 +782,14 @@ def test_an_experiment_run_from_a_terminal_counts_as_the_projects_worker(
         with pytest.raises(WorkerBusy):
             workers.start(project.root, "advance")
 
+        # A write-up started from a terminal says what it is, and is shown as that.
+        state["worker"]["kind"] = "write"
+        (project.root / "state.json").write_text(json.dumps(state))
+        assert make_workers().status(project.root)["kind"] == "write"
+        state["worker"]["kind"] = "something else"  # not a kind of work: judged as before
+        (project.root / "state.json").write_text(json.dumps(state))
+        assert make_workers().status(project.root)["kind"] == "run"
+
         # It finished and took its name out of state.json: the project is free at once,
         # even while that process is still around.
         state["worker"] = None

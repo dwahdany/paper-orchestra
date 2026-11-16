@@ -809,9 +809,13 @@ class Workers:
         host = str(worker.get("host") or self._host)
         pid = worker.get("pid") if host == self._host else None
         pid = pid if isinstance(pid, int) and _pid_alive(pid) else None
+        # A worker that is not an engine phase says what it is (a write-up); otherwise the
+        # status tells: `advance` sets it to running, `run` leaves it as it was.
+        named = worker.get("kind")
+        inferred = "advance" if state.get("status") == "running" else "run"
         return _Entry(
             root=root,
-            kind="advance" if state.get("status") == "running" else "run",
+            kind=named if named in KINDS else inferred,
             options={},
             pid=pid,
             started=str(worker.get("started") or ""),
