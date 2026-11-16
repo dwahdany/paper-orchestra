@@ -35,9 +35,9 @@ export const app = {
     trail: {},              // project id -> the pages opened on the way
     request: { text: '', about: true, for: 'all' },
     goMenu: null,           // which Continue control has its list of phases open: 'strip', 'overview' or null
-    rested: {},             // experiment path -> {deps, at}: what rests on it, as the server said when it was rejected
     cutoffEdit: null,       // the research cutoff being changed on the overview
     starting: {},           // experiment id -> a run is being started (the server may settle an unfinished one first)
+    cancelling: {},         // experiment id -> its approval is being taken back, or its run cancelled
     defaults: null,         // GET /api/defaults, as last fetched
     feedLimit: 40,
     newPage: null,          // the "new page" dialog
@@ -50,7 +50,7 @@ export const app = {
     showLessons: false,
     toast: null,
     flash: null,
-    health: null,
+    health: null,           // GET /api/health, as last answered
     library: null,          // the list of projects, as last fetched
     doctor: null,
   },
@@ -73,24 +73,15 @@ export function defaults() {
   }
   return d.data;
 }
+/** Ask the server whether it is there, and keep what it says about itself (its workspace,
+    whether it stops its workers when it ends): the banner for a server that is gone says the
+    last thing the server said, since it can no longer be asked. */
+export function askHealth() {
+  return api.health().then((health) => { if (health && typeof health === 'object') app.ui.health = health; return health; });
+}
 /** Where what the person is typing is kept on this device until it is sent or saved. */
 export const requestKey = (pid) => 'po-request:' + pid;
 export const requestForKey = (pid) => 'po-request-for:' + pid;
-export const restedKey = (pid) => 'po-rested:' + pid;
-/** What the server said rests on an experiment when it was rejected, kept with the moment of
-    that rejection: the answer comes once, and the experiment's page lists it for as long as
-    that rejection stands, also after a reload. */
-export function keepRested(store, path, deps) {
-  const page = store.byPath.get(path);
-  app.ui.rested[path] = { deps, at: (page && page.meta && page.meta.decided_at) || '' };
-  storage.set(restedKey(store.pid), app.ui.rested);
-}
-/** The same, read back: `null` once the experiment has been decided again since. */
-export function restedOf(page) {
-  const kept = page && app.ui.rested[page.path];
-  if (!kept || !kept.deps || page.review !== 'rejected') return null;
-  return !kept.at || kept.at === ((page.meta || {}).decided_at || '') ? kept.deps : null;
-}
 export const codeKey = (pid, key) => 'po-code:' + pid + ':' + key;
 export const reasonsKey = (pid) => 'po-reasons:' + pid;
 
@@ -107,8 +98,9 @@ export function openProjectUi(pid) {
   ui.approve = {}; ui.codeTab = {}; ui.codeEdit = {}; ui.runOpen = {}; ui.asDiff = {}; ui.histVersion = {};
   ui.newPage = null; ui.limitEdit = null; ui.limits = null; ui.limitsOpen = false;
   ui.editProposal = {}; ui.reapprove = null; ui.netNudge = null; ui.showLessons = false; ui.focusEditor = '';
-  const rested = storage.get(restedKey(pid), {});
-  ui.goMenu = null; ui.rested = rested && typeof rested === 'object' && !Array.isArray(rested) ? rested : {}; ui.cutoffEdit = null; ui.starting = {};
+  ui.goMenu = null; ui.cutoffEdit = null; ui.starting = {}; ui.cancelling = {};
+  /* (an earlier version kept on this device what rests on a rejected experiment; the server says it now) */
+  storage.remove('po-rested:' + pid);
   ui.paper = { templates: ui.paper.templates, template: ui.paper.template };
   const typed = String(storage.get(requestKey(pid), '') || '');
   /* whom the instruction being typed is for is kept with it (and only with it) */

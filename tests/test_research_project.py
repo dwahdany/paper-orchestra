@@ -2176,6 +2176,51 @@ def test_the_feed_says_how_a_run_was_approved(project):
 # -- round 2 of the audit repairs -----------------------------------------------
 
 
+def test_withdrawing_a_request_is_an_event_like_leaving_it(project):
+    page = hypothesis(project)
+    shared = project.add_request("Keep every run under a minute")
+    own = project.add_request("Use batch size 8 and three seeds", role="designer", target="H1")
+    seen = project.events()[-1]["seq"]
+
+    project.delete_request(own.id)
+
+    # Another window learns of it from the stream, and the activity feed has a line for it.
+    (event,) = project.events(after=seen)
+    assert event["type"] == "request.withdrawn"
+    assert event["summary"] == (
+        "You withdrew your request to the designer: Use batch size 8 and three seeds."
+    )
+    assert event["data"] == {
+        "request": own.id,
+        "target": page.path,
+        "for": "designer",
+        "state": "open",
+        "by": "human",
+    }
+    assert event["refs"] == [f"requests/{own.id}.json", page.path]
+    assert project.requests() == [shared]
+
+    # One that a phase had closed already can be taken off the list as well.
+    project.close_request(shared.id, round=1, phase="analyze")
+    project.delete_request(shared.id)
+    event = project.events()[-1]
+    assert (
+        event["summary"]
+        == "You withdrew your request to the agents: Keep every run under a minute."
+    )
+    assert (event["data"]["for"], event["data"]["state"]) == ("all", "done")
+
+    # What is not there is not withdrawn, and says nothing.
+    count = len(project.events())
+    for missing in (own.id, "rq-ffffffff", "../project"):
+        with pytest.raises(NotFound):
+            project.delete_request(missing)
+    assert len(project.events()) == count
+    # The type is one the stream takes, named with the others when a wrong one is refused.
+    with pytest.raises(ProjectError, match=r"request\.created, request\.withdrawn"):
+        project.emit("request.deleted", "No such thing.")
+
+
 def test_a_request_is_for_one_role_or_for_every_agent(project):
     page = hypothesis(project)
     shared = project.add_request("Keep every run under a minute")
@@ -2639,6 +2684,9 @@ def test_a_lost_state_file_is_a_problem_to_report(project):
     problem = {"path": "state.json", "message": project.problems()[0]["message"]}
     assert project.problems() == [problem]
     assert "events.jsonl" in problem["message"] and "not started" in problem["message"]
+    # The entry names its file once: the message goes on from the path.
+    assert problem["message"].startswith("is missing or cannot be read")
+    assert project.state_lost().startswith("state.json is missing or cannot be read")
     (project.root / "state.json").write_text("[1, 2")
     assert [item["path"] for item in project.problems()] == ["state.json"]
     (project.root / "state.json").write_text(json.dumps({"round": 1, "phases": []}))
@@ -2646,6 +2694,28 @@ def test_a_lost_state_file_is_a_problem_to_report(project):
     phase = {"round": 1, "phase": "research", "status": "completed"}
     (project.root / "state.json").write_text(json.dumps({"round": 1, "phases": [phase]}))
     assert project.problems() == [] and project.state_lost() is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+@pytest.mark.parametrize("name", ["state.json", "events.jsonl"])
+def test_a_pipe_in_the_place_of_the_state_or_the_events_holds_nobody_up(project, name):
+    """Opening a named pipe waits for a writer that never comes.  A project directory can
+    come from anywhere, and looking at where it stands must not hang on one."""
+    project.emit("phase.finished", "The research phase finished.", phase="research", round=1)
+    (project.root / name).unlink(missing_ok=True)
+    os.mkfifo(project.root / name)
+    answers: list[str | None] = []
+    looking = threading.Thread(target=lambda: answers.append(project.state_lost()), daemon=True)
+    looking.start()
+    looking.join(timeout=10)
+    try:
+        assert answers, "state_lost() waits on the pipe"
+    finally:
+        if not answers:  # let the reader go, so that the test process can end
+            with open(project.root / name, "w"):
+                pass
+    # What it says is the store's to decide; that it answers is the point.
+    assert answers[0] is None or "state.json" in answers[0]
 
 
 def test_a_project_file_nested_beyond_reading_is_a_project_that_cannot_be_opened(project):

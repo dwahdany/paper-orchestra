@@ -12,10 +12,11 @@
    there is: the API has none), and rolled back with the server's message if it is refused. */
 
 import { api, Unreachable } from './api.js';
+import { askHealth } from './core.js';
 import { STAGES, relOf } from './vocab.js';
 
 const VERDICT = { supports: 1, refutes: 1, answers: 1 };
-const STRUCTURAL = /^(page\.|review\.decided|proposal\.created|experiment\.state|run\.started|run\.finished|request\.created|phase\.|checkpoint|budget\.warning|error|paper\.|project\.)/;
+const STRUCTURAL = /^(page\.|review\.decided|proposal\.created|experiment\.state|run\.started|run\.finished|request\.(created|withdrawn)|phase\.|checkpoint|budget\.warning|error|paper\.|project\.)/;
 const MAX_ACTIVITY = 600;
 
 export class Store {
@@ -54,9 +55,10 @@ export class Store {
     this._timer = 0;
     this._busy = false;
     this._again = false;
-    /* The state comes with the event stream, the lists of pages and experiments are fetched:
-       `behind` is true from a state that moved until lists read after it have arrived.
-       What is said from both together (what a press of Continue does) waits for that. */
+    /* The state comes with the event stream; what a press of Continue will do (`next_step`)
+       comes with the project view, which is fetched. `behind` is true from a state that moved
+       until a project view read after it has arrived: the forecast in hand belongs to the
+       state before, and nothing is said from it meanwhile. */
     this.behind = false;
     this._moves = 0;
   }
@@ -175,7 +177,13 @@ export class Store {
     const order = (it) => { const i = STAGES.indexOf(it.kind); return (i < 0 ? 50 : i) * 10 + (it.type === 'page' ? 0 : 1); };
     this.pendingItems = items.sort((a, b) => order(a) - order(b) || String(a.when).localeCompare(String(b.when)));
 
-    this.experiments = s.experiments.map((row) => { const page = this.byPath.get(row.path); return page ? Object.assign({}, row, { review: page.review, state: page.state, title: page.title }) : row; });
+    this.experiments = s.experiments.map((row) => {
+      const page = this.byPath.get(row.path);
+      if (!page) return row;
+      /* an interrupted run is marked on the row of either list: the page's mark follows the one that says so */
+      if (row.interrupted && page.state === 'running' && page.interrupted == null) page.interrupted = true;
+      return Object.assign({}, row, { review: page.review, state: page.state, title: page.title });
+    });
     this.expById = new Map(this.experiments.map((row) => [row.id, row]));
     this.requests = s.requests;
   }
@@ -240,7 +248,7 @@ export class Store {
     const row = this.server.experiments.find((r) => r.id === eid);
     if (!row) return null;
     const run = row.last_run || {};
-    return [row.updated, row.review, row.state, row.runs, run.status, run.finished, (run.repairs || []).length, row.interrupted ? 'interrupted' : ''].join('|');
+    return [row.updated, row.review, row.state, row.runs, run.status, run.finished, (run.repairs || []).length, row.interrupted ? 'interrupted' : '', row.cancel_does || ''].join('|');
   }
   /** GET .../experiments/{eid} takes up to half a second: only for the experiment that is open. */
   experiment(eid) {
@@ -262,6 +270,13 @@ export class Store {
       of the findings is read again when it is next shown. */
   invalidateFindings() {
     for (const [path, entry] of this.views) { const page = this.byPath.get(path); if (page && page.kind === 'finding') { entry.key = null; entry.gen += 1; } }
+  }
+
+  /** What rests on a rejected experiment (`dependents` of its view) is made of other pages:
+      the findings based on its runs, the verdicts they carry. When one of those changed, the
+      experiments that are rejected are read again when they are next shown. */
+  invalidateRejected() {
+    for (const [eid, entry] of this.exps) { const row = this.expById.get(eid); if (row && row.review === 'rejected') { entry.key = null; entry.gen += 1; } }
   }
 
   /** A page that was deleted is gone at once, here and in every other tab that hears of it:
@@ -312,7 +327,8 @@ export class Store {
     if (!p) return;
     const exit = p.worker && p.worker.last_exit;
     const state = p.state || {};
-    const wanted = state.status === 'failed' || (state.status === 'stopped' && state.error) || (exit && !exit.stopped && exit.code !== 0);
+    /* (how a write-up ended is said by the paper view, from the project's events: its worker's log is not read for it) */
+    const wanted = state.status === 'failed' || (state.status === 'stopped' && state.error) || (exit && !exit.stopped && exit.code !== 0 && exit.kind !== 'write');
     const key = wanted ? [state.status, state.error, exit && exit.at].join('|') : null;
     if (!wanted) { this.workerLog = null; return; }
     if (this.workerLog && this.workerLog.key === key) return;
@@ -344,7 +360,7 @@ export class Store {
     source.onerror = () => {
       if (this.closed) return;
       this.live = 'reconnecting';
-      api.health().catch(() => {});      // tells the shell whether the server is there at all
+      askHealth().catch(() => {});       // tells the shell whether the server is there at all
       if (source.readyState === 2) {     // closed for good (refused): open a new one, resuming after what we have
         this.source = null;
         source.close();
@@ -359,10 +375,15 @@ export class Store {
     const before = this.project.state || {};
     const moved = before.status !== data.state.status || before.phase !== data.state.phase || before.round !== data.state.round
       || (before.phases || []).length !== (data.state.phases || []).length
+      || before.next_phase !== data.state.next_phase
+      || ('state_source' in data && (this.project.state_source || null) !== (data.state_source || null))
       || ((this.project.worker || {}).state !== (data.worker || {}).state)
       || ((this.project.worker || {}).verified !== (data.worker || {}).verified);
     this.project.state = data.state;
     this.project.checkpoint = data.state.checkpoint;
+    /* where that reading came from, and what is wrong with state.json, arrive with it */
+    if ('state_problem' in data) this.project.state_problem = data.state_problem;
+    if ('state_source' in data) this.project.state_source = data.state_source;
     if (data.worker) this.project.worker = data.worker;
     if (this.server) this.server.project = this.project;
     if (moved) { this._moves++; this.behind = true; this.refresh(); }
@@ -394,6 +415,7 @@ export class Store {
       const eid = data.experiment || (type === 'experiment.state' ? data.id : null);
       if (eid) this.invalidateExperiment(eid);
       if (type === 'run.finished' || (/^(review\.decided|page\.)/.test(type) && /^(experiment|result|source)$/.test(data.kind || 'experiment'))) this.invalidateFindings();
+      if (/^(review\.decided|page\.)/.test(type) && /^(finding|hypothesis|result)$/.test(data.kind || '')) this.invalidateRejected();
       if (this.paper && /^(paper\.|review\.decided|run\.finished|page\.)/.test(type)) this.loadPaper();
       this.refresh();
     }

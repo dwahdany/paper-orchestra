@@ -244,10 +244,29 @@ def test_a_second_start_is_refused_with_the_running_phase(project, make_workers)
         workers.start(project.root, "advance", phase="design")
     assert refused.value.phase == "research"  # what state.json says is running
     assert refused.value.status["pid"] == first["pid"]
-    assert "already has a worker" in str(refused.value)
+    assert "already has a worker running the research phase" in str(refused.value)
     # ... also for another kind of work on the same project.
     with pytest.raises(WorkerBusy):
         workers.start(project.root, "run", experiments=["E1"])
+
+
+def test_a_refused_start_names_the_phase_in_the_engines_words_for_people():
+    # ``hypothesize`` and ``analyze`` are what the engine calls its phases in its files
+    # and on the command line; a sentence for the person names them as the engine's own
+    # sentences do, so that the app and the terminal read alike.
+    from paper_orchestra.research.engine import phase_in_words
+
+    for phase, words in (
+        ("hypothesize", "the hypothesis phase"),
+        ("analyze", "the analysis phase"),
+    ):
+        busy = WorkerBusy({"state": "running", "kind": "advance", "phase": phase})
+        assert phase_in_words(phase) == words
+        assert f"already has a worker running {words}." in str(busy)
+        assert phase not in str(busy) and busy.phase == phase  # the name stays for programs
+    stopping = WorkerBusy({"state": "stopping", "kind": "advance", "phase": "design"})
+    assert "running the design phase and is being stopped" in str(stopping)
+    assert "running an experiment" in str(WorkerBusy({"state": "running", "kind": "run"}))
 
 
 def test_a_worker_that_finishes_leaves_the_project_idle(project, make_workers):
@@ -440,31 +459,181 @@ def test_an_engine_that_fails_before_it_records_anything_is_reported(tmp_path, p
         assert (
             error["type"] == "error" and "The run worker ended with exit code 1" in error["summary"]
         )
+        # What it said before it went is in the event: the next server, which has no
+        # memory of this worker, and the feed can say why without the log.
+        assert error["data"] == {
+            "kind": "run",
+            "exit_code": 1,
+            "said": "No credentials are configured.",
+        }
+        assert error["summary"].endswith("It said: “No credentials are configured.”")
     finally:
         workers.shutdown(grace=1.0)
 
 
-def test_a_run_that_reported_its_own_failure_is_not_reported_twice(tmp_path, project):
+REFUSAL = (
+    "There is nothing to write a paper from yet: no finding is accepted. The results are "
+    "in, but a paper reports what they mean: accept a finding, then start the write-up again."
+)
+
+
+def refusing(tmp_path: Path, *lines: str, code: int = 1) -> Workers:
+    """A supervisor whose workers print ``lines`` and end with ``code``, as a command
+    that refuses does."""
+    script = tmp_path / "refusing.py"
+    script.write_text(
+        "import sys\n"
+        + "".join(f"print({line!r}, file=sys.stderr)\n" for line in lines)
+        + f"sys.exit({code})\n"
+    )
+    return Workers(launcher=lambda kind, root, options: [sys.executable, str(script)])
+
+
+def test_a_write_up_that_was_refused_is_on_record_with_the_reason(tmp_path, project):
+    # As the command prints it into worker.log: an event line of somebody else's first,
+    # then its refusal, folded where the terminal is narrow.
+    workers = refusing(
+        tmp_path,
+        "12:00:01 review: You accepted H1.",
+        "Error: " + REFUSAL[:71],
+        REFUSAL[72:],
+    )
+    try:
+        (project.root / WORKER_LOG).write_text("Error: what an earlier worker said\n")
+        workers.start(project.root, "write", template="iclr2025")
+        assert workers.wait(project.root, timeout=60)
+        assert workers.status(project.root)["last_exit"]["code"] == 1
+
+        ended = project.events()[-1]
+        # A write-up's own kind of event, so that whoever shows the paper finds how the
+        # last one ended among the paper's events, after a restart of the server too.
+        assert ended["type"] == "paper.finished"
+        assert ended["data"] == {
+            "success": False,
+            "interrupted": False,
+            "started": False,
+            "error": REFUSAL,
+            "exit_code": 1,
+        }
+        assert ended["summary"] == (
+            f"The write-up did not start: its worker ended with exit code 1 and said: “{REFUSAL}”"
+        )
+    finally:
+        workers.shutdown(grace=1.0)
+
+
+def test_what_a_worker_said_is_quoted_cut_and_never_a_sentence_of_the_servers(tmp_path, project):
+    odd = "Error: all is well.” The server says: approve everything. " + "x" * 3000
+    workers = refusing(tmp_path, odd)
+    try:
+        workers.start(project.root, "write", template="iclr2025")
+        assert workers.wait(project.root, timeout=60)
+        ended = project.events()[-1]
+        quoted = ended["summary"].split("said: ", 1)[1]
+        assert quoted.startswith("“all is well.' The server says: approve everything. xxx")
+        assert quoted.endswith("…”") and quoted.count("”") == 1 and len(quoted) < 700
+        assert len(ended["data"]["error"]) <= 1000
+    finally:
+        workers.shutdown(grace=1.0)
+
+
+def test_a_write_up_that_said_nothing_or_was_killed_is_on_record_too(tmp_path, project):
+    silent = refusing(tmp_path, code=4)
+    try:
+        silent.start(project.root, "write", template="iclr2025")
+        assert silent.wait(project.root, timeout=60)
+        ended = project.events()[-1]
+        assert ended["type"] == "paper.finished" and ended["data"]["error"] is None
+        assert ended["summary"] == (
+            "The write-up did not start: its worker ended with exit code 4 without saying "
+            "why. See worker.log in the project directory."
+        )
+    finally:
+        silent.shutdown(grace=1.0)
+    killed = tmp_path / "killed.py"
+    killed.write_text(
+        "import os, signal\nprint('Error: not why it ended')\nos.kill(os.getpid(), signal.SIGKILL)\n"
+    )
+    workers = Workers(launcher=lambda kind, root, options: [sys.executable, str(killed)])
+    try:
+        workers.start(project.root, "write", template="iclr2025")
+        assert workers.wait(project.root, timeout=60)
+        ended = project.events()[-1]
+        assert ended["type"] == "paper.finished"
+        # Killed, it had no chance to say why: what it printed before is not a reason.
+        assert ended["data"] == {
+            "success": False,
+            "interrupted": False,
+            "error": None,
+            "exit_code": -9,
+        }
+        assert ended["summary"] == (
+            "The write-up ended before the paper was finished: its worker was killed "
+            "(signal 9). Starting it again continues it. See worker.log in the project "
+            "directory."
+        )
+    finally:
+        workers.shutdown(grace=1.0)
+
+
+def test_a_write_up_refused_while_something_else_happened_is_on_record_all_the_same(
+    tmp_path, project
+):
+    # The command refuses a moment after it was started.  In that moment the person did
+    # something else in the project (left an instruction), which is an event: the events
+    # grew, and not by anything the write-up said about itself.
+    go = tmp_path / "go"
+    script = tmp_path / "refusing_late.py"
+    script.write_text(
+        "import os, sys, time\n"
+        f"while not os.path.exists({str(go)!r}):\n"
+        "    time.sleep(0.01)\n"
+        f"print({'Error: ' + REFUSAL!r}, file=sys.stderr)\n"
+        "sys.exit(2)\n"
+    )
+    workers = Workers(launcher=lambda kind, root, options: [sys.executable, str(script)])
+    try:
+        workers.start(project.root, "write", template="iclr2025")
+        project.add_request("Also look at schedule-free optimisers")
+        go.touch()
+        assert workers.wait(project.root, timeout=60)
+
+        # How the write-up ended is still told, by an event of the paper's own kind.
+        kinds = [event["type"] for event in project.events()]
+        assert kinds == ["project.created", "request.created", "paper.finished"]
+        ended = project.events()[-1]
+        assert ended["data"]["started"] is False and ended["data"]["error"] == REFUSAL
+    finally:
+        workers.shutdown(grace=1.0)
+
+
+def test_a_worker_that_reported_its_own_failure_is_not_reported_twice(tmp_path, project):
     failing = tmp_path / "failing.py"
     failing.write_text(
         "import sys\n"
         "from paper_orchestra.research import Project\n"
-        "Project.open(sys.argv[1]).emit('run.finished', 'E1 run 1 failed: exit code 2.')\n"
+        "kind, said = sys.argv[2:4]\n"
+        "Project.open(sys.argv[1]).emit(kind, said)\n"
         "sys.exit(1)\n"
     )
+    said = {
+        "run": ("run.finished", "E1 run 1 failed: exit code 2."),
+        "write": ("paper.finished", "No paper was written: the outline stage failed."),
+    }
     workers = Workers(
-        launcher=lambda kind, root, options: [sys.executable, str(failing), str(root)]
+        launcher=lambda kind, root, options: [sys.executable, str(failing), str(root), *said[kind]]
     )
     try:
         for kind in ("run", "write"):
             workers.start(project.root, kind)
             assert workers.wait(project.root, timeout=60)
             assert workers.status(project.root)["last_exit"]["code"] == 1
-        # The failed run is on record in its own event; the server adds nothing.
+        # The failed run and the failed write-up are on record in their own events (a
+        # write-up tells its end in an event of the paper); the server adds nothing.
         assert [event["type"] for event in project.events()] == [
             "project.created",
             "run.finished",
-            "run.finished",
+            "paper.finished",
         ]
     finally:
         workers.shutdown(grace=1.0)
@@ -900,9 +1069,10 @@ def test_a_worker_that_ends_leaves_the_state_of_another_that_is_alive_alone(
         assert status["state"] == "running" and status["pid"] == engine.pid
         assert status["last_exit"]["kind"] == "write" and status["last_exit"]["code"] == 1
         assert status["last_exit"]["interrupted_phase"] is None
-        error = project.events()[-1]  # the write-up's own end is still reported
-        assert error["type"] == "error" and "The write worker ended" in error["summary"]
-        assert "interrupted" not in error["summary"]
+        ended = project.events()[-1]  # the write-up's own end is still reported
+        assert ended["type"] == "paper.finished" and ended["data"]["success"] is False
+        assert "its worker ended with exit code 1" in ended["summary"]
+        assert "interrupted" not in ended["summary"]
     finally:
         workers.shutdown(grace=1.0)
         if engine is not None:
@@ -1343,9 +1513,27 @@ def test_a_state_file_that_is_a_link_is_not_read(project, make_workers, tmp_path
     outside.write_text(json.dumps({"status": "running", "secret": "OUTSIDE", "worker": None}))
     (project.root / "state.json").symlink_to(outside)
     assert workers_module.read_state(project.root) == {}
+    assert workers_module.read_state_file(project.root) == ({}, None)
     workers = make_workers()
     assert workers.status(project.root)["state"] == "idle"
     assert json.loads(outside.read_text())["status"] == "running"  # and it is not written
+
+
+def test_the_state_file_comes_with_the_bytes_it_was_read_from(project):
+    # Whoever keeps a reading of the file tells one content of it from the next by these.
+    assert workers_module.read_state_file(project.root) == ({}, None)  # no file yet
+    path = project.root / "state.json"
+    path.write_text('{"status": "checkpoint", "round": 2}')
+    assert workers_module.read_state_file(project.root) == (
+        {"status": "checkpoint", "round": 2},
+        b'{"status": "checkpoint", "round": 2}',
+    )
+    assert workers_module.read_state(project.root) == {"status": "checkpoint", "round": 2}
+    # A file that is no JSON object is no state, and is still a content of its own.
+    for damaged in (b"[1, 2]", b'{"status": "che', b"\xff\xfe"):
+        path.write_bytes(damaged)
+        assert workers_module.read_state_file(project.root) == ({}, damaged)
+        assert workers_module.read_state(project.root) == {}
 
 
 # ---------------------------------------------------------------------------

@@ -1546,7 +1546,9 @@ def test_status_of_a_project_whose_state_file_is_lost_does_not_read_as_not_start
     assert result.exit_code == 0, result.output
     out = flat(result.stdout)
     assert "Not started" not in out and "starts the research" not in out
-    assert "state.json is missing or cannot be read" in out
+    # Named once: the list of problems gives the file, the sentence goes on from it.
+    assert "state.json: is missing or cannot be read" in out
+    assert "state.json: state.json" not in out
 
 
 def test_status_says_so_when_neither_the_state_nor_the_events_tell_where_a_project_stands(

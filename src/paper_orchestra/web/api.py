@@ -37,6 +37,27 @@ The engine, experiment execution and the paper write-up live in other modules
 of the package and run in worker processes; what the API needs from them is
 reached through :class:`Services`, which tests replace.
 
+What a client would otherwise guess or work out a second time, the API says:
+
+* where a project stands is the engine's reading of it (``state``, from
+  ``state.json`` or, when that file does not say, rebuilt from the project's
+  events), with what is wrong with the file in ``state_problem`` and where the
+  reading came from in ``state_source``; the project view, the library row and
+  the event stream say the same;
+* what a press of Continue does is ``next_step`` of the project view, the
+  engine's own answer; the analyst's recommendation of more research is
+  ``recommends`` on the checkpoint, for as long as its journal page stands;
+* what cancelling an experiment does is ``cancel_does`` (take the approval back,
+  or cancel the run), and the answer to the cancel says which happened;
+* an experiment whose run was interrupted is marked wherever its page is listed,
+  what rests on a rejected experiment comes with its view, a suggested edit to a
+  finding is listed with its number check, and how the last write-up went is
+  read from the project's events.
+
+Looking at a project writes nothing to it and takes none of its locks.  (The
+one exception is older than this list: a look that finds the worker of a
+phase gone records that phase as interrupted; see ``workers``.)
+
 Four endpoints go beyond the list of the specification: ``POST
 .../experiments/{eid}/run`` (run an approved experiment now), ``GET
 .../worker/log`` (what a worker wrote before it stopped), ``POST
@@ -82,6 +103,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from paper_orchestra import __version__
 from paper_orchestra.memory.wiki import slugify, split_front_matter
 from paper_orchestra.research.model import (
+    COMPUTE_BACKENDS,
+    EFFORTS,
     FOR_ALL,
     HUMAN,
     REQUEST_ROLES,
@@ -139,7 +162,7 @@ from paper_orchestra.web.workers import (
     WorkerError,
     Workers,
     lock_held,
-    read_state,
+    read_state_file,
 )
 
 __all__ = [
@@ -182,6 +205,17 @@ _MIN_URL_SECRET_CHARS = 4
 _COUNT_SECONDS = 0.3
 #: Seconds a Run waits for the runs a dead worker left to be settled before it decides.
 _SETTLE_SECONDS = 20.0
+#: Seconds one listing of the edit proposals spends on the number checks of suggested
+#: edits to findings; an edit it does not get to is listed without a report.
+_ROW_CHECK_SECONDS = 0.5
+#: The most of a project's problems one answer lists; ``problems_total`` says how many
+#: there are.
+_MAX_PROBLEMS = 50
+#: The ledger of what the models cost, which the engine reads when it rebuilds a state.
+_USAGE_FILE = "usage.json"
+#: What the engine opens by name to say where a project stands.  The server asks it only
+#: where each of these is an ordinary file of the project itself (:func:`_from_elsewhere`).
+_READ_BY_THE_ENGINE = (STATE_FILE, EVENTS_FILE, _USAGE_FILE)
 #: A record of a project (usage, the paper's state, a manifest) is far smaller.
 _MAX_JSON_BYTES = 32 * 1024 * 1024
 #: Half of a surrogate pair: valid in a JSON file, impossible to send or store as UTF-8.
@@ -535,6 +569,48 @@ class Services:
 
     def request_cancel(self, project: Project, ref: str) -> None:
         self._experiments().request_cancel(project, ref)
+
+    def withdraw(self, project: Project, ref: str) -> ResearchPage:
+        """Take back the approval of a run that has not started (``experiments.withdraw``):
+        the page, ``planned`` again.  ``ProjectError`` when there is none to take back:
+        a process is running the experiment, or the run it was approved for is over
+        (the page is then moved to how that run ended)."""
+        return self._later("withdraw")(project, ref)
+
+    def _engine(self) -> Any:
+        """The engine module, for what only it knows: how a state is read, what an
+        ``advance`` would do, how a phase is named.  ``ImportError`` where it cannot be
+        loaded; the callers then answer without it."""
+        return importlib.import_module("paper_orchestra.research.engine")
+
+    def engine_state(self, project: Project) -> dict[str, Any]:
+        """Where the project stands as the engine reads it (``engine.read_state``): what
+        ``state.json`` says, or round, phases and what comes next rebuilt from the
+        project's events when the file is lost or holds no phase.  Nothing is written."""
+        return dict(self._engine().read_state(project))
+
+    def state_problem(self, project: Project) -> str | None:
+        """What is wrong with ``state.json`` in a sentence (``engine.state_problem``):
+        that the state is read from the events instead, or that nothing on file says
+        where the project stands.  ``None`` when the file is the engine's account, or
+        no phase has run."""
+        problem = self._engine().state_problem(project)
+        return str(problem) if problem else None
+
+    def next_step(self, project: Project, state: Mapping[str, Any]) -> dict[str, Any]:
+        """What an ``advance`` without a phase would do from ``state`` (the engine's
+        reading), as ``engine.next_step`` says it: ``{"will_run", "then", "experiments",
+        "results", "checkpoint_of", "needs_phase"}``.  Reads only."""
+        return dict(self._engine().next_step(project, state))
+
+    def phase_words(self) -> dict[str, str]:
+        """How a sentence for the person names each phase (``the hypothesis phase``), in
+        the engine's words; empty where the engine cannot be asked."""
+        try:
+            name = self._engine().phase_in_words
+        except (ImportError, AttributeError):
+            return {}
+        return {phase: str(name(phase)) for phase in PHASES}
 
     def runs(self, project: Project, experiment_id: str) -> list[dict[str, Any]]:
         return list(self._experiments().runs(project, experiment_id))
@@ -984,6 +1060,193 @@ class _Counts:
                 del self._known[root]
 
 
+@dataclass(frozen=True)
+class _Standing:
+    """Where a project stands, as an answer says it."""
+
+    #: The engine's state.  Shared between answers: read, never changed.
+    state: dict[str, Any]
+    #: What is wrong with ``state.json``, in a sentence; ``None`` when nothing is.
+    problem: str | None
+    #: ``file`` (state.json is the engine's account), ``events`` (it is not, and the
+    #: state was rebuilt from events.jsonl), ``not_started`` (no phase has run) or
+    #: ``unknown`` (nothing that can be read says where the project stands).
+    source: str
+    #: False where the engine could not be asked: what an ``advance`` would do is then
+    #: not foretold.
+    engine: bool = True
+    #: The file that kept the engine from being asked: something that is not an
+    #: ordinary file stands in its place (``problem`` says so).
+    odd: str | None = None
+
+
+class _Standings:
+    """Where each project stands, as the engine last read it.  Thread-safe.
+
+    A project whose ``state.json`` holds its phases is read from that file at
+    every look, as it always was; what is kept is the engine's reading of it,
+    for as long as the file holds the same bytes (:meth:`of_file`), so that a
+    look costs one reading of the file and no second one.
+
+    Where the file does not say, the engine reads the project's events from the
+    first to the last (and, where they do not tell either, looks at who wrote
+    the pages), which neither the listing of hundreds of projects nor every look
+    at one project can do.  That answer is kept until something changes that it
+    rests on (:meth:`of`): the state file, the events (every change made through
+    the project adds one), the usage ledger, a directory that holds pages, or
+    whether one of those three files is the project's own (a link in its place is
+    not read through).  Finding that out costs some fifteen ``stat`` calls and
+    reads nothing.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._known: dict[Path, tuple[tuple[Any, ...], _Standing]] = {}
+        self._files: dict[Path, tuple[bytes, _Standing]] = {}
+        #: What the log was told about a project already (see :meth:`first_complaint`).
+        self._complained: set[tuple[Path, str]] = set()
+
+    def first_complaint(self, root: Path, about: str) -> bool:
+        """Whether this is the first time ``about`` is to be logged for the project: a
+        failure that every look at a project meets is said once."""
+        with self._guard:
+            known = (root, about) in self._complained
+            self._complained.add((root, about))
+        return not known
+
+    def of_file(self, root: Path, content: bytes, read: Callable[[], _Standing]) -> _Standing:
+        """What ``read`` made of the project's ``state.json`` when the file held
+        ``content``; ``read`` is called when it holds something else now."""
+        with self._guard:
+            known = self._files.get(root)
+        if known is not None and known[0] == content:
+            return known[1]
+        standing = read()
+        with self._guard:
+            self._files[root] = (content, standing)
+        return standing
+
+    @staticmethod
+    def _signature(root: Path) -> tuple[Any, ...]:
+        files = (_signature(root / STATE_FILE), _signature(root / _USAGE_FILE))
+        # A link and the file it leads to look alike to ``stat``; the reading differs
+        # (the engine is not asked through a link), so which of the two is there counts.
+        own = tuple(_not_own_file(root, name) for name in _READ_BY_THE_ENGINE)
+        return (*files, *own, *_Counts._signature(root))
+
+    def of(self, root: Path, read: Callable[[], _Standing]) -> _Standing:
+        """What ``read`` returned when the project in ``root`` last changed; ``read`` is
+        called (outside the lock: it may take a while) when it changed since."""
+        signature = self._signature(root)  # before the reading: a change during it is seen
+        with self._guard:
+            known = self._known.get(root)
+        if known is not None and known[0] == signature:
+            return known[1]
+        standing = read()
+        with self._guard:
+            self._known[root] = (signature, standing)
+        return standing
+
+    def keep(self, roots: set[Path]) -> None:
+        """Forget the projects that are no longer in the workspace."""
+        with self._guard:
+            for kept in (self._known, self._files):
+                for root in set(kept) - roots:
+                    del kept[root]
+            self._complained = {said for said in self._complained if said[0] in roots}
+
+
+@dataclass
+class _Trail:
+    """How far a project's events were read for its write-ups, and what they said."""
+
+    guard: threading.Lock = field(default_factory=threading.Lock)
+    inode: int | None = None
+    offset: int = 0
+    started: dict[str, Any] | None = None
+    finished: dict[str, Any] | None = None
+
+
+class _PaperEvents:
+    """The last write-up of each project as its ``paper.`` events tell it.  Thread-safe.
+
+    ``events.jsonl`` only grows, so it is read once from its beginning and then
+    only as far as it grew: a look at the paper costs one ``stat`` when nothing
+    happened.  What is kept per project is the last ``paper.started`` and the
+    ``paper.finished`` that belongs to it, cut down to what an answer shows.  A
+    stream that was replaced or cut short is read anew; one that is not the
+    project's own file (a link) is not read at all.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._trails: dict[Path, _Trail] = {}
+
+    def last(self, root: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """``(started, finished)`` of the project's last write-up: the events that say
+        how it began and how it ended, either of them ``None`` when there is none."""
+        with self._guard:
+            trail = self._trails.setdefault(root, _Trail())
+        with trail.guard:
+            self._catch_up(trail, root / EVENTS_FILE)
+            return trail.started, trail.finished
+
+    def keep(self, roots: set[Path]) -> None:
+        """Forget the projects that are no longer in the workspace."""
+        with self._guard:
+            for root in set(self._trails) - roots:
+                del self._trails[root]
+
+    @staticmethod
+    def _catch_up(trail: _Trail, path: Path, piece: int = 1 << 20) -> None:
+        try:
+            found = os.lstat(path)
+        except OSError:
+            found = None
+        if found is None or found.st_ino != trail.inode or found.st_size < trail.offset:
+            # Another file under that name, a shorter one, or none: what was read counts
+            # for nothing.
+            trail.inode = found.st_ino if found else None
+            trail.offset, trail.started, trail.finished = 0, None, None
+        if found is None or found.st_size == trail.offset:
+            return
+        try:
+            handle = _open_plain(path)
+        except OSError:
+            return  # a link, a pipe: not the project's events
+        with handle:
+            handle.seek(trail.offset)
+            rest = b""
+            while data := handle.read(piece):
+                *lines, rest = (rest + data).split(b"\n")
+                for raw in lines:
+                    trail.offset += len(raw) + 1
+                    if b'"paper.' in raw:
+                        _PaperEvents._take(trail, raw)
+            # (``rest`` is a line still being written: it is read when it is whole.)
+
+    @staticmethod
+    def _take(trail: _Trail, raw: bytes) -> None:
+        try:
+            event = json.loads(raw)
+        except (ValueError, RecursionError):
+            return
+        kind = event.get("type") if isinstance(event, dict) else None
+        if kind not in ("paper.started", "paper.finished"):
+            return
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        said = {"at": event.get("ts"), "summary": event.get("summary"), "data": data}
+        if kind == "paper.started":
+            said["data"] = {"template": data.get("template")}  # the rest can be long
+            trail.started, trail.finished = said, None
+        elif trail.started is not None and trail.finished is None:
+            trail.finished = said
+        else:
+            # An end without a beginning of its own: the write-up was refused, or its
+            # worker died, before it said that it started.
+            trail.started, trail.finished = None, said
+
+
 @dataclass
 class Context:
     """Everything an endpoint works with; one per app, at ``app.state.context``."""
@@ -994,6 +1257,8 @@ class Context:
     live: LiveSettings = field(default_factory=LiveSettings)
     uploads: UploadLimits = field(default_factory=UploadLimits)
     counts: _Counts = field(default_factory=_Counts)
+    standings: _Standings = field(default_factory=_Standings)
+    paper: _PaperEvents = field(default_factory=_PaperEvents)
 
 
 def _context(request: Request) -> Context:
@@ -1122,11 +1387,16 @@ def _many(value: str | None) -> list[str] | None:
 
 @router.get("/health")
 def health(context: Ctx) -> dict[str, Any]:
+    """That the server is there, and what it is.  ``stops_workers_on_exit`` says what
+    its end does to the agents and experiments it runs: ``false`` (the default) leaves
+    them running, to be found again by the next server; ``true`` stops them
+    (``paper-orchestra ui --stop-workers-on-exit``)."""
     return {
         "ok": True,
         "name": "PaperOrchestra",
         "version": __version__,
         "workspace": str(context.workspace.root),
+        "stops_workers_on_exit": bool(context.workers.stop_on_exit),
     }
 
 
@@ -1147,11 +1417,20 @@ def defaults(context: Ctx) -> dict[str, Any]:
     """What a new project starts with when the composer says nothing else:
     ``settings`` (the object ``POST /api/projects`` merges its ``settings`` into),
     the engine's ``phases`` in order, and ``request_for``: whom a request can be
-    addressed to (``POST .../requests``, field ``for``)."""
+    addressed to (``POST .../requests``, field ``for``).
+
+    Also the values a form may offer, which are the ones the settings accept:
+    ``efforts`` (``settings.models.effort``) and ``compute_backends``
+    (``settings.compute``).  ``phase_words`` is how a sentence for the person names
+    each phase (``{"hypothesize": "the hypothesis phase"}``), as the engine's own
+    sentences and the server's refusals name it."""
     return {
         "settings": context.services.default_settings(),
         "phases": list(PHASES),
         "request_for": list(REQUEST_FOR),
+        "efforts": list(EFFORTS),
+        "compute_backends": list(COMPUTE_BACKENDS),
+        "phase_words": context.services.phase_words(),
     }
 
 
@@ -1181,11 +1460,18 @@ _NOTHING_SPENT = {"model_usd": 0.0, "experiment_seconds": 0.0, "experiment_usd":
 
 
 def _engine_state(root: Path) -> dict[str, Any]:
-    """``state.json`` with every key of spec 5.2 present: a project that has not run has
-    no file yet, and a client should not have to care."""
-    written = read_state(root)
+    """``state.json`` as the server itself reads it (never through a link), with every
+    key of spec 5.2 present.  What an answer carries is :func:`_standing`: the engine's
+    reading, which this is the first step of."""
+    return _state_on_file(root)[0]
+
+
+def _state_on_file(root: Path) -> tuple[dict[str, Any], bytes | None]:
+    """:func:`_engine_state`, and the bytes of the file it was read from (``None`` when
+    the project has no such file of its own)."""
+    written, content = read_state_file(root)
     spent = written.get("spent")
-    return {
+    state = {
         "schema": SCHEMA,
         "status": "idle",
         "round": 0,
@@ -1197,6 +1483,134 @@ def _engine_state(root: Path) -> dict[str, Any]:
         "error": None,
         **written,
         "spent": {**_NOTHING_SPENT, **(spent if isinstance(spent, dict) else {})},
+    }
+    return state, content
+
+
+def _phase_records(state: Mapping[str, Any]) -> bool:
+    """Whether the state holds a record of a phase, by the engine's own measure (an
+    object that names a phase and a round).  ``state.json`` is then the engine's
+    account, and nothing else is read to say where the project stands."""
+    phases = state.get("phases")
+    for record in phases if isinstance(phases, list) else ():
+        round = record.get("round") if isinstance(record, dict) else None
+        whole = isinstance(round, int) and not isinstance(round, bool) and round >= 0
+        if whole and record.get("phase") in PHASES:
+            return True
+    return False
+
+
+def _not_own_file(root: Path, name: str) -> bool:
+    """Whether something stands under ``name`` in the project directory that is not an
+    ordinary file: a link, a pipe, a directory.  One ``lstat``."""
+    try:
+        found = os.lstat(root / name)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not stat.S_ISREG(found.st_mode)
+
+
+_NOT_A_FILE = (
+    "{name} of this project is not an ordinary file (a link, or something else in its "
+    "place), so where the project stands is not read here: the server opens a project's "
+    "records only as files of the project itself. Remove or rename it and look again; "
+    "the agents write their state anew when they next work."
+)
+
+
+def _from_file(services: Services, project: Project, written: dict[str, Any]) -> _Standing:
+    """Where a project stands whose ``state.json`` holds its phases (``written``, as the
+    server read it): the file as the engine reads it, and nothing more."""
+    try:
+        return _Standing(services.engine_state(project), None, "file")
+    except ImportError:  # an installation without the engine shows the file as it is
+        return _Standing(written, None, "file", engine=False)
+
+
+def _from_elsewhere(services: Services, project: Project, written: dict[str, Any]) -> _Standing:
+    """Where a project stands whose ``state.json`` holds no phase (``written``, as the
+    server read it): rebuilt from its events by the engine, not started, or unknown.
+
+    The engine opens the files it reads by their names.  The server opens nothing
+    of a project through a link that leads out of it and waits for no pipe, so
+    the engine is asked only where those files are the project's own.
+    """
+    root = project.root
+    odd = next((name for name in _READ_BY_THE_ENGINE if _not_own_file(root, name)), None)
+    if odd is not None:
+        problem = _NOT_A_FILE.format(name=odd)
+        return _Standing(written, problem, "unknown", engine=False, odd=odd)
+    try:
+        state, problem = services.engine_state(project), services.state_problem(project)
+    except ImportError:
+        return _Standing(written, None, "not_started", engine=False)
+    if state["phases"]:
+        return _Standing(state, problem, "events" if problem else "file")
+    return _Standing(state, problem, "unknown" if problem else "not_started")
+
+
+def _standing(context: Context, project: Project, *, apart: bool = False) -> _Standing:
+    """Where the project stands, as the engine reads it (see :class:`_Standing`).
+
+    Costs one reading of ``state.json`` for a project whose file holds its phases
+    (the engine reads it a second time only when it changed), and a few ``stat``
+    calls for any other once it has been read (:class:`_Standings`).  With
+    ``apart`` the project is opened anew where its pages have to be looked at, so
+    that the listing of a library keeps no pages in memory.  Nothing is written
+    and no lock is taken.
+    """
+    root = project.root
+    written, content = _state_on_file(root)
+    if content is not None and _phase_records(written):
+        services = context.services
+        return context.standings.of_file(
+            root, content, lambda: _from_file(services, project, written)
+        )
+
+    def read() -> _Standing:
+        opened = Project.open(root) if apart else project
+        return _from_elsewhere(context.services, opened, written)
+
+    return context.standings.of(root, read)
+
+
+def _still_recommends(project: Project, checkpoint: Mapping[str, Any]) -> bool:
+    """Whether the recommendation a checkpoint carries stands as the pages are now: its
+    journal page is there, was not rejected since, and still says ``next: research``."""
+    path = checkpoint.get("recommends_page")
+    if checkpoint.get("recommends") != "research" or not isinstance(path, str) or not path:
+        return False
+    try:
+        page = project.page(path)
+    except (ProjectError, OSError, ValueError):
+        return False
+    asks = str(page.meta.get("next") or "").strip().lower() == "research"
+    return page.kind == "journal" and page.review != "rejected" and asks
+
+
+def _as_it_stands(project: Project, state: dict[str, Any]) -> dict[str, Any]:
+    """``state`` with the recommendation of its checkpoint as it stands now: ``recommends``
+    and ``recommends_page`` are ``None`` once the journal page no longer recommends
+    anything (the person rejected or changed it), so that a client need not look the
+    page up to know.  The summary of the checkpoint is what was said then, and stays."""
+    checkpoint = state.get("checkpoint")
+    if not isinstance(checkpoint, dict) or not checkpoint.get("recommends"):
+        return state
+    if _still_recommends(project, checkpoint):
+        return state
+    return {**state, "checkpoint": {**checkpoint, "recommends": None, "recommends_page": None}}
+
+
+def _shown_standing(context: Context, project: Project) -> dict[str, Any]:
+    """Where the project stands, as the project view and the event stream carry it:
+    ``state``, ``state_problem`` and ``state_source``."""
+    standing = _standing(context, project)
+    return {
+        "state": _as_it_stands(project, standing.state),
+        "state_problem": standing.problem,
+        "state_source": standing.source,
     }
 
 
@@ -1211,12 +1625,13 @@ def _worker(context: Context, root: Path, state: Mapping[str, Any]) -> dict[str,
     return None
 
 
-def _state_and_worker(context: Context, root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    state = _engine_state(root)
-    worker = _worker(context, root, state) or context.workers.status(root)
-    if state["status"] == "running" and worker["state"] == "idle":
-        state = _engine_state(root)  # the look has just recorded that its worker is gone
-    return state, worker
+def _standing_and_worker(context: Context, project: Project) -> tuple[_Standing, dict[str, Any]]:
+    root = project.root
+    standing = _standing(context, project)
+    worker = _worker(context, root, standing.state) or context.workers.status(root)
+    if standing.state["status"] == "running" and worker["state"] == "idle":
+        standing = _standing(context, project)  # the look has just recorded that it is gone
+    return standing, worker
 
 
 def _modified(root: Path) -> str:
@@ -1229,14 +1644,24 @@ def _modified(root: Path) -> str:
 
 
 def _summary(context: Context, key: str, project: Project) -> dict[str, Any]:
-    """One row of the library, from ``project.json`` and ``state.json`` alone.  ``pending``
-    is what the last checkpoint counted; :func:`_counted` puts the live number there."""
-    state = _engine_state(project.root)
+    """One row of the library, from ``project.json`` and ``state.json`` alone where that
+    file says where the project stands (:func:`_standing`, which is what the project
+    view goes by as well: a row never says "not started" of a project whose page says
+    otherwise).  ``pending`` is what the last checkpoint counted; :func:`_counted` puts
+    the live number there."""
+    standing = _standing(context, project, apart=True)
+    state = standing.state
     worker = _worker(context, project.root, state)
     if worker is not None and state["status"] == "running" and worker["state"] == "idle":
-        state = _engine_state(project.root)
+        standing = _standing(context, project, apart=True)
+        state = standing.state
     checkpoint = state.get("checkpoint") if isinstance(state.get("checkpoint"), dict) else None
     waiting = checkpoint.get("pending") if checkpoint else None
+    if checkpoint:
+        # Whether its recommendation still stands is told by a page, which a row does not
+        # read: the row says nothing about it (the project view does).
+        unread = ("recommends", "recommends_page")
+        checkpoint = {name: value for name, value in checkpoint.items() if name not in unread}
     return {
         "id": key,
         "title": project.title,
@@ -1252,6 +1677,8 @@ def _summary(context: Context, key: str, project: Project) -> dict[str, Any]:
         else None,
         "spent": state["spent"],
         "error": state["error"],
+        "state_problem": standing.problem,
+        "state_source": standing.source,
         "updated": _modified(project.root),
         "worker": worker["state"] if worker else "idle",
         # False: the project's files name a worker this server cannot verify (no Stop).
@@ -1312,9 +1739,55 @@ def _keep_repo_secret(project: Project, changes: dict[str, Any]) -> dict[str, An
     return changes
 
 
+def _next_step(
+    context: Context, project: Project, standing: _Standing, worker: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """What a press of Continue (an ``advance`` without a phase) would do, as the engine
+    says it; ``None`` while a worker has the project (it decides as it goes) and where
+    the engine cannot be asked.  A forecast that fails must not cost the project view."""
+    if not standing.engine or worker.get("state") != "idle":
+        return None
+    try:
+        return context.services.next_step(project, standing.state)
+    except Exception as exc:
+        if context.standings.first_complaint(project.root, type(exc).__name__):
+            # Said once for each kind of failure, not at every look at the project.
+            log.exception("What an advance of %s would do could not be told.", project.root)
+        return None
+
+
+def _problems(project: Project, standing: _Standing) -> tuple[list[dict[str, str]], int]:
+    """What the project's files had to be read around (``Project.problems()``): the first
+    ``_MAX_PROBLEMS`` of them, and how many there are.
+
+    Each is listed under its file, so a message does not begin with that file's
+    name a second time.  That ``state.json`` is lost is left out where
+    ``state_problem`` says it: one thing is said once, by whoever knows it best.
+
+    The store opens ``state.json`` and the events by their names to say whether the
+    state is lost, and would wait for ever on a pipe put in their place.  Where
+    one of them is no ordinary file (``state_problem`` then names it), nothing is
+    listed until that is put right.
+    """
+    if standing.odd is not None:
+        return [], 0
+    state_problem = standing.problem
+    found = []
+    for item in project.problems():
+        where, message = str(item.get("path") or ""), str(item.get("message") or "")
+        if where == STATE_FILE and state_problem:
+            continue
+        if where and message.startswith(f"{where} "):
+            message = message[len(where) + 1 :]
+        found.append({"path": where, "message": message})
+    return found[:_MAX_PROBLEMS], len(found)
+
+
 def _project_view(context: Context, project: Project) -> dict[str, Any]:
-    state, worker = _state_and_worker(context, project.root)
-    usage = _read_json(project.root, "usage.json")
+    standing, worker = _standing_and_worker(context, project)
+    state = _as_it_stands(project, standing.state)
+    usage = _read_json(project.root, _USAGE_FILE)
+    problems, total = _problems(project, standing)
     return {
         "schema": SCHEMA,
         "id": context.workspace.key_of(project),
@@ -1323,12 +1796,16 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
         "settings": _shown_settings(project),
         "dir": project.root.name,
         "state": state,
+        "state_problem": standing.problem,
+        "state_source": standing.source,
+        "next_step": _next_step(context, project, standing, worker),
         "counts": project.counts(),
         "checkpoint": state.get("checkpoint"),
         "worker": worker,
         "attachments": project.attachments(),
         "usage": usage if isinstance(usage, dict) else None,
-        "problems": project.problems()[:50],
+        "problems": problems,
+        "problems_total": total,
     }
 
 
@@ -1337,13 +1814,21 @@ def list_projects(context: Ctx) -> dict[str, Any]:
     """Every project of the workspace, the most recently active first.
 
     A row is ``{"id", "title", "created", "dir", "status", "round", "phase",
-    "next_phase", "checkpoint", "pending", "spent", "error", "updated", "worker",
-    "worker_verified", "counts"}``.  ``counts`` is ``Project.counts()`` as the
-    project view gives it and ``pending`` its total (proposed pages and edit
-    proposals as they are now).  Counting is bounded per listing: where a
-    project's pages changed and the listing did not get to it, ``counts`` is
-    ``null`` and ``pending`` is what the last checkpoint counted, until the next
-    listing.
+    "next_phase", "checkpoint", "pending", "spent", "error", "state_problem",
+    "state_source", "updated", "worker", "worker_verified", "counts"}``.
+    ``counts`` is ``Project.counts()`` as the project view gives it and
+    ``pending`` its total (proposed pages and edit proposals as they are now).
+    Counting is bounded per listing: where a project's pages changed and the
+    listing did not get to it, ``counts`` is ``null`` and ``pending`` is what the
+    last checkpoint counted, until the next listing.
+
+    ``status``, ``round``, ``phase``, ``next_phase``, ``checkpoint``, ``spent`` and
+    ``error`` are the engine's reading of where the project stands, with
+    ``state_problem`` and ``state_source`` as the project view has them: a project
+    whose ``state.json`` is lost is listed where its events say it stands, not as
+    one that has not started.  That reading replays the events once for such a
+    project and is kept until its files change; a project whose ``state.json``
+    reads fine costs nothing more than that file.
 
     ``unreadable`` lists the directories that hold a project which cannot be
     opened or listed, each with ``dir``, ``id`` (``null`` if this server never
@@ -1369,7 +1854,10 @@ def list_projects(context: Ctx) -> dict[str, Any]:
             listed.append(_presentable(counted, hidden))
         except Exception as exc:
             failed.append(_not_listed(key, project, exc))
-    context.counts.keep({project.root for project in found.values()})
+    roots = {project.root for project in found.values()}
+    context.counts.keep(roots)
+    context.standings.keep(roots)
+    context.paper.keep(roots)
     return {"projects": listed, "unreadable": context.workspace.unreadable() + failed}
 
 
@@ -1578,7 +2066,34 @@ async def create_project(request: Request, context: Ctx) -> dict[str, Any]:
 @router.get("/projects/{pid}")
 def get_project(project: Proj, context: Ctx) -> dict[str, Any]:
     """``project.json``, the engine's ``state``, ``counts``, the ``checkpoint`` and the
-    ``worker``."""
+    ``worker``.
+
+    ``state`` is where the project stands as the engine reads it: ``state.json``,
+    or, when that file is lost or holds no phase, round, phases, checkpoint and
+    what comes next rebuilt from the project's events.  ``state_problem`` is the
+    engine's sentence about that (``null`` when the file is its account) and
+    ``state_source`` says where the reading came from: ``"file"``, ``"events"``,
+    ``"not_started"`` (no phase has run, nothing is wrong) or ``"unknown"``
+    (nothing on file says where the project stands: Continue has to name a phase).
+
+    ``next_step`` is what a press of Continue (``POST .../advance`` without a
+    phase) would do, by the engine's own rule: ``{"will_run": [phases, in order],
+    "then": the phase its checkpoint names as next, "experiments": [ids the run
+    phase is owed], "results": how many result records have no analysis yet,
+    "checkpoint_of": a phase whose owed checkpoint is written first (or ``null``),
+    "needs_phase": the call would be refused until a phase is named}``.  It is
+    ``null`` while a worker has the project.
+
+    ``checkpoint`` (also ``state.checkpoint``) carries ``recommends`` and
+    ``recommends_page``: ``"research"`` and the path of the journal page when the
+    analyst recommended another look at the literature and that page still
+    stands; both ``null`` otherwise.
+
+    ``problems`` lists at most 50 of what the project's files had to be read
+    around, each ``{"path", "message"}`` with the message not repeating the
+    path; ``problems_total`` says how many there are.  A lost ``state.json`` is
+    not among them when ``state_problem`` says it.
+    """
     return _project_view(context, project)
 
 
@@ -1614,13 +2129,32 @@ class AdvanceBody(_Body):
     instruction: str | None = None
 
 
+def _refuse_unread_state(context: Context, project: Project) -> None:
+    """Refuse to start the agents where the view says that the project's state is not
+    read (:func:`_from_elsewhere`: a link, a pipe or a directory stands where the state
+    file, the events or the usage ledger should be).  The view foretells no press then,
+    and what it does not offer must not happen behind it: the engine would read through
+    the link, or wait for the pipe, by the file's name."""
+    standing = _standing(context, project)
+    if standing.odd is not None:
+        raise ApiError(409, "conflict", f"Nothing was started. {standing.problem}")
+
+
 @router.post("/projects/{pid}/advance", status_code=202)
 def advance(project: Proj, context: Ctx, body: AdvanceBody | None = None) -> dict[str, Any]:
     """Start the engine from its next phase (or ``phase``) up to the next checkpoint.
 
     Returns at once; the worker reports through the event stream.  409 with the
     running ``worker`` and ``phase`` when the project already has one.
+
+    409 ``conflict`` as well, with nothing started, where the project view says that
+    the state is not read because ``state.json``, the events or the usage ledger is not
+    an ordinary file of the project (``state_source`` is ``"unknown"`` and ``next_step``
+    is ``null``): the engine opens those files by their names, and the server starts
+    none that would read through a link what it does not read itself.  The message is
+    ``state_problem`` of the view, which says how to put it right.
     """
+    _refuse_unread_state(context, project)
     body = body or AdvanceBody()
     phase = (body.phase or "").strip() or None
     if phase is not None and phase not in PHASES:
@@ -1776,6 +2310,7 @@ async def event_stream(
     workers: Workers | None = None,
     *,
     secrets: Callable[[], Sequence[str]] | None = None,
+    standing: Callable[[], Mapping[str, Any]] | None = None,
 ) -> AsyncIterator[bytes]:
     """The project's activity as server-sent events, for as long as the client listens.
 
@@ -1784,11 +2319,16 @@ async def event_stream(
       is ``id: <seq>`` and ``data: <the event>`` with no ``event:`` line, so one
       ``onmessage`` handler receives them all and the browser resumes with
       ``Last-Event-ID``;
-    * ``event: state`` with ``{"state": <state.json>, "worker": <worker status>}``
-      at the start and whenever either changes;
+    * ``event: state`` with ``{"state", "state_problem", "state_source", "worker"}``
+      at the start and whenever ``state.json`` or the worker changes: where the
+      project stands as the project view says it, and the worker's status;
     * a comment line after ``heartbeat_seconds`` of silence.
 
-    Following costs two ``stat`` calls per look; files are read off the event loop
+    ``standing`` gives ``state``, ``state_problem`` and ``state_source`` (the engine's
+    reading, see :func:`_shown_standing`).  Without it the frame carries ``state``
+    alone, as ``state.json`` holds it.
+
+    Following costs three ``stat`` calls per look; files are read off the event loop
     and in bounded pieces, so one slow client holds back only itself.
 
     ``secrets`` gives the strings that must not be sent (asked again whenever there
@@ -1812,13 +2352,16 @@ async def event_stream(
             checked = now
             await asyncio.to_thread(workers.status, root)
         glance = workers.glance(root) if workers is not None else "idle"
-        current = (_signature(root / STATE_FILE), glance)
+        # (Whether the state file is the project's own counts too: a link put in its place
+        # leads to a file that ``stat`` cannot tell from the one that stood there.)
+        current = (_signature(root / STATE_FILE), _not_own_file(root, STATE_FILE), glance)
         if current != seen:
             seen = current
-            state = await asyncio.to_thread(_engine_state, root)
+            shown = await asyncio.to_thread(_stream_standing, root, standing)
             worker = await asyncio.to_thread(workers.status, root) if workers else None
-            busy = state["status"] == "running" or bool(worker and worker["state"] != "idle")
-            yield _sse("state", _presentable({"state": state, "worker": worker}, hidden()))
+            status = shown["state"].get("status")
+            busy = status == "running" or bool(worker and worker["state"] != "idle")
+            yield _sse("state", _presentable({**shown, "worker": worker}, hidden()))
             sent = True
         while tail.grown() and (lines := await asyncio.to_thread(tail.read)):
             mask = _LineMask(hidden())
@@ -1835,6 +2378,20 @@ async def event_stream(
             quiet_since = time.monotonic()
             yield b": keep-alive\n\n"
         await asyncio.sleep(live.poll_seconds)
+
+
+def _stream_standing(
+    root: Path, standing: Callable[[], Mapping[str, Any]] | None
+) -> dict[str, Any]:
+    """What a ``state`` frame of the stream says about where the project stands.  A
+    reading that fails (the project's files changed under it) is not the end of the
+    stream: the frame then carries the state file as it is."""
+    if standing is not None:
+        try:
+            return dict(standing())
+        except (ProjectError, OSError) as exc:
+            log.warning("Where %s stands could not be read for its stream: %s", root, exc)
+    return {"state": _engine_state(root)}
 
 
 @router.get("/projects/{pid}/events")
@@ -1856,6 +2413,7 @@ async def events(pid: str, request: Request, context: Ctx, after: int = 0) -> St
             context.live,
             context.workers,
             secrets=lambda: context.services.secrets(project),
+            standing=lambda: _shown_standing(context, project),
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -2062,16 +2620,27 @@ def list_pages(
 ) -> dict[str, Any]:
     """Pages without their text.  ``kind``, ``review`` and ``state`` take one value or
     several separated by commas; ``q`` keeps the pages that match a search, best first,
-    each with its ``snippet``."""
+    each with its ``snippet``.
+
+    The row of an experiment also carries ``interrupted``, as the experiments'
+    own listing does: true where the page says ``running`` and nothing is running
+    it any more, so that whatever is drawn from this list (a glyph, a pill) can
+    say what the experiment's view says in words."""
     pages = project.pages(kind=_many(kind), review=_many(review), state=_many(state))
+    interrupted = _interrupted(context, project, [p for p in pages if p.kind == "experiment"])
+
+    def row(page: ResearchPage) -> dict[str, Any]:
+        listed = page.to_dict(body=False)
+        if page.kind == "experiment":
+            listed["interrupted"] = page.id in interrupted
+        return listed
+
     if q and q.strip():
         hits = {hit.path: hit for hit in project.search(q, k=len(pages) or 1, review=None)}
         order = {path: position for position, path in enumerate(hits)}
         pages = sorted((p for p in pages if p.path in hits), key=lambda p: order[p.path])
-        return {
-            "pages": [{**p.to_dict(body=False), "snippet": hits[p.path].snippet} for p in pages]
-        }
-    return {"pages": [page.to_dict(body=False) for page in pages]}
+        return {"pages": [{**row(p), "snippet": hits[p.path].snippet} for p in pages]}
+    return {"pages": [row(page) for page in pages]}
 
 
 class PageCreate(_Body):
@@ -2373,9 +2942,19 @@ def review(body: ReviewBody, project: Proj, context: Ctx) -> dict[str, Any]:
 def list_proposals(project: Proj, context: Ctx, review: str = "proposed") -> dict[str, Any]:
     """Edit proposals, oldest first: the pending ones, or ``review=accepted``,
     ``rejected`` or ``all``.  Each carries the ``page`` it would change (without text)
-    and how many lines it adds and removes."""
+    and how many lines it adds and removes.
+
+    A pending edit to a finding also carries ``number_report``: the number check of
+    the finding as it would read with the edit applied, as the page view gives it
+    for the same proposal, so that an edit can be judged, and an edit that brings
+    a number found nowhere can be marked, where it is listed.  ``number_report`` is
+    ``null`` where the report could not be made (``number_report_error`` says why)
+    and where the listing did not get to it: one listing spends a bounded time on
+    these checks.  A client that decides in the list treats ``null`` as "not
+    checked here" and shows the edit's own view first."""
     wanted = None if review == "all" else review
     pages = {page.path: page for page in project.pages()}
+    deadline = time.monotonic() + _ROW_CHECK_SECONDS
     rows = []
     for proposal in project.proposals(review=wanted):
         page = pages.get(proposal.target)
@@ -2387,6 +2966,10 @@ def list_proposals(project: Proj, context: Ctx, review: str = "proposed") -> dic
             diff = unified_diff(page.body, proposal.body).split("\n")[2:]
             row["lines_added"] = sum(line.startswith("+") for line in diff)
             row["lines_removed"] = sum(line.startswith("-") for line in diff)
+        if page is not None and page.kind == "finding" and proposal.review == "proposed":
+            row.update(number_report=None, number_report_error=None)
+            if time.monotonic() < deadline:
+                row.update(_numbers(context, project, _as_proposed(page, proposal)))
         rows.append(row)
     return {"proposals": rows}
 
@@ -2500,11 +3083,41 @@ def _interrupted(context: Context, project: Project, pages: Sequence[ResearchPag
     }
 
 
+def _cancel_does(context: Context, project: Project, page: ResearchPage) -> str | None:
+    """What ``POST .../cancel`` would do to the experiment as it stands: ``"withdraw"``
+    (it is approved and has not started: the approval is taken back and it is a plan
+    again), ``"cancel"`` (it waits in the queue or is being run: the run ends as
+    cancelled) or ``None`` (there is nothing to cancel).
+
+    An experiment that reads ``approved`` while a process holds its run lock is
+    being run (the page was saved from an editor meanwhile): its approval is in
+    use, and what can be done is to cancel the run.
+    """
+    if page.state in ("queued", "running"):
+        return "cancel"
+    if page.state != "approved":
+        return None
+    return "cancel" if context.services.run_held(project, str(page.id)) is True else "withdraw"
+
+
+def _dependents(context: Context, project: Project, page: ResearchPage) -> Any:
+    """What rests on a rejected experiment, as the answer to its rejection said it;
+    ``None`` for an experiment that is not rejected, and where it cannot be told."""
+    if page.review != "rejected":
+        return None
+    try:
+        return context.services.dependents(project, page.path)
+    except (ApiError, ProjectError, OSError) as exc:
+        log.warning("What rests on %s could not be listed: %s", page.id, exc)
+        return None
+
+
 @router.get("/projects/{pid}/experiments")
 def list_experiments(project: Proj, context: Ctx) -> dict[str, Any]:
     """Every experiment page (without text) with a summary of its runs: how many, and
     the latest one's record.  ``interrupted`` is true where the page says ``running``
-    and nothing is running it any more (see the experiment's own view)."""
+    and nothing is running it any more, and ``cancel_does`` says what a cancel would
+    do (see the experiment's own view for both)."""
     pages = project.pages(kind="experiment")
     interrupted = _interrupted(context, project, pages)
     rows = []
@@ -2517,6 +3130,7 @@ def list_experiments(project: Proj, context: Ctx) -> dict[str, Any]:
                 "runs": len(runs),
                 "last_run": _run_view(context, project, page.id, latest) if latest else None,
                 "interrupted": page.id in interrupted,
+                "cancel_does": _cancel_does(context, project, page),
             }
         )
     return {"experiments": rows}
@@ -2556,6 +3170,10 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
         # The page says "running" and nothing runs it: Run starts it again.
         "interrupted": interrupted,
         "interrupted_note": _INTERRUPTED.format(id=experiment_id) if interrupted else None,
+        # What the cancel endpoint would do now: "withdraw", "cancel" or nothing.
+        "cancel_does": _cancel_does(context, project, page),
+        # For a rejected experiment: the findings and verdicts that rest on its runs.
+        "dependents": _dependents(context, project, page),
         "html": render_markdown(
             _blank(page.body, context.services.secrets(project)),
             project=project,
@@ -2617,7 +3235,17 @@ def get_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     running the experiment any more (the project has no worker and no process
     holds the experiment's run lock); ``interrupted_note`` then says so in a
     sentence, and ``POST .../run`` settles the unfinished run and starts the
-    experiment again."""
+    experiment again.
+
+    ``cancel_does`` is what ``POST .../cancel`` would do as things stand:
+    ``"withdraw"`` (the experiment is approved and has not started: its approval
+    is taken back), ``"cancel"`` (it is queued or being run: the run ends as
+    cancelled) or ``null`` (nothing to cancel).
+
+    ``dependents`` is ``null`` unless the experiment is rejected; then it is what
+    rests on it, in the shape the review answer gives with the rejection
+    (``{"experiment", "results", "findings", "hypotheses"}``), for as long as the
+    rejection stands."""
     return _experiment_view(context, project, _experiment(project, eid))
 
 
@@ -2723,12 +3351,147 @@ def run_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     return {"worker": _start_run(context, project, str(page.id))}
 
 
-@router.post("/projects/{pid}/experiments/{eid}/cancel", status_code=202)
-def cancel(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
-    """Ask the running job of the experiment to stop; the run ends as ``cancelled``."""
-    page = _experiment(project, eid)
+class CancelBody(_Body):
+    #: What the person was told the press does (``cancel_does`` of the experiment as they
+    #: saw it): ``"withdraw"`` or ``"cancel"``.  When the experiment has moved on and the
+    #: press would do the other, nothing is done (409).
+    expect: str | None = None
+
+
+_CANCEL_DOES = ("withdraw", "cancel")
+_NOT_AS_TOLD = {
+    "withdraw": (
+        "{id} is {state} and has been taken up by a run since you looked: its approval is "
+        "in use and cannot be taken back. Nothing was changed. Cancel its run if you want "
+        "it stopped."
+    ),
+    "cancel": (
+        "{id} is approved and has not started: there is no run to cancel. Nothing was "
+        "changed. Take the approval back if you do not want it run."
+    ),
+}
+_CANCEL_SAID = {
+    "withdrawn": (
+        "{id} is a plan again: its approval was taken back and nothing ran. Approve it "
+        "again when you want it run."
+    ),
+    "cancelled": "{id} is cancelled. Approve it again when you want it run.",
+    "cancelling": (
+        "{id} was told to stop. The worker that runs it ends the job and records the run "
+        "as cancelled within about a second."
+    ),
+    "nothing": "{id} is {state}: there is nothing to cancel.",
+}
+
+
+def _take_back(context: Context, project: Project, page: ResearchPage) -> str:
+    """Take back the approval of ``page``, which has not started; returns the outcome:
+    ``withdrawn``, ``ended`` (the run it was approved for was over: the page now says
+    how) or ``nothing`` (it is a plan already: somebody else took the approval back).
+
+    409 when a process took the experiment up in this very moment, whether its page
+    still reads ``approved`` or has moved on to ``queued`` or ``running``: an approval
+    that is in use is not taken back, and nothing of the run in flight is touched.
+    """
+    try:
+        context.services.withdraw(project, page.path)
+    except ProjectError as exc:
+        now = _experiment(project, str(page.id))
+        if now.state == "approved":
+            in_use = str(exc)  # the experiments module's own words: it is being run
+        elif now.state in ("queued", "running"):
+            in_use = _NOT_AS_TOLD["withdraw"].format(id=page.id, state=now.state)
+        else:
+            return "nothing" if now.state == "planned" else "ended"
+        raise ApiError(
+            409,
+            "conflict",
+            in_use,
+            page=now.to_dict(body=False),
+            cancel_does=_cancel_does(context, project, now),
+        ) from exc
+    return "withdrawn"
+
+
+def _cancel_run(context: Context, project: Project, page: ResearchPage) -> str:
+    """Cancel the run of ``page``, which is queued or being run; returns the outcome:
+    ``cancelled`` (nobody was running it: done here and now), ``cancelling`` (whoever
+    runs it was told to stop) or ``ended`` (its run was over already)."""
     context.services.request_cancel(project, page.path)
-    return {"cancelling": page.id}
+    state = _experiment(project, str(page.id)).state
+    if state == "cancelled":
+        return "cancelled"
+    return "cancelling" if state in ("approved", "queued", "running") else "ended"
+
+
+@router.post("/projects/{pid}/experiments/{eid}/cancel")
+def cancel(
+    eid: str, project: Proj, context: Ctx, response: Response, body: CancelBody | None = None
+) -> dict[str, Any]:
+    """Take back the approval of an experiment that has not started, or cancel its run:
+    what ``paper-orchestra research cancel`` does.
+
+    An approved experiment that no process is running becomes a plan again
+    (``planned``): nothing is cancelled and nothing is recorded as a run.  One
+    that waits in the queue is cancelled at once; one that is being run is told
+    to stop, and its worker ends the job and records the run as cancelled.
+    ``cancel_does`` of the experiment says beforehand which of these a press does.
+
+    The answer says what happened: ``{"experiment", "outcome", "before", "state",
+    "message", "page", "cancel_does"}``.  ``outcome`` is ``"withdrawn"``,
+    ``"cancelled"``, ``"cancelling"`` (status 202: the run ends a moment later),
+    ``"nothing"`` (there was nothing to cancel, or no longer: another window took
+    the approval back first) or ``"ended"`` (the run was over before anything could
+    be done: the page now says how it ended).  ``before`` and
+    ``state`` are the experiment's state before and after, ``message`` says it in a
+    sentence, ``page`` is the page as it is now and ``cancel_does`` what a further
+    press would do.
+
+    ``{"expect": "withdraw" | "cancel"}`` is what the person was told the press
+    does.  When the experiment moved on meanwhile and the press would do the
+    other, nothing is done: 409 with the ``page`` and ``cancel_does`` as they are
+    now.  Taking an approval back never cancels, requeues or starts a run: when a
+    process took the experiment up in that very moment (its page may still read
+    ``approved``, or have moved on to ``queued`` or ``running``) the answer is 409
+    as well, and the run in flight is not touched.
+    """
+    expect = ((body.expect if body else None) or "").strip().lower() or None
+    if expect is not None and expect not in _CANCEL_DOES:
+        raise ApiError(
+            422, "invalid", f"expect is 'withdraw' or 'cancel', not {str(expect)[:40]!r}."
+        )
+    page = _experiment(project, eid)
+    before, does = str(page.state), _cancel_does(context, project, page)
+    if expect is not None and does is not None and expect != does:
+        raise ApiError(
+            409,
+            "conflict",
+            _NOT_AS_TOLD[expect].format(id=page.id, state=before),
+            page=page.to_dict(body=False),
+            cancel_does=does,
+        )
+    if does == "withdraw":
+        outcome = _take_back(context, project, page)
+    elif does == "cancel":
+        outcome = _cancel_run(context, project, page)
+    else:
+        outcome = "nothing"
+    now = _experiment(project, str(page.id))
+    if outcome == "ended":
+        what = "the approval could be taken back" if does == "withdraw" else "it could be cancelled"
+        message = f"{page.id} is {now.state}: its run had ended before {what}."
+    else:
+        message = _CANCEL_SAID[outcome].format(id=page.id, state=now.state)
+    response.status_code = 202 if outcome == "cancelling" else 200
+    return {
+        "experiment": page.id,
+        "outcome": outcome,
+        "before": before,
+        "state": now.state,
+        "message": message,
+        "page": now.to_dict(body=False),
+        "cancel_does": _cancel_does(context, project, now),
+    }
 
 
 def _find_run(
@@ -3048,16 +3811,56 @@ class PaperBody(_Body):
     model: str | None = None
 
 
+def _last_write_up(context: Context, project: Project, running: bool) -> dict[str, Any] | None:
+    """How the project's last write-up went, from its ``paper.`` events; ``None`` when
+    none is on record.
+
+    ``outcome`` is ``written``, ``failed`` (it ran and no paper came of it:
+    ``paper/state.json`` says where), ``stopped`` (it was interrupted: starting it
+    again continues it), ``refused`` (it ended before it began: nothing to write a
+    paper from, a setting that cannot be read; ``summary`` and ``error`` say why),
+    ``running``, or ``unfinished`` (it began and nothing says how it ended: its
+    worker is gone).  ``exit_code`` is that of the worker where the server recorded
+    the end for a worker that left no account of its own (:mod:`workers`), ``None``
+    where the write-up told its own end.
+    """
+    started, finished = context.paper.last(project.root)
+    if started is None and finished is None:
+        return None
+    ended = finished["data"] if finished else {}
+    if finished is None:
+        outcome = "running" if running else "unfinished"
+    elif ended.get("success") is True:
+        outcome = "written"
+    elif ended.get("interrupted") is True:
+        outcome = "stopped"
+    else:
+        # An end without a beginning of its own is a write-up that never got that far.
+        outcome = "refused" if started is None or ended.get("started") is False else "failed"
+    return {
+        "outcome": outcome,
+        "started_at": started["at"] if started else None,
+        "started_summary": started["summary"] if started else None,
+        "template": started["data"].get("template") if started else None,
+        "ended_at": finished["at"] if finished else None,
+        "summary": finished["summary"] if finished else None,
+        "error": ended.get("error"),
+        "exit_code": ended.get("exit_code"),
+        "pdf": ended.get("pdf") if ended.get("success") is True else None,
+    }
+
+
 def _paper_view(context: Context, project: Project) -> dict[str, Any]:
     paper = project.root / PAPER_DIR
     state = _read_json(project.root, f"{PAPER_DIR}/{STATE_FILE}")
     worker = context.workers.status(project.root)
     final = paper / "final_paper.pdf"
     missing = context.services.paper_missing(project)
+    running = worker["state"] != "idle" and worker["kind"] == "write"
     return {
         "exists": paper.is_dir(),
         "state": state if isinstance(state, dict) else None,
-        "running": worker["state"] != "idle" and worker["kind"] == "write",
+        "running": running,
         "final_pdf": f"{PAPER_DIR}/final_paper.pdf" if final.is_file() else None,
         # What a write-up would refuse for ("results", "finding"), or None: it can start.
         "missing": missing,
@@ -3065,6 +3868,8 @@ def _paper_view(context: Context, project: Project) -> dict[str, Any]:
         "missing_detail": str(getattr(missing, "detail", "") or ""),
         # The accepted findings a paper would not report, whether or not it can start.
         "left_out": context.services.paper_left_out(project),
+        # How the last write-up went, as the project's events tell it.
+        "last": _last_write_up(context, project, running),
         "worker": worker,
     }
 
@@ -3097,5 +3902,21 @@ def get_paper(project: Proj, context: Ctx) -> dict[str, Any]:
     ``{"id", "path", "title", "reason"}``: every record such a finding is based on
     belongs to an experiment that was rejected or is gone.  ``missing_detail`` says
     the same in a sentence where that is why the paper cannot be written yet (empty
-    otherwise)."""
+    otherwise).
+
+    ``last`` says how the last write-up went, read from the project's ``paper.``
+    events (so that it is the same after a restart of the server), or ``null``
+    when none is on record: ``{"outcome", "started_at", "started_summary",
+    "template", "ended_at", "summary", "error", "exit_code", "pdf"}``.  ``outcome``
+    is ``"written"``, ``"failed"``, ``"stopped"``, ``"refused"`` (it ended before it
+    began, for the reason ``summary`` and ``error`` give), ``"running"`` or
+    ``"unfinished"`` (it began, and nothing says how it ended).  ``started_*`` are
+    those of its ``paper.started`` event (``null`` for a write-up that was refused
+    before it began), ``ended_at`` and ``summary`` those of its ``paper.finished``.
+    ``exit_code`` is ``null`` unless the account of the end is the server's: the
+    worker ended without one of its own (it refused before it began, or was
+    killed: a negative code), and ``summary`` then says what happened and what to
+    do.  ``paper/state.json`` of a write-up that was killed still reads as it did
+    in that moment; ``last`` is what says that it is over.
+    """
     return _paper_view(context, project)

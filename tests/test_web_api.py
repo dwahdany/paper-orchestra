@@ -363,6 +363,11 @@ def test_health_says_what_is_running(client, workspace):
     body = client.get("/api/health").json()
     assert body["ok"] is True and body["name"] == "PaperOrchestra"
     assert body["workspace"] == str(workspace)
+    # What the end of this server does to its workers: the test's server was asked to
+    # stop them, a server started without the option leaves them running.
+    assert body["stops_workers_on_exit"] is True
+    with TestClient(create_app(workspace), base_url=BASE_URL) as plain:
+        assert plain.get("/api/health").json()["stops_workers_on_exit"] is False
 
 
 def test_doctor_reports_what_the_command_reports(client):
@@ -1265,6 +1270,10 @@ def test_requests_are_left_listed_and_withdrawn(client, project):
     assert client.delete(url(project, f"/requests/{request['id']}")).json() == {
         "deleted": request["id"]
     }
+    # The withdrawal is in the project's activity, so that another window drops the row.
+    last = client.get(url(project, "/activity?limit=1")).json()["events"][0]
+    assert last["type"] == "request.withdrawn" and last["data"]["request"] == request["id"]
+    assert last["summary"] == "You withdrew your request to the agents: Design a smaller test."
     assert client.delete(url(project, f"/requests/{request['id']}")).status_code == 404
     assert client.delete(url(project, "/requests/..%2f..%2fproject")).status_code == 404
     assert len(client.get(url(project, "/requests")).json()["requests"]) == 1
@@ -1506,9 +1515,27 @@ def test_an_approved_experiment_can_be_run_now(client, project, services, launch
     assert again.status_code == 202 and again.json()["worker"]["state"] == "running"
 
 
-def test_cancel_asks_the_running_job_to_stop(client, project):
+def test_cancel_asks_the_running_job_to_stop(client, project, services):
+    # Nothing is approved, queued or running: there is nothing to cancel, and nobody is asked.
+    nothing = client.post(url(project, "/experiments/E1/cancel"))
+    assert nothing.status_code == 200, nothing.text
+    assert nothing.json()["outcome"] == "nothing"
+    assert nothing.json()["message"] == "E1 is planned: there is nothing to cancel."
+    assert not (project.experiment_dir("E1") / "cancel").exists()
+
+    running_without_a_worker(project, services)
     response = client.post(url(project, "/experiments/E1/cancel"))
-    assert response.status_code == 202 and response.json() == {"cancelling": "E1"}
+    # Whoever runs it is told to stop (the stand-in leaves the flag and cancels nothing).
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert (body["experiment"], body["outcome"], body["before"], body["state"]) == (
+        "E1",
+        "cancelling",
+        "running",
+        "running",
+    )
+    assert body["message"].startswith("E1 was told to stop.")
+    assert body["page"]["id"] == "E1" and body["cancel_does"] == "cancel"
     assert (project.experiment_dir("E1") / "cancel").read_text() == "requested"
     assert client.post(url(project, "/experiments/E4/cancel")).status_code == 404
 
@@ -1744,6 +1771,17 @@ def test_advance_starts_a_worker_and_a_second_start_is_refused(client, project, 
     paper = client.post(url(project, "/paper"), json={"template": "cvpr2025"})
     assert paper.status_code == 409  # one worker per project, whatever it does
 
+    # The sentence names the phase as the engine's own sentences do, not by the word the
+    # engine uses in its files; the field keeps that word for the client.
+    state = json.loads((project.root / "state.json").read_text())
+    state.update(phase="hypothesize")
+    state["phases"] = [{"round": 1, "phase": "hypothesize", "status": "running"}]
+    (project.root / "state.json").write_text(json.dumps(state))
+    third = client.post(url(project, "/advance")).json()
+    assert third["phase"] == "hypothesize"
+    assert "a worker running the hypothesis phase." in third["error"]["message"]
+    assert "hypothesize" not in third["error"]["message"]
+
 
 def test_advance_needs_no_body_and_checks_what_it_is_given(client, project, launched):
     bad = client.post(url(project, "/advance"), json={"phase": "publish"})
@@ -1846,6 +1884,7 @@ def test_the_paper_step_starts_a_worker_and_reports_its_state(client, project, l
         "missing": None,
         "missing_detail": "",
         "left_out": [],
+        "last": None,
         "worker": client.get(url(project)).json()["worker"],
     }
     unknown = client.post(url(project, "/paper"), json={"template": "../../etc"})
@@ -2544,8 +2583,16 @@ def test_the_api_works_without_the_experiments_module(workspace, project, monkey
         create_app(workspace, static_dir=tmp_path / "none"), base_url=BASE_URL
     ) as client:
         assert client.get(url(project, "/pages/H1")).status_code == 200
+        # Nothing of a plan can be cancelled, which nobody has to be asked about ...
+        nothing = client.post(url(project, "/experiments/E1/cancel"))
+        assert nothing.status_code == 200 and nothing.json()["outcome"] == "nothing"
+        # ... and taking back an approval is the experiments module's to do.
+        project.review("E1", "accept")
+        project.set_state("E1", "approved", by="human")
         refused = client.post(url(project, "/experiments/E1/cancel"))
         assert refused.status_code == 400 and error_of(refused)["code"] == "not_available"
+        # Where the project stands is still said: the engine is not what is missing.
+        assert client.get(url(project)).json()["state_source"] == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -3313,6 +3360,17 @@ def test_the_default_settings_are_served(client):
     assert body["settings"]["compute"] == "local" and "model_usd" in body["settings"]["limits"]
     assert body["phases"] == ["intake", "research", "hypothesize", "design", "run", "analyze"]
     assert body["request_for"] == ["all", "scout", "theorist", "designer", "analyst"]
+    # The lists a form offers are the lists the settings accept: a client has none of its own.
+    assert body["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+    assert body["compute_backends"] == ["local", "modal"]
+    for effort in body["efforts"]:
+        given = {"models": {"effort": effort}}
+        assert ProjectSettings.from_dict(given, strict=True).models.effort == effort
+    for backend in body["compute_backends"]:
+        assert ProjectSettings.from_dict({"compute": backend}, strict=True).compute == backend
+    # ... and the words the engine's own sentences use for the phases.
+    assert body["phase_words"]["hypothesize"] == "the hypothesis phase"
+    assert set(body["phase_words"]) == set(body["phases"])
 
 
 def test_a_request_can_be_addressed_to_one_role(client, project):
@@ -3474,6 +3532,11 @@ def test_rejecting_an_experiment_says_what_rests_on_it(real, project):
         ("H1", "supported", [finding.id])
     ]
     assert "dependents" not in other  # only a rejected experiment has something to say
+    # The experiment's own view carries the same, so that the list is there after a
+    # reload, in another window and on another device, for as long as it is rejected.
+    assert real.get(url(project, "/experiments/E1")).json()["dependents"] == rests
+    project.review("E1", "accept")
+    assert real.get(url(project, "/experiments/E1")).json()["dependents"] is None
 
 
 def running_without_a_worker(project: Project, services: FakeServices) -> None:
@@ -4341,3 +4404,942 @@ def test_the_token_of_a_repository_an_experiment_names_itself_is_blanked_too(
     assert project.page("E1").meta["repo"] == other
     # The library still reads no page for it.
     assert client.get("/api/projects").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# The seams between the API and the app: the server says it, the app shows it
+# ---------------------------------------------------------------------------
+
+
+def record_of(phase: str, round: int = 1, status: str = "completed") -> dict[str, Any]:
+    """A phase record as the engine writes it into state.json."""
+    return {
+        "round": round, "phase": phase, "status": status,
+        "started": "2026-11-15T12:00:00Z", "finished": "2026-11-15T12:00:05Z",
+        "seconds": 5.0, "attempts": 1, "error": None, "produced": [],
+        "instruction": None, "requests": [],
+    }  # fmt: skip
+
+
+def phases_ran(project: Project, *phases: str, following: str = "hypothesize") -> dict[str, Any]:
+    """The project as the engine leaves it at the checkpoint after ``phases`` (intake and
+    research when none are named): their events, and the state.json that goes with them."""
+    phases = phases or ("intake", "research")
+    for phase in phases:
+        project.emit("phase.started", f"Round 1: the {phase} phase started.", phase=phase, round=1)
+        project.emit(
+            "phase.finished",
+            f"The {phase} phase finished.",
+            phase=phase,
+            round=1,
+            data={"produced": [], "seconds": 5.0},
+        )
+    paused = project.emit(
+        "checkpoint",
+        "2 topics await your review. Next: what comes next.",
+        phase=phases[-1],
+        round=1,
+        data={"pending": {"topic": 2}, "edits": 0, "next": following},
+    )
+    state = {
+        "schema": 1, "status": "checkpoint", "round": 1, "phase": phases[-1],
+        "next_phase": following,
+        "checkpoint": {"round": 1, "phase": phases[-1], "at": paused["ts"],
+                       "summary": paused["summary"], "pending": {"topic": 2},
+                       "recommends": None, "recommends_page": None},
+        "phases": [record_of(phase) for phase in phases], "worker": None,
+        "spent": {"model_usd": 0.75, "experiment_seconds": 0.0, "experiment_usd": 0.0},
+        "error": None,
+    }  # fmt: skip
+    (project.root / "state.json").write_text(json.dumps(state))
+    return state
+
+
+def files_of(root: Path) -> dict[str, tuple[int, int]]:
+    """Every file under ``root`` with what tells one version of it from the next."""
+    found = sorted(path for path in root.rglob("*") if path.is_file())
+    return {
+        path.relative_to(root).as_posix(): (path.stat().st_mtime_ns, path.stat().st_size)
+        for path in found
+    }
+
+
+def row_of(client, directory: str) -> dict[str, Any]:
+    rows = client.get("/api/projects").json()["projects"]
+    return next(row for row in rows if row["dir"] == directory)
+
+
+def test_a_lost_state_is_shown_as_the_engine_reads_it_with_the_problem_in_a_field_of_its_own(
+    client, workspace
+):
+    project = Project.create(workspace / "lost", title="Lost", brief="Does warmup matter?")
+    written = phases_ran(project)
+    view = client.get(url(project)).json()
+    assert (view["state_source"], view["state_problem"]) == ("file", None)
+    assert view["state"] == written and view["checkpoint"] == written["checkpoint"]
+
+    (project.root / "state.json").unlink()
+    view = client.get(url(project)).json()
+
+    # Not round 0, $0.00 and idle beside a reported problem: where the project stands, read
+    # from its events as the engine reads it, and the engine's sentence about that.
+    state = view["state"]
+    assert (state["status"], state["round"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        1,
+        "research",
+        "hypothesize",
+    )
+    assert [(p["phase"], p["status"]) for p in state["phases"]] == [
+        ("intake", "completed"),
+        ("research", "completed"),
+    ]
+    assert view["checkpoint"]["pending"] == {"topic": 2}
+    assert view["state_source"] == "events"
+    assert view["state_problem"].startswith(
+        "state.json is missing. Round, phases and what comes next are read from the "
+        "project's events (events.jsonl) instead"
+    )
+    # Said once, in its own field: the list of what was read around does not repeat it.
+    assert view["problems"] == [] and view["problems_total"] == 0
+    # What a press of Continue does comes from the same reading.
+    assert view["next_step"]["will_run"] == ["hypothesize"]
+    assert view["next_step"]["then"] == "design"
+
+    # The library row does not claim "not started" where the project page says otherwise.
+    row = row_of(client, "lost")
+    assert (row["status"], row["round"], row["phase"], row["next_phase"]) == (
+        "checkpoint",
+        1,
+        "research",
+        "hypothesize",
+    )
+    assert row["checkpoint"]["pending"] == {"topic": 2}
+    assert (row["state_source"], row["state_problem"]) == ("events", view["state_problem"])
+
+    # A file that is there and does not say: the same, with the engine's word for it.
+    (project.root / "state.json").write_text("{}")
+    view = client.get(url(project)).json()
+    assert view["state_source"] == "events" and view["state"]["status"] == "checkpoint"
+    assert view["state_problem"].startswith("state.json holds no record of the phases that ran.")
+
+
+def test_where_a_project_stands_is_said_not_guessed(client, workspace, project):
+    # Never started: nothing is wrong, and intake is what comes first.
+    fresh = Project.create(workspace / "fresh", title="Fresh", brief="An idea.")
+    view = client.get(url(fresh)).json()
+    assert (view["state_source"], view["state_problem"]) == ("not_started", None)
+    assert (view["state"]["status"], view["state"]["next_phase"]) == ("idle", "intake")
+    assert view["next_step"] == {
+        "will_run": ["intake", "research"],
+        "then": "hypothesize",
+        "experiments": [],
+        "results": 0,
+        "checkpoint_of": None,
+        "needs_phase": False,
+    }
+    row = row_of(client, "fresh")
+    assert (row["status"], row["state_source"], row["state_problem"]) == (
+        "idle",
+        "not_started",
+        None,
+    )
+
+    # Agents wrote pages, and neither state.json nor the events say where that was: the
+    # engine cannot tell, and a press of Continue has to name the phase.
+    view = client.get(url(project)).json()
+    assert view["state_source"] == "unknown"
+    assert "cannot tell where the project stands" in view["state_problem"]
+    assert view["state"]["status"] == "idle" and view["state"]["phases"] == []
+    assert view["next_step"]["needs_phase"] is True and view["next_step"]["will_run"] == []
+    row = row_of(client, "warmup")
+    assert (row["state_source"], row["state_problem"]) == ("unknown", view["state_problem"])
+
+    # With the engine's account on file there is nothing to say.
+    phases_ran(project, "intake", "research", "hypothesize", following="design")
+    view = client.get(url(project)).json()
+    assert (view["state_source"], view["state_problem"]) == ("file", None)
+    assert (view["next_step"]["will_run"], view["next_step"]["then"]) == (["design"], "run")
+    assert row_of(client, "warmup")["state_source"] == "file"
+
+
+def test_the_library_replays_no_events_for_a_project_whose_state_reads_fine(
+    client, workspace, monkeypatch
+):
+    for number in range(6):
+        made = Project.create(workspace / f"p{number}", title=f"Project {number}", brief="x")
+        phases_ran(made)
+    lost = Project.open(workspace / "p5")
+    (lost.root / "state.json").unlink()
+    replayed: list[str] = []
+    events = Project.events
+
+    def counting(self, *args, **kwargs):
+        replayed.append(self.root.name)
+        return events(self, *args, **kwargs)
+
+    monkeypatch.setattr(Project, "events", counting)
+    rows = client.get("/api/projects").json()["projects"]
+    assert {row["status"] for row in rows} == {"checkpoint"} and len(rows) == 6
+    # Only the project whose state.json does not say where it stands is read from its events.
+    assert set(replayed) == {"p5"}
+    del replayed[:]
+
+    def no_pages(self, *args, **kwargs):
+        raise AssertionError("the library must not read pages again")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Project, "_all_pages", no_pages)
+        patched.setattr(Project, "_load_page", no_pages)
+        again = client.get("/api/projects").json()["projects"]
+    # ... and only once: nothing changed in it, so nothing is replayed at the next look.
+    assert replayed == []
+    assert [row["state_source"] for row in again] == [row["state_source"] for row in rows]
+
+    # An event more, and the next look reads it again.
+    lost.emit("agent.activity", "Something happened.")
+    assert row_of(client, "p5")["state_source"] == "events" and replayed == ["p5", "p5"]
+
+
+@pytest.mark.parametrize("source", ["file", "events"])
+def test_looking_at_a_project_writes_nothing_and_takes_no_lock(client, workspace, source):
+    fcntl = pytest.importorskip("fcntl")
+    project = Project.create(workspace / "lost", title="Lost", brief="Does warmup matter?")
+    phases_ran(project)
+    if source == "events":
+        (project.root / "state.json").unlink()
+    locks = [project.root / ".worker.lock", project.root / ".project.lock"]
+    for lock in locks:
+        lock.touch()
+    before = files_of(project.root)
+
+    held = [lock.open("r+") for lock in locks]
+    try:
+        for handle in held:
+            # Somebody has the project (a worker) and somebody is writing to it.
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        started = time.monotonic()
+        view = client.get(url(project)).json()
+        rows = client.get("/api/projects").json()["projects"]
+        for path in ("/pages", "/experiments", "/proposals", "/paper", "/requests", "/graph"):
+            assert client.get(url(project, path)).status_code == 200, path
+        assert time.monotonic() - started < 5  # nothing waited for either lock
+    finally:
+        for handle in held:
+            handle.close()
+
+    assert view["state_source"] == source and rows[0]["state_source"] == source
+    assert view["next_step"]["will_run"] == ["hypothesize"]
+    assert files_of(project.root) == before
+
+
+def test_where_a_project_stands_is_not_read_through_what_is_no_file_of_its_own(
+    client, stream, workspace, tmp_path
+):
+    project = Project.create(workspace / "linked", title="Linked", brief="x")
+    outside = tmp_path / "elsewhere.json"
+    outside.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "round": 7,
+                "error": "OUTSIDE-SECRET",
+                "phase": "design",
+                "phases": [record_of("design", 7, "failed")],
+            }
+        )
+    )
+    (project.root / "state.json").symlink_to(outside)
+
+    view = client.get(url(project))
+    assert "OUTSIDE-SECRET" not in view.text and view.json()["state"]["round"] == 0
+    assert view.json()["state_source"] == "unknown" and view.json()["next_step"] is None
+    assert view.json()["state_problem"].startswith(
+        "state.json of this project is not an ordinary file"
+    )
+    row = client.get("/api/projects")
+    assert "OUTSIDE-SECRET" not in row.text
+    assert row.json()["projects"][0]["state_source"] == "unknown"
+    live = stream(url(project, "/events"))
+    wait_for(lambda: live.states())
+    assert b"OUTSIDE-SECRET" not in live._data
+    assert live.states()[0]["state_source"] == "unknown"
+
+    # Something that is no file at all (a pipe would be waited for without end).
+    (project.root / "state.json").unlink()
+    os.mkfifo(project.root / "events.jsonl.pipe")
+    (project.root / "events.jsonl").unlink()
+    os.rename(project.root / "events.jsonl.pipe", project.root / "events.jsonl")
+    started = time.monotonic()
+    view = client.get(url(project)).json()
+    assert time.monotonic() - started < 5
+    assert view["state_source"] == "unknown"
+    assert view["state_problem"].startswith("events.jsonl of this project is not an ordinary file")
+
+
+def test_no_agent_is_started_where_the_view_says_that_the_state_is_not_read(
+    client, workspace, launched, tmp_path
+):
+    project = Project.create(workspace / "linked", title="Linked", brief="x")
+    written = phases_ran(project)
+    outside = tmp_path / "elsewhere.json"
+    (project.root / "state.json").rename(outside)
+    (project.root / "state.json").symlink_to(outside)
+    view = client.get(url(project)).json()
+    assert (view["state_source"], view["next_step"]) == ("unknown", None)
+
+    # The view says that where the project stands is not read, and foretells no press. A
+    # press must not then start an engine that reads the state through that very link: the
+    # answer is the sentence of the view, and nothing is started, with a phase named or not.
+    for body in ({}, {"phase": "hypothesize"}):
+        refused = client.post(url(project, "/advance"), json=body)
+        assert refused.status_code == 409, refused.text
+        assert error_of(refused) == {
+            "code": "conflict",
+            "message": f"Nothing was started. {view['state_problem']}",
+        }
+    assert launched.calls == []
+    assert client.get(url(project)).json()["worker"]["state"] == "idle"
+
+    # Put right (the file is the project's own again), the same press starts the agents.
+    (project.root / "state.json").unlink()
+    outside.rename(project.root / "state.json")
+    view = client.get(url(project)).json()
+    assert (view["state_source"], view["state"]) == ("file", written)
+    assert client.post(url(project, "/advance")).status_code == 202
+    assert [kind for kind, _ in launched.calls] == ["advance"]
+
+
+def test_a_link_and_the_file_it_led_to_are_told_apart_at_the_next_look(
+    client, stream, workspace, launched, tmp_path
+):
+    project = Project.create(workspace / "linked", title="Linked", brief="x")
+    phases_ran(project)
+    (project.root / "state.json").unlink()  # lost: where it stands is read from the events
+    events, outside = project.root / "events.jsonl", tmp_path / "events.jsonl"
+    assert client.get(url(project)).json()["state_source"] == "events"
+    live = stream(url(project, f"/events?after={project.events()[-1]['seq']}"))
+    wait_for(lambda: live.states(), message="the first state")
+
+    events.rename(outside)
+    events.symlink_to(outside)
+    problem = client.get(url(project)).json()["state_problem"]
+    assert problem.startswith("events.jsonl of this project is not an ordinary file")
+    # Put right by moving the file itself back: under the project's name stands what the
+    # link led to, with the same inode, time and size.  The next look must not go on
+    # saying that it is no file of the project's (nor go on refusing to start anything).
+    events.unlink()
+    outside.rename(events)
+    view = client.get(url(project)).json()
+    assert view["state_source"] == "events" and view["next_step"]["will_run"] == ["hypothesize"]
+    assert client.post(url(project, "/advance")).status_code == 202
+
+    # The same for a window that is open: the stream says so without being asked.
+    project = Project.create(workspace / "watched", title="Watched", brief="x")
+    phases_ran(project)
+    state, outside = project.root / "state.json", tmp_path / "state.json"
+    live = stream(url(project, f"/events?after={project.events()[-1]['seq']}"))
+    wait_for(lambda: live.states(), message="the first state")
+    assert live.states()[-1]["state_source"] == "file"
+    state.rename(outside)
+    state.symlink_to(outside)
+    wait_for(lambda: live.states()[-1]["state_source"] == "unknown", message="the link is seen")
+    state.unlink()
+    outside.rename(state)
+    wait_for(lambda: live.states()[-1]["state_source"] == "file", message="the file is seen")
+
+
+def test_the_stream_says_where_a_project_with_a_lost_state_stands(stream, workspace):
+    project = Project.create(workspace / "lost", title="Lost", brief="Does warmup matter?")
+    written = phases_ran(project)
+    (project.root / "state.json").unlink()
+
+    live = stream(url(project, f"/events?after={project.events()[-1]['seq']}"))
+    wait_for(lambda: live.states(), message="the first state")
+    first = live.states()[0]
+    # What the stream hands the app replaces what the project view gave it: the same reading.
+    assert first["state"]["status"] == "checkpoint" and first["state"]["round"] == 1
+    assert first["state_source"] == "events" and "events.jsonl" in first["state_problem"]
+
+    # The engine writes its file anew when it next works: the stream says so.
+    temporary = project.root / "state.json.tmp"
+    temporary.write_text(json.dumps(written))
+    os.replace(temporary, project.root / "state.json")
+    wait_for(lambda: len(live.states()) == 2, message="the state on file again")
+    second = live.states()[1]
+    assert (second["state_source"], second["state_problem"]) == ("file", None)
+    assert second["state"] == written
+
+
+def approved_experiment(project: Project, services: FakeServices) -> None:
+    """H1 and E1 accepted and the run of E1 approved, as the person does it."""
+    project.review("H1", "accept")
+    project.review("E1", "accept")
+    services.approve(project, "E1")
+
+
+def test_the_project_says_what_a_press_of_continue_will_do(client, project, services, caplog):
+    from paper_orchestra.research import engine
+
+    phases_ran(project, "intake", "research", "hypothesize", following="design")
+    said = client.get(url(project)).json()["next_step"]
+    assert (said["will_run"], said["then"], said["experiments"]) == (["design"], "run", [])
+
+    # What the person approved comes first, and the phase that was next stays next.
+    approved_experiment(project, services)
+    said = client.get(url(project)).json()["next_step"]
+    assert said == {
+        "will_run": ["run", "analyze"],
+        "then": "design",
+        "experiments": ["E1"],
+        "results": 0,
+        "checkpoint_of": None,
+        "needs_phase": False,
+    }
+    # It is the engine's own answer, not a second rule of the server's.
+    assert said == engine.next_step(Project.open(project.root))
+
+    # A result nobody has analysed comes before the phase that was next as well.
+    project.set_state("E1", "queued", by="system")
+    project.set_state("E1", "running", by="system")
+    project.set_state("E1", "succeeded", by="system")
+    a_finding(project)
+    said = client.get(url(project)).json()["next_step"]
+    assert (said["will_run"], said["then"], said["results"]) == (["analyze"], "design", 1)
+
+    # A forecast that fails costs the forecast, not the project view, and the log is
+    # told once however often the project is looked at.
+    def broken(project, state):
+        raise RuntimeError("no forecast today")
+
+    working = services.next_step
+    services.next_step = broken
+    for _ in range(3):
+        view = client.get(url(project))
+        assert view.status_code == 200 and view.json()["next_step"] is None
+    assert len([r for r in caplog.records if "would do could not be told" in r.message]) == 1
+    services.next_step = working
+
+    # While somebody works on the project, nothing is foretold: the worker decides.
+    client.post(url(project, "/advance"))
+    wait_for(lambda: (project.root / "ready").exists())
+    assert client.get(url(project)).json()["next_step"] is None
+    # The library does not ask at all: its rows stay cheap.
+    assert "next_step" not in client.get("/api/projects").json()["projects"][0]
+
+
+def test_the_checkpoint_carries_the_recommendation_for_as_long_as_it_stands(
+    client, stream, workspace
+):
+    project = Project.create(
+        workspace / "rec", title="Rec", brief="x", settings={"review": {"journal": "review"}}
+    )
+    journal = project.create_page(
+        "journal", "Round 1", "Schedule-free optimisers were not looked at.\n",
+        author="agent:analyst", fields={"next": "research"}, round=1,
+    )  # fmt: skip
+    state = phases_ran(project, "intake", "research", "hypothesize", "design", "run", "analyze")
+    state["checkpoint"].update(recommends="research", recommends_page=journal.path)
+    (project.root / "state.json").write_text(json.dumps(state))
+
+    view = client.get(url(project)).json()
+    assert view["checkpoint"]["recommends"] == "research"
+    assert view["checkpoint"]["recommends_page"] == journal.path
+    assert view["state"]["checkpoint"] == view["checkpoint"]
+    live = stream(url(project, "/events"))
+    wait_for(lambda: live.states())
+    assert live.states()[0]["state"]["checkpoint"]["recommends_page"] == journal.path
+
+    # A journal page the person rejected since recommends nothing any more: the client
+    # is told so, and does not have to look the page up to find out.
+    project.review(journal.path, "reject", reason="Not now.")
+    view = client.get(url(project)).json()
+    assert view["checkpoint"]["recommends"] is None
+    assert view["checkpoint"]["recommends_page"] is None
+    assert view["state"]["checkpoint"] == view["checkpoint"]
+    assert "2 topics await your review." in view["checkpoint"]["summary"]  # the rest stands
+    # The row of the library claims nothing about it either way.
+    assert "recommends" not in row_of(client, "rec")["checkpoint"]
+
+    # A checkpoint that names a page which is gone, or names nothing a file can name.
+    for page in ("wiki/journal/nowhere.md", "../../etc/passwd", 7):
+        state["checkpoint"].update(recommends="research", recommends_page=page)
+        (project.root / "state.json").write_text(json.dumps(state))
+        assert client.get(url(project)).json()["checkpoint"]["recommends"] is None
+
+
+# -- taking an approval back ---------------------------------------------------------
+
+
+def test_cancel_takes_back_an_approval_that_has_not_started(real, project):
+    project.review("E1", "accept")
+    assert real.get(url(project, "/experiments/E1")).json()["cancel_does"] is None
+    assert real.post(url(project, "/experiments/E1/approve")).status_code == 200
+    # What a press of the button does is said before it is pressed.
+    assert real.get(url(project, "/experiments/E1")).json()["cancel_does"] == "withdraw"
+    assert real.get(url(project, "/experiments")).json()["experiments"][0]["cancel_does"] == (
+        "withdraw"
+    )
+    seen = project.events()[-1]["seq"]
+
+    taken = real.post(url(project, "/experiments/E1/cancel"), json={"expect": "withdraw"})
+
+    # As `paper-orchestra research cancel` does it: the experiment is a plan again.
+    assert taken.status_code == 200, taken.text
+    body = taken.json()
+    assert (body["experiment"], body["outcome"], body["before"], body["state"]) == (
+        "E1",
+        "withdrawn",
+        "approved",
+        "planned",
+    )
+    assert body["message"] == (
+        "E1 is a plan again: its approval was taken back and nothing ran. Approve it again "
+        "when you want it run."
+    )
+    assert body["page"]["state"] == "planned" and body["cancel_does"] is None
+    page = Project.open(project.root).page("E1")
+    assert (page.state, page.meta["state_reason"]) == (
+        "planned",
+        "You withdrew the approval of its run.",
+    )
+    # Nothing was cancelled and nothing is on record as a run.
+    assert real.get(url(project, "/experiments/E1")).json()["runs"] == []
+    assert not (project.experiment_dir("E1") / ".cancel").exists()
+    assert [event["type"] for event in project.events(after=seen)] == ["experiment.state"]
+
+    again = real.post(url(project, "/experiments/E1/cancel"), json={"expect": "withdraw"})
+    assert again.status_code == 200 and again.json()["outcome"] == "nothing"
+    assert again.json()["message"] == "E1 is planned: there is nothing to cancel."
+
+    # Without a word about what was expected, the state decides, as on the command line.
+    assert real.post(url(project, "/experiments/E1/approve")).status_code == 200
+    plain = real.post(url(project, "/experiments/E1/cancel"))
+    assert plain.status_code == 200 and plain.json()["outcome"] == "withdrawn"
+    assert (
+        real.post(url(project, "/experiments/E1/cancel"), json={"expect": "x"}).status_code == 422
+    )
+
+
+def test_a_queued_experiment_is_cancelled_as_before(real, project):
+    project.review("E1", "accept")
+    real.post(url(project, "/experiments/E1/approve"))
+    project.set_state("E1", "queued", by="system")
+    assert real.get(url(project, "/experiments/E1")).json()["cancel_does"] == "cancel"
+
+    cancelled = real.post(url(project, "/experiments/E1/cancel"), json={"expect": "cancel"})
+
+    # Nobody is running it: it is cancelled here and now.
+    assert cancelled.status_code == 200, cancelled.text
+    body = cancelled.json()
+    assert (body["outcome"], body["before"], body["state"]) == ("cancelled", "queued", "cancelled")
+    assert body["message"] == "E1 is cancelled. Approve it again when you want it run."
+    assert Project.open(project.root).page("E1").state == "cancelled"
+
+
+def test_the_press_does_what_the_person_was_told_or_nothing(real, project):
+    fcntl = pytest.importorskip("fcntl")
+    project.review("E1", "accept")
+    real.post(url(project, "/experiments/E1/approve"))
+
+    # Told "Cancel" (an older view of the experiment), and there is no run to cancel.
+    stale = real.post(url(project, "/experiments/E1/cancel"), json={"expect": "cancel"})
+    assert stale.status_code == 409 and stale.json()["error"]["code"] == "conflict"
+    assert "has not started" in stale.json()["error"]["message"]
+    assert stale.json()["cancel_does"] == "withdraw" and stale.json()["page"]["state"] == "approved"
+    assert Project.open(project.root).page("E1").state == "approved"
+
+    # A process took the experiment up meanwhile (it holds the run lock): taking the
+    # approval back must not cancel, requeue or otherwise touch the run in flight.
+    lock = project.experiment_dir("E1") / ".run.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert real.get(url(project, "/experiments/E1")).json()["cancel_does"] == "cancel"
+        before = files_of(project.root)
+        late = real.post(url(project, "/experiments/E1/cancel"), json={"expect": "withdraw"})
+        assert late.status_code == 409 and "cannot be taken back" in late.json()["error"]["message"]
+        assert late.json()["cancel_does"] == "cancel"
+        assert files_of(project.root) == before  # no flag for the runner, no state moved
+        # Asked to cancel the run, the server does: whoever holds the lock sees the flag.
+        told = real.post(url(project, "/experiments/E1/cancel"), json={"expect": "cancel"})
+        assert told.status_code == 202 and told.json()["outcome"] == "cancelling"
+        assert (project.experiment_dir("E1") / ".cancel").exists()
+        assert Project.open(project.root).page("E1").state == "approved"
+
+
+class Racing(Services):
+    """Services that see no process running an experiment: the moment between a look at
+    the run lock and the withdrawal, in which a worker takes the experiment up."""
+
+    def run_held(self, project, experiment_id):
+        return False
+
+
+def test_an_approval_a_run_took_up_in_that_moment_is_not_taken_back(
+    workspace, project, launched, live, tmp_path
+):
+    fcntl = pytest.importorskip("fcntl")
+    app = create_app(workspace, launcher=launched, services=Racing(), live=live,
+                     static_dir=tmp_path / "none", stop_workers_on_exit=True)  # fmt: skip
+    project.review("E1", "accept")
+    with TestClient(app, base_url=BASE_URL) as client:
+        assert client.post(url(project, "/experiments/E1/approve")).status_code == 200
+        lock = project.experiment_dir("E1") / ".run.lock"
+        with lock.open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            before = files_of(project.root)
+            for body in ({"expect": "withdraw"}, {}):
+                refused = client.post(url(project, "/experiments/E1/cancel"), json=body)
+                assert refused.status_code == 409, refused.text
+                assert "is being run right now" in refused.json()["error"]["message"]
+                assert refused.json()["page"]["state"] == "approved"
+            assert files_of(project.root) == before  # the run in flight was not touched
+
+
+def test_an_approval_whose_run_is_over_is_said_to_be_used_up(client, project, services):
+    approved_experiment(project, services)
+
+    def withdraw(project, ref):
+        # As the experiments module finds it: the approval was used by a run that is over,
+        # and the page is moved to how that run ended.
+        project.set_state(ref, "queued", by="system")
+        project.set_state(ref, "running", by="system")
+        project.set_state(ref, "succeeded", by="system")
+        raise ProjectError("E1 is succeeded; there is no approval to withdraw.")
+
+    services.withdraw = withdraw
+    answer = client.post(url(project, "/experiments/E1/cancel"), json={"expect": "withdraw"})
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert (body["outcome"], body["before"], body["state"]) == ("ended", "approved", "succeeded")
+    assert body["message"] == (
+        "E1 is succeeded: its run had ended before the approval could be taken back."
+    )
+
+
+def test_an_approval_a_run_took_up_and_moved_on_with_is_not_said_to_have_ended(
+    client, project, services
+):
+    approved_experiment(project, services)
+
+    def withdraw(project, ref):
+        # A worker took the experiment up between the look and the withdrawal and has
+        # moved its page on: the experiments module finds it running.
+        project.set_state(ref, "queued", by="system")
+        project.set_state(ref, "running", by="system")
+        raise ProjectError("E1 is running; there is no approval to withdraw. Cancel its run.")
+
+    services.withdraw = withdraw
+    seen = project.events()[-1]["seq"]
+    answer = client.post(url(project, "/experiments/E1/cancel"), json={"expect": "withdraw"})
+
+    # Not "its run had ended": the run is under way, and the press did nothing to it.
+    assert answer.status_code == 409, answer.text
+    assert error_of(answer) == {
+        "code": "conflict",
+        "message": "E1 is running and has been taken up by a run since you looked: its "
+        "approval is in use and cannot be taken back. Nothing was changed. Cancel its run if "
+        "you want it stopped.",
+    }
+    assert (answer.json()["page"]["state"], answer.json()["cancel_does"]) == ("running", "cancel")
+    assert not (project.experiment_dir("E1") / ".cancel").exists()
+    moves = [event["data"]["state"] for event in project.events(after=seen)]
+    assert moves == ["queued", "running"]  # the worker's own, and nothing after them
+
+
+def test_an_approval_somebody_else_took_back_in_that_moment_leaves_nothing_to_do(
+    client, project, services
+):
+    approved_experiment(project, services)
+
+    def withdraw(project, ref):
+        # Another window took the approval back between the look and this press.
+        project.set_state(ref, "planned", by="human", reason="You withdrew the approval.")
+        raise ProjectError("E1 is planned; there is no approval to withdraw.")
+
+    services.withdraw = withdraw
+    answer = client.post(url(project, "/experiments/E1/cancel"), json={"expect": "withdraw"})
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert (body["outcome"], body["before"], body["state"]) == ("nothing", "approved", "planned")
+    # The sentence is about the experiment as it is, not as the press found it.
+    assert body["message"] == "E1 is planned: there is nothing to cancel."
+
+
+# -- an interrupted run, wherever a page is listed -------------------------------------
+
+
+def test_an_interrupted_experiment_is_marked_wherever_its_page_is_listed(client, project, services):
+    rows = {row["path"]: row for row in client.get(url(project, "/pages")).json()["pages"]}
+    experiment = next(row for row in rows.values() if row["kind"] == "experiment")
+    assert experiment["interrupted"] is False
+    assert all("interrupted" not in row for row in rows.values() if row["kind"] != "experiment")
+
+    running_without_a_worker(project, services)
+    # The glyph in the rail and on the map is drawn from this list: it says what the
+    # experiment's own view says in words.
+    listed = client.get(url(project, "/pages?kind=experiment")).json()["pages"]
+    assert [(row["id"], row["state"], row["interrupted"]) for row in listed] == [
+        ("E1", "running", True)
+    ]
+    found = client.get(url(project, "/pages?q=variance")).json()["pages"]
+    assert next(row for row in found if row["id"] == "E1")["interrupted"] is True
+
+
+# -- the problems of a project's files ---------------------------------------------------
+
+
+def test_a_problem_names_its_file_once_and_a_capped_list_says_how_many_there_are(client, workspace):
+    project = Project.create(workspace / "odd", title="Odd", brief="x")
+    # Phases ran by what the events hold, but not which: the store reports the state as
+    # lost.  Its sentence begins with the name of the file; the entry in the list of
+    # problems, which names the file already, goes on from there.
+    project.emit("checkpoint", "A pause.", phase="research", round=1)
+    assert project.state_lost().startswith("state.json is missing")
+    assert project.problems() == [
+        {"path": "state.json", "message": project.state_lost()[len("state.json ") :]}
+    ]
+
+    view = client.get(url(project)).json()
+    assert view["state_problem"] is None
+    assert view["problems"] == [
+        {"path": "state.json", "message": project.state_lost()[len("state.json ") :]}
+    ]
+    assert view["problems"][0]["message"].startswith("is missing or cannot be read")
+    assert view["problems_total"] == 1
+
+    folder = project.root / "wiki" / "hypotheses"
+    folder.mkdir(parents=True, exist_ok=True)
+    for number in range(60):
+        (folder / f"H{number + 1}-by-hand.md").write_text(
+            "---\ntitle: By hand\ncites: [sources/nowhere]\n---\nText.\n"
+        )
+    view = client.get(url(project)).json()
+    assert len(view["problems"]) == 50 and view["problems_total"] >= 61
+
+
+# -- how the last write-up went, from what is on disk ---------------------------------------
+
+
+def paper_started(project: Project) -> dict[str, Any]:
+    return project.emit(
+        "paper.started",
+        "Writing a paper from the wiki with the iclr2025 template: 1 succeeded run, 1 "
+        "accepted finding.",
+        data={"template": "iclr2025", "dir": "paper", "findings": ["wiki/findings/F1-x.md"]},
+    )
+
+
+def restarted(workspace, launched, live, tmp_path) -> TestClient:
+    """Another server on the same workspace: it knows only what is on disk."""
+    return TestClient(
+        create_app(workspace, launcher=launched, services=FakeServices(), live=live,
+                   static_dir=tmp_path / "none", stop_workers_on_exit=True),
+        base_url=BASE_URL,
+    )  # fmt: skip
+
+
+def test_how_the_last_write_up_went_is_read_from_the_projects_events(
+    client, project, workspace, launched, live, tmp_path
+):
+    assert client.get(url(project, "/paper")).json()["last"] is None
+    started = paper_started(project)
+    failed = project.emit(
+        "paper.finished",
+        "No paper was written: the outline stage failed.",
+        data={"success": False, "pdf": None, "error": "the outline stage failed", "cost_usd": 0.2},
+    )
+
+    last = client.get(url(project, "/paper")).json()["last"]
+
+    assert last == {
+        "outcome": "failed",
+        "started_at": started["ts"],
+        "started_summary": started["summary"],
+        "template": "iclr2025",
+        "ended_at": failed["ts"],
+        "summary": "No paper was written: the outline stage failed.",
+        "error": "the outline stage failed",
+        "exit_code": None,
+        "pdf": None,
+    }
+
+    # A write-up that was refused before it began: its worker's end is the server's event.
+    refused = project.emit(
+        "paper.finished",
+        "The write-up did not start: its worker ended with exit code 1 and said: “There is "
+        "nothing to write a paper from yet: no finding is accepted.”",
+        data={"success": False, "interrupted": False, "started": False, "exit_code": 1,
+              "error": "There is nothing to write a paper from yet: no finding is accepted."},
+    )  # fmt: skip
+    last = client.get(url(project, "/paper")).json()["last"]
+    assert last == {
+        "outcome": "refused",
+        "started_at": None,
+        "started_summary": None,
+        "template": None,
+        "ended_at": refused["ts"],
+        "summary": refused["summary"],
+        "error": "There is nothing to write a paper from yet: no finding is accepted.",
+        "exit_code": 1,
+        "pdf": None,
+    }
+    # A server that was started afterwards says the same: nothing of it was in memory.
+    with restarted(workspace, launched, live, tmp_path) as other:
+        assert other.get(url(project, "/paper")).json()["last"] == last
+
+    # The next write-up: running, stopped, and written.
+    started = paper_started(project)
+    last = client.get(url(project, "/paper")).json()["last"]
+    assert (last["outcome"], last["started_at"], last["ended_at"], last["summary"]) == (
+        "unfinished",  # no worker writes it, and none said how it ended
+        started["ts"],
+        None,
+        None,
+    )
+    stopped = project.emit(
+        "paper.finished",
+        "The write-up was stopped before the paper was finished; starting it again continues it.",
+        data={"success": False, "interrupted": True, "error": None},
+    )
+    last = client.get(url(project, "/paper")).json()["last"]
+    assert (last["outcome"], last["ended_at"]) == ("stopped", stopped["ts"])
+    paper_started(project)
+    project.emit(
+        "paper.finished",
+        "The paper is written: paper/final_paper.pdf.",
+        data={"success": True, "pdf": "paper/final_paper.pdf", "error": None, "cost_usd": 1.5},
+    )
+    last = client.get(url(project, "/paper")).json()["last"]
+    assert (last["outcome"], last["pdf"]) == ("written", "paper/final_paper.pdf")
+
+
+def test_a_write_up_that_is_running_is_said_to_be(client, project, launched):
+    client.post(url(project, "/paper"), json={"template": "iclr2025"})
+    wait_for(lambda: (project.root / "ready").exists())
+    paper_started(project)
+    paper = client.get(url(project, "/paper")).json()
+    assert paper["running"] is True and paper["last"]["outcome"] == "running"
+
+
+def test_a_refused_write_up_is_shown_with_its_reason_also_by_the_next_server(
+    workspace, project, live, tmp_path
+):
+    refusing = tmp_path / "refusing.py"
+    refusing.write_text(
+        "import sys\n"
+        "print('Error: There is nothing to write a paper from yet: no finding is accepted.',"
+        " file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+
+    def serve() -> TestClient:
+        app = create_app(
+            workspace,
+            launcher=lambda kind, root, options: [sys.executable, str(refusing)],
+            services=FakeServices(),
+            live=live,
+            static_dir=tmp_path / "none",
+            stop_workers_on_exit=True,
+        )
+        return TestClient(app, base_url=BASE_URL)
+
+    with serve() as first:
+        assert first.post(url(project, "/paper"), json={"template": "iclr2025"}).status_code == 202
+        wait_for(lambda: first.get(url(project)).json()["worker"]["state"] == "idle")
+        wait_for(lambda: first.get(url(project, "/paper")).json()["last"] is not None)
+        last = first.get(url(project, "/paper")).json()["last"]
+    assert last["outcome"] == "refused" and last["exit_code"] == 1
+    assert last["error"] == "There is nothing to write a paper from yet: no finding is accepted."
+    assert last["summary"].startswith("The write-up did not start: its worker ended with exit")
+    assert last["started_at"] is None and last["ended_at"]
+    # Not from the server's memory, and not from the end of worker.log, which the next
+    # worker writes over what this one said.
+    (project.root / "worker.log").write_text("something else entirely\n")
+    with serve() as second:
+        assert second.get(url(project)).json()["worker"]["last_exit"] is None
+        assert second.get(url(project, "/paper")).json()["last"] == last
+
+
+def test_the_paper_events_are_read_once_and_then_only_what_was_added(client, project, monkeypatch):
+    started = paper_started(project)
+    assert client.get(url(project, "/paper")).json()["last"]["started_at"] == started["ts"]
+    read: list[int] = []
+    opened = api_module._open_plain
+
+    def counting(path):
+        handle = opened(path)
+        if Path(path).name == "events.jsonl":
+            read.append(os.fstat(handle.fileno()).st_size)
+        return handle
+
+    monkeypatch.setattr(api_module, "_open_plain", counting)
+    assert client.get(url(project, "/paper")).json()["last"]["started_at"] == started["ts"]
+    assert read == []  # nothing was added: the file is not opened again
+    project.emit("agent.activity", "Something else happened.")
+    client.get(url(project, "/paper"))
+    assert len(read) == 1
+    # A stream that was written anew (restored from a copy) is read from its beginning.
+    (project.root / "events.jsonl").write_text("")
+    assert client.get(url(project, "/paper")).json()["last"] is None
+
+
+# -- the number check of a suggested edit, where the list decides ------------------------------
+
+
+def test_a_suggested_edit_to_a_finding_is_listed_with_what_its_numbers_check_found(
+    workspace, project, launched, live, tmp_path, monkeypatch
+):
+    services = Reporting()
+    finding = a_finding(project)
+    proposal = project.propose_edit(
+        finding.path, author="agent:analyst", summary="Report the better run",
+        body="Accuracy reached 97.3%, 41.8 points above the baseline.\n", round=1,
+    )  # fmt: skip
+    app = create_app(workspace, launcher=launched, services=services, live=live,
+                     static_dir=tmp_path / "none", stop_workers_on_exit=True)  # fmt: skip
+    with TestClient(app, base_url=BASE_URL) as client:
+        rows = {
+            row["id"]: row for row in client.get(url(project, "/proposals")).json()["proposals"]
+        }
+        # What the quick accept in the list decides on: the check of the text as it would
+        # read, in the row itself, as the detail shows it.
+        row = rows[proposal.id]
+        assert row["number_report"]["unverified"] == ["97.3"]
+        assert row["number_report_error"] is None
+        detail = client.get(url(project, f"/pages/{finding.id}")).json()["proposals"][0]
+        assert row["number_report"] == detail["number_report"]
+        assert (
+            services.reported[0].body == "Accuracy reached 97.3%, 41.8 points above the baseline.\n"
+        )
+        # An edit to a page that is no finding has no numbers to trace.
+        other = next(row for key, row in rows.items() if key != proposal.id)
+        assert "number_report" not in other
+
+        # The listing spends a bounded time on it: an edit it does not get to says so by
+        # carrying no report, and the app opens the detail before it decides.
+        monkeypatch.setattr(api_module, "_ROW_CHECK_SECONDS", 0.0)
+        del services.reported[:]
+        late = client.get(url(project, "/proposals")).json()["proposals"]
+        row = next(row for row in late if row["id"] == proposal.id)
+        assert row["number_report"] is None and row["number_report_error"] is None
+        assert services.reported == []
+        monkeypatch.setattr(api_module, "_ROW_CHECK_SECONDS", 60.0)
+
+        # A report that cannot be made is said, as in the detail.
+        def broken(project, page):
+            raise ProjectError("The evidence could not be read.")
+
+        services.number_report = broken
+        row = client.get(url(project, "/proposals")).json()["proposals"][-1]
+        assert row["number_report"] is None
+        assert row["number_report_error"] == "The evidence could not be read."
+
+        # One that is decided has nothing left to check.
+        services.number_report = Reporting().number_report
+        client.post(
+            url(project, "/review"), json={"items": [{"ref": proposal.id, "decision": "reject"}]}
+        )
+        decided = client.get(url(project, "/proposals?review=all")).json()["proposals"]
+        assert "number_report" not in next(row for row in decided if row["id"] == proposal.id)

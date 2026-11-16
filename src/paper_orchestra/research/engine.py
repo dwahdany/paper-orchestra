@@ -28,6 +28,11 @@ project's events are a second one: :func:`read_state` rebuilds round, phases
 and what comes next from ``events.jsonl`` when the file is lost or damaged, and
 :func:`state_problem` says so.  A project with work on file is never taken for
 one that has not started.
+
+:func:`next_step` says what an ``advance()`` without a phase would do, for whoever
+shows the project: it asks the rules ``advance()`` itself goes by, reads only, and
+needs neither the worker lock nor a model.  :func:`phase_in_words` is how a
+sentence for the person names a phase.
 """
 
 from __future__ import annotations
@@ -83,6 +88,8 @@ __all__ = [
     "EngineError",
     "WorkerBusy",
     "as_worker",
+    "next_step",
+    "phase_in_words",
     "read_state",
     "state_problem",
     "worker_alive",
@@ -139,6 +146,20 @@ _DOING = {
 }
 #: Phases whose agent can act on a request of the person.
 _TAKES_REQUESTS = ("research", "hypothesize", "design", "analyze")
+
+
+def phase_in_words(name: Any) -> str:
+    """A phase as a sentence for the person names it: ``the hypothesis phase`` for
+    ``hypothesize``, ``the analysis phase`` for ``analyze``.
+
+    The engine's own sentences (its events and checkpoints) use these words.
+    Whoever else names a phase to the person (the web server, when it refuses a
+    second worker) asks here, so that a phase has one name wherever it is read.
+    What is no phase of the engine keeps the name it came with.
+    """
+    return f"the {_NOUN.get(name, name) if isinstance(name, str) else name} phase"
+
+
 #: The phases that follow an approval, not a checkpoint's "next": what the person approved
 #: is run, and what ran is analysed, wherever in the round that falls.
 _RUNS = ("run", "analyze")
@@ -217,6 +238,19 @@ def _records(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _recommendation(data: Any) -> dict[str, Any]:
+    """The two fields of a checkpoint that carry the analyst's recommendation, read from
+    a checkpoint or from the data of its event: ``recommends`` is the phase the round's
+    journal recommends before the one that is next (only ``research`` can be) and
+    ``recommends_page`` the journal page that says so.  Both are ``None`` when nothing
+    is recommended, also for a checkpoint written before these fields existed."""
+    data = data if isinstance(data, Mapping) else {}
+    phase, page = data.get("recommends"), data.get("recommends_page")
+    if phase != "research" or not isinstance(page, str) or not page:
+        return {"recommends": None, "recommends_page": None}
+    return {"recommends": phase, "recommends_page": page}
+
+
 def _read_checkpoint(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -227,7 +261,12 @@ def _read_checkpoint(value: Any) -> dict[str, Any] | None:
         if _whole(count)
     }
     summary = value.get("summary")
-    return {**value, "summary": summary if isinstance(summary, str) else "", "pending": counted}
+    return {
+        **value,
+        "summary": summary if isinstance(summary, str) else "",
+        "pending": counted,
+        **_recommendation(value),
+    }
 
 
 def _read_leniently(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -348,6 +387,7 @@ def _from_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                         "at": stamp,
                         "summary": event.get("summary"),
                         "pending": pending,
+                        **_recommendation(data),
                     }
                 ),
             )
@@ -442,6 +482,40 @@ def state_problem(project: Project) -> str | None:
             "phase to go on with."
         )
     return None
+
+
+def next_step(project: Project, state: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """What an ``advance()`` with no phase named would do as the project stands, for
+    whoever shows it (the label of the app's Continue button)::
+
+        {"will_run": ["run", "analyze"], "then": "hypothesize",
+         "experiments": ["E1"], "results": 0,
+         "checkpoint_of": None, "needs_phase": False}
+
+    ``will_run`` are the phases the call runs, in order, when each of them
+    completes, and ``then`` is the phase its checkpoint names as next.  What the
+    person approved comes first: ``experiments`` are the accepted experiments a
+    run phase is owed (approved, or left queued or running by a worker that is
+    gone), and ``results`` is how many result records have no analysis yet.
+    ``checkpoint_of`` names a phase that completed without its checkpoint (its
+    worker died right after it): the call writes that checkpoint first, and when
+    ``will_run`` is empty that is all it does.  ``needs_phase`` says that the call
+    would be refused, because nothing on file says where the project stands
+    (:func:`state_problem`): a phase has to be named.
+
+    The answer comes from the rules :meth:`Engine.advance` itself goes by, applied
+    to a copy of the state.  It assumes that the experiments which wait do run:
+    when none of them can (each changed since its approval, say), ``advance()``
+    goes on with the phase that was next in the same call and its checkpoint says
+    why.  Whether the models can be used and what the budgets allow is not looked
+    at: a call that is refused for that says so itself.
+
+    For a project nobody is working on.  Nothing is written and no lock is taken;
+    ``state`` is what :func:`read_state` returned, for a caller that holds it
+    already (it is not changed).
+    """
+    mine = copy.deepcopy(dict(state)) if state is not None else read_state(project)
+    return Engine._reading(project, mine)._forecast()
 
 
 def _is_zombie(pid: int) -> bool:
@@ -720,6 +794,21 @@ class Engine:
         #: file anew (:func:`state_problem`); ``None`` when nothing was.
         self._lost: str | None = None
 
+    @classmethod
+    def _reading(cls, project: Project, state: dict[str, Any]) -> Engine:
+        """An engine that only reads: it holds ``project`` and ``state`` (its own to
+        change) and nothing of what work needs, no harness, no backend, no lock.
+
+        The rules that decide which phase comes next read the state and the
+        project's pages and nothing else, so :func:`next_step` asks them here
+        instead of repeating them.
+        """
+        reader = cls.__new__(cls)
+        reader.project = project
+        reader._state = state
+        reader._lock = threading.RLock()
+        return reader
+
     # -- public ------------------------------------------------------------------
 
     @property
@@ -778,11 +867,8 @@ class Engine:
             told: list[str] = []
             notes: list[str] = []
             back: str | None = None
-            first = self._overdue(name) if phase is None and name else None
-            if first is not None:
-                # (Before an analysis that is still to be finished, the run is the
-                # round's own or returns where the records say: nothing to remember.)
-                back, name = (None if name in _RUNS else name), first
+            if phase is None and name:
+                name, back = self._comes_first(name)
             while name:
                 outcome = self._run_phase(name, instruction)
                 if outcome.status != "completed" or outcome.report is None:
@@ -1075,6 +1161,12 @@ class Engine:
         self.project.emit("error", _one_line(message, 600), data={"problems": problems})
         raise EngineError(message)
 
+    def _position_unknown(self) -> bool:
+        """Whether nothing on file says where the project stands although agents have
+        worked on it: no phase on record, and pages in the wiki that only a phase
+        leaves behind."""
+        return not self._state["phases"] and _agents_wrote(self.project)
+
     def _refuse_unknown_position(self) -> None:
         """Refuse to choose a phase when nothing on file says where the project stands.
 
@@ -1082,7 +1174,7 @@ class Engine:
         phase would be intake: on a project whose wiki holds the agents' pages that
         would do its first steps a second time, and pay for them.
         """
-        if self._state["phases"] or not _agents_wrote(self.project):
+        if not self._position_unknown():
             return
         # (As the file was found: this worker has written an empty one since.)
         problem = self._lost or state_problem(self.project) or ""
@@ -1224,13 +1316,26 @@ class Engine:
             self._announce(record)
         else:
             self._settle_requests(record)
-        written = [event for event in since if event.get("type") == "checkpoint"]
-        if written:
+        written = self._announced(since)
+        if written is not None:
             # It had announced the pause and died before the state said so: one pause
             # is one event, so the event that is there is the checkpoint.
-            self._adopt_checkpoint(written[-1], note)
+            self._adopt_checkpoint(written, note)
             return None
         return self._after(owed, _Outcome("completed"), [], [note])
+
+    @staticmethod
+    def _announced(events: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+        """The checkpoint among the events of a phase's latest run, when it was announced."""
+        written = [event for event in events if event.get("type") == "checkpoint"]
+        return written[-1] if written else None
+
+    @staticmethod
+    def _next_of(event: Mapping[str, Any]) -> str:
+        """The phase a checkpoint event names as next."""
+        data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+        following = data.get("next")
+        return str(following) if following in PHASES else _NEXT[str(event["phase"])]
 
     def _events_of(self, record: Mapping[str, Any]) -> list[dict[str, Any]]:
         """The events of the phase ``record`` is of, from its latest start on."""
@@ -1247,7 +1352,7 @@ class Engine:
         """Make the state say what a checkpoint event on file announced."""
         data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
         name, round = str(event["phase"]), int(event["round"])
-        following = data.get("next") if data.get("next") in PHASES else _NEXT[name]
+        following = self._next_of(event)
         checkpoint = _read_checkpoint(
             {
                 "round": round,
@@ -1255,6 +1360,7 @@ class Engine:
                 "at": event.get("ts"),
                 "summary": f"{note} {event.get('summary') or ''}".strip(),
                 "pending": data.get("pending"),
+                **_recommendation(data),
             }
         )
         with self._lock:
@@ -1353,12 +1459,29 @@ class Engine:
         """
         if name == "run":
             return None
-        waiting = self.project.pages(
-            kind="experiment", review="accepted", state=["approved", "queued", "running"]
-        )
-        if waiting:
+        if self._awaiting_run():
             return "run"
         return "analyze" if name != "analyze" and self._new_results() else None
+
+    def _awaiting_run(self) -> list[ResearchPage]:
+        """The accepted experiments a run phase is owed: approved, or left queued or
+        running by a worker that is gone."""
+        return self.project.pages(
+            kind="experiment", review="accepted", state=["approved", "queued", "running"]
+        )
+
+    def _comes_first(self, name: str) -> tuple[str, str | None]:
+        """Where a call that names no phase begins when ``name`` is the phase that is
+        next: ``(the phase it starts with, the phase that was next and stays so)``.
+
+        The second is ``None`` when the call starts with ``name`` itself, and also
+        before an analysis that is still to be finished: the run is then the round's
+        own or returns where the records say, and there is nothing to remember.
+        """
+        first = self._overdue(name)
+        if first is None:
+            return name, None
+        return first, (None if name in _RUNS else name)
 
     @staticmethod
     def _instruction_note(instruction: str, back: str) -> str:
@@ -1825,44 +1948,153 @@ class Engine:
         another one than the records imply (a file edited by hand).
         """
         round = self._state["round"]
-        if name == "intake":
-            return "research"
-        aside = self._return_phase() or back
-        if name == "run":
-            if outcome.ran or self._new_results():
-                return "analyze"
-            if aside is not None and not named:
-                # Nothing ran, so there is nothing to pause for: what could not be run
-                # is said at the checkpoint of the phase that was next.
-                return aside
-            self._checkpoint(name, round, aside or "run", told, notes)
-            return None
+        at_once, following = self._follows(name, ran=bool(outcome.ran), back=back, named=named)
+        if at_once is not None:
+            return at_once
         if name == "analyze" and len(told) < 2:
             # The run phase reports the experiments that are planned again where its
             # checkpoint is this one.  Here it did not report in this call (the analysis
             # was resumed after a stop, a failure or a spent budget, or was asked for by
             # itself), and what it said then went with that call: said from the pages.
             notes = [*notes, *self._planned_again()]
-        following = _NEXT[name]
-        if name == "analyze":
-            following = aside or following
-            notes = [*notes, *self._journal_note(round)]
-        self._checkpoint(name, round, following, told, notes)
+        recommending = self._recommending(round) if name == "analyze" else None
+        notes = [*notes, *self._journal_note(recommending)]
+        self._checkpoint(name, round, str(following), told, notes, recommends=recommending)
         return None
 
-    def _journal_note(self, round: int) -> list[str]:
-        """What the checkpoint repeats when the round's journal recommends more research.
+    def _follows(
+        self, name: str, *, ran: bool, back: str | None = None, named: bool = False
+    ) -> tuple[str | None, str | None]:
+        """What follows the phase ``name`` once it has completed: ``(the phase that
+        runs at once, None)``, or ``(None, the phase its checkpoint names as next)``
+        when the call pauses there.
 
-        ``next: research`` in the journal's front matter is the analyst's
-        recommendation and changes nothing about what runs next: which phase runs
-        is the person's to choose, and going back to the literature costs a session.
+        ``ran`` says whether the run phase executed an experiment; ``back`` and
+        ``named`` are those of :meth:`_after`.  This is the rule alone, without the
+        checkpoint: :meth:`_after` acts on it and :func:`next_step` foretells by it.
         """
-        asked = any(
-            str(page.meta.get("next") or "").strip().lower() == "research"
+        if name == "intake":
+            return "research", None
+        aside = self._return_phase() or back
+        if name == "run":
+            if ran or self._new_results():
+                return "analyze", None
+            if aside is not None and not named:
+                # Nothing ran, so there is nothing to pause for: what could not be run
+                # is said at the checkpoint of the phase that was next.
+                return aside, None
+            return None, aside or "run"
+        if name == "analyze":
+            return None, aside or _NEXT[name]
+        return None, _NEXT[name]
+
+    def _forecast(self) -> dict[str, Any]:
+        """What :meth:`advance` would do with no phase named, by its own rules; see
+        :func:`next_step`.  Changes this engine's state as the phases would, and
+        nothing on disk: only for an engine that reads (:meth:`_reading`)."""
+        self._settle_dead_worker()
+        waiting = [str(page.id or page.path) for page in self._awaiting_run()]
+        said: dict[str, Any] = {
+            "will_run": [],
+            "then": None,
+            "experiments": waiting,
+            "results": len(self._new_results()),
+            "checkpoint_of": None,
+            "needs_phase": False,
+        }
+        if self._position_unknown():
+            return {**said, "needs_phase": True}
+        owed = self._unsettled_phase()
+        name: str | None
+        if owed is None:
+            name = self._next_phase()
+        else:
+            # The pause a dead worker owed comes first, as in :meth:`_first_phase`: the
+            # checkpoint it had announced already, or the one that follows the phase.
+            said["checkpoint_of"] = owed
+            written = self._announced(self._events_of(self._state["phases"][-1]))
+            if written is not None:
+                return {**said, "then": self._next_of(written)}
+            name, said["then"] = self._follows(owed, ran=False)
+        back = None
+        if name:
+            name, back = self._comes_first(name)
+        while name and len(said["will_run"]) <= len(PHASES):
+            said["will_run"].append(name)
+            self._assume_completed(name)
+            name, said["then"] = self._follows(name, ran=name == "run" and bool(waiting), back=back)
+        return said
+
+    def _assume_completed(self, name: str) -> None:
+        """For a forecast: the records as :meth:`_run_phase` leaves them once the phase
+        ``name`` has run to its end (its record last, and completed)."""
+        round = self._round_for(name)
+        record = self._open_record(name, round) or self._new_record(name, round, None)
+        phases = self._state["phases"]
+        phases[:] = [known for known in phases if known is not record] + [record]
+        record["status"] = "completed"
+        self._state.update(round=round, phase=name)
+
+    def _recommending(self, round: int) -> ResearchPage | None:
+        """The journal page of the round whose recommendation of more research still
+        stands, the latest one when several do; ``None`` when none does.
+
+        ``next: research`` in a journal page's front matter is that recommendation.
+        A page the person rejected recommends nothing, and neither does one that
+        was written before the research phase last completed in the round: the
+        person followed it, and a later analysis of the round has no reason to say
+        it again unless its own journal page asks anew.
+        """
+        asking = [
+            page
             for page in self.project.pages(kind="journal", review=["accepted", "proposed"])
             if page.round == round
-        )
-        if not asked:
+            and str(page.meta.get("next") or "").strip().lower() == "research"
+            and not self._researched_since(page)
+        ]
+        return max(asking, key=lambda page: (page.created, page.path), default=None)
+
+    def _researched_since(self, page: ResearchPage) -> bool:
+        """Whether a research phase of the page's round completed after ``page`` was
+        written.
+
+        The phase records are in the order the phases ran, and each lists what it
+        produced: a page of an analysis is told by the place of that analysis among
+        them.  A page that is in no record (the person wrote it) is told by its
+        stamp, and counts as written after a phase that ended in the same second.
+        """
+        phases = self._state["phases"]
+        done = [
+            index
+            for index, record in enumerate(phases)
+            if record.get("phase") == "research"
+            and record.get("round") == page.round
+            and record.get("status") == "completed"
+        ]
+        if not done:
+            return False
+        latest = done[-1]
+
+        def wrote(record: Mapping[str, Any]) -> bool:
+            produced = record.get("produced")
+            return isinstance(produced, list) and page.path in produced
+
+        if any(wrote(record) for record in phases[latest + 1 :]):
+            return False
+        if any(wrote(record) for record in phases[:latest]):
+            return True
+        written, finished = parse_stamp(page.created), parse_stamp(phases[latest].get("finished"))
+        return written is not None and finished is not None and written < finished
+
+    def _journal_note(self, recommending: ResearchPage | None) -> list[str]:
+        """What the checkpoint of an analysis repeats when a journal page of the round
+        recommends more research (``recommending``, from :meth:`_recommending`).
+
+        The recommendation is the analyst's and changes nothing about what runs
+        next: which phase runs is the person's to choose, and going back to the
+        literature costs a session.
+        """
+        if recommending is None:
             return []
         return [
             "The journal page of this round recommends another look at the literature "
@@ -1881,6 +2113,7 @@ class Engine:
         notes: Sequence[str],
         *,
         budget_said: bool = False,
+        recommends: ResearchPage | None = None,
     ) -> None:
         """Pause for the person: say what was done, what needs their eye, what comes next.
 
@@ -1889,7 +2122,15 @@ class Engine:
         beyond that.  The state keeps the whole account, the event the part that is
         new to the feed.  A model budget that the work has passed is said here too,
         unless ``notes`` already say it (``budget_said``).
+
+        ``recommends`` is the journal page that recommends more research before the
+        phase that is next (:meth:`_recommending`).  ``notes`` say so in a sentence;
+        the checkpoint and its event also carry it as ``recommends`` and
+        ``recommends_page``, for whoever shows the choice beside the recommendation.
         """
+        recommended = (
+            {"recommends": "research", "recommends_page": recommends.path} if recommends else {}
+        )
         if not budget_said:
             notes = [*notes, *self._overrun_note(name)]
         pending = self.project.counts()["pending"]
@@ -1915,7 +2156,12 @@ class Engine:
             phase=name,
             round=round,
             refs=refs,
-            data={"pending": pending["by_kind"], "edits": pending["proposals"], "next": following},
+            data={
+                "pending": pending["by_kind"],
+                "edits": pending["proposals"],
+                "next": following,
+                **recommended,
+            },
         )
         with self._lock:
             self._state.update(
@@ -1932,6 +2178,7 @@ class Engine:
                         part.strip() for part in [*told, *closing] if part and part.strip()
                     ),
                     "pending": dict(pending["by_kind"]),
+                    **_recommendation(recommended),
                 },
             )
             self._save()

@@ -1,13 +1,13 @@
 /* What the person can do: one table of actions (the `data-act` attributes of the markup),
    one handler each for clicks, submits, typing, changes, drops and keys. */
 
-import { VIEWS, app, codeKey, go, keepRested, link, reasonsKey, requestForKey, requestKey, select } from './core.js';
+import { VIEWS, app, askHealth, codeKey, go, link, reasonsKey, requestForKey, requestKey, select } from './core.js';
 import { api, connection, Unreachable } from './api.js';
-import { $, $$, ago, bytes, cap, cutoffFrom, cutoffParts, cutoffWords, lineDiff, plain, plural, storage } from './util.js';
+import { $, $$, ago, bytes, cap, cutoffFrom, cutoffParts, cutoffWords, lineDiff, listOf, plain, plural, storage } from './util.js';
 import { STAGES, EXTRA_KINDS, PHASE_DO, ROLE, agentName, phaseName, roleName } from './vocab.js';
 import { dropDraft, isDirty, label, schedulePreview, touchDraft } from './page.js';
 import { mapView } from './map.js';
-import { currentItem } from './inbox.js';
+import { currentItem, editCheck } from './inbox.js';
 import { EXAMPLE, clearComposer, composer, composerReady, composerSettings, keepComposer, loadDoctor, loadLibrary, totalSize } from './home.js';
 import { clearToast, closeOverlay, openHelp, openNewPage, openPalette, overlayOpen, renderToast, say, sayError, trapTab } from './overlays.js';
 import { dismissNotices, theme } from './shell.js';
@@ -86,11 +86,10 @@ async function flush(entries) {
     out.results.forEach((result, i) => { if (result.ok && result.worker_error) sayError(cap(entries[i].label) + ' is accepted and approved, but the run could not start now: ' + plain(result.worker_error.message) + ' It runs when you continue.'); });
     out.failed.forEach((failure) => { const page = failure.entry.item && failure.entry.item.page; if (page && page.kind === 'experiment' && page.id) s.invalidateExperiment(page.id); });   // its code may be what changed: read it again
     /* an experiment was rejected: the server says what rests on it (the findings based on its
-       runs, the verdicts they carry). Kept for its page, which lists it with links, and said. */
+       runs, the verdicts they carry). Said here; its page lists it with links, from the server. */
     out.results.forEach((result, i) => {
       const deps = result.ok && result.dependents, entry = entries[i];
       if (!deps || !entry) return;
-      keepRested(s, entry.target, deps);
       if (!out.failed.length && restCount(deps)) say(restSentence(entry.label, deps), { ms: 12000, action: { href: link({ view: 'experiments', sel: entry.target, sub: '' }), label: 'Show' } });
     });
     app.render('decided');
@@ -139,22 +138,27 @@ function decide(ref, decision, options) {
   delete app.ui.checked[ref];
   if (options.immediate) { app.render('decide'); return flush([entry]); }
   later([entry], decision);
-  say(describe([entry], decision), { undo: [entry], note: earlier() });
+  say(describe([entry], decision) + (options.also ? ' ' + options.also : ''), { undo: [entry], note: earlier() });
   if (next !== undefined && next !== app.route.sel) go({ sel: next, sub: '' }, true); else app.render('decide');
   return entry;
 }
 function bulk(decision, reason) {
   const s = store(), refs = Object.keys(app.ui.checked || {});
   const batch = ++batchCounter;
-  const entries = refs.map((ref) => entryFor(ref, decision, { batch, reason })).filter(Boolean);
-  if (!entries.length) return;
+  const all = refs.map((ref) => entryFor(ref, decision, { batch, reason })).filter(Boolean);
+  /* an edit to a finding whose numbers the list could not check is not accepted unread with the rest */
+  const unread = decision === 'accept' ? all.filter((entry) => { const check = editCheck(entry.item); return check && !check.checked; }) : [];
+  const entries = all.filter((entry) => unread.indexOf(entry) < 0);
+  const left = unread.length ? ' ' + (unread.length === 1 ? cap(unread[0].label) + ' was left' : plural(unread.length, 'suggested edit') + ' to findings were left') + ': the numbers ' + (unread.length === 1 ? 'it' : 'they') + ' would bring were not checked in the list. Open ' + (unread.length === 1 ? 'it' : 'each') + ' to read the check, then decide.' : '';
+  if (!entries.length) { if (left) { say(left.trim()); app.render('bulk'); } return; }
   entries.forEach((entry) => s.decide(entry));
   app.ui.checked = {};
   app.ui.rejecting = null;
   delete app.ui.reasons.bulk;
   keepReasons();
   later(entries, decision);
-  say(describe(entries, decision), { undo: entries, note: earlier() });
+  const brought = decision === 'accept' ? entries.map((entry) => brings(entry.label, editCheck(entry.item))).filter(Boolean).join(' ') : '';
+  say(describe(entries, decision) + (brought ? ' ' + brought : '') + left, { undo: entries, note: earlier() });
   if (app.route.view === 'inbox') go({ sel: '', sub: '' }, true); else app.render('bulk');
 }
 function undo() {
@@ -174,6 +178,34 @@ function undo() {
   else say(took + ' Nothing was sent.');
   app.render('undo');
   return true;
+}
+
+/* ---------- a suggested edit to a finding, decided where it is listed ---------- */
+/** What an accepted edit brings into a finding, where the server's check of the text as it
+    would read found numbers on no record: "It brings 73.25, which was found in no record." */
+function brings(name, check) {
+  if (!check || !check.checked || !check.missing.length) return '';
+  const n = check.missing.length, shown = check.missing.slice(0, 4);
+  return cap(name) + ' brings ' + listOf(shown) + (n > shown.length ? ' and ' + (n - shown.length) + ' more' : '') + ', which ' + (n === 1 ? 'was' : 'were') + ' found in no run record, source or file of yours.';
+}
+/** Accept from a list or from the map, away from the edit's own note. The rows of the
+    proposals carry what the number check found for an edit to a finding. An edit whose check
+    the list does not have is opened first, with the check beside it; one that brings a
+    number found nowhere is opened first as well where no mark beside the button says so
+    (the map); in a list that marks it, the accept goes through and says what it brings. */
+function quickAccept(el) {
+  const ref = el.dataset.ref, item = store().pending().find((it) => it.ref === ref);
+  const check = editCheck(item);
+  const beside = !!(el.closest && el.closest('.review-change'));          // the note itself: its check is on screen
+  const marked = !!(el.closest && el.closest('.in-row, .ov-item'));       // a row that carries the mark
+  if (check && !beside && (!check.checked || (check.missing.length && !marked))) {
+    const r = app.route, view = r.view === 'map' ? 'map' : 'inbox';
+    go({ view, sel: item.page.path, sub: '' });
+    say(check.checked ? cap(label(item.page)) + ': the suggested edit brings ' + listOf(check.missing.slice(0, 4)) + ', found in no record. It is open beside the text with its number check; decide there.'
+      : 'The numbers this edit to ' + label(item.page) + ' would bring were not checked in the list. It is open with its number check; decide there.', { ms: 9000 });
+    return null;
+  }
+  return decide(ref, 'accept', check && !beside ? { also: brings('it', check) } : {});
 }
 
 /** How much rests on a rejected experiment, as the server counted it. */
@@ -203,7 +235,6 @@ async function rejectAccepted(path, reason) {
     if (!result.ok) sayError(result.status === 409 ? cap(label(page)) + ' changed after you read it, so it was not rejected. It is shown as it is now.' : cap(label(page)) + ' was not rejected: ' + plain((result.error && result.error.message) || 'the server refused it.'));
     else {
       const deps = result.dependents;
-      if (deps) keepRested(s, path, deps);
       /* the page in front of the person now says that it is rejected, and lists what rests on it with links */
       say(restCount(deps) ? restSentence(label(page), deps) : 'Rejected ' + label(page) + ' after all. It is kept with your reason.', { ms: 12000 });
     }
@@ -479,7 +510,7 @@ function selectInContext(path) {
 
 /* ---------- the table of actions ---------- */
 const ACT = {
-  accept: (el) => decide(el.dataset.ref, 'accept'),
+  accept: (el) => quickAccept(el),
   'accept-run': (el) => acceptAndRun(el.dataset.ref),
   reaccept: async (el) => {
     const s = store(), page = s.byPath.get(el.dataset.ref);
@@ -569,7 +600,7 @@ const ACT = {
   theme: () => theme.toggle(),
   palette: () => openPalette(), help: () => openHelp(), 'overlay-x': () => closeOverlay(),
   undo: () => undo(), 'toast-x': () => clearToast(), 'toast-x-follow': () => clearToast(),
-  'retry-connection': () => { api.health().then(() => { if (store()) store().refreshNow(); app.render('online'); }, () => {}); },
+  'retry-connection': () => { askHealth().then(() => { if (store()) store().refreshNow(); app.render('online'); }, () => {}); },
   'start-example': () => { const s = composer(); s.text = EXAMPLE; keepComposer(); app.render('ui'); const t = $('#idea-text'); if (t) t.focus(); },
   'file-add': () => { const input = $('#file-input'); if (input) input.click(); },
   'file-del': (el) => { const s = composer(); s.files.splice(+el.dataset.i, 1); keepComposer(); app.render('ui'); },
@@ -583,7 +614,7 @@ const ACT = {
     const s = store();
     try { await api.deleteRequest(s.pid, el.dataset.ref); await s.refreshNow(); say('The instruction is withdrawn. No further phase is given it.'); }
     catch (error) {
-      /* withdrawn already (in another window: that writes no event): the list is read again, and the row goes */
+      /* withdrawn already, in another window, a moment before the event of that reached this one: the list is read again, and the row goes */
       await s.refreshNow();
       if (error.status === 404 && !s.requests.some((r) => r.id === el.dataset.ref)) say('That instruction was withdrawn already. No further phase is given it.');
       else sayError('Not withdrawn: ' + message(error));
@@ -613,12 +644,34 @@ const ACT = {
     delete app.ui.starting[eid];
     app.render('run');
   },
+  /* Take an approval back, or cancel a run: which of the two the press does is what the
+     button said (`data-does`, the server's `cancel_does`), and the server is told so: it
+     does that or nothing. What happened is said in the server's own sentence. */
   'cancel-run': async (el) => {
     const s = store(), eid = el.dataset.eid;
-    const row = s.expById.get(eid) || {};
-    const waiting = ['approved', 'queued'].indexOf(row.state) >= 0;   // approved, not started: the approval is taken back
-    try { await api.cancel(s.pid, eid); say(waiting ? eid + ' will not run: its approval is taken back. Approve it again when you want it run.' : row.interrupted ? 'The interrupted run of ' + eid + ' is cancelled. Approve it again when you want it run.' : 'Cancelling the run of ' + eid + '. It is recorded as cancelled.'); s.invalidateExperiment(eid); s.refresh(); }
-    catch (error) { sayError('Not cancelled: ' + message(error)); }
+    const told = el.dataset.does === 'withdraw' || el.dataset.does === 'cancel' ? el.dataset.does : null;
+    if (app.ui.cancelling[eid]) return;
+    app.ui.cancelling[eid] = true;
+    app.render('cancel');
+    try {
+      const answer = await api.cancel(s.pid, eid, told);
+      s.invalidateExperiment(eid);
+      await s.refreshNow();
+      say(plain((answer && answer.message) || '') || (told === 'withdraw' ? 'The approval of ' + eid + ' is taken back.' : 'The server was asked to cancel ' + eid + '.'));
+    } catch (error) {
+      /* 409: the experiment moved on since the button was drawn, and nothing was done. The
+         server says what it is now; the page is read again and its button says what a press does now. */
+      s.invalidateExperiment(eid);
+      await s.refreshNow().catch(() => {});
+      sayError(error.status === 409 ? error.message : (told === 'withdraw' ? 'The approval of ' + eid + ' was not taken back: ' : eid + ' was not cancelled: ') + message(error));
+    }
+    delete app.ui.cancelling[eid];
+    app.render('cancel');
+    /* the button is gone with what it did: the keyboard goes to what can be done now */
+    if (!document.activeElement || document.activeElement === document.body) {
+      const next = $('#approve [data-act="approve"]:not([disabled]), .run-live [data-act="cancel-run"], .callout [data-act="cancel-run"], .callout [data-act="reapprove"], .exp-runs [data-act="reapprove"], .exp-page [data-act="edit"]');
+      if (next) next.focus({ preventScroll: true });
+    }
   },
   'show-run': (el) => { const eid = el.dataset.eid, n = +el.dataset.run; const s = store(), entry = s.exps.get(eid); const runs = ((entry && entry.data && entry.data.runs) || []).slice().sort((a, b) => b.number - a.number); const now = app.ui.runOpen[eid] === undefined ? (runs[0] && runs[0].status !== 'running' ? runs[0].number : null) : app.ui.runOpen[eid]; app.ui.runOpen[eid] = now === n ? null : n; app.render('ui'); },
   'code-tab': (el) => { app.ui.codeTab[el.dataset.eid] = el.dataset.name; app.render('ui'); },

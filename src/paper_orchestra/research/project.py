@@ -131,6 +131,20 @@ REQUESTS_DIR = "requests"
 EXPERIMENTS_DIR = "experiments"
 PAPER_DIR = "paper"
 LOCK_FILE = ".project.lock"
+#: The event of a request the person withdrew (:meth:`Project.delete_request`).
+REQUEST_WITHDRAWN = "request.withdrawn"
+
+
+def _event_types() -> tuple[str, ...]:
+    """The types of event the stream takes: those ``model.EVENT_TYPES`` lists, with the
+    withdrawal of a request next to its creation where that list does not name it."""
+    types = list(EVENT_TYPES)
+    if REQUEST_WITHDRAWN not in types:
+        types.insert(types.index("request.created") + 1, REQUEST_WITHDRAWN)
+    return tuple(types)
+
+
+_EVENT_TYPES = _event_types()
 
 #: Sections only pipeline code writes.  The wiki layer refuses a model session's write
 #: to them whatever backend the session came through.
@@ -2755,10 +2769,33 @@ class Project:
         self.note_request(request_id, round=round, phase=phase, close=True)
 
     def delete_request(self, request_id: str) -> None:
-        """Withdraw a request the person no longer wants handled."""
+        """Withdraw a request the person no longer wants handled.
+
+        Its file is removed and one ``request.withdrawn`` event says so, as leaving it
+        was an event: whoever follows the project (another window of the app, the
+        activity feed) learns that it is gone.  ``NotFound`` when there is no such
+        request; nothing is said then.
+        """
         with self._lock:
             request = self._request(request_id)
             self._request_path(request.id).unlink(missing_ok=True)
+            whom = "the agents" if request.role == FOR_ALL else f"the {request.role}"
+            self.emit(
+                REQUEST_WITHDRAWN,
+                _sentence(f"You withdrew your request to {whom}: {_clip(request.text, 160)}"),
+                refs=[
+                    f"{REQUESTS_DIR}/{request.id}.json",
+                    *([request.target] if request.target else []),
+                ],
+                data={
+                    "request": request.id,
+                    "target": request.target,
+                    "for": request.role,
+                    # Whether a phase was still to be given it ("open") or had closed it.
+                    "state": request.state,
+                    "by": HUMAN,
+                },
+            )
 
     # -- events ------------------------------------------------------------------
 
@@ -2809,9 +2846,9 @@ class Project:
         ``events.jsonl`` that is a symbolic link (or anything else) is refused
         with ``ProjectError``.
         """
-        if type not in EVENT_TYPES:
+        if type not in _EVENT_TYPES:
             raise ProjectError(
-                f"{type!r} is not an event type; the types are: {', '.join(EVENT_TYPES)}."
+                f"{type!r} is not an event type; the types are: {', '.join(_EVENT_TYPES)}."
             )
         path = self.root / EVENTS_FILE
         secrets_known = self._secrets()
@@ -3099,11 +3136,16 @@ class Project:
         """What to say when the engine's ``state.json`` is missing, cannot be read or
         holds no record of a phase although phases have run (their events are on file);
         ``None`` otherwise.  Such a project is not "not started"."""
-        state = _read_json(self.root / STATE_FILE)
+        # Only ordinary files are opened: a named pipe in their place would wait for a
+        # writer that never comes, and a project directory can come from anywhere.
+        state_file, events_file = self.root / STATE_FILE, self.root / EVENTS_FILE
+        state = _read_json(state_file) if state_file.is_file() else None
         if isinstance(state, dict) and isinstance(state.get("phases"), list) and state["phases"]:
             return None
         try:
-            with (self.root / EVENTS_FILE).open("rb") as handle:
+            if not events_file.is_file():
+                raise OSError("not an ordinary file")
+            with events_file.open("rb") as handle:
                 ran = any(
                     b'"type": "phase.' in line or b'"type": "checkpoint"' in line for line in handle
                 )
@@ -3130,7 +3172,8 @@ class Project:
         found = [{"path": PROJECT_FILE, "message": message} for message in self._file_problems]
         lost = self.state_lost()
         if lost:
-            found.append({"path": STATE_FILE, "message": lost})
+            # The entry names its file already; the message goes on from there.
+            found.append({"path": STATE_FILE, "message": lost.removeprefix(f"{STATE_FILE} ")})
         pages = self._all_pages()
         resolver = _Resolver(self.wiki, pages)
         if IDEA_PATH not in resolver.pages:

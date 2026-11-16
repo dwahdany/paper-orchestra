@@ -70,7 +70,8 @@ export const api = {
   health: () => request('GET', '/api/health'),
   doctor: () => request('GET', '/api/doctor'),
   templates: () => request('GET', '/api/templates'),
-  /** What a new project starts with (`settings`), the phases in order, and whom a request can be for. */
+  /** What a new project starts with (`settings`), the phases in order, whom a request can be
+      for, and the values the settings for model effort and compute accept. */
   defaults: () => request('GET', '/api/defaults'),
   render: (markdown, pid, path, signal) => request('POST', '/api/render', { markdown, project: pid || null, path: path || null }, { signal }),
 
@@ -107,7 +108,11 @@ export const api = {
   putCode: (pid, eid, name, text) => request('PUT', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/code/' + pathOf(name), { text }),
   approve: (pid, eid, body) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/approve', body || {}),
   run: (pid, eid) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/run'),
-  cancel: (pid, eid) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/cancel'),
+  /** Take back the approval of an experiment that has not started, or cancel its run: the
+      server does what `cancel_does` of the experiment says. `expect` is what the person was
+      told the press does (`withdraw` or `cancel`): when the experiment has moved on and the
+      press would do the other, nothing is done and the answer is a 409 that says so. */
+  cancel: (pid, eid, expect) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/cancel', expect ? { expect } : undefined),
   runRecord: (pid, eid, number) => request('GET', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/runs/' + number),
   runLog: (pid, eid, number, offset) => request('GET', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/runs/' + number + '/log' + query({ offset })),
   fileUrl: (pid, path, download) => project(pid) + '/files/' + pathOf(path) + (download ? '?download=1' : ''),

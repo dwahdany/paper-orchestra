@@ -1154,6 +1154,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "review.decided",
     "proposal.created",
     "request.created",
+    "request.withdrawn",
     "agent.activity",
     "experiment.state",
     "run.started",

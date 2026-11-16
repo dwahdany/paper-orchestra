@@ -307,3 +307,98 @@ def test_the_stylesheet_covers_what_the_repairs_brought():
         ".paper-left",
     ):
         assert selector in css, f"the stylesheet has no rule for {selector}"
+
+
+def _js(name: str) -> str:
+    return _text(STATIC_DIR / "js" / name)
+
+
+def test_the_client_shows_what_the_server_says_and_keeps_no_copy_of_its_rules():
+    """What the server says about a project, the client shows; what it kept only because
+    the server did not say it is gone: the copy of the engine's rule for what a press of
+    Continue does, the pattern that found the analyst's recommendation in a sentence, the
+    guess that a state is lost, what rests on a rejected experiment kept on the device, and
+    the lists of efforts and backends."""
+    shell, store = _js("shell.js"), _js("store.js")
+    # What a press of Continue does is the server's `next_step`, not worked out from the
+    # list of experiments and the results nobody has analysed.
+    assert "next_step" in shell, "the main button is not labelled from the server's next_step"
+    for mirrored in (".analysed", "x.state === 'approved' || x.state === 'queued'"):
+        assert mirrored not in shell, f"shell.js still works out what Continue does: {mirrored}"
+    # The analyst's recommendation is a field of the checkpoint, not a sentence to find.
+    assert "recommends_page" in shell and ".recommends" in shell
+    for source in (shell, _js("overview.js")):
+        assert "journal page of this round recommends[" not in source, (
+            "the recommendation is still looked for in the checkpoint's sentence"
+        )
+    # Where a project stands is the engine's reading, with what is wrong said beside it.
+    assert "state_problem" in shell and "state_source" in shell
+    assert "path === 'state.json'" not in shell, "a lost state is still guessed from the problems"
+    assert "state_problem" in store, "the state that arrives with the stream loses its problem"
+    home = _js("home.js")
+    assert "state_source" in home, "the library row does not say where a project's state is from"
+    # What rests on a rejected experiment comes with the experiment, from the server.
+    core = _js("core.js")
+    for kept in ("keepRested", "restedOf", "restedKey"):
+        assert not any(kept in _text(path) for path in _files(".js")), (
+            f"what rests on a rejected experiment is still kept on the device ({kept})"
+        )
+    # (What an earlier version kept there is removed when a project opens, and never read.)
+    assert (
+        "ui.rested" not in core
+        and "rested: {}" not in core
+        and "storage.get('po-rested" not in core
+    )
+    assert ".dependents" in _js("page.js")
+    # The efforts and the compute backends a setting accepts are the server's lists.
+    assert "efforts" in home and "compute_backends" in home
+    for copied in ("['xhigh', 'extra high']", "['modal', 'Modal sandboxes']", "['low', 'low']"):
+        assert copied not in home, f"the composer carries a list of its own: {copied}"
+
+
+def test_the_client_says_what_the_server_said_happened():
+    """Taking an approval back, how a write-up ended, what ends with the server and how
+    many problems a project has are said in the server's words or from its fields."""
+    api, actions = _js("api.js"), _js("actions.js")
+    # Cancel says what the person was told it does, and shows the server's sentence.
+    assert "{ expect }" in api, "a cancel does not say what the person was told it does"
+    assert "will not run: its approval is taken back" not in actions
+    assert "answer.message" in actions
+    experiments = _js("experiments.js")
+    assert "cancel_does" in experiments and "Take the approval back" in experiments
+    assert "data-does" in experiments
+    # How the last write-up went is `last` of GET /paper, not the server's memory of a
+    # worker and the tail of its log.
+    paper = _js("paper.js")
+    assert "paper.last" in paper
+    for gone in ("last_exit", "workerLog", "x.type === 'paper.started'"):
+        assert gone not in paper, f"the paper view still reads {gone}"
+    # A write-up whose worker was killed left a state that still reads as running: how it
+    # ended is the server's account (it carries the worker's exit code), and is shown.
+    assert "last.exit_code" in paper, "the server's account of a write-up's end is not shown"
+    shell = _js("shell.js")
+    assert "stops_workers_on_exit" in shell
+    assert "unless it was started to stop them" not in shell
+    assert "problems_total" in shell and "50 or more" not in shell
+    # A withdrawn request is an event: the list of requests is read again when it arrives.
+    assert re.search(r"request\\\.\(created\|withdrawn\)", _js("store.js")), (
+        "request.withdrawn is not among the events that make the lists be read again"
+    )
+    # The quick accept of a suggested edit to a finding knows what the number check found.
+    assert "number_report" in _js("inbox.js")
+    # An interrupted run is drawn as that wherever the page has a mark.
+    vocab = _js("vocab.js")
+    assert "interrupted: 'halt'" in vocab and "shownState" in vocab
+
+
+def test_the_stylesheet_covers_what_the_seams_brought():
+    css = _text(STATIC_DIR / "css" / "app.css")
+    for selector in (
+        ".gl.t-halt",
+        ".tag-state.t-halt",
+        ".go-warn",
+        ".go-pick",
+        ".in-flag",
+        ".paper-last",
+    ):
+        assert selector in css, f"the stylesheet has no rule for {selector}"

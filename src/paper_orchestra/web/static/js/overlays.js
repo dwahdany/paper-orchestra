@@ -76,7 +76,8 @@ function commands() {
     else {
       /* what a press of the main button does, and the phases that can be chosen in its place */
       const step = nextStep(store, e);
-      add(step.label, step.href ? 'opens Experiments' : 'runs up to the next checkpoint', () => (step.href ? go(step.href) : app.act('continue')));
+      /* (where a phase has to be named before anything goes on, only the phases are offered) */
+      if (!step.pick && !step.blocked) add(step.label, step.href ? 'opens Experiments' : 'runs up to the next checkpoint', () => (step.href ? go(step.href) : app.act('continue')));
       phaseChoices(store, e, step).forEach((c) => add(c.title, 'a phase of your choice', () => app.act('continue-phase', { dataset: { phase: c.phase } })));
     }
     add('New page', 'a page of your own', () => app.act('new-page'));

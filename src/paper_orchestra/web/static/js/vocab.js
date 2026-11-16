@@ -27,10 +27,16 @@ export const kindName = (kind, many) => (KIND[kind] ? (many ? KIND[kind].many : 
 export const TONE = {
   open: 'open', planned: 'open', approved: 'ready', queued: 'ready',
   testing: 'live', running: 'live',
+  /* a run whose worker is gone: the page says "running", nothing runs it, and it waits for the person */
+  interrupted: 'halt',
   supported: 'pos', succeeded: 'pos', answered: 'pos',
   refuted: 'neg', failed: 'neg',
   inconclusive: 'void', dropped: 'void', cancelled: 'void',
 };
+/** The state a mark and a word show for a page: what the page says, except for an experiment
+    whose run was interrupted. The server marks such a page wherever it lists it
+    (`interrupted`); its file still says "running", and the mark must not. */
+export const shownState = (page) => (page && page.kind === 'experiment' && page.state === 'running' && page.interrupted ? 'interrupted' : (page && page.state) || '');
 export const STATES = {
   question: ['open', 'answered', 'dropped'],
   hypothesis: ['open', 'testing', 'supported', 'refuted', 'inconclusive', 'dropped'],
@@ -76,6 +82,13 @@ export const ROLE = {
   analyst: { pick: 'The agent that analyses the results (analyst)', name: 'the analyst', phase: 'analyze' },
 };
 export const roleName = (role) => (ROLE[role] ? ROLE[role].name : role ? 'the ' + role : 'everyone');
+/** The values two settings accept come from the server (`efforts` and `compute_backends` of
+    /api/defaults); these are the words for the ones this interface knows. A value it does
+    not know is offered under its own name. */
+export const EFFORT_NAME = { xhigh: 'extra high' };
+export const effortName = (effort) => EFFORT_NAME[effort] || String(effort || '');
+export const COMPUTE_NAME = { local: ['This machine (local CPU)', 'this machine'], modal: ['Modal sandboxes', 'Modal sandboxes'] };
+export const computeName = (backend, short) => (COMPUTE_NAME[backend] ? COMPUTE_NAME[backend][short ? 1 : 0] : String(backend || ''));
 
 export const agentName = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : String(author || '').replace(/^agent:/, '') || 'engine');
 
@@ -115,6 +128,7 @@ export function glyphInner(kind, review, state, options) {
       const k = small ? 2.1 : 2.7;
       mark = `<path class="g-m" d="M${-k} ${-k + dy} ${k} ${k + dy}M${k} ${-k + dy} ${-k} ${k + dy}"/>`;
     } else if (tone === 'ready') mark = '<circle class="g-dot" r="2"/>';
+    else if (tone === 'halt') mark = `<path class="g-m" d="M-1.9 ${-2.7 + dy}v5.4M1.9 ${-2.7 + dy}v5.4"/>`;
     else if (tone === 'void') mark = '<path class="g-m" d="M-3 0h6"/>';
   }
   if (review === 'rejected') mark += '<path class="g-strike" d="M-9.5 8 9.5-8"/>';
@@ -127,7 +141,7 @@ export function glyph(kind, review, state, size) {
   const z = +size || 18;
   return raw(`<svg class="glyph" width="${z}" height="${z}" viewBox="-10 -10 20 20" aria-hidden="true">${glyphInner(kind, review, state)}</svg>`);
 }
-export const pageGlyph = (page, size) => glyph(page.kind, page.review, page.state, size);
+export const pageGlyph = (page, size) => glyph(page.kind, page.review, shownState(page), size);
 
 /* ---------- icons (16px, 1.5 stroke) ---------- */
 const ICONS = {

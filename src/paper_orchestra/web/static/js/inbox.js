@@ -1,13 +1,40 @@
 /* The inbox: everything that waits for a decision, with the proposal beside it. */
 
 import { app, link } from './core.js';
-import { ago, html, raw, setHTML, tf } from './util.js';
-import { KIND, STAGES, agentName, glyph, icon, kindName } from './vocab.js';
+import { ago, html, plural, raw, setHTML, tf } from './util.js';
+import { KIND, STAGES, agentName, glyph, icon, kindName, shownState } from './vocab.js';
 import { afterRender, pageName, panelHTML, proposalWhat } from './page.js';
 import { continueControl, engineView } from './shell.js';
 
 export const whatOf = (item) => (item.type === 'page' ? 'New ' + kindName(item.kind).toLowerCase() : proposalWhat(item.prop, item.page));
 export const summaryOf = (item) => (item.type === 'edit' ? item.prop.summary : item.page.summary && item.page.summary !== item.page.title ? item.page.summary : '');
+
+/** What the listing knows of the number check of a suggested edit to a finding. The rows of
+    GET .../proposals carry it for such an edit (`number_report`: the check of the finding as
+    it would read with the edit applied), so that the edit can be judged where it is listed:
+    `null` for anything else; `{checked: false}` where the listing has no report (it spends a
+    bounded time on them, or the check failed: the edit's own view shows it); otherwise
+    `{checked: true, missing}`, the numbers that were found on no record. */
+export function editCheck(item) {
+  if (!item || item.type !== 'edit' || !item.prop || item.prop.number_report === undefined) return null;
+  const report = item.prop.number_report;
+  if (!report || typeof report !== 'object') return { checked: false, missing: [] };
+  return { checked: true, missing: (Array.isArray(report.unverified) ? report.unverified : []).map(String) };
+}
+/** The mark a row carries for it: quiet when every number was found, said when not. */
+export function checkMark(item) {
+  const check = editCheck(item);
+  if (!check || (check.checked && !check.missing.length)) return '';
+  if (!check.checked) return html`<span class="in-flag" data-numbers="unchecked" data-tip="The numbers this edit would bring were not checked in this list. Open it: the check stands beside the text.">${icon('warn')}numbers not checked here</span>`;
+  return html`<span class="in-flag" data-numbers="unverified" data-tip="With this edit the finding would name ${check.missing.slice(0, 6).join(', ')}${check.missing.length > 6 ? ' and more' : ''}: found in no run record, source or file of yours">${icon('warn')}${plural(check.missing.length, 'number')} not found</span>`;
+}
+/** What the quick accept of a row says it does. */
+export function acceptTip(item, key) {
+  const check = editCheck(item), k = key ? ' (A)' : '';
+  if (check && !check.checked) return 'Open it first: its numbers were not checked in this list';
+  if (check && check.missing.length) return 'Accept' + k + ': it brings ' + plural(check.missing.length, 'number') + ' found in no record';
+  return 'Accept' + k;
+}
 
 /** The item the inbox is on: the one about the selected page, or the first. */
 export function currentItem(store, route) {
@@ -31,10 +58,10 @@ export const inboxView = {
         return html`<div class="in-row${on ? ' cur' : ''}" data-ref="${it.ref}">
           <label class="in-check"><input type="checkbox" data-check="${it.ref}"${checked[it.ref] ? raw(' checked') : ''} aria-label="Select ${it.page.id || it.page.title}"></label>
           <a class="in-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}"${on ? raw(' aria-current="true"') : ''}>
-            <span class="in-name">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', it.page.state, 18)}${pageName(it.page)}</span>
+            <span class="in-name">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', shownState(it.page), 18)}${pageName(it.page)}</span>
             ${sum ? html`<span class="in-sum">${sum}</span>` : ''}
-            <span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)}${it.round ? ', round ' + it.round : ''} · ${ago(it.when)}</span></a>
-          <span class="in-quick"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="Accept (A)" aria-label="Accept">${icon('check')}</button>
+            <span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)}${it.round ? ', round ' + it.round : ''} · ${ago(it.when)}</span>${checkMark(it)}</a>
+          <span class="in-quick"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="${acceptTip(it, true)}" aria-label="${acceptTip(it)}">${icon('check')}</button>
             <button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-tip="Reject, with a reason (R)" aria-label="Reject">${icon('x')}</button></span></div>`;
       })}</div>`;
     });

@@ -29,6 +29,8 @@ from paper_orchestra.research.engine import (
     EngineError,
     WorkerBusy,
     as_worker,
+    next_step,
+    phase_in_words,
     read_state,
     worker_alive,
 )
@@ -469,7 +471,16 @@ def test_state_json_has_exactly_the_documented_shape(project, team, backend):
     state = json.loads((project.root / "state.json").read_text())
 
     assert set(state) == STATE_KEYS and state["schema"] == 1
-    assert set(state["checkpoint"]) == {"round", "phase", "at", "summary", "pending"}
+    assert set(state["checkpoint"]) == {
+        "round",
+        "phase",
+        "at",
+        "summary",
+        "pending",
+        "recommends",
+        "recommends_page",
+    }
+    assert state["checkpoint"]["recommends"] is None  # only an analysis recommends anything
     assert set(state["spent"]) == {"model_usd", "experiment_seconds", "experiment_usd"}
     for record in state["phases"]:
         assert set(record) == PHASE_KEYS
@@ -2121,10 +2132,26 @@ def test_the_journal_recommends_more_research_and_the_checkpoint_repeats_it(proj
     assert "research advance" in summary and "--phase research" in summary
     assert summary.endswith("Next: proposing hypotheses from what you accepted.")
     assert events(project, "checkpoint")[-1]["data"]["next"] == "hypothesize"
+    # The same as a field, for whoever shows the checkpoint: nobody has to find it in the
+    # sentence.  The event carries it too, so a state rebuilt from the events still has it.
+    journal = "wiki/journal/round-1.md"
+    assert (state["checkpoint"]["recommends"], state["checkpoint"]["recommends_page"]) == (
+        "research",
+        journal,
+    )
+    said = events(project, "checkpoint")[-1]["data"]
+    assert (said["recommends"], said["recommends_page"]) == ("research", journal)
+    assert "recommends" not in events(project, "checkpoint")[0]["data"]
+    (project.root / "state.json").unlink()
+    rebuilt = read_state(project)["checkpoint"]
+    assert (rebuilt["recommends"], rebuilt["recommends_page"]) == ("research", journal)
 
     state = advance(project, team, backend)
     assert (state["round"], state["phase"]) == (2, "hypothesize")
     assert team.calls.count("research.scout") == 1
+    assert (
+        state["checkpoint"]["recommends"] is None and state["checkpoint"]["recommends_page"] is None
+    )
 
 
 @pytest.mark.parametrize("decision", ["accept", "reject", "none"])
@@ -3319,3 +3346,345 @@ def test_the_scripted_model_of_the_browser_test_carries_a_project_through_a_roun
 
     state = go()
     assert (state["round"], state["phase"]) == (2, "hypothesize")
+
+
+def test_the_scripted_analyst_recommends_research_and_suggests_an_edit_when_asked(
+    tmp_path, scripted
+):
+    project = Project.create(tmp_path / "p", title="Warmup", brief=BRIEF)
+    client = scripted.client()
+
+    def go(**options) -> dict:
+        engine = Engine(project, client_for=lambda _: client, scholar=make_scholar())
+        return engine.advance(**options)
+
+    go()
+    accept_all(project)
+    go()
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="One is enough here")
+    go()
+    project.review("E1", "accept")
+    experiments.approve(project, "E1")
+    state = go()
+    # Without the marks the analyst recommends nothing and suggests no edit.
+    assert (state["phase"], state["checkpoint"]["recommends"]) == ("analyze", None)
+    assert "next" not in project.page("wiki/journal/round-1.md").meta
+    assert project.proposals() == []
+    accept_all(project)
+    finding = project.page("F1")
+
+    # An instruction that carries the marks, as the browser check leaves one: the journal
+    # of the next analysis says `next: research`, and an accepted finding gets a suggested
+    # edit with a number that is on no record.  No file of the project is written by hand.
+    ask(project, f"{scripted.RESEARCH_MARK} {scripted.EDIT_MARK} look at it again", role="analyst")
+    experiments.approve(project, "E1")
+    state = go()
+
+    journal = project.page("wiki/journal/round-1-2.md")
+    assert journal.author == "agent:analyst" and journal.meta["next"] == "research"
+    assert (state["checkpoint"]["recommends"], state["checkpoint"]["recommends_page"]) == (
+        "research",
+        journal.path,
+    )
+    assert state["next_phase"] == "hypothesize"  # a recommendation, nothing more
+    (proposal,) = [edit for edit in project.proposals() if edit.target == finding.path]
+    assert proposal.author == "agent:analyst" and proposal.fields == {}
+    assert proposal.body == finding.body.rstrip() + "\n\n" + scripted.EDIT_SENTENCE + "\n"
+    report = experiments.edit_report(project, proposal)
+    assert report["unverified"] == [scripted.EDIT_NUMBER]
+    assert project.page("F1").body == finding.body  # unchanged until the person decides
+    # The instruction was the analyst's and is closed by its phase: the next analysis
+    # does neither again.
+    assert project.requests() == []
+    experiments.approve(project, "E1")
+    go()
+    assert "next" not in project.page("wiki/journal/round-1-3.md").meta
+    assert len(project.proposals()) == 1
+
+    # The marks concern the analyst alone: no other role fails or does anything for them.
+    ask(project, f"{scripted.RESEARCH_MARK} {scripted.EDIT_MARK}", role="theorist")
+    state = go()
+    assert (state["status"], state["round"], state["phase"]) == ("checkpoint", 2, "hypothesize")
+
+
+# ---------------------------------------------------------------------------
+# A recommendation the person followed; what a press of Continue will do
+# ---------------------------------------------------------------------------
+
+
+def test_a_recommendation_the_person_followed_is_not_repeated(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    mine = own_experiment(project, backend)
+    team.journal_meta = "next: research\n"
+    state = advance(project, team, backend)
+    assert (state["round"], state["phase"], state["next_phase"]) == (1, "analyze", "design")
+    assert state["checkpoint"]["recommends_page"] == "wiki/journal/round-1.md"
+    assert "recommends another look at the literature" in state["checkpoint"]["summary"]
+
+    # The person follows it, in the same round; the analyst has nothing more to ask for.
+    team.journal_meta = ""
+    state = advance(project, team, backend, phase="research")
+    assert (state["round"], state["phase"]) == (1, "research")
+    assert state["checkpoint"]["recommends"] is None
+    approve(project, mine, backend)
+    state = advance(project, team, backend)
+
+    # A later analysis of the round does not say again what was done about already.
+    assert (state["round"], state["phase"]) == (1, "analyze")
+    assert project.page("wiki/journal/round-1.md").meta["next"] == "research"
+    assert "recommends another look at the literature" not in state["checkpoint"]["summary"]
+    assert state["checkpoint"]["recommends"] is None
+    assert state["checkpoint"]["recommends_page"] is None
+    assert "recommends" not in events(project, "checkpoint")[-1]["data"]
+
+    # A journal page written after that research recommends it anew, and is the one named.
+    team.journal_meta = "next: research\n"
+    approve(project, mine, backend)
+    state = advance(project, team, backend)
+    assert "recommends another look at the literature" in state["checkpoint"]["summary"]
+    assert state["checkpoint"]["recommends_page"] == "wiki/journal/round-1-3.md"
+
+
+def test_a_recommendation_written_by_hand_stands_until_research_has_run_after_it(
+    project, team, backend
+):
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    # The person's own note, in no phase's record: its stamp says when it was written.
+    note = project.create_page(
+        "journal", "What this round lacks", "Schedule-free optimisers.\n", author="human",
+        fields={"next": "research"}, round=1,
+    )  # fmt: skip
+    state = advance(project, team, backend)
+    assert state["checkpoint"]["recommends_page"] == note.path
+
+    # Research that completed before the note was written is not research done about it.
+    research = next(p for p in state["phases"] if p["phase"] == "research")
+    assert research["finished"] <= note.created
+
+
+FORECAST = {
+    "will_run": [],
+    "then": None,
+    "experiments": [],
+    "results": 0,
+    "checkpoint_of": None,
+    "needs_phase": False,
+}
+
+
+def press(project: Project, team: Team, backend: FakeBackend) -> tuple[dict, list[str], dict]:
+    """What ``next_step`` says an ``advance()`` without a phase will do, the phases the
+    call then started, and the state it ended in."""
+    said = next_step(project)
+    seen = project.events()[-1]["seq"]
+    state = advance(project, team, backend)
+    started = [e["phase"] for e in project.events(after=seen) if e["type"] == "phase.started"]
+    return said, started, state
+
+
+def test_what_a_press_will_do_is_what_advance_then_does(project, team, backend):
+    # A project that has not started: intake and research, in one call.
+    said, started, state = press(project, team, backend)
+    assert said == {**FORECAST, "will_run": ["intake", "research"], "then": "hypothesize"}
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+    accept_all(project)
+
+    said, started, state = press(project, team, backend)
+    assert said == {**FORECAST, "will_run": ["hypothesize"], "then": "design"}
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+
+    said, started, state = press(project, team, backend)
+    assert said == {**FORECAST, "will_run": ["design"], "then": "run"}
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+    accept_all(project)
+
+    # Nothing is approved yet: the run phase would say so and pause where it is.
+    assert next_step(project) == {**FORECAST, "will_run": ["run"], "then": "run"}
+    approve_all(project)
+
+    said, started, state = press(project, team, backend)
+    assert said == {
+        **FORECAST,
+        "will_run": ["run", "analyze"],
+        "then": "hypothesize",
+        "experiments": ["E1"],
+    }
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+    accept_all(project)
+    for proposal in project.proposals():
+        project.review(proposal.id, "accept")
+
+    # One more run approved at the checkpoint of the analysis: it comes first, and the
+    # round that was to begin still begins afterwards.
+    approve(project, "E1", backend)
+    said, started, state = press(project, team, backend)
+    assert (said["will_run"], said["then"]) == (["run", "analyze"], "hypothesize")
+    assert (started, state["round"], state["next_phase"]) == (["run", "analyze"], 1, "hypothesize")
+
+    said, started, state = press(project, team, backend)
+    assert said == {**FORECAST, "will_run": ["hypothesize"], "then": "design"}
+    assert (started, state["round"], state["next_phase"]) == (["hypothesize"], 2, "design")
+
+
+def test_a_press_with_nothing_approved_pauses_at_the_run_phase_again(project, team, backend):
+    to_design_checkpoint(project, team, backend)
+    said, started, state = press(project, team, backend)
+    assert (said["will_run"], said["then"], said["experiments"]) == (["run"], "run", [])
+    assert (started, state["phase"], state["next_phase"]) == (["run"], "run", "run")
+
+
+def test_the_forecast_knows_what_comes_before_the_phase_that_was_next(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    # An experiment of the person's own, approved while the design phase is next.
+    mine = own_experiment(project, backend)
+
+    said, started, state = press(project, team, backend)
+    assert said == {
+        **FORECAST,
+        "will_run": ["run", "analyze"],
+        "then": "design",
+        "experiments": [mine],
+    }
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+
+    # A result nobody has analysed, as `research run` leaves it: the analysis comes first.
+    approve(project, mine, backend)
+    experiments.run(project, mine, compute=backend)
+    said, started, state = press(project, team, backend)
+    assert said == {**FORECAST, "will_run": ["analyze"], "then": "design", "results": 1}
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+
+
+def test_the_forecast_of_an_interrupted_phase_is_its_resumption(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    team.interrupt = "design.designer"
+    with pytest.raises(KeyboardInterrupt):
+        advance(project, team, backend)
+    assert read_state(project)["status"] == "stopped"
+    assert next_step(project) == {**FORECAST, "will_run": ["design"], "then": "run"}
+
+    # What is approved meanwhile comes before the phase is resumed, and it is resumed after.
+    mine = own_experiment(project, backend)
+    said, started, state = press(project, team, backend)
+    assert (said["will_run"], said["then"]) == (["run", "analyze"], "design")
+    assert said["experiments"] == [mine]
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+    said, started, state = press(project, team, backend)
+    assert (said["will_run"], said["then"], said["experiments"]) == (["design"], "run", [])
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+
+    # A state left at "running" by a worker that died reads the same way.
+    state.update(status="running", phase="design", next_phase="design", checkpoint=None)
+    state["phases"][-1].update(status="running", finished=None)
+    state["worker"] = DEAD_WORKER
+    (project.root / "state.json").write_text(json.dumps(state))
+    assert next_step(project) == {**FORECAST, "will_run": ["design"], "then": "run"}
+
+
+@pytest.mark.parametrize("announced", [True, False])
+def test_the_forecast_of_a_phase_whose_checkpoint_is_still_owed(project, team, backend, announced):
+    state = advance(project, team, backend)
+    # As the file stood when research had completed and its worker died before the pause.
+    state.update(status="running", checkpoint=None, worker=DEAD_WORKER)
+    (project.root / "state.json").write_text(json.dumps(state))
+    if not announced:
+        # ... before the checkpoint's event was written, not after it.
+        log = project.root / "events.jsonl"
+        lines = log.read_text().splitlines(keepends=True)
+        assert json.loads(lines[-1])["type"] == "checkpoint"
+        log.write_text("".join(lines[:-1]))
+
+    said, started, state = press(project, team, backend)
+
+    # No phase runs: the press writes the checkpoint the dead worker owed.
+    assert said == {**FORECAST, "then": "hypothesize", "checkpoint_of": "research"}
+    assert (started, state["status"], state["next_phase"]) == ([], "checkpoint", "hypothesize")
+
+
+def test_the_forecast_says_when_a_phase_has_to_be_named(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    (project.root / "state.json").unlink()
+    (project.root / "events.jsonl").unlink()
+
+    said = next_step(project)
+
+    assert said == {**FORECAST, "needs_phase": True}
+    with pytest.raises(EngineError, match="--phase"):
+        advance(project, team, backend)
+
+
+def test_the_forecast_of_a_lost_state_is_read_from_the_events(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    project.review("H2", "reject", reason="Too vague to test")
+    (project.root / "state.json").unlink()
+
+    said, started, state = press(project, team, backend)
+
+    assert said == {**FORECAST, "will_run": ["design"], "then": "run"}
+    assert (started, state["next_phase"]) == (said["will_run"], said["then"])
+
+
+def test_the_forecast_writes_nothing_and_takes_no_lock(project, team, backend):
+    fcntl = pytest.importorskip("fcntl")
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+
+    def files() -> dict[str, tuple[int, int]]:
+        found = sorted(path for path in project.root.rglob("*") if path.is_file())
+        return {
+            path.relative_to(project.root).as_posix(): (
+                path.stat().st_mtime_ns,
+                path.stat().st_size,
+            )
+            for path in found
+        }
+
+    before = files()
+    given = read_state(project)
+    kept = json.loads(json.dumps(given))
+    with (project.root / ".worker.lock").open("a") as held:
+        # Somebody holds the project: a look does not wait for them, and takes nothing.
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        said = next_step(project)
+        assert next_step(project, given) == said
+    assert (said["will_run"], said["then"], said["experiments"]) == (
+        ["run", "analyze"],
+        "hypothesize",
+        ["E1"],
+    )
+    assert files() == before and given == kept
+    # ... and it needs none of what work needs: no model, no credentials, no backend.
+    assert project.page("E1").state == "approved"
+
+
+def test_a_phase_has_one_name_in_the_sentences_a_person_reads():
+    assert [phase_in_words(name) for name in PHASES] == [
+        "the intake phase",
+        "the research phase",
+        "the hypothesis phase",
+        "the design phase",
+        "the run phase",
+        "the analysis phase",
+    ]
+    # What is no phase of the engine keeps the name it came with.
+    assert phase_in_words("review") == "the review phase"

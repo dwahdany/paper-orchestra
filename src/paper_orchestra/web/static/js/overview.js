@@ -3,10 +3,10 @@
 
 import { app, defaults, link } from './core.js';
 import { MONTH_NAMES, ago, checkpointDid, clock, cutoffParts, cutoffWords, dayOf, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, setHTML } from './util.js';
-import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, icon, pageGlyph, phaseName, roleName } from './vocab.js';
+import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, icon, pageGlyph, phaseName, roleName, shownState } from './vocab.js';
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
 import { UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
-import { summaryOf, whatOf } from './inbox.js';
+import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
 export function stripMap(store) {
@@ -210,14 +210,14 @@ export const overviewView = {
     const waitingApproval = store.experiments.filter((x) => x.review === 'accepted' && (x.state === 'planned' || !x.state));
     const lastAct = store.activity.slice().reverse().find((ev) => ev.agent);
     const headline = e.unverified ? 'This server cannot verify the project\'s worker.'
-      : e.lost && !e.crashed ? 'Where this project stands is not on file.'
+      : e.unknown && !e.crashed ? 'Where this project stands is not known.'
       : e.mode === 'running' ? 'Round ' + (e.round || 1) + ': the ' + (lastAct ? lastAct.agent : 'engine') + ' is at work on ' + phaseName(e.phase) + '.'
       : e.mode === 'experiment' ? 'An experiment is running.' : e.mode === 'writing' ? 'The paper is being written.'
       : e.mode === 'failed' ? cap1(phaseName(e.next || e.phase)) + ' failed.' : e.died || e.crashed ? 'The agents stopped unexpectedly.'
       : e.mode === 'stopped' ? 'You stopped the agents during ' + phaseName(e.next || e.phase) + '.' : e.fresh ? 'Research has not started.'
       : e.budget ? 'Round ' + (e.round || 1) + ' stopped at a budget.' : 'Round ' + (e.round || 1) + ' is paused at a checkpoint.';
     const sub = e.unverified ? plain(e.note) || UNVERIFIED
-      : e.lost && !e.crashed ? plain(e.lostNote)
+      : e.unknown && !e.crashed ? plain(e.stateNote) || 'Nothing on file says which round and phase it is in. Choose the phase to go on with.'
       : e.working ? 'You can keep reading and deciding while it works.'
       : e.mode === 'failed' ? plain(e.error) : e.died ? plain(e.error) : e.crashed ? crashText(store, e.exit)
       : e.fresh ? 'Nothing has been spent. The idea' + ((p.attachments || []).length ? ' and ' + plural(p.attachments.length, 'file') : '') + ' are in place.'
@@ -228,9 +228,9 @@ export const overviewView = {
       : html`${items.length ? html`<a class="btn btn-l" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${items.length}</a>` : ''}
         ${continueControl(store, e, 'overview', true)}
         ${e.mode === 'failed' || e.died || e.crashed ? html`<a class="btn btn-l" href="#/setup">Open Setup</a>` : ''}`;
-    const waiting = items.length ? items.map((it) => { const sum = summaryOf(it); return html`<div class="ov-item" data-ref="${it.ref}"><a class="ov-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', it.page.state, 18)}
-        <span class="in-name">${pageName(it.page)}</span>${sum ? html`<span class="in-sum">${sum}</span>` : ''}<span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)} · ${ago(it.when)}</span></a>
-        <span class="in-quick on"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="Accept" aria-label="Accept">${icon('check')}</button><button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-view="inbox" data-tip="Reject, with a reason" aria-label="Reject">${icon('x')}</button></span></div>`; })
+    const waiting = items.length ? items.map((it) => { const sum = summaryOf(it); return html`<div class="ov-item" data-ref="${it.ref}"><a class="ov-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', shownState(it.page), 18)}
+        <span class="in-name">${pageName(it.page)}</span>${sum ? html`<span class="in-sum">${sum}</span>` : ''}<span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)} · ${ago(it.when)}</span>${checkMark(it)}</a>
+        <span class="in-quick on"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="${acceptTip(it)}" aria-label="${acceptTip(it)}">${icon('check')}</button><button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-view="inbox" data-tip="Reject, with a reason" aria-label="Reject">${icon('x')}</button></span></div>`; })
       : html`<p class="quiet ov-none">Nothing is waiting for you.</p>`;
     const watch = html`${running.map((x) => { const run = x.last_run && x.last_run.status === 'running' ? x.last_run : null; const est = (x.meta || {}).est_minutes; return html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span>
         <span class="in-what">${run ? html`run ${run.number} · <span data-since="${run.started}">${clock((Date.now() - (parseStamp(run.started) || Date.now())) / 1000)}</span>${est ? ' of about ' + est + ' min' : ''}` : 'queued'}</span>
@@ -239,15 +239,16 @@ export const overviewView = {
       ${interrupted.map((x) => html`<a class="ov-run ov-broken" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">interrupted · the worker that ran it is gone · run it again, or cancel it</span></a>`)}
       ${waitingApproval.map((x) => html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">accepted · runs only after you approve it</span></a>`)}`;
     const anyWatch = running.length + broken.length + interrupted.length + waitingApproval.length;
-    /* what the checkpoint said, without the sentences that stand beside the button already */
+    /* What the checkpoint said, as it said it then. (What the analyst recommended is among it;
+       whether that still stands is the checkpoint's field, shown beside the button.) The
+       count of instructions that wait for the scout is said live beside the button instead. */
     const why = idle ? researchReasons(store, e) : [];
     let did = e.mode === 'checkpoint' && !e.budget && p.checkpoint ? checkpointDid(p.checkpoint.summary) : '';
-    if (why.some((w) => w.kind === 'recommended')) did = did.replace(/The journal page of this round recommends[^.]*\.(\s*That is yours to decide[^.]*\.)?\s*/, '');
     if (why.some((w) => w.kind === 'requests')) did = did.replace(/\d+ requests? for the scout waits? for the research phase[^.]*\.\s*/, '');
     did = did.trim();
-    const beside = idle ? continueNotes(store, e) : '';
+    const beside = idle ? continueNotes(store, e, !!did) : '';
     setHTML(root, html`<div class="overview"><div class="ov-wrap">
-      <header class="ov-head"><div class="ov-state">${e.working ? html`<span class="live-dot"></span>` : ''}${p.title}${e.lost ? '' : ' · ' + (e.round ? 'round ' + e.round : 'new')}</div><h1>${headline}</h1><p class="ov-sub">${sub}</p>
+      <header class="ov-head"><div class="ov-state">${e.working ? html`<span class="live-dot"></span>` : ''}${p.title}${e.unknown ? '' : ' · ' + (e.round ? 'round ' + e.round : 'new')}</div><h1>${headline}</h1><p class="ov-sub">${sub}</p>
         ${did ? html`<p class="ov-note">${cap1(phaseName(p.checkpoint.phase)) || 'The last phase'} finished ${ago(p.checkpoint.at)}: ${did}</p>` : ''}
         <div class="row ov-actions">${actions}</div>${String(beside) ? html`<div class="ov-next">${beside}</div>` : ''}</header>
       ${problemsHTML(store)}

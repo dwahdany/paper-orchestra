@@ -47,6 +47,12 @@ project's files.  What this module guarantees:
   recovery ends what a run's record names as its job; the server lets it settle
   only where nothing so named is still running, because the record is a file
   like any other and the server settles at a mere look.
+* **How a worker ended is on file, not in the server's memory.**  A worker that
+  ended without an account of its own (the command refused, the process was
+  killed) is given one in the project's events, with what it said last (the
+  reason a command gives when it refuses); for a write-up that is a
+  ``paper.finished`` event, so that the paper's own events say how the last
+  write-up ended, to this server and to the next.
 
 No ``preexec_fn`` (unsafe in a threaded server) and no parent-death signal (it
 follows the thread that started the child, and server threads end): the child
@@ -76,10 +82,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from paper_orchestra.research.model import format_stamp, parse_stamp
+from paper_orchestra.research.model import format_stamp, parse_stamp, quotable
 from paper_orchestra.research.project import EVENTS_FILE, STATE_FILE
 from paper_orchestra.utils.common import write_json
-from paper_orchestra.web.security import PathEscape, open_for_append
+from paper_orchestra.web.security import PathEscape, open_confined, open_for_append
 
 try:  # POSIX
     import fcntl
@@ -100,6 +106,8 @@ __all__ = [
     "Workers",
     "default_command",
     "lock_held",
+    "read_state",
+    "read_state_file",
     "settle_stale_runs",
 ]
 
@@ -144,6 +152,15 @@ _MAX_JSON_BYTES = 32 * 1024 * 1024
 #: No process has a number this large (Linux allows up to 2**22), and one that large in a
 #: file cannot even be asked about.
 _PID_LIMIT = 2**22
+#: How much of the end of what a worker wrote is read for the reason it gave when it
+#: ended, how much of that reason an event keeps, and how much of it a sentence quotes.
+_LAST_WORDS_BYTES = 16 * 1024
+_LAST_WORDS_CHARS = 1000
+_QUOTED_CHARS = 600
+#: How much of what was added to a project's events while a worker lived is looked
+#: through for the worker's own account of its end.  A worker that left none ended
+#: within moments of its start, and little was written beside it.
+_EVENTS_SINCE_BYTES = 4 * 1024 * 1024
 
 #: ``(kind, project directory, options) -> argv`` of the worker process.
 Launcher = Callable[[str, Path, Mapping[str, Any]], Sequence[str]]
@@ -169,7 +186,7 @@ class WorkerBusy(WorkerError):
             super().__init__(f"Nothing was started. {status.get('note') or ''}".strip())
             return
         doing = (
-            f"the {self.phase} phase"
+            _phase_in_words(self.phase)
             if status.get("phase")
             else _WORK.get(str(status.get("kind")), "its work")
         )
@@ -178,6 +195,18 @@ class WorkerBusy(WorkerError):
             f"This project already has a worker running {doing}{ending}. Wait for it to "
             "reach its checkpoint, or stop it first."
         )
+
+
+def _phase_in_words(phase: Any) -> str:
+    """The phase as a sentence for the person names it (``the hypothesis phase`` for
+    ``hypothesize``): in the engine's words, which its own events and checkpoints use,
+    so that a refusal of the server reads like everything else the person is told.
+    The engine is asked when a sentence is made, not when this module is loaded."""
+    try:
+        from paper_orchestra.research.engine import phase_in_words
+    except ImportError:  # an installation without the engine names the phase as it is
+        return f"the {phase} phase"
+    return phase_in_words(phase)
 
 
 def default_command(kind: str, root: Path, options: Mapping[str, Any]) -> list[str]:
@@ -676,9 +705,9 @@ def _now() -> str:
     return format_stamp(datetime.now(UTC))
 
 
-def _read_json(path: Path, *, follow_links: bool = False) -> Any:
-    """What a JSON file of the project holds; ``None`` when it is absent, not JSON, or
-    not an ordinary file.
+def _read_bytes(path: Path, *, follow_links: bool = False) -> bytes | None:
+    """What a file of the project holds; ``None`` when it is absent or not an ordinary
+    file.
 
     Not read through a symbolic link unless ``follow_links`` says so: what
     ``state.json`` holds is shown in the app, and a project directory that came
@@ -703,18 +732,49 @@ def _read_json(path: Path, *, follow_links: bool = False) -> Any:
             taken += len(chunk)
         if taken > _MAX_JSON_BYTES:
             return None  # it grew while it was read
-        return json.loads(b"".join(chunks).decode("utf-8"))
-    except (OSError, ValueError, RecursionError):
-        # RecursionError: brackets nested deeper than the reader follows.
+        return b"".join(chunks)
+    except OSError:
         return None
     finally:
         os.close(descriptor)
 
 
+def _as_json(data: bytes | None) -> Any:
+    """The JSON value ``data`` is, or ``None`` when it is none."""
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):
+        # RecursionError: brackets nested deeper than the reader follows.
+        return None
+
+
+def _read_json(path: Path, *, follow_links: bool = False) -> Any:
+    """What a JSON file of the project holds; ``None`` when it is absent, not JSON, or
+    not an ordinary file (see :func:`_read_bytes` for what is not read)."""
+    return _as_json(_read_bytes(path, follow_links=follow_links))
+
+
+def read_state_file(root: Path) -> tuple[dict[str, Any], bytes | None]:
+    """``state.json`` of the project as :func:`read_state` gives it, and the bytes it was
+    read from (``None`` when there is no such file of the project's own): what tells
+    one content of the file from the next, for whoever keeps a reading of it."""
+    data = _read_bytes(Path(root) / STATE_FILE)
+    state = _as_json(data)
+    return (state if isinstance(state, dict) else {}), data
+
+
 def read_state(root: Path) -> dict[str, Any]:
-    """``state.json`` of the project, or ``{}`` when the engine has not written one."""
-    state = _read_json(Path(root) / STATE_FILE)
-    return state if isinstance(state, dict) else {}
+    """``state.json`` of the project as the file holds it, or ``{}`` when the engine has
+    not written one (or what is there is not the project's own file).
+
+    This is what the supervisor goes by: who the file names as the worker, and
+    whether a phase reads as running.  Where a project stands is the engine's
+    reading, which knows what to make of a file that is lost or damaged; the API
+    asks the engine for that and shows no state from here alone.
+    """
+    return read_state_file(root)[0]
 
 
 def _named_pid(state: Mapping[str, Any]) -> int | None:
@@ -743,6 +803,29 @@ def _size(path: Path) -> int | None:
         return path.stat().st_size
     except OSError:
         return None
+
+
+def _event_since(root: Path, offset: int, prefix: str) -> bool:
+    """Whether the project's events hold, from byte ``offset`` on, an event whose type
+    begins with ``prefix``.  Also true where that cannot be told (the events are not
+    the project's own file, or more was written since than is looked through): the
+    caller then adds no account of its own to a stream it cannot read."""
+    try:
+        with open_confined(root, EVENTS_FILE) as handle:
+            if os.fstat(handle.fileno()).st_size < offset:
+                return True  # another file than the one that was measured
+            handle.seek(offset)
+            written = handle.read(_EVENTS_SINCE_BYTES + 1)
+    except (OSError, ValueError):  # PathEscape is a ValueError
+        return True
+    if len(written) > _EVENTS_SINCE_BYTES:
+        return True
+    for line in written.splitlines():
+        event = _as_json(line)
+        kind = event.get("type") if isinstance(event, dict) else None
+        if isinstance(kind, str) and kind.startswith(prefix):
+            return True
+    return False
 
 
 def mark_interrupted(root: Path, reason: str, *, by_person: bool) -> str | None:
@@ -911,6 +994,10 @@ class _Entry:
     launched: float = 0.0
     #: Size of ``events.jsonl`` when this server started it, for the same purpose.
     events_size: int | None = None
+    #: Where in ``worker.log`` what this worker writes begins (after the line that says
+    #: what was started); ``None`` for a worker that was found, whose output is not told
+    #: from that of the workers before it.
+    log_offset: int | None = None
     #: Known through ``state.json["worker"]`` alone: an engine started from a terminal.
     from_state: bool = False
     #: The server that started it, as its record says (pid and start token): while that
@@ -1266,6 +1353,7 @@ class Workers:
             header = f"\n[paper-orchestra] {started} starting: {shlex.join(command)}\n"
             output.write(header.encode("utf-8", errors="replace"))
             output.flush()
+            log_offset = os.fstat(output.fileno()).st_size
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -1288,6 +1376,7 @@ class Workers:
             started=started,
             launched=launched,
             events_size=events_size,
+            log_offset=log_offset,
             command=command,
             process=process,
             start_token=_start_token(process.pid),
@@ -1627,15 +1716,22 @@ class Workers:
         Killed by a signal, always.  Otherwise a failure it left no account of.  For
         the engine: ``state.json`` untouched since the worker started means it
         stopped before the engine could record anything (no credentials, a broken
-        project).  For a run or a write-up: no event since it started (the command
-        refused, another worker holds the project); one that failed at its work is
-        on record in its own events.  An interrupt from elsewhere (exit code 130)
-        is somebody's orderly stop.
+        project).  For a run: no event since it started (the command refused,
+        another worker holds the project); one that failed at its work is on record
+        in its own events.  For a write-up: no event of the paper's since it
+        started.  A write-up tells its start and its end in ``paper.`` events and
+        nothing else does, so what anybody else wrote in that time (the person
+        decided a page a moment after starting it) is no account of it.  An
+        interrupt from elsewhere (exit code 130) is somebody's orderly stop.
         """
         if code is None or code in (0, 130):
             return False
         if code < 0:
             return True
+        if entry.kind == "write":
+            return entry.events_size is not None and not _event_since(
+                entry.root, entry.events_size, "paper."
+            )
         if entry.kind != "advance":
             return entry.events_size is not None and _size(entry.root / EVENTS_FILE) == (
                 entry.events_size
@@ -1664,16 +1760,36 @@ class Workers:
         return phase
 
     def _report_death(self, entry: _Entry, code: int | None, phase: str | None) -> None:
-        """Say in the activity stream that a worker ended without being asked to."""
+        """Say in the activity stream that a worker ended without being asked to, with
+        what it said last when it ended by itself (the reason a command gives when it
+        refuses).  The event is the account of that end that outlasts this server.
+
+        A write-up is told as a ``paper.finished`` event, as the write-up tells its
+        own end: whoever shows the paper reads how the last one went from the
+        paper's events.  Any other worker is an ``error`` event.
+        """
         from paper_orchestra.research.project import Project, ProjectError
 
-        summary = _death_reason(entry.kind, code)
-        if phase:
-            summary += f" The {phase} phase was recorded as interrupted; continuing resumes it."
-        try:
-            Project.open(entry.root).emit(
-                "error", summary, phase=phase or "", data={"kind": entry.kind, "exit_code": code}
+        # A worker that was killed had no chance to say why: what it printed is no reason.
+        said = _last_words(entry.root, entry.log_offset) if code is not None and code > 0 else ""
+        if entry.kind == "write":
+            kind, summary, data = (
+                "paper.finished",
+                _write_up_ended(code, said),
+                _paper_data(code, said),
             )
+        else:
+            summary = _death_reason(entry.kind, code)
+            if phase:
+                summary += (
+                    f" {_phase_in_words(phase).capitalize()} was recorded as interrupted; "
+                    "continuing resumes it."
+                )
+            if said:
+                summary += f" It said: “{quotable(said, _QUOTED_CHARS)}”"
+            kind, data = "error", {"kind": entry.kind, "exit_code": code, "said": said}
+        try:
+            Project.open(entry.root).emit(kind, summary, phase=phase or "", data=data)
         except (ProjectError, OSError) as exc:
             log.warning("Could not record the end of the worker in %s: %s", entry.root, exc)
 
@@ -1794,3 +1910,55 @@ def _death_reason(kind: str, code: int | None) -> str:
     else:
         how = f"ended with exit code {code}"
     return f"The {kind} worker {how} without finishing. See {WORKER_LOG} in the project directory."
+
+
+def _last_words(root: Path, offset: int | None) -> str:
+    """What a worker said last, from what it wrote to ``worker.log`` from ``offset`` on:
+    the refusal of the command it ran (the last ``Error: ...`` it printed, which may be
+    folded over several lines), else its last line (the error a traceback ends in).
+    On one line and cut to what an event keeps; empty when it wrote nothing, when the
+    log is not the project's own file, or when ``offset`` is not known.
+    """
+    if offset is None:
+        return ""
+    try:
+        with open_confined(root, WORKER_LOG) as handle:
+            size = os.fstat(handle.fileno()).st_size
+            handle.seek(max(offset, size - _LAST_WORDS_BYTES))
+            written = handle.read(_LAST_WORDS_BYTES).decode("utf-8", errors="replace")
+    except (OSError, ValueError):  # PathEscape is a ValueError
+        return ""
+    lines = [line.strip() for line in written.splitlines() if line.strip()]
+    refusals = [number for number, line in enumerate(lines) if line.startswith("Error:")]
+    if refusals:
+        words = " ".join(lines[refusals[-1] :])[len("Error:") :]
+    else:
+        words = lines[-1] if lines else ""
+    words = " ".join(words.split())
+    return words if len(words) <= _LAST_WORDS_CHARS else words[: _LAST_WORDS_CHARS - 1] + "…"
+
+
+def _write_up_ended(code: int | None, said: str) -> str:
+    """One sentence for a write-up whose worker ended without an account of its own."""
+    if code is not None and code < 0:
+        return (
+            "The write-up ended before the paper was finished: its worker was killed "
+            f"(signal {-code}). Starting it again continues it. See {WORKER_LOG} in the "
+            "project directory."
+        )
+    start = f"The write-up did not start: its worker ended with exit code {code}"
+    if said:
+        # Its words stand as a quotation: they are the command's, not the server's.
+        return f"{start} and said: “{quotable(said, _QUOTED_CHARS)}”"
+    return f"{start} without saying why. See {WORKER_LOG} in the project directory."
+
+
+def _paper_data(code: int | None, said: str) -> dict[str, Any]:
+    """The data of the ``paper.finished`` event the server writes for such a write-up, in
+    the shape of the write-up's own (``success``, ``interrupted``, ``error``), with the
+    exit code.  ``started`` is false where the worker ended by itself without having
+    written any event: it was refused before it began."""
+    data: dict[str, Any] = {"success": False, "interrupted": False}
+    if code is not None and code > 0:
+        data["started"] = False
+    return {**data, "error": said or None, "exit_code": code}

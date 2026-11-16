@@ -5,7 +5,7 @@
 import { app, link } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf } from './util.js';
-import { TONE, agentName, glyph, icon, pageGlyph } from './vocab.js';
+import { TONE, agentName, glyph, icon, pageGlyph, shownState } from './vocab.js';
 import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, planProblemsHTML, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
 
 const GROUPS = [
@@ -40,9 +40,9 @@ function subline(store, x) {
 function stateCell(x) {
   if (x.review === 'rejected') return html`<span class="tag tag-rejected">rejected</span>`;
   if (x.review === 'proposed') return html`<span class="tag tag-proposed">proposed</span>`;
-  if (x.state === 'running' && x.interrupted) return html`<span class="st-word t-prop">${icon('warn')}interrupted</span>`;
-  const tone = TONE[x.state] || 'open';
-  return html`<span class="st-word t-${tone}">${glyph('experiment', 'accepted', x.state, 14)}${x.state || 'planned'}</span>`;
+  /* (an interrupted run has its own mark and word: the page says "running", and nothing runs it) */
+  const state = shownState(x) || 'planned';
+  return html`<span class="st-word t-${TONE[state] || 'open'}">${glyph('experiment', 'accepted', state, 14)}${state}</span>`;
 }
 function timeCell(x) {
   const run = x.last_run || {}, m = x.meta || {};
@@ -197,6 +197,21 @@ function approveHTML(store, page, data) {
   </section>`;
 }
 
+/** The button that takes an approval back or cancels a run. Which of the two a press does
+    is the server's word (`cancel_does` of the experiment: `withdraw` for one that is approved
+    and has not started, `cancel` for one that waits in the queue or runs), and the button
+    says it; the press tells the server what the person was told (`data-does`), so that it
+    does that or nothing. Where the server has not said, the button promises neither. */
+function cancelButton(eid, does, opt) {
+  const known = does === 'withdraw' || does === 'cancel';
+  const label = does === 'withdraw' ? 'Take the approval back' : does === 'cancel' ? opt.label || 'Cancel the run' : opt.label || 'Do not run it';
+  const tip = does === 'withdraw' ? 'It becomes a plan again: nothing is cancelled and nothing is recorded as a run. Approve it again when you want it run.'
+    : does === 'cancel' ? opt.tip || 'Its run is cancelled and recorded as that; it can be approved again'
+      : opt.tip || 'Its approval is taken back, or its run is cancelled: the answer says which';
+  const busy = !!app.ui.cancelling[eid];
+  return html`<button class="btn ${opt.cls || 'btn-quiet'}" data-act="cancel-run" data-eid="${eid}"${known ? html` data-does="${does}"` : ''} data-tip="${tip}"${busy ? raw(' disabled') : ''}>${opt.stop ? icon('stop') : ''}${label}</button>`;
+}
+
 export function failureKind(run) {
   const k = run.error_kind;
   if (run.status === 'cancelled') return 'cancelled';
@@ -329,13 +344,13 @@ function runBlock(store, page, data, run, open) {
       ${run.code_digest ? html`<span class="quiet">Code digest ${String(run.code_digest).slice(0, 12)}…</span>` : ''}</p></div></div>`;
 }
 
-function liveHTML(store, page, data, run) {
+function liveHTML(store, page, data, run, does) {
   const eid = page.id, plan = data.plan || {};
   const est = plan.est_minutes ? plan.est_minutes * 60 : null, limit = (run.plan && run.plan.timeout_seconds) || plan.timeout_seconds || null;
   const elapsed = (Date.now() - (parseStamp(run.started) || Date.now())) / 1000;
   const total = est || limit || 0;
   return html`<section class="run-live"><div class="run-top"><h2><span class="live-dot" aria-hidden="true"></span>Run ${run.number} is running on ${backendName(run.backend, plan.gpu)}</h2>
-    <button class="btn btn-neg-quiet" data-act="cancel-run" data-eid="${eid}">${icon('stop')}Cancel run</button></div>
+    ${cancelButton(eid, does, { cls: 'btn-neg-quiet', stop: true, label: 'Cancel run', tip: 'The job is ended and the run recorded as cancelled' })}</div>
     ${total ? html`<progress class="meter-p" max="1" value="${Math.min(1, elapsed / total)}" data-since="${run.started}" data-total="${total}" aria-label="Elapsed, of the ${est ? 'estimate' : 'time limit'}"></progress>` : ''}
     <dl class="run-facts"><div><dt>Elapsed</dt><dd>${sinceClock(run.started)}${est ? html` <span class="quiet">of about ${minutes(plan.est_minutes)}</span>` : ''}</dd></div>
       <div><dt>Limit</dt><dd>${limit ? minutes(limit / 60) : 'none'} <span class="quiet">then it is stopped</span></dd></div>
@@ -380,7 +395,7 @@ function detailHTML(store, page, route) {
   const head = html`<header class="page-head"><div class="page-kicker"><span class="kicker-kind">${pageGlyph(page, 18)}<span>Experiment <b>${eid}</b></span></span>
       <span class="page-tools"><a class="ibtn" href="${link({ view: 'map', sel: page.path, sub: '' })}" data-tip="Show on the map (1)" aria-label="Show on the map">${icon('map')}</a><a class="ibtn" href="${link({ view: 'wiki', sel: page.path, sub: '' })}" data-tip="Open in the wiki (2)" aria-label="Open in the wiki">${icon('open')}</a></span></div>
     <h1 class="page-title">${page.title}</h1>${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
-    <div class="page-status">${reviewTag(page)}${page.state === 'running' && row.interrupted ? html`<span class="tag tag-proposed tag-interrupted">interrupted</span>` : stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span>${unacceptLink(page)}</div>
+    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span>${unacceptLink(page)}</div>
     ${tests.length ? html`<div class="ex-testsline"><span class="quiet">Tests</span>${tests.map((h) => html`<a class="chip" href="${link({ view: 'wiki', sel: h.path, sub: '' })}" data-sel="${h.path}" data-tip="${pageTip(h)}">${pageGlyph(h, 12)}<b>${h.id}</b> ${h.title}</a>`)}</div>` : ''}</header>`;
   if (!data) {
     return html`${head}${entry && entry.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The experiment could not be loaded: ${entry.error.message} <button class="linkish" data-act="reload-experiment" data-eid="${eid}">Try again</button></span></div>`
@@ -394,6 +409,12 @@ function detailHTML(store, page, route) {
   const held = worker.verified === false ? 'The project\'s files name a worker this server cannot verify: nothing can be started until it has ended or is forgotten (see the overview).' : 'The agents are at work; it runs when they reach it, or when they have stopped.';
   const starting = !!app.ui.starting[eid];
   const interrupted = page.state === 'running' && (data.interrupted || row.interrupted);
+  /* What a press of the button that cancels would do as things stand: the server's word,
+     from the list that was read together with the page's state (the experiment's own view
+     may be a moment older, and about the state before). An approval can only be taken back
+     from an experiment that reads approved: anything else is not said at all. */
+  const told = row.cancel_does !== undefined ? row.cancel_does : data.page && data.page.state === page.state ? data.cancel_does : undefined;
+  const does = told === 'cancel' || (told === 'withdraw' && page.state === 'approved') ? told : undefined;
   let top = '';
   if (page.review === 'rejected') top = reviewBar(store, page, { part: 'page' });
   else if (interrupted && app.ui.reapprove !== eid) {
@@ -402,7 +423,7 @@ function detailHTML(store, page, route) {
     top = html`<section class="callout callout-changed callout-interrupted" data-interrupted="${eid}"><h2>${icon('warn')}The run was interrupted</h2>
       <p>${plain(data.interrupted_note) || 'The worker that ran ' + eid + ' is gone and nothing is running it now. Run it again to go on, or cancel it.'}</p>
       <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Settling the unfinished run…' : 'Run it again'}</button>
-        <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="The unfinished run is settled and the experiment recorded as cancelled; it can be approved again">Cancel it</button></div></section>`;
+        ${cancelButton(eid, does, { label: 'Cancel it', tip: 'The unfinished run is settled and the experiment recorded as cancelled; it can be approved again' })}</div></section>`;
   }
   else if (page.review === 'proposed' || page.state === 'planned' || !page.state || app.ui.reapprove === eid) top = approveHTML(store, page, data);
   else if ((page.state === 'approved' || page.state === 'queued') && data.approval && data.approval.digest && data.approval.matches === false) {
@@ -413,15 +434,15 @@ function detailHTML(store, page, route) {
       <p>You approved this experiment${data.approval.at ? ' ' + ago(data.approval.at) : ''}. It is no longer what you approved, so it will not run as it is. Look at what changed, then approve it again.</p>
       ${changes.length ? html`<ul class="changed-list">${changes.map((c) => html`<li>${c}</li>`)}</ul>` : ''}
       <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Look and approve again…</button>
-        <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="Take the approval back: it is recorded as cancelled and can be approved again">Do not run it</button></div></section>`;
+        ${cancelButton(eid, does, {})}</div></section>`;
   } else if (page.state === 'approved' || page.state === 'queued') {
     top = html`<section class="callout"><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
       <p>${busy ? held : 'It runs first, and is analysed, when you continue the project; or run it now.'}</p>
       <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Starting…' : 'Run now'}</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
-        <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="Take the approval back: it is recorded as cancelled and can be approved again">Do not run it</button></div></section>`;
-  } else if (page.state === 'running' && latest && latest.status === 'running') top = liveHTML(store, page, data, latest);
+        ${cancelButton(eid, does, {})}</div></section>`;
+  } else if (page.state === 'running' && latest && latest.status === 'running') top = liveHTML(store, page, data, latest, does);
   else if (page.review === 'accepted' && !runs.length && (page.state === 'cancelled' || page.state === 'failed' || page.state === 'succeeded') && app.ui.reapprove !== eid) {
-    /* it ended without a run on record (the approval was taken back before it started): not a dead end */
+    /* it ended without a run on record (cancelled while it waited in the queue): not a dead end */
     top = html`<section class="callout"><h2>${page.state === 'cancelled' ? 'Cancelled before it ran' : cap(page.state) + ', with no run on record'}</h2>
       <p>${meta.state_reason ? plain(meta.state_reason) + ' ' : ''}Nothing ran. Approve it again when you want it run.</p>
       <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Approve it again…</button></div></section>`;

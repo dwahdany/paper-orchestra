@@ -2,7 +2,7 @@
 
 import { app, link } from './core.js';
 import { api } from './api.js';
-import { ago, cap, dateTime, duration, html, join, parseStamp, plain, plural, raw, setHTML } from './util.js';
+import { ago, cap, dateTime, duration, html, join, plain, plural, raw, setHTML } from './util.js';
 import { icon, pageGlyph } from './vocab.js';
 import { engineView } from './shell.js';
 
@@ -53,27 +53,40 @@ function numbersHTML(store, findings) {
     ${clean ? html`<p class="quiet pn-clean">${told.length || failed.length ? 'In the other ' + plural(clean, 'finding') : clean === 1 ? 'In the one accepted finding' : 'In all ' + clean + ' accepted findings'}, every number that was looked for was found in the records ${clean === 1 ? 'it is' : 'they are'} based on. Short and round numbers are not checked.</p>` : ''}
   </section>`;
 }
+/** How the project's last write-up went, as the server reads it from the project's events
+    (`last` of GET .../paper: `outcome`, when it started and ended, what it said then). It is
+    on file, so it reads the same after a restart of the server and in any window. */
+const lastOf = (paper) => (paper.last && typeof paper.last === 'object' ? paper.last : null);
+
 /** What the last write-up said when it started: what it was written from, which accepted
     findings were left out and why, and which numbers were taken out (the server's sentence). */
-function startedHTML(store) {
-  const ev = store.activity.slice().reverse().find((x) => x.type === 'paper.started');
-  if (!ev || !ev.summary) return '';
-  return html`<p class="paper-started" data-started><b>${dateTime(ev.ts) ? 'Started ' + dateTime(ev.ts) + '.' : 'When it started:'}</b> ${plain(ev.summary)}</p>`;
+function startedHTML(last) {
+  if (!last || !last.started_summary) return '';
+  return html`<p class="paper-started" data-started><b>${dateTime(last.started_at) ? 'Started ' + dateTime(last.started_at) + '.' : 'When it started:'}</b> ${plain(last.started_summary)}</p>`;
 }
 
-/** A write-up that ended before it could record why in paper/state.json: it was refused
-    (no finding that can be reported, a research cutoff that cannot be read) or its worker
-    died. The worker's own last words, from worker.log, say which. */
-function endedHTML(store, state, running) {
-  const exit = (store.project.worker || {}).last_exit;
-  if (running || !exit || exit.kind !== 'write' || exit.stopped || !exit.code) return '';
-  /* a run that got as far as its own state says how it ended there */
-  if (state && state.updated_at && (parseStamp(state.updated_at) || 0) >= (parseStamp(exit.at) || 0) - 3000 && state.status !== 'running') return '';
-  const log = store.workerLog && typeof store.workerLog.text === 'string' ? store.workerLog.text : null;
-  const lines = log == null ? [] : log.trimEnd().split('\n');
-  const from = lines.map((line) => /^\[paper-orchestra\] .* starting: /.test(line)).lastIndexOf(true);
-  const words = lines.slice(from + 1).join(' ').replace(/\s+/g, ' ').replace(/^Error:\s*/, '').trim().slice(0, 900);
-  return html`<div class="note note-neg paper-ended" role="alert" data-ended>${icon('warn')}<span><b>The last write-up ended before it wrote anything${dateTime(exit.at) ? ' (' + dateTime(exit.at) + ')' : ''}.</b> ${words ? plain(words) : log == null ? 'Reading what its worker wrote…' : 'Its worker wrote no reason. Its log is worker.log in the project folder.'}</span></div>`;
+/** A write-up that left nothing in paper/state.json to say how it ended. It was refused
+    before it began (nothing that can be reported, a research cutoff that cannot be read): the
+    server's reason says which. Or it began and nothing says how it ended: its worker is gone.
+    Or it ran and failed without a state on file. Or its worker ended without an account of
+    its own (it was killed) and the state on file still reads as it did in that moment: the
+    account of that end is then the server's (`last.exit_code` is the worker's, and
+    `last.summary` says what happened and what to do). Each in the server's sentence. */
+function lastHTML(last, state, running) {
+  if (!last || running) return '';
+  const when = dateTime(last.ended_at || last.started_at);
+  const at = when ? ' (' + when + ')' : '';
+  if (last.outcome === 'refused') {
+    return html`<div class="note note-neg paper-last" role="alert" data-ended="refused">${icon('warn')}<span><b>The last write-up did not start${at}.</b> ${plain(last.error || last.summary || 'Its worker gave no reason.')}</span></div>`;
+  }
+  if (last.outcome === 'unfinished') {
+    return html`<div class="note note-warn paper-last" role="status" data-ended="unfinished">${icon('warn')}<span><b>The last write-up began${at} and nothing says how it ended.</b> Its worker is gone, and it can be started again.</span></div>`;
+  }
+  const cut = last.exit_code != null;   // the server's account: the worker left none
+  if (last.outcome === 'failed' && (!state || cut)) {
+    return html`<div class="note note-neg paper-last" role="alert" data-ended="failed">${icon('warn')}<span><b>The last write-up ${cut ? 'did not finish' : 'failed'}${at}.</b> ${plain(last.error || last.summary || 'Its worker gave no reason.')}</span></div>`;
+  }
+  return '';
 }
 
 export const paperView = {
@@ -82,7 +95,7 @@ export const paperView = {
     loadTemplates();
     if (!store.paper) store.loadPaper();
     const paper = store.paper || {};
-    const state = paper.state || null;
+    const state = paper.state || null, last = lastOf(paper);
     const running = !!paper.running || e.mode === 'writing';
     clearInterval(pollTimer);
     if (running) pollTimer = setInterval(() => { if (app.store === store && app.route.view === 'paper') store.loadPaper(); else clearInterval(pollTimer); }, 3000);
@@ -115,12 +128,12 @@ export const paperView = {
         ${busy && !running ? html`<span class="quiet">${worker.verified === false ? 'The project\'s files name a worker this server cannot verify; the write-up can start once it has ended or is forgotten (see the overview).' : 'The agents are at work; the write-up can start when they have stopped.'}</span>` : ''}
       </form>
       ${ui.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span><b>Not started.</b> ${ui.error}</span></div>` : ''}
-      ${endedHTML(store, state, running)}
+      ${lastHTML(last, state, running)}
       ${ui.templatesError ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The templates could not be listed: ${ui.templatesError.message}</span></div>` : ''}
       ${leftOutHTML(store, paper)}
       ${numbersHTML(store, accepted)}
       ${state ? html`<section class="paper-state"><h2 class="sec-t">${running ? 'In progress' : state.status === 'succeeded' ? 'Finished' : state.status === 'failed' ? 'Failed' : state.status === 'interrupted' ? 'Interrupted' : 'Last run'} <span class="quiet">${state.updated_at ? ago(state.updated_at) : ''}</span></h2>
-          ${startedHTML(store)}
+          ${startedHTML(last)}
           ${state.error ? html`<p class="note note-neg">${icon('warn')}<span>${plain(state.error)}</span></p>` : ''}
           <ol class="paper-stages">${stages.map((name) => { const s = state.stages[name] || {}; return html`<li class="ps ps-${String(s.status || 'pending').replace(/[^a-z]/g, '')}"><span class="ps-m">${mark(s.status)}</span><span class="ps-n">${STAGE_NAME[name] || name}</span><span class="ps-s">${s.status || 'pending'}${s.reused ? ' (reused)' : ''}${s.attempts > 1 ? ' · ' + s.attempts + ' attempts' : ''}</span><span class="ps-t n">${s.seconds ? duration(s.seconds) : ''}</span>${s.error ? html`<span class="ps-e">${s.error}</span>` : ''}</li>`; })}</ol></section>`
         : paper.exists === false ? html`<p class="quiet paper-none">No paper has been written for this project.</p>` : ''}

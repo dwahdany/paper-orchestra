@@ -4,7 +4,7 @@
    the open route into the page, keeping scroll positions and the caret. A render caused by
    the event stream waits while the person is in the middle of typing. */
 
-import { app, openProjectUi, parseHash } from './core.js';
+import { app, askHealth, openProjectUi, parseHash } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $, $$, clock, html, parseStamp, plain, setHTML } from './util.js';
 import { Store } from './store.js';
@@ -222,11 +222,11 @@ connection.on((ok) => {
   if (ok) { if (app.store && app.store.loaded) { app.store.retryFailed(); app.store.refreshNow(); } else if (app.store) app.store.load(); if (app.route.name === 'library') loadLibrary(true); }
 });
 /* while the server is gone, ask again every few seconds; fetches flip the state back */
-setInterval(() => { if (!connection.ok) api.health().catch(() => {}); }, 3000);
+setInterval(() => { if (!connection.ok) askHealth().catch(() => {}); }, 3000);
 setInterval(tick, 1000);
 /* "38 min ago" should not stay true for ever */
 setInterval(() => { if (document.visibilityState === 'visible') renderSoon('minute', true); }, 60000);
-api.health().then((health) => { app.ui.health = health; if (app.route.name !== 'project') renderSoon('health', true); }, () => {});
+askHealth().then(() => { if (app.route.name !== 'project') renderSoon('health', true); }, () => {});
 if (!location.hash || location.hash === '#' || location.hash === '#/') {
   /* straight to the composer when there is no project yet, to the library otherwise */
   history.replaceState(null, '', '#/library');

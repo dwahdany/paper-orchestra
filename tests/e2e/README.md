@@ -28,34 +28,57 @@ against what the server answers:
   (not found, found only outside the finding's records, not checked), on a finding, on a
   suggested edit to a finding (inbox and page) and in the paper view;
 - rejecting an experiment that has run lists, with links, the findings and verdicts the
-  server says rest on it, and the paper view names the accepted findings a paper would
-  then leave out, each with the server's reason;
+  server says rest on it (`dependents` of the experiment's view: the same after a reload
+  and in a browser that never saw the rejection), and the paper view names the accepted
+  findings a paper would then leave out, each with the server's reason;
 - a result record that was edited by hand says so;
 - a worker the server cannot verify is shown with the server's note, without Stop, and
-  can be forgotten; a run whose worker is gone is shown as interrupted and Run starts it
-  again; the banner for a server that is gone says that agents and experiments go on;
+  can be forgotten; a run whose worker is gone is shown as interrupted, by its words, its
+  pill and its mark in every view, and Run starts it again; the banner for a server that
+  is gone says what that server said becomes of agents and experiments when it ends
+  (`stops_workers_on_exit` of `GET /api/health`);
 - the library lists a project that cannot be opened with the reason, and its rows count
   what waits, suggested edits included;
 - the composer's numbers are those of `GET /api/defaults`, and it takes a research cutoff
   as a month and a year;
 - a project's problems are listed on the overview and counted by a quiet mark in the top
   bar, in the server's words; a research cutoff that cannot be read is corrected there;
-- the main button and the strip say what a press does from the server's state ("Run the
-  approved experiment, then analyse it"), the phase that was next is offered again
-  afterwards, and in the moment between the state arriving and the lists of pages the
-  button promises neither a run nor an analysis that has just been done;
+- the main button and the strip say what a press does as the server says it (`next_step`
+  of the project view: "Run the approved experiment, then analyse it"), the phase that was
+  next is offered again afterwards, and in the moment between the state arriving and the
+  project view the button promises neither a run nor an analysis that has just been done;
+- cancelling is what the server says it is (`cancel_does`): an approved experiment that
+  has not started offers "Take the approval back" and is a plan again afterwards, one in
+  the queue is cancelled, the press tells the server which of the two the person was told,
+  and what happened is said in the server's sentence; a press that another window overtook
+  (it started the run) changes nothing and says so;
+- a project whose `state.json` is lost stands where its events say, with the engine's
+  sentence about it beside the main button, among the problems and on its row in the
+  library; with the events gone as well the app says that nothing tells where it stands,
+  and the one button asks for the phase to go on with; with a link in the file's place
+  the app shows the server's sentence and offers no press at all, and a press sent past
+  the app is refused by the server with the same sentence;
+- the analyst's recommendation of more research is the checkpoint's field (`recommends`,
+  with the journal page): it goes when that page is rejected and returns when it is
+  accepted again;
+- a suggested edit to a finding is marked in the inbox list by what its number check found;
+  the quick accept of a marked row says what the edit brings, the map opens such an edit
+  instead of accepting it, and a row the listing could not check opens first as well;
+- how the last write-up went, one that was refused and one whose worker was killed in the
+  middle included, is the server's account (`last` of `GET .../paper`), the same after a
+  reload;
+- the composer offers the model efforts and compute backends `GET /api/defaults` lists;
 - `[redacted]` and `***` in a log are plain text, not an error.
 
 And a few things a reload, another window or the keyboard must not break:
 
 - whom an instruction is for is kept with the text that is being typed, across a reload; an
-  instruction that was withdrawn in another window leaves the list at the next press of
-  Withdraw, which says that it was withdrawn already;
+  instruction that was withdrawn in another window leaves the list by itself (the server
+  records a `request.withdrawn` event), and a press of Withdraw that comes a moment after
+  the other window's says that it was withdrawn already;
 - E opens the editor with the keyboard in the text and nothing typed into it;
 - the list beside the main button closes when Tab leaves it, and Escape from the question
   of a rejection gives the keyboard back to what asked it;
-- what rests on a rejected experiment is still listed after a reload, for as long as that
-  rejection stands, and not for a later one;
 - with a phase to resume and a run approved meanwhile, the line of the round draws the run,
   its analysis and then the resumed phase;
 - the run of a result record that was edited by hand says that the record was edited since.
@@ -102,12 +125,15 @@ The flows change the project, so every run needs a fresh workspace. Options:
   projects have the same title; they are told apart by the number of their pages);
   otherwise it says that it was skipped. It also checks that what is being typed in one
   project (an instruction, an edit of a code file) does not turn up in the other.
-- A few states cannot be reached by using the app: a suggested edit to a finding (only an
-  agent proposes one), a worker on another machine, a run whose worker is gone, a
+- A few states cannot be reached by using the app: a worker on another machine, a run
+  whose worker is gone, a `state.json` that is lost (and the events with it), a
   `project.json` with a cutoff nobody can read, a project that cannot be opened. For those
-  the checks write the project's files the way a person with an editor would, and take the
-  workspace's path from `GET /api/health`. With a server on another machine these parts
-  are skipped, and the checks say so in a `note` line.
+  the checks write, move or remove the project's files the way a person with an editor
+  would, and take the workspace's path from `GET /api/health`. With a server on another
+  machine these parts are skipped, and the checks say so in a `note` line. What only an
+  agent brings about (a journal page that recommends more research, a suggested edit to a
+  finding) is not written by hand: the scripted analyst does it when an instruction asks
+  for it (below).
 - `hostile` writes pages, an instruction and a project title full of markup, script tags,
   right-to-left overrides, combining marks and a word of 225 letters, looks at every view
   at two widths, and removes them again.
@@ -120,8 +146,22 @@ The flows change the project, so every run needs a fresh workspace. Options:
 `scripted_model.py` answers as each role (intake, scout, theorist, designer, runner,
 analyst) through the same tools a model gets, with a pause between steps so that a browser
 can watch pages arrive and stop a phase in the middle. It never looks anything up: the
-scout writes a topic and a question instead of verifying papers. An instruction that
-contains `[scripted-failure]` makes the phase that reads it fail, which is how the checks
-get a failed phase to look at. Asked to repair the code of a failed run, the scripted runner
-replaces it by a script that works, which is how the checks get a run that succeeded on
-repaired code.
+scout writes a topic and a question instead of verifying papers. Asked to repair the code
+of a failed run, the scripted runner replaces it by a script that works, which is how the
+checks get a run that succeeded on repaired code. To the stages of the write-up it has
+nothing useful to say, and says so slowly: a write-up fails at its outline after a second
+or two, which is how the checks get a failed write-up and, by ending its worker before
+that, one that was cut short.
+
+An instruction steers it where a check needs a state that only an agent can bring about.
+The marks are words in the text of the instruction:
+
+- `[scripted-failure]` makes the phase that reads it fail, which is how the checks get a
+  failed phase to look at;
+- `[scripted-more-research]` makes the analyst write `next: research` into the round's
+  journal page: the recommendation the checkpoint of the analysis repeats;
+- `[scripted-edit]` makes the analyst suggest an edit to the first accepted finding of its
+  index, adding a sentence with a number that is on no record (73.25).
+
+The last two concern the analyst alone: the `rules` check leaves them in an instruction
+for the analyst, through the box on the overview, and the next analysis is given it.

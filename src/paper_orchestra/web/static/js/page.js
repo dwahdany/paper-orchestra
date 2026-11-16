@@ -2,10 +2,10 @@
    note), body, lineage, editor, history. The body is the server's rendering; a suggested
    edit is read in place (the server's `marked_html`), the unified diff one click away. */
 
-import { app, link, restedOf } from './core.js';
+import { app, link } from './core.js';
 import { api } from './api.js';
 import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, listOf, minutes, money, parseStamp, plain, plural, raw, storage, tf } from './util.js';
-import { STATES, TONE, agentName, glyph, icon, kindName, pageGlyph } from './vocab.js';
+import { STATES, TONE, agentName, glyph, icon, kindName, pageGlyph, shownState } from './vocab.js';
 
 /* ---------- naming a page ---------- */
 export function shortTitle(page) {
@@ -21,7 +21,12 @@ export const pageName = (page) => html`${hasId(page) ? html`<b class="pn-id">${p
 export const pageTip = (page) => kindName(page.kind) + (hasId(page) ? ' ' + page.id : '') + ' · ' + page.title;
 
 /* ---------- status: three dimensions, each with a word and a shape ---------- */
-export const stateTag = (page) => (page.state ? html`<span class="tag tag-state t-${TONE[page.state] || 'none'}">${glyph(page.kind, 'accepted', page.state, 14)}${page.state}</span>` : '');
+/** The state of a page as a word with its mark. An experiment whose run was interrupted says
+    that, wherever its page is shown: not "running", which is what its file still says. */
+export function stateTag(page) {
+  const state = shownState(page);
+  return state ? html`<span class="tag tag-state t-${TONE[state] || 'none'}">${glyph(page.kind, 'accepted', state, 14)}${state}</span>` : '';
+}
 export const reviewTag = (page) => (page.review === 'proposed' ? html`<span class="tag tag-proposed">Proposed</span>` : page.review === 'rejected' ? html`<span class="tag tag-rejected">Rejected</span>` : '');
 export const who = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : 'the ' + agentName(author));
 function byline(page) {
@@ -44,7 +49,7 @@ export function statusParts(store, page) {
   if (page.kind === 'experiment') {
     const row = store.expById.get(page.id) || {};
     const run = row.last_run || {};
-    if (page.state === 'running') return row.interrupted ? ['interrupted', 'needs you'] : ['running'];
+    if (page.state === 'running') return page.interrupted || row.interrupted ? ['interrupted', 'needs you'] : ['running'];
     if (page.state === 'succeeded') return ['succeeded'].concat(run.seconds != null ? [durationShort(run.seconds)] : []);
     if (page.state === 'failed') return ['failed', 'needs you'];
     if (page.state === 'approved') return ['approved', 'runs next'];
@@ -190,9 +195,13 @@ export function reviewBar(store, page, opt) {
   if (edits) store.pendingFor(page.path).forEach((proposal) => parts.push(changeNote(store, page, proposal, opt)));
   if (whole && page.review === 'rejected' && !opt.compact) {
     const meta = page.meta || {};
+    /* what rests on a rejected experiment comes with the experiment, from the server
+       (`dependents` of its view): the same after a reload and on any device */
+    const entry = page.kind === 'experiment' && page.id ? store.experiment(page.id) : null;
+    const rests = entry && entry.data ? restsOnHTML(store, entry.data.dependents) : '';
     parts.push(html`<div class="note note-rejected"><b>Rejected</b> by ${who(meta.decided_by || 'human')}${meta.decided_at ? ', ' + dateTime(meta.decided_at) : ''}.${meta.decision_reason ? html` <q>${meta.decision_reason}</q>` : ''}
       <span class="note-sub">The page is kept. Agents see its title and this reason, nothing else. <button class="linkish" data-act="reaccept" data-ref="${page.path}">Accept it after all</button></span>
-      ${page.kind === 'experiment' && restedOf(page) ? html`<div class="rested">${restsOnHTML(store, restedOf(page))}</div>` : ''}</div>`);
+      ${String(rests) ? html`<div class="rested">${rests}</div>` : ''}</div>`);
   }
   return join(parts);
 }

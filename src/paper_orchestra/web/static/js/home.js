@@ -3,7 +3,7 @@
 import { app, defaults } from './core.js';
 import { api } from './api.js';
 import { MONTH_NAMES, ago, bytes, checkpointDid, cutoffFrom, cutoffParts, cutoffWords, html, money, plain, plural, raw, setHTML, storage } from './util.js';
-import { KIND, STAGES, icon, phaseName } from './vocab.js';
+import { KIND, STAGES, computeName, effortName, icon, phaseName } from './vocab.js';
 import { stripMapSmall } from './overview.js';
 
 /* ---------- start: one box for the idea ---------- */
@@ -18,6 +18,14 @@ const reviewDefault = (kind) => { const d = defaults(); const policy = d && d.se
 function reviewKinds() {
   const d = defaults(), policy = (d && d.settings && d.settings.review) || {};
   return STAGES.filter((kind) => kind !== 'idea' && kind !== 'source' && kind !== 'result' && policy[kind] != null);
+}
+/** The values a setting accepts, as the server lists them (`efforts`, `compute_backends` of
+    /api/defaults). Until they are known the list is empty, and the one choice is the
+    project's default; a choice kept from before a reload is offered until then. */
+function accepted(name, kept) {
+  const d = defaults();
+  const list = d && Array.isArray(d[name]) ? d[name].filter((x) => typeof x === 'string' && x) : [];
+  return kept && list.indexOf(kept) < 0 && !d ? list.concat([kept]) : list;
 }
 /** The limits a new project gets when the composer says nothing: the server's, or `null`. */
 const limitDefaults = () => { const d = defaults(); return (d && d.settings && d.settings.limits) || null; };
@@ -81,9 +89,10 @@ export const startView = {
     const limit = String(s.model_usd).trim() !== '' && typed > 0 ? money(typed) : limits && limits.model_usd != null ? money(limits.model_usd) : '';
     const hint = (value, unit) => (value == null ? 'the default' : value + ' ' + unit);
     const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth), cutoffNow = cutoff.value ? cutoffParts(cutoff.value) : null;
+    /* a choice kept from an earlier visit that the server no longer lists is not sent behind a list that does not show it */
+    if (d) { if (s.effort && accepted('efforts').indexOf(s.effort) < 0) s.effort = ''; if (s.compute && accepted('compute_backends').indexOf(s.compute) < 0) s.compute = ''; }
     const kinds = reviewKinds();
     const waits = (kind) => (s.auto[kind] != null ? !s.auto[kind] : reviewDefault(kind) !== 'auto');
-    const backendName = { local: 'this machine', modal: 'Modal sandboxes' };
     setHTML(root, html`<div class="start"><div class="start-col">
       <h1>What do you want to find out?</h1>
       <p class="start-lede">Describe the idea in a few sentences and add anything you already have. Agents research it and fill a wiki with sources, questions, hypotheses and experiments. They only suggest: nothing is accepted, and nothing runs, without you.</p>
@@ -102,12 +111,12 @@ export const startView = {
       <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
       <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, a research cutoff, limits, what needs your review</span></summary><div class="adv-grid">
         <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea" autocomplete="off"></label>
-        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + models.effort + ')' : 'As the project default'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['xhigh', 'extra high'], ['max', 'max']].map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
+        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + effortName(models.effort) + ')' : 'As the project default']].concat(accepted('efforts', s.effort).map((v) => [v, effortName(v)])).map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
         <div class="adv-cutoff" role="group" aria-labelledby="opt-cutoff-l"><span id="opt-cutoff-l">Only literature before</span><span class="cutoff-fields">
           <label class="sr" for="opt-cutoff-month">Month of the research cutoff</label><select id="opt-cutoff-month" data-input="opt" data-name="cutoffMonth"><option value="0"${+s.cutoffMonth ? '' : raw(' selected')}>any month</option>${MONTH_NAMES.map((name, i) => html`<option value="${i + 1}"${+s.cutoffMonth === i + 1 ? raw(' selected') : ''}>${name}</option>`)}</select>
           <label class="sr" for="opt-cutoff-year">Year of the research cutoff</label><input id="opt-cutoff-year" data-input="opt" data-name="cutoffYear" value="${s.cutoffYear}" placeholder="year" inputmode="numeric" maxlength="4" autocomplete="off"></span>
           <span class="quiet cutoff-hint" data-cutoff>${cutoff.error ? cutoff.error : cutoffNow ? 'Papers published in ' + cutoffWords(cutoffNow) + ' or later are left out.' : 'Optional. Without a year, literature of any date is in scope.'}</span></div>
-        <label><span>Experiments run on</span><select id="opt-compute" data-input="opt" data-name="compute">${[['', d && d.settings && backendName[d.settings.compute] ? 'Default (' + backendName[d.settings.compute] + ')' : 'As the project default'], ['local', 'This machine (local CPU)'], ['modal', 'Modal sandboxes']].map(([v, t]) => html`<option value="${v}"${s.compute === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
+        <label><span>Experiments run on</span><select id="opt-compute" data-input="opt" data-name="compute">${[['', d && d.settings && d.settings.compute ? 'Default (' + computeName(d.settings.compute, true) + ')' : 'As the project default']].concat(accepted('compute_backends', s.compute).map((v) => [v, computeName(v)])).map(([v, t]) => html`<option value="${v}"${s.compute === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
         <label><span>Model spend limit</span><input id="opt-model-usd" data-input="opt" data-name="model_usd" value="${s.model_usd}" placeholder="${limits && limits.model_usd != null ? Number(limits.model_usd).toFixed(2) + ' dollars' : 'the default'}" inputmode="decimal" autocomplete="off"></label>
         <label><span>Time limit per run</span><input id="opt-exp-min" data-input="opt" data-name="exp_minutes" value="${s.exp_minutes}" placeholder="${limits && limits.experiment_seconds != null ? hint(Math.round(limits.experiment_seconds / 6) / 10, 'minutes') : 'the default'}" inputmode="decimal" autocomplete="off"></label>
         <label><span>Experiment spend limit</span><input id="opt-exp-usd" data-input="opt" data-name="exp_usd" value="${s.exp_usd}" placeholder="${limits && limits.experiment_usd != null ? Number(limits.experiment_usd).toFixed(2) + ' dollars' : 'the default'}" inputmode="decimal" autocomplete="off"></label>
@@ -148,17 +157,26 @@ function waitingWords(row) {
   /* while the pages of a project that changed are still to be counted, the number is the last checkpoint's */
   return n + ' waiting for you' + (pending ? '' : ' at the last checkpoint');
 }
+/** Where a row says the project stands. The row carries the engine's reading and where it
+    came from (`state_source`): a project whose state.json is lost is listed where its events
+    say it stands, and "Not started" is said only of one the server says has not started. */
 function rowState(row) {
   const running = row.worker && row.worker !== 'idle';
   const waiting = waitingWords(row);
   const and = (text) => (waiting ? text + ' · ' + waiting : text);
+  /* Nothing on file says where it stands: said as that, with the server's sentence on the row.
+     What it needs is in that sentence (a phase to be named, or a file to be put right): the
+     row does not guess which. */
+  if (!running && row.state_source === 'unknown') return ['pause', 'State unknown', and('needs you')];
   /* the project's files name a worker this server cannot verify: said as that, not as "running" */
   if (running && row.worker_verified === false) return ['pause', 'Worker not verified', and('named in its files; see the project')];
   if (running || row.status === 'running') return ['live', 'Round ' + (row.round || 1) + ' · ' + phaseName(row.phase), and('running now')];
   if (row.status === 'failed') return ['neg', 'Round ' + (row.round || 1) + ' · ' + phaseName(row.next_phase || row.phase) + ' failed', and('needs you')];
   if (row.status === 'stopped') return [row.error ? 'neg' : 'pause', 'Round ' + (row.round || 1) + ' · stopped', and(row.error ? 'the agents stopped unexpectedly' : 'stopped by you')];
   if (row.status === 'checkpoint') return ['pause', 'Round ' + (row.round || 1) + ' · checkpoint', waiting || 'ready to continue'];
-  return ['idle', 'Not started', waiting || 'ready'];
+  if (row.state_source ? row.state_source === 'not_started' : !row.round) return ['idle', 'Not started', waiting || 'ready'];
+  /* at rest in a round, with no checkpoint on record */
+  return ['pause', 'Round ' + (row.round || 1) + (row.phase ? ' · after ' + phaseName(row.phase) : ''), waiting || 'ready to continue'];
 }
 
 export const libraryView = {
@@ -182,13 +200,17 @@ export const libraryView = {
         const by = counts ? counts.by_kind || {} : null, pending = counts ? counts.pending || {} : null;
         /* what the last phase did; how much waits now is said live in the next column */
         const did = row.checkpoint && row.checkpoint.summary ? checkpointDid(row.checkpoint.summary) : '';
-        const say = row.status === 'failed' || (row.status === 'stopped' && row.error) ? plain(row.error) : did ? 'After ' + phaseName(row.checkpoint.phase) + ': ' + did : row.status === 'idle' ? 'The idea is in place; research has not started.' : '';
+        const fresh = row.state_source ? row.state_source === 'not_started' : row.status === 'idle' && !row.round;
+        const say = row.state_source === 'unknown' ? plain(row.state_problem || 'Nothing on file says where this project stands.')
+          : row.status === 'failed' || (row.status === 'stopped' && row.error) ? plain(row.error) : did ? 'After ' + phaseName(row.checkpoint.phase) + ': ' + did : fresh ? 'The idea is in place; research has not started.' : '';
+        /* state.json did not say, and the engine read the events instead: the row stands where they say, and says so */
+        const rebuilt = row.state_source === 'events' && row.state_problem ? plain(row.state_problem) : '';
         /* two projects of one title are told apart by their folders */
         const twin = row.title && lib.projects.filter((x) => x.title === row.title).length > 1;
         const waits = pending && pending.total ? plural(pending.pages || 0, 'proposed page') + (pending.proposals ? ' and ' + plural(pending.proposals, 'suggested edit') : '') + ' wait for a decision' : '';
         return html`<a class="lib-row" href="#/p/${encodeURIComponent(row.id)}/map"><div class="lib-main"><h2>${row.title || row.dir}</h2>${twin && row.dir ? html`<code class="lib-dir">${row.dir}/</code>` : ''}<p>${say}</p></div>
           <div class="lib-map">${stripMapSmall(by, pending ? pending.by_kind : null)}<span class="lib-counts">${by ? (STAGES.slice(1).some((k) => by[k]) ? (by.source || 0) + ' sources · ' + (by.hypothesis || 0) + ' hypotheses · ' + (by.experiment || 0) + ' experiments · ' + (by.finding || 0) + ' findings' : 'idea only') : ' '}</span></div>
-          <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2"${waits ? html` data-tip="${waits}"` : ''}>${st[2]}</span></div>
+          <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2"${waits ? html` data-tip="${waits}"` : ''}>${st[2]}</span>${rebuilt ? html`<span class="lib-st3" data-state-problem data-tip="${rebuilt}">${icon('warn')}read from its events</span>` : ''}</div>
           <div class="lib-num"><span>${money((row.spent || {}).model_usd || 0)}</span><span class="quiet">${ago(row.updated)}</span></div></a>`;
       })}</div>${broken}`;
     }

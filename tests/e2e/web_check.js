@@ -96,10 +96,12 @@ async function idle(pid, timeout) {
 }
 
 /** Where a project is on disk, or '' when this process cannot see it (a server on another
-    machine). A few states cannot be reached by using the app: a suggested edit to a finding
-    (only an agent proposes one), a run whose worker is gone, a worker on another machine, a
-    page edited into a problem. For those the check writes the project's files the way a
-    person with an editor would, which the product allows while no agent is running. */
+    machine). A few states cannot be reached by using the app: a run whose worker is gone, a
+    worker on another machine, a state.json that is lost, a page edited into a problem. For
+    those the check writes the project's files the way a person with an editor would, which
+    the product allows while no agent is running. (What only an agent brings about, a journal
+    page that recommends more research and a suggested edit to a finding, the scripted
+    analyst does when an instruction asks for it: see scripted_model.py.) */
 async function projectDir(pid) {
   const health = (await api('GET', '/api/health')).data || {};
   const view = (await api('GET', '/api/projects/' + pid)).data || {};
@@ -503,32 +505,6 @@ CHECKS.wiki = async ({ page, pid }) => {
     const after = (await api('GET', '/api/projects/' + pid + '/pages/' + pagePath('wiki/topics/why-warmup-helps.md'))).data;
     ok(/now gives one data point/.test(after.page.body) && /a sentence of my own/.test(after.page.body) && !after.proposals.length, 'the page holds the suggestion with my change, and the suggestion is decided');
   }
-  /* A suggested edit to a finding carries the number check of the text as it would read, in
-     the inbox and on the page: the numbers an edit brings are judged before the decision.
-     (Only an agent proposes an edit; this one is put into the project's files by hand.) */
-  const dir = await projectDir(pid);
-  if (dir) {
-    const f1 = (await api('GET', '/api/projects/' + pid + '/pages/F1')).data.page;
-    const edit = { id: 'ep-e2e0f1ed', target: f1.path, author: 'agent:analyst', round: f1.round || 1, created: stamp(), summary: 'Say how much smaller the spike is with the warmup',
-      body: f1.body.replace(/\s+$/, '') + '\n\nWith the warmup the spike is 73.25 times smaller.\n', fields: {}, relations_add: {}, base_updated: f1.updated, review: 'proposed', decided_by: null, decided_at: null, decision_reason: null };
-    fs.writeFileSync(path.join(dir, 'proposals', edit.id + '.json'), JSON.stringify(edit, null, 4));
-    let asEdited = null;
-    for (let i = 0; i < 40 && !asEdited; i++) { asEdited = ((await api('GET', '/api/projects/' + pid + '/pages/F1')).data.proposals || []).find((x) => x.id === edit.id) || null; if (!asEdited) await sleep(250); }
-    if (ok(!!asEdited && !!asEdited.number_report, 'the server reports the numbers of the suggested edit: ' + JSON.stringify(asEdited && asEdited.number_report && asEdited.number_report.unverified))) {
-      await reopen(page, '#/p/' + pid + '/wiki/F1', '.wiki-rail .review-change .review-num');
-      const inMargin = (await text(page, '.wiki-rail .review-change .review-num')).replace(/\s+/g, ' ');
-      ok(inMargin.includes(asEdited.number_report.summary) && /Numbers, as the finding would read/.test(inMargin), 'on the page the suggested edit shows the server\'s sentence for the text as it would read: ' + inMargin.trim().slice(0, 150));
-      ok(/Not found:\s*73\.25/.test(await text(page, '.wiki-rail .review-change .numcheck-flag')), 'and names the number the edit brings that is on no record: ' + (await text(page, '.wiki-rail .review-change .numcheck-flag')).trim());
-      await until(page, () => /73\.25/.test((document.querySelector('.prose-marked .num-flag') || {}).textContent || ''), null, 4000, 'the number is flagged in the edit as it is read in place');
-      ok(/of the finding as it is now/.test(await text(page, '.numcheck .rail-h')), 'the check of the page as it is says that it is of the page as it is: ' + (await text(page, '.numcheck .rail-h')).trim());
-      await shot(page, 'wiki-edit-numbers');
-      await open(page, '#/p/' + pid + '/inbox/F1', '.in-detail .review-change .review-num');
-      ok((await text(page, '.in-detail .review-change .review-num')).replace(/\s+/g, ' ').includes(asEdited.number_report.summary) && /Not found:\s*73\.25/.test(await text(page, '.in-detail .review-change .numcheck-flag')), 'and so does the inbox: ' + (await text(page, '.in-detail .review-change .review-num')).replace(/\s+/g, ' ').trim().slice(0, 120));
-      await shot(page, 'inbox-edit-numbers');
-    }
-    const gone = await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: edit.id, decision: 'reject', reason: 'Written for the browser check.' }] });
-    ok(gone.status === 200 && gone.data.ok, 'the suggested edit written for this is rejected again');
-  } else notes.push('wiki: the project directory is not on this machine; the number check of a suggested edit to a finding was not looked at');
   /* a result record that was edited by hand says so on its page */
   const record = (await api('GET', '/api/projects/' + pid + '/pages/' + pagePath('wiki/results/E2-run1.md'))).data;
   ok(record.edited_record === false, 'a record as code wrote it is not marked: ' + record.edited_record);
@@ -655,10 +631,20 @@ CHECKS.experiments = async ({ page, pid }) => {
   await page.waitForSelector('.run.open .failure.k-cancelled');
   ok(/Stopped when you stopped the agents/.test(await text(page, '.run.open .failure .fail-t')) && /queued again/.test(await text(page, '.run.open .failure')), 'its run says that it was stopped with the agents and is queued again: ' + (await text(page, '.run.open .failure .fail-t')));
   await shot(page, 'experiment-stopped-with-the-agents');
-  /* an approval can be taken back before the run */
+  /* An experiment that waits in the queue is cancelled: the button says what the server says a
+     press does (`cancel_does`), the press tells the server what the person was told, and what
+     happened is said in the server's own sentence. */
+  ok(queued.cancel_does === 'cancel', 'the server says that a cancel of a queued experiment cancels it: ' + queued.cancel_does);
+  await until(page, () => (document.querySelector('.callout [data-act="cancel-run"]') || { dataset: {} }).dataset.does === 'cancel', null, 8000, 'the button of a queued experiment is the one that cancels');
+  ok((await text(page, '.callout [data-act="cancel-run"]')).trim() === 'Cancel the run', 'and says so: ' + (await text(page, '.callout [data-act="cancel-run"]')).trim());
+  const cancels = [];
+  const listenCancel = async (response) => { if (response.request().method() === 'POST' && /\/cancel$/.test(response.url())) cancels.push({ sent: JSON.parse(response.request().postData() || '{}'), status: response.status(), answer: await response.json().catch(() => null) }); };
+  page.on('response', listenCancel);
   await page.click('.callout [data-act="cancel-run"]');
-  await until(page, () => /cancelled/.test((document.querySelector('.page-status .tag-state') || {}).textContent || ''), null, 10000, '"Do not run it" takes the approval back');
-  ok(/will not run/.test(await text(page, '.toast')), 'and says so: ' + (await text(page, '.toast')).trim().slice(0, 70));
+  await until(page, () => /cancelled/.test((document.querySelector('.page-status .tag-state') || {}).textContent || ''), null, 10000, 'the queued experiment is cancelled');
+  page.off('response', listenCancel);
+  ok(cancels.length === 1 && cancels[0].sent.expect === 'cancel' && cancels[0].answer && cancels[0].answer.outcome === 'cancelled', 'the press said what the person was told, and the server cancelled: ' + JSON.stringify(cancels.map((c) => [c.sent, c.status, c.answer && c.answer.outcome])));
+  ok(cancels.length === 1 && (await text(page, '.toast')).replace(/\s+/g, ' ').includes(cancels[0].answer.message), 'the app says what happened in the server\'s sentence: ' + (await text(page, '.toast')).trim().slice(0, 90));
   /* a run stopped at its time limit: a limit, not a bug */
   const short = await api('POST', '/api/projects/' + pid + '/experiments/E4/approve', { backend: 'local', timeout_seconds: 3, start: true });
   ok(short.status === 200 && short.data.worker, 'a run with a three-second limit starts: ' + short.status);
@@ -684,6 +670,36 @@ CHECKS.experiments = async ({ page, pid }) => {
   await page.waitForSelector('.approve [data-act="approve"]:not([data-start])');
   await page.click('.approve [data-act="approve"]:not([data-start])');
   await until(page, () => /Approved to run/.test((document.querySelector('.callout h2') || {}).textContent || ''), null, 8000, 'approved without starting: it waits for the run phase');
+  /* Taking an approval back. An approved experiment that has not started becomes a plan again,
+     as `research cancel` does from a terminal: the server says that this is what a press does
+     (`cancel_does: "withdraw"`), the button says it, and afterwards the app says what the
+     server said happened. By the keyboard, and the keyboard lands on what can be done next. */
+  const asApproved = (await api('GET', '/api/projects/' + pid + '/experiments/E1')).data;
+  ok(asApproved.page.state === 'approved' && asApproved.cancel_does === 'withdraw', 'the server says that a cancel of an approved experiment that has not started takes the approval back: ' + asApproved.cancel_does);
+  await until(page, () => (document.querySelector('.callout [data-act="cancel-run"]') || { dataset: {} }).dataset.does === 'withdraw', null, 8000, 'the button knows that a press takes the approval back');
+  ok((await text(page, '.callout [data-act="cancel-run"]')).trim() === 'Take the approval back', 'the button says "Take the approval back": ' + (await text(page, '.callout [data-act="cancel-run"]')).trim());
+  const runsBefore = asApproved.runs.length;
+  const taken = [];
+  const listenTaken = async (response) => { if (response.request().method() === 'POST' && /\/cancel$/.test(response.url())) taken.push({ sent: JSON.parse(response.request().postData() || '{}'), status: response.status(), answer: await response.json().catch(() => null) }); };
+  page.on('response', listenTaken);
+  await page.focus('.callout [data-act="cancel-run"]');
+  await page.keyboard.press('Enter');
+  await until(page, () => /withdrew the approval/.test((document.querySelector('.approve .approve-back') || {}).textContent || ''), null, 10000, 'the experiment is a plan again and says that the approval was withdrawn');
+  page.off('response', listenTaken);
+  ok(taken.length === 1 && taken[0].sent.expect === 'withdraw' && taken[0].status === 200 && taken[0].answer.outcome === 'withdrawn' && taken[0].answer.state === 'planned', 'the press told the server what the person was told, and the server took the approval back: ' + JSON.stringify(taken.map((c) => [c.sent, c.status, c.answer && c.answer.outcome])));
+  ok(taken.length === 1 && (await text(page, '.toast')).replace(/\s+/g, ' ').includes(taken[0].answer.message) && /approval was taken back/.test(await text(page, '.toast')), 'the confirmation is the server\'s sentence: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim().slice(0, 110));
+  const asPlan = (await api('GET', '/api/projects/' + pid + '/experiments/E1')).data;
+  ok(asPlan.page.state === 'planned' && asPlan.runs.length === runsBefore && asPlan.cancel_does === null, 'on the server it is planned, with no run recorded and nothing left to cancel: ' + asPlan.page.state + ', ' + asPlan.runs.length + ' runs');
+  ok(await page.evaluate(() => !!document.activeElement && document.activeElement.dataset.act === 'approve'), 'the keyboard is on the approval that can be given again: ' + (await focusOf(page)));
+  ok(/planned/.test(await text(page, '.page-status .tag-state')) && (await count(page, '.callout [data-act="cancel-run"]')) === 0, 'the page shows a plan, with nothing to take back');
+  await shot(page, 'experiment-approval-withdrawn');
+  /* a reload shows the same: it is the page's own state, not something this window remembers */
+  await page.reload();
+  await until(page, () => /withdrew the approval/.test((document.querySelector('.approve .approve-back') || {}).textContent || ''), null, 10000, 'after a reload the plan still says that its approval was withdrawn');
+  /* approved again, with the keyboard, for the run phase that follows */
+  await page.focus('.approve [data-act="approve"]:not([data-start])');
+  await page.keyboard.press('Enter');
+  await until(page, () => /Approved to run/.test((document.querySelector('.callout h2') || {}).textContent || ''), null, 8000, 'and it is approved again from the form');
   const findings = (await api('GET', '/api/projects/' + pid + '/pages?kind=finding')).data.pages.length;
   await page.keyboard.press('1');
   await page.waitForSelector('.strip [data-act="continue"]');
@@ -780,16 +796,23 @@ CHECKS.agents = async ({ page, pid }) => {
   await until(page, (id) => !document.querySelector('.rq[data-rq="' + id + '"]'), forScout.id, 5000, 'a withdrawn instruction leaves the list');
   ok(!(await api('GET', '/api/projects/' + pid + '/requests')).data.requests.some((r) => r.id === forScout.id), 'and is gone from the server');
   ok((await count(page, '.go-rec[data-reason="requests"]')) === 0, 'and with it the reason for more research');
-  /* an instruction withdrawn in another window (that writes no event): this window still lists
-     it, and a press of Withdraw says that it is gone and takes the row away, not "not withdrawn" */
+  /* An instruction withdrawn in another window is an event (`request.withdrawn`): this window
+     takes the row away by itself, and the activity says who withdrew what. */
   const elsewhere = (await api('POST', '/api/projects/' + pid + '/requests', { text: 'Withdrawn in another window.', for: 'designer' })).data.request;
   await page.waitForSelector('.rq[data-rq="' + elsewhere.id + '"] [data-act="rq-del"]');
   ok((await api('DELETE', '/api/projects/' + pid + '/requests/' + elsewhere.id)).status === 200, 'an instruction is withdrawn in another window');
-  if (await count(page, '.rq[data-rq="' + elsewhere.id + '"] [data-act="rq-del"]')) {
-    await page.click('.rq[data-rq="' + elsewhere.id + '"] [data-act="rq-del"]');
-    await until(page, (id) => !document.querySelector('.rq[data-rq="' + id + '"]'), elsewhere.id, 5000, 'a press of Withdraw on an instruction that is gone already takes the row away');
-    ok(/withdrawn already/.test(await text(page, '.toast')) && (await count(page, '.toast-error')) === 0 && !/rq-[0-9a-f]{6}/.test(await text(page, '.toast')), 'and says that it was withdrawn already, without the name of a file: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim());
-  }
+  await until(page, (id) => !document.querySelector('.rq[data-rq="' + id + '"]'), elsewhere.id, 8000, 'an instruction withdrawn in another window leaves the list of this one by itself');
+  await until(page, () => [...document.querySelectorAll('.feed .ev')].slice(0, 6).some((row) => /You withdrew your request to the designer/.test(row.textContent) && /you/.test((row.querySelector('.ev-who') || {}).textContent || '')), null, 6000, 'and the activity has a line for it, as something you did');
+  /* The other window was a moment faster: the press of Withdraw here reaches a request that is
+     gone already. It says so and takes the row away, not "not withdrawn". */
+  const raced = (await api('POST', '/api/projects/' + pid + '/requests', { text: 'Withdrawn a moment earlier elsewhere.', for: 'designer' })).data.request;
+  await page.waitForSelector('.rq[data-rq="' + raced.id + '"] [data-act="rq-del"]');
+  const first = '**/api/projects/' + pid + '/requests/' + raced.id;
+  await page.route(first, async (route) => { if (route.request().method() === 'DELETE') await api('DELETE', '/api/projects/' + pid + '/requests/' + raced.id); await route.continue(); });
+  await page.click('.rq[data-rq="' + raced.id + '"] [data-act="rq-del"]');
+  await until(page, (id) => !document.querySelector('.rq[data-rq="' + id + '"]'), raced.id, 6000, 'a press of Withdraw on an instruction that another window withdrew first takes the row away');
+  await page.unroute(first);
+  ok(/withdrawn already/.test(await text(page, '.toast')) && (await count(page, '.toast-error')) === 0 && !/rq-[0-9a-f]{6}/.test(await text(page, '.toast')), 'and says that it was withdrawn already, without the name of a file: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim());
   const rows = await count(page, '.feed .ev');
   await page.click('[data-act="feed-more"]');
   await until(page, (n) => document.querySelectorAll('.feed .ev').length > n, rows, 5000, 'earlier activity is fetched when asked for');
@@ -1003,7 +1026,23 @@ CHECKS.states = async ({ page, pid, context }) => {
       await page.waitForSelector('.callout-interrupted');
       ok((await text(page, '.callout-interrupted p')).trim() === left.interrupted_note, 'the experiment says so in the server\'s sentence: ' + (await text(page, '.callout-interrupted p')).trim().slice(0, 90));
       ok((await count(page, '.run-live')) === 0 && (await count(page, '.callout-interrupted [data-act="run-now"]')) === 1 && (await count(page, '.callout-interrupted [data-act="cancel-run"]')) === 1 && /interrupted/.test(await text(page, '.page-status')), 'it is not shown as a live run; Run it again and Cancel are offered');
+      /* The mark says what the words say, wherever the page has one: the server marks the
+         experiment in every list of pages, and no mark or pill goes on saying "running". */
+      const asListed = (await api('GET', '/api/projects/' + pid + '/pages?kind=experiment')).data.pages.find((x) => x.id === 'E1');
+      ok(!!asListed && asListed.interrupted === true && asListed.state === 'running', 'the list of pages marks the experiment as interrupted: ' + JSON.stringify(asListed && [asListed.state, asListed.interrupted]));
+      ok((await text(page, '.exp-page .page-status .tag-state')).trim() === 'interrupted' && (await count(page, '.exp-page .page-status .tag-state.t-halt .gl.t-halt')) === 1, 'the pill in the header says interrupted, with the mark of it: ' + (await text(page, '.exp-page .page-status')).trim().slice(0, 40));
+      ok((await count(page, '.exp-rail .idx.cur .gl.t-halt')) === 1 && (await count(page, '.exp-rail .idx.cur .gl.t-live')) === 0 && (await count(page, '.exp-page .kicker-kind .gl.t-halt')) === 1, 'the mark in the rail and beside the title is the one of an interrupted run, not of a running one');
       await shot(page, 'experiment-interrupted');
+      await open(page, '#/p/' + pid + '/wiki/E1', '.page-wiki .page-status');
+      ok((await text(page, '.page-wiki .page-status .tag-state')).trim() === 'interrupted' && (await count(page, '.wiki-index .idx.cur .gl.t-halt')) === 1, 'in the wiki its pill and its mark in the index say interrupted: ' + (await text(page, '.page-wiki .page-status .tag-state')).trim());
+      await open(page, '#/p/' + pid + '/map/E1', '.map-svg .node.sel');
+      ok((await count(page, '.map-svg .node.sel.t-halt .gl.t-halt')) === 1 && /, interrupted$/.test(await page.getAttribute('.map-svg .node.sel', 'aria-label')) && (await text(page, '.panel .page-status .tag-state')).trim() === 'interrupted', 'on the map the node is drawn and named as interrupted, and so is the page beside it: ' + (await page.getAttribute('.map-svg .node.sel', 'aria-label')));
+      await shot(page, 'map-interrupted');
+      /* what a press of Continue does is the server's word too: the interrupted run is run again first */
+      const owed = (await api('GET', '/api/projects/' + pid)).data.next_step;
+      ok(!!owed && owed.experiments.includes('E1') && owed.will_run[0] === 'run', 'the server says that a press of Continue runs the interrupted experiment first: ' + JSON.stringify(owed));
+      await until(page, () => /^Run the interrupted experiment again/.test(((document.querySelector('.strip [data-act="continue"]') || {}).textContent || '').trim()), null, 8000, 'and the main button says so');
+      await open(page, '#/p/' + pid + '/experiments/E1', '.callout-interrupted');
       const runsBefore = left.runs.length;
       await page.click('.callout-interrupted [data-act="run-now"]');
       await until(page, () => /succeeded/.test((document.querySelector('.page-status .tag-state') || {}).textContent || '') && !document.querySelector('.callout-interrupted'), null, 90000, 'Run starts the interrupted experiment again, and it ends');
@@ -1011,16 +1050,109 @@ CHECKS.states = async ({ page, pid, context }) => {
       const again = (await api('GET', '/api/projects/' + pid + '/experiments/E1')).data;
       ok(again.page.state === 'succeeded' && again.interrupted === false && again.runs.length === runsBefore + 1, 'it ran once more and is no longer interrupted: ' + again.page.state + ', ' + again.runs.length + ' runs (were ' + runsBefore + ')');
     }
-  } else notes.push('states: the project directory is not on this machine; a worker the server cannot verify and an interrupted run were not looked at');
+    /* Where a project stands when state.json is lost. The engine reads round, phases and what
+       comes next from the project's events; the server passes that reading on with the
+       engine's sentence about it (`state_problem`) and where it came from (`state_source`).
+       The app shows the project where it stands, with that sentence, and never as one that
+       has not started. With the events gone as well nothing says where it stands: the app
+       says that, and the one button asks for the phase to go on with. */
+    await idle(pid);
+    const kept = fs.mkdtempSync(path.join(os.tmpdir(), 'po-e2e-state-'));
+    const stood = (await api('GET', '/api/projects/' + pid)).data;
+    await open(page, '#/p/' + pid + '/map', '.strip');
+    try {
+      fs.renameSync(stateFile, path.join(kept, 'state.json'));
+      let lost = null;
+      for (let i = 0; i < 40 && !(lost && lost.state_source === 'events'); i++) { lost = (await api('GET', '/api/projects/' + pid)).data; if (lost.state_source !== 'events') await sleep(250); }
+      if (ok(!!lost && lost.state_source === 'events' && !!lost.state_problem && lost.state.round === stood.state.round && lost.state.phases.length > 0, 'with state.json gone the server gives the engine\'s reading from the events, and says so: ' + JSON.stringify(lost && [lost.state_source, lost.state.round, lost.state.next_phase]) + ' (the file said round ' + stood.state.round + ', next ' + stood.state.next_phase + ')')) {
+        ok(!lost.problems.some((x) => x.path === 'state.json'), 'and says it once: not among the problems of the files as well');
+        /* this window was open: the state that arrives with the event stream brings the sentence along */
+        await until(page, () => !!document.querySelector('.strip-sub [data-state-problem]'), null, 20000, 'the open window learns that the state was read from the events, without a reload');
+        const said = (await text(page, '.strip-sub [data-state-problem]')).replace(/\s+/g, ' ').trim();
+        ok(said === lost.state_problem.replace(/\s+/g, ' ').trim(), 'the strip shows the engine\'s sentence as the server gives it: ' + said.slice(0, 110));
+        ok(new RegExp('round ' + lost.state.round).test(await text(page, '.strip-kicker')) && !/Not started|not known/i.test(await text(page, '.strip')), 'and the project stands where its events say, not as "not started": ' + (await text(page, '.strip-kicker')).trim());
+        ok((await text(page, '.top-prob')).trim() === String(lost.problems_total + 1) && (await count(page, '.top-status.st-failed')) === 0, 'the quiet mark in the top bar counts it: ' + (await text(page, '.top-prob')).trim());
+        await shot(page, 'state-read-from-events');
+        await reopen(page, '#/p/' + pid + '/overview', '#problems [data-state-problem]');
+        ok((await text(page, '#problems [data-state-problem]')).replace(/\s+/g, ' ').trim() === lost.state_problem.replace(/\s+/g, ' ').trim(), 'after a reload the overview says the same, among what was read around');
+        ok(new RegExp('round ' + lost.state.round, 'i').test(await text(page, '.ov-state')) && /\$\d/.test(await text(page, '.spend-big')) && (await text(page, '.spend-big b >> nth=0')).trim() === '$' + lost.state.spent.model_usd.toFixed(2), 'with the round and the spending the events account for: ' + (await text(page, '.ov-state')).trim().slice(-10) + ', ' + (await text(page, '.spend-big b >> nth=0')).trim());
+        await shot(page, 'overview-state-read-from-events');
+        await open(page, '#/library', '.lib-row');
+        const rowNow = ((await api('GET', '/api/projects')).data.projects || []).find((x) => x.id === pid);
+        ok(!!rowNow && rowNow.state_source === 'events' && rowNow.round === lost.state.round, 'the row of the library carries the same reading: ' + JSON.stringify(rowNow && [rowNow.state_source, rowNow.status, rowNow.round]));
+        const libRow = '.lib-row[href="#/p/' + pid + '/map"]';
+        ok(new RegExp('Round ' + lost.state.round).test(await text(page, libRow + ' .lib-st1')) && !/Not started/.test(await text(page, libRow)) && /read from its events/.test(await text(page, libRow + ' [data-state-problem]')), 'and the library lists the project where it stands, saying where that was read: ' + (await text(page, libRow + ' .lib-st')).replace(/\s+/g, ' ').trim());
+        await shot(page, 'library-state-read-from-events');
+      }
+      /* the events gone too: nothing says where the project stands */
+      fs.renameSync(path.join(dir, 'events.jsonl'), path.join(kept, 'events.jsonl'));
+      let adrift = null;
+      for (let i = 0; i < 40 && !(adrift && adrift.state_source === 'unknown'); i++) { adrift = (await api('GET', '/api/projects/' + pid)).data; if (adrift.state_source !== 'unknown') await sleep(250); }
+      if (ok(!!adrift && adrift.state_source === 'unknown' && !!adrift.state_problem && !!adrift.next_step && adrift.next_step.needs_phase === true, 'with the events gone as well the server says that nothing tells where the project stands, and that a phase has to be named: ' + JSON.stringify(adrift && [adrift.state_source, adrift.next_step]))) {
+        await reopen(page, '#/p/' + pid + '/map', '.strip.s-unknown');
+        ok((await text(page, '.strip-text')).replace(/\s+/g, ' ').trim() === adrift.state_problem.replace(/\s+/g, ' ').trim() && /not known/.test(await text(page, '.strip-kicker')), 'the strip says so in the server\'s sentence: ' + (await text(page, '.strip-text')).trim().slice(0, 100));
+        ok(/State unknown/.test(await text(page, '.top-status')) && /State unknown/.test(await text(page, '#status .sb-state')) && !/Not started/.test(await text(page, '.strip')), 'the header and the status bar say that the state is unknown, not that nothing has started');
+        ok((await count(page, '.strip [data-act="continue"]')) === 0 && /Choose the phase to go on with/.test(await text(page, '.strip .go-pick [data-act="go-menu"]')), 'no press without a phase is offered: the one button asks for the phase: ' + (await text(page, '.strip .go-pick')).trim());
+        await page.focus('.strip .go-pick [data-act="go-menu"]');
+        await page.keyboard.press('Enter');
+        await page.waitForSelector('.strip .go-menu .go-i:focus');
+        ok((await count(page, '.strip .go-menu [data-act="continue-phase"]')) >= 2 && (await count(page, '.strip .go-menu [data-act="continue-phase"][data-phase="research"]')) === 1, 'which opens the list of phases, with the keyboard in it: ' + (await page.locator('.strip .go-menu .go-i b').allTextContents()).join(', '));
+        await shot(page, 'state-unknown');
+        await page.keyboard.press('Escape');
+        await until(page, () => !document.querySelector('.go-menu') && document.activeElement.dataset.act === 'go-menu', null, 3000, 'Escape closes it and gives the keyboard back to the button');
+        await open(page, '#/library', '.lib-row');
+        const libRow = '.lib-row[href="#/p/' + pid + '/map"]';
+        ok(/State unknown/.test(await text(page, libRow + ' .lib-st1')) && !/Not started/.test(await text(page, libRow)) && (await text(page, libRow + ' .lib-main p')).replace(/\s+/g, ' ').includes(adrift.state_problem.replace(/\s+/g, ' ').trim()), 'the library says the same of the project, with the server\'s sentence: ' + (await text(page, libRow + ' .lib-st')).replace(/\s+/g, ' ').trim());
+      }
+      /* A link where state.json should be. The server reads no record of a project through a
+         link, so it can say neither where the project stands nor what a press would do: the
+         app shows its sentence, which says what to put right, and offers no press at all. */
+      fs.renameSync(path.join(kept, 'events.jsonl'), path.join(dir, 'events.jsonl'));
+      fs.symlinkSync(path.join(kept, 'state.json'), stateFile);
+      let linked = null;
+      for (let i = 0; i < 40 && !(linked && linked.state_source === 'unknown' && linked.next_step === null); i++) { linked = (await api('GET', '/api/projects/' + pid)).data; if (!(linked.state_source === 'unknown' && linked.next_step === null)) await sleep(250); }
+      if (ok(!!linked && linked.state_source === 'unknown' && linked.next_step === null && /not an ordinary file/.test(linked.state_problem || ''), 'with a link in the place of state.json the server says that it does not read it, and says nothing about a press: ' + JSON.stringify(linked && [linked.state_source, linked.next_step]))) {
+        await reopen(page, '#/p/' + pid + '/map', '.strip.s-unknown');
+        ok((await text(page, '.strip-text')).replace(/\s+/g, ' ').trim() === linked.state_problem.replace(/\s+/g, ' ').trim(), 'the strip shows the server\'s sentence, which says what to put right: ' + (await text(page, '.strip-text')).trim().slice(0, 90));
+        ok((await count(page, '.strip [data-act="continue"], .strip [data-act="go-menu"], .strip [data-act="continue-phase"]')) === 0, 'and no press is offered that nobody could say the effect of');
+        await page.keyboard.press('5');
+        await page.waitForSelector('.ov-head');
+        ok((await count(page, '.ov-actions [data-act="continue"], .ov-actions [data-act="go-menu"]')) === 0 && (await text(page, '.ov-sub')).replace(/\s+/g, ' ').trim() === linked.state_problem.replace(/\s+/g, ' ').trim(), 'the overview says the same, and offers none either');
+        /* what the app does not offer does not happen behind it: the server starts no agent that would read the state through the link */
+        const behind = await api('POST', '/api/projects/' + pid + '/advance', {});
+        const after = (await api('GET', '/api/projects/' + pid)).data;
+        ok(behind.status === 409 && String((behind.data.error || {}).message || '').includes(linked.state_problem) && after.worker.state === 'idle', 'and a press sent past the app is refused with the same sentence, with nothing started: ' + behind.status);
+        const linkedRow = '.lib-row[href="#/p/' + pid + '/map"]';
+        await open(page, '#/library', linkedRow);
+        ok(/State unknown/.test(await text(page, linkedRow + ' .lib-st1')) && !/choose the phase/.test(await text(page, linkedRow)) && (await text(page, linkedRow + ' .lib-main p')).replace(/\s+/g, ' ').includes(linked.state_problem.replace(/\s+/g, ' ').trim()), 'the library row says the server\'s sentence and does not promise a choice of phase that the project does not offer: ' + (await text(page, linkedRow + ' .lib-st')).replace(/\s+/g, ' ').trim());
+      }
+    } finally {
+      /* whatever went wrong above, the project gets its files back for the checks that follow */
+      for (const name of ['events.jsonl', 'state.json']) if (fs.existsSync(path.join(kept, name))) fs.renameSync(path.join(kept, name), path.join(dir, name));
+      fs.rmSync(kept, { recursive: true, force: true });
+    }
+    let whole = null;
+    for (let i = 0; i < 40 && !(whole && whole.state_source === 'file'); i++) { whole = (await api('GET', '/api/projects/' + pid)).data; if (whole.state_source !== 'file') await sleep(250); }
+    ok(!!whole && whole.state_source === 'file' && whole.state_problem === null && whole.state.round === stood.state.round, 'with its files back the project stands where it stood, with nothing to say about its state: ' + JSON.stringify(whole && [whole.state_source, whole.state_problem]));
+    await reopen(page, '#/p/' + pid + '/map', '.strip');
+    ok((await count(page, '[data-state-problem]')) === 0 && (await count(page, '.strip.s-unknown')) === 0, 'and the app says nothing about it any more');
+  } else notes.push('states: the project directory is not on this machine; a worker the server cannot verify, an interrupted run and a lost state.json were not looked at');
   /* the server unreachable: say so, keep the draft, come back */
+  const healthBefore = (await api('GET', '/api/health')).data || {};
   await open(page, '#/p/' + pid + '/wiki/Q2/edit', 'textarea#ed-body');
   await page.fill('#ed-summary', 'Typed while the server was away');
   await context.setOffline(true);
   await page.keyboard.press('Control+s');
   await until(page, () => !document.querySelector('#banner').hidden, null, 8000, 'the banner says the server is not answering');
   ok(/not answering/.test(await text(page, '#banner')), 'in plain words');
-  /* what ending the server does, said truly: agents and experiments keep running, and the app finds them again */
-  ok(/Agents and experiments that were running go on without the server/.test(await text(page, '#banner')) && /finds them again when it is back/.test(await text(page, '#banner')), 'the banner says that agents and experiments go on without the server and are found again: ' + (await text(page, '#banner')).replace(/\s+/g, ' ').trim().slice(0, 200));
+  /* What ending the server does to agents and experiments, said truly: the server says
+     whether it stops its workers when it ends (`stops_workers_on_exit` of /api/health), and
+     the banner says that, from the last answer the app had. */
+  const stops = healthBefore.stops_workers_on_exit;
+  const about = (await text(page, '#banner [data-workers]')).replace(/\s+/g, ' ').trim();
+  ok(typeof stops === 'boolean' && (await page.getAttribute('#banner [data-workers]', 'data-workers')) === (stops ? 'stopped' : 'go-on'), 'the banner goes by what the server said of itself (stops its workers when it ends: ' + stops + ')');
+  ok(stops ? /started to stop agents and experiments when it ends/.test(about) && !/go on without/.test(about) : /go on without the server/.test(about) && /finds them again when it is back/.test(about), 'and says what is true of this server: ' + about);
+  ok(!/unless/.test(about), 'without hedging');
   ok((await page.inputValue('#ed-summary')) === 'Typed while the server was away', 'what was typed is kept');
   ok(/Not saved/.test(await text(page, '.editor .note-neg')), 'the editor says it was not saved');
   await shot(page, 'state-offline');
@@ -1050,7 +1182,7 @@ CHECKS.states = async ({ page, pid, context }) => {
    experiment says what rests on it; a project's problems are said where the person sees
    them; the library lists a project that cannot be opened, and counts what waits live; the
    research cutoff is a year and a month, and one that cannot be read is put right here. */
-CHECKS.rules = async ({ page, pid }) => {
+CHECKS.rules = async ({ browser, page, pid }) => {
   const dir = await projectDir(pid);
   await idle(pid);
   await open(page, '#/p/' + pid + '/overview', '.ov-head');
@@ -1076,12 +1208,19 @@ CHECKS.rules = async ({ page, pid }) => {
   await page.keyboard.press('Tab');
   await until(page, () => !document.querySelector('.go-menu'), null, 3000, 'Tab out of the list of phases closes it');
   ok(await page.evaluate(() => { const a = document.activeElement, more = document.querySelector('.ov-actions .go-more'); return !!a && a !== document.body && a !== more && !a.closest('.go') && !!(more.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING); }), 'and the keyboard has moved on to what follows the button: ' + (await focusOf(page)));
-  /* The analyst's recommendation. A journal page of the round says `next: research`; the
-     engine repeats that at the checkpoint of the analysis and changes nothing by itself.
-     The app shows it beside the choice, in the server's words made the app's. */
-  const note = await api('POST', '/api/projects/' + pid + '/pages', { kind: 'journal', title: 'What this round still lacks', body: 'Schedule-free optimisers were not looked at.\n', fields: { next: 'research' } });
-  ok(note.status === 201 && note.data.page.meta.next === 'research', 'a journal page of the round recommends more research: ' + note.status);
-  ok((await count(page, '.go-rec[data-reason="recommended"]')) === 0, 'which by itself changes nothing in the app: the engine has not said so at a checkpoint');
+  /* The analyst's recommendation, and an edit the analyst suggests to a finding. Only an agent
+     brings either about: an instruction for the analyst asks the scripted one for both (see
+     scripted_model.py), left through the box as a person would leave it. The journal page of
+     the round then says `next: research`; the engine repeats that at the checkpoint of the
+     analysis, as a field (`recommends`, with the page), and changes nothing by itself. The
+     app shows the recommendation beside the choice, for as long as the server says it stands. */
+  ok((await count(page, '.go-rec[data-reason="recommended"]')) === 0, 'nothing is recommended before the analyst has said so');
+  await page.fill('#rq-text', 'For the browser check: [scripted-more-research] [scripted-edit]');
+  await page.selectOption('#rq-for', 'analyst');
+  await page.click('.rq-form button[type=submit]');
+  await until(page, () => [...document.querySelectorAll('.rq')].some((r) => /scripted-more-research/.test(r.textContent) && /for the analyst/.test(r.textContent)), null, 5000, 'an instruction for the analyst is left');
+  ok(/given to the next analysis/.test(await text(page, '.toast')), 'and the app says when the analyst is given it: ' + (await text(page, '.toast')).trim());
+  await page.evaluate(() => { document.querySelector('.overview').scrollTop = 0; });
   const approved = await api('POST', '/api/projects/' + pid + '/experiments/E1/approve', { backend: 'local' });
   ok(approved.status === 200, 'an experiment is approved, so that a run and its analysis come next: ' + approved.status);
   await until(page, () => /^Run the (approved experiment|\d+ approved experiments), then analyse (it|them)/.test(((document.querySelector('.ov-actions [data-act="continue"]') || {}).textContent || '').trim()), null, 8000, 'the overview\'s button says that the run and its analysis come next');
@@ -1097,12 +1236,17 @@ CHECKS.rules = async ({ page, pid }) => {
   await until(page, () => !!document.querySelector('.ov-state .live-dot'), null, 15000, 'the engine starts');
   await until(page, () => /paused at a checkpoint/.test((document.querySelector('.ov-head h1') || {}).textContent || '') && !document.querySelector('.ov-state .live-dot'), null, 150000, 'and pauses after the analysis');
   const paused = await idle(pid);
-  ok(paused.checkpoint.phase === 'analyze' && /recommends another look at the literature/.test(paused.checkpoint.summary), 'the checkpoint of the analysis carries the recommendation: ' + paused.checkpoint.summary.slice(0, 160));
+  const journal = paused.checkpoint.recommends_page || '';
+  ok(paused.checkpoint.phase === 'analyze' && paused.checkpoint.recommends === 'research' && /^wiki\/journal\//.test(journal), 'the checkpoint of the analysis carries the recommendation as a field, with the journal page that makes it: ' + JSON.stringify([paused.checkpoint.recommends, journal]));
   ok(paused.state.next_phase === (before.next_phase === 'run' || before.next_phase === 'analyze' ? 'hypothesize' : before.next_phase), 'which did not change the phase that is next: ' + before.next_phase + ' -> ' + paused.state.next_phase);
+  ok((await api('GET', '/api/projects/' + pid + '/requests')).data.requests.some((r) => /scripted-more-research/.test(r.text) && r.state === 'done' && r.handled_in.some((h) => h.phase === 'analyze')), 'the instruction for the analyst was given to that analysis, and is done');
   await page.waitForSelector('.ov-next .go-rec[data-reason="recommended"]');
   const rec = (await text(page, '.ov-next .go-rec[data-reason="recommended"]')).replace(/\s+/g, ' ').trim();
-  ok(/The journal page of this round recommends another look at the literature before new hypotheses\. It is yours to decide\./.test(rec), 'the recommendation is shown beside the choice: ' + rec);
+  /* the checkpoint's own words stand right above, so beside the button the reason is named in a few words, with its choice */
+  ok(/Recommended in the journal page of this round\. It is yours to decide\./.test(rec), 'the recommendation is shown beside the choice: ' + rec);
   ok((await count(page, '.ov-next .go-rec[data-reason="recommended"] [data-act="continue-phase"][data-phase="research"]')) === 1 && /Search the literature again/.test(rec), 'with the choice it recommends next to it');
+  ok((await page.getAttribute('.ov-next .go-rec[data-reason="recommended"] a[data-sel]', 'data-sel')) === journal, 'and a link to the journal page the server names: ' + (await page.getAttribute('.ov-next .go-rec[data-reason="recommended"] a[data-sel]', 'data-sel')));
+  ok(/recommends another look at the literature/.test(await text(page, '.ov-note')), 'the checkpoint\'s own words, above, say what the analyst recommended: ' + (await text(page, '.ov-note')).replace(/\s+/g, ' ').trim().slice(-170));
   ok(!/paper-orchestra research advance|--phase|next: research/.test(await page.locator('.ov-head').innerText()), 'in the app\'s words: no command line and no field of a file: ' + (await text(page, '.ov-note')).trim().slice(0, 140));
   /* (the state arrives with the event stream, the list of pages a moment later: the results are marked as analysed in that list) */
   await until(page, () => /^Continue to |^Resume /.test(((document.querySelector('.ov-actions [data-act="continue"]') || {}).textContent || '').trim()), null, 8000, 'the main button still offers the phase that is next');
@@ -1116,9 +1260,17 @@ CHECKS.rules = async ({ page, pid }) => {
   ok(/recommends another look at the literature/.test(await text(page, '.go-menu [data-phase="research"] .go-why')), 'and in the list the recommendation stands with that choice');
   await page.keyboard.press('Escape');
   await shot(page, 'overview-recommendation');
+  /* Whether the recommendation stands is the server's word, not something the app looks up:
+     once the journal page is rejected the checkpoint carries none, and the line beside the
+     button goes (the checkpoint's own words stay what they were). Accepted again, it is back. */
+  ok((await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: journal, decision: 'reject', reason: 'Not now.' }] })).data.ok, 'the journal page is rejected in another window');
+  await until(page, () => !document.querySelector('.go-rec[data-reason="recommended"]'), null, 8000, 'with its journal page rejected the recommendation is no longer shown beside the button');
+  ok((await api('GET', '/api/projects/' + pid)).data.checkpoint.recommends === null && /recommends another look at the literature/.test(await text(page, '.ov-note')), 'because the server no longer says it; what the checkpoint said then is still there');
+  ok((await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: journal, decision: 'accept' }] })).data.ok, 'the journal page is accepted again');
+  await until(page, () => !!document.querySelector('.ov-next .go-rec[data-reason="recommended"]'), null, 8000, 'and the recommendation is shown again');
   await page.keyboard.press('1');
   await page.waitForSelector('.strip-sub .go-rec[data-reason="recommended"]');
-  ok((await count(page, '.strip-sub .go-rec [data-act="continue-phase"][data-phase="research"]')) === 1, 'the strip on the map shows the recommendation and the choice too');
+  ok(/The journal page of this round recommends another look at the literature first\. It is yours to decide\./.test((await text(page, '.strip-sub .go-rec[data-reason="recommended"]')).replace(/\s+/g, ' ')) && (await count(page, '.strip-sub .go-rec [data-act="continue-phase"][data-phase="research"]')) === 1, 'the strip on the map says the recommendation in a sentence, with the choice: ' + (await text(page, '.strip-sub .go-rec[data-reason="recommended"]')).replace(/\s+/g, ' ').trim().slice(0, 110));
   await shot(page, 'map-recommendation');
   /* more research is the person's explicit choice: the press names the phase */
   const named = [];
@@ -1133,6 +1285,72 @@ CHECKS.rules = async ({ page, pid }) => {
   const last = searched.state.phases[searched.state.phases.length - 1];
   ok(last.phase === 'research' && last.status === 'completed' && searched.state.next_phase === 'hypothesize', 'the research phase ran, and hypotheses come next: ' + last.phase + ' ' + last.status + ', next ' + searched.state.next_phase);
   ok((await count(page, '.go-rec[data-reason="recommended"]')) === 0, 'the recommendation is not repeated once the round has moved on');
+
+  /* A suggested edit to a finding carries the number check of the text as it would read: on
+     the page and in the inbox beside the edit, and in the row that lists it, so that the edit
+     is not accepted from a list with its check out of sight. The scripted analyst suggested
+     one above; it adds a sentence with a number that is on no record. */
+  const rowsNow = (await api('GET', '/api/projects/' + pid + '/proposals')).data.proposals;
+  const edit = rowsNow.find((r) => r.page && r.page.kind === 'finding' && /73\.25/.test(r.body || ''));
+  if (ok(!!edit && !!edit.number_report && edit.number_report.unverified.includes('73.25'), 'the analyst suggested an edit to a finding, and its row carries the number check of the text as it would read: ' + JSON.stringify(edit && [edit.target, edit.number_report && edit.number_report.unverified]))) {
+    const fid = edit.page.id, row = '.in-row[data-ref="' + edit.id + '"]';
+    const asEdited = ((await api('GET', '/api/projects/' + pid + '/pages/' + fid)).data.proposals || []).find((x) => x.id === edit.id);
+    ok(!!asEdited && !!asEdited.number_report && asEdited.number_report.summary === edit.number_report.summary, 'the row and the page give the same report: ' + edit.number_report.summary.slice(0, 90));
+    await open(page, '#/p/' + pid + '/wiki/' + fid, '.wiki-rail .review-change .review-num');
+    const inMargin = (await text(page, '.wiki-rail .review-change .review-num')).replace(/\s+/g, ' ');
+    ok(inMargin.includes(asEdited.number_report.summary) && /Numbers, as the finding would read/.test(inMargin), 'on the page the suggested edit shows the server\'s sentence for the text as it would read: ' + inMargin.trim().slice(0, 150));
+    ok(/Not found:\s*73\.25/.test(await text(page, '.wiki-rail .review-change .numcheck-flag')), 'and names the number the edit brings that is on no record: ' + (await text(page, '.wiki-rail .review-change .numcheck-flag')).trim());
+    await until(page, () => /73\.25/.test((document.querySelector('.prose-marked .num-flag') || {}).textContent || ''), null, 4000, 'the number is flagged in the edit as it is read in place');
+    ok(/of the finding as it is now/.test(await text(page, '.numcheck .rail-h')), 'the check of the page as it is says that it is of the page as it is: ' + (await text(page, '.numcheck .rail-h')).trim());
+    await shot(page, 'wiki-edit-numbers');
+    await open(page, '#/p/' + pid + '/inbox/' + fid, '.in-detail .review-change .review-num');
+    ok((await text(page, '.in-detail .review-change .review-num')).replace(/\s+/g, ' ').includes(asEdited.number_report.summary) && /Not found:\s*73\.25/.test(await text(page, '.in-detail .review-change .numcheck-flag')), 'and so does the inbox: ' + (await text(page, '.in-detail .review-change .review-num')).replace(/\s+/g, ' ').trim().slice(0, 120));
+    await shot(page, 'inbox-edit-numbers');
+    /* in the list: the row is marked, and its quick accept says what it would bring */
+    ok(/1 number not found/.test(await text(page, row + ' .in-flag[data-numbers="unverified"]')) && /73\.25/.test(await page.getAttribute(row + ' .in-flag', 'data-tip')), 'the row of the edit is marked: a number it brings was not found: ' + (await text(page, row + ' .in-flag')).trim());
+    ok(/brings 1 number found in no record/.test(await page.getAttribute(row + ' [data-act="accept"]', 'aria-label')), 'and its quick accept says so before it is pressed: ' + (await page.getAttribute(row + ' [data-act="accept"]', 'aria-label')));
+    const waitingBefore = await waitingNow(page);
+    await page.focus(row + ' [data-act="accept"]');
+    await page.keyboard.press('Enter');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n - 1, waitingBefore, 3000, 'the quick accept of a marked row accepts');
+    ok(/brings 73\.25/.test(await text(page, '.toast')) && /found in no run record/.test(await text(page, '.toast')) && (await count(page, '.toast [data-act="undo"]')) === 1, 'and the confirmation says what the edit brings, with the undo: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim().slice(0, 130));
+    await page.keyboard.press('z');
+    await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, waitingBefore, 3000, 'which takes it back');
+    /* on the map nothing beside the mark says what the check found: the press opens the edit, with its check, instead of deciding it */
+    await open(page, '#/p/' + pid + '/map', '.map-svg .node');
+    const mark = '.map-svg .node[data-key="' + edit.target + '"] .n-yes';
+    if (await count(page, mark)) {
+      await page.click(mark);
+      await until(page, (id) => location.hash.endsWith('/map/' + id) && !!document.querySelector('.panel .review-change .review-num'), fid, 6000, 'on the map the accept mark of such an edit opens it beside the map, with its number check');
+      ok(/decide there/.test(await text(page, '.toast')) && (await count(page, '.toast [data-act="undo"]')) === 0 && (await waitingNow(page)) === waitingBefore, 'and decides nothing: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim().slice(0, 120));
+      await page.keyboard.press('Escape');
+    } else notes.push('rules: the finding with the suggested edit has no accept mark on the map; the map\'s way of opening it first was not looked at');
+    /* A listing that has no report for the edit (it spends a bounded time on them, and a check
+       can fail): the row says that the numbers were not checked here, and its quick accept
+       opens the edit instead of accepting what nobody could have judged. */
+    const listing = '**/api/projects/' + pid + '/proposals*';
+    await page.route(listing, async (route) => {
+      const response = await route.fetch(), data = await response.json();
+      (data.proposals || []).forEach((r) => { if (r.id === edit.id) { r.number_report = null; r.number_report_error = 'not checked in this listing'; } });
+      await route.fulfill({ response, json: data });
+    });
+    await reopen(page, '#/p/' + pid + '/inbox', row + ' .in-flag[data-numbers="unchecked"]');
+    ok(/numbers not checked here/.test(await text(page, row + ' .in-flag')) && /Open it first/.test(await page.getAttribute(row + ' [data-act="accept"]', 'aria-label')), 'a row without a report says that its numbers were not checked here, and that a press opens it: ' + (await text(page, row + ' .in-flag')).trim());
+    await page.focus(row + ' [data-act="accept"]');
+    await page.keyboard.press('Enter');
+    await until(page, (id) => location.hash.endsWith('/inbox/' + id) && !!document.querySelector('.in-detail .review-change .review-num'), fid, 6000, 'its quick accept opens the edit with its number check');
+    ok(/not checked in the list/.test(await text(page, '.toast')) && (await waitingNow(page)) === waitingBefore && (await count(page, '.toast [data-act="undo"]')) === 0, 'and decides nothing: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim().slice(0, 120));
+    /* selected with others and accepted together, such an edit is left out, and the app says so */
+    await page.check(row + ' .in-check input');
+    await page.keyboard.press('Shift+A');
+    await until(page, () => /was left/.test((document.querySelector('.toast') || {}).textContent || ''), null, 4000, 'accepting the selection leaves the unchecked edit out and says so');
+    ok((await waitingNow(page)) === waitingBefore, 'so nothing was decided: ' + (await text(page, '.toast')).replace(/\s+/g, ' ').trim().slice(0, 130));
+    await page.unroute(listing);
+    const still = (await api('GET', '/api/projects/' + pid + '/proposals')).data.proposals.find((r) => r.id === edit.id);
+    ok(!!still && still.review === 'proposed', 'the suggested edit is still undecided on the server');
+    const gone = await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: edit.id, decision: 'reject', reason: 'Suggested for the browser check.' }] });
+    ok(gone.status === 200 && gone.data.ok, 'and is rejected, now that it has been looked at');
+  }
 
   /* Rejecting an experiment says what rests on it. An experiment that was accepted and has run
      can be rejected after all; the server answers with the findings based on its runs and the
@@ -1163,13 +1381,26 @@ CHECKS.rules = async ({ page, pid }) => {
     await shot(page, 'experiment-rejected-what-rests-on-it');
     await page.click('.note-rejected .rested a.chip >> nth=0');
     await until(page, (path) => document.querySelector('.page[data-page="' + path + '"]') && /\/wiki\//.test(location.hash), listed[0][1], 5000, 'a link opens the finding');
-    /* the server says it once, with the rejection: the page keeps listing it for as long as that rejection stands, also after a reload */
+    /* The server says it with the experiment for as long as the rejection stands (`dependents`
+       of its view): the same after a reload, in another browser, and with nothing kept on the device. */
+    const asRejected = (await api('GET', '/api/projects/' + pid + '/experiments/E1')).data.dependents;
+    ok(!!asRejected && JSON.stringify(asRejected.findings.map((f) => f.id)) === JSON.stringify(deps.findings.map((f) => f.id)) && JSON.stringify(asRejected.hypotheses.map((h) => h.id)) === JSON.stringify(deps.hypotheses.map((h) => h.id)), 'the view of the rejected experiment carries what the answer to the rejection said: ' + JSON.stringify(asRejected && asRejected.findings.map((f) => f.id)));
     await reopen(page, '#/p/' + pid + '/experiments/E1', '.exp-page .note-rejected');
     await until(page, (n) => document.querySelectorAll('.note-rejected .rested a.chip').length === n, listed.length, 5000, 'after a reload the rejected experiment still lists what rests on it');
+    ok((await page.evaluate(() => Object.keys(localStorage).filter((key) => /rested/.test(key)).length)) === 0, 'and this device keeps no copy of the list');
+    const elsewhere = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' });
+    const second = await elsewhere.newPage();
+    watch(second, () => 'rules (a second browser)');
+    await open(second, '#/p/' + pid + '/experiments/E1', '.exp-page .note-rejected');
+    await until(second, (n) => document.querySelectorAll('.note-rejected .rested a.chip').length === n, listed.length, 8000, 'a browser that never saw the rejection lists what rests on it too');
+    await open(second, '#/p/' + pid + '/wiki/E1', '.page-wiki .note-rejected');
+    await until(second, (n) => document.querySelectorAll('.page-wiki .note-rejected .rested a.chip').length === n, listed.length, 8000, 'and so does the page of the experiment in the wiki');
+    await elsewhere.close();
   }
   ok((await api('GET', '/api/projects/' + pid + '/pages/E1')).data.page.review === 'rejected', 'the experiment is rejected on the server');
   /* An accepted finding that now rests on nothing a paper reports is named in the paper view,
      with the server's reason, before a write-up is started. */
+  await page.bringToFront();
   const paperNow = (await api('GET', '/api/projects/' + pid + '/paper')).data || {};
   if (Array.isArray(paperNow.left_out)) {
     const alone = deps ? deps.findings.filter((f) => f.only && f.review === 'accepted') : [];
@@ -1188,10 +1419,12 @@ CHECKS.rules = async ({ page, pid }) => {
   await open(page, '#/p/' + pid + '/experiments/E1', '.exp-page .note-rejected');
   await page.click('.note-rejected [data-act="reaccept"]');
   await until(page, () => !document.querySelector('.exp-page .note-rejected') && !!document.querySelector('.exp-page .page-unaccept'), null, 8000, 'and can be accepted after all, as before');
-  /* a rejection made elsewhere after that is another rejection: the list kept from the first one is not shown for it */
-  ok((await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: 'E1', decision: 'reject', reason: 'Rejected in another window.' }] })).data.ok, 'the experiment is rejected again, in another window');
+  /* a rejection made in another window: this window, which did not make it, lists what the server says rests on the experiment */
+  const again = await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: 'E1', decision: 'reject', reason: 'Rejected in another window.' }] });
+  ok(again.data.ok, 'the experiment is rejected again, in another window');
   await until(page, () => /Rejected in another window/.test((document.querySelector('.exp-page .note-rejected') || {}).textContent || ''), null, 8000, 'which this window shows');
-  ok((await count(page, '.note-rejected .rested')) === 0, 'without the list that belonged to the earlier rejection');
+  const restsNow = again.data.results[0].dependents || { findings: [], hypotheses: [] };
+  await until(page, (n) => document.querySelectorAll('.note-rejected .rested a.chip').length === n, restsNow.findings.length + restsNow.hypotheses.length, 8000, 'with what rests on it, though the rejection was not made here');
   ok((await api('POST', '/api/projects/' + pid + '/review', { items: [{ ref: 'E1', decision: 'accept' }] })).data.ok, 'and it is accepted again for the checks that follow');
   await until(page, () => !document.querySelector('.exp-page .note-rejected'), null, 8000, 'which this window shows too');
 
@@ -1216,6 +1449,7 @@ CHECKS.rules = async ({ page, pid }) => {
     let view = null;
     for (let i = 0; i < 40 && !(view && view.problems.length >= 2); i++) { view = (await api('GET', '/api/projects/' + pid)).data; if (view.problems.length < 2) await sleep(250); }
     ok(view.settings.research_cutoff === 'some time last spring' && view.problems.some((x) => /cutoff/i.test(x.message)) && view.problems.some((x) => x.path === 'proposals/ep-0bad0bad.json'), 'the server reports both problems: ' + JSON.stringify(view.problems.map((x) => x.path)));
+    ok(view.problems_total === view.problems.length && !view.problems.some((x) => x.path && x.message.startsWith(x.path)), 'says how many there are, and names each file once: ' + view.problems_total);
     try {
     await reopen(page, '#/p/' + pid + '/map', '.top-prob');
     ok((await text(page, '.top-prob')).trim() === String(view.problems.length), 'a quiet mark in the top bar counts the problems: ' + (await text(page, '.top-prob')).trim());
@@ -1224,6 +1458,7 @@ CHECKS.rules = async ({ page, pid }) => {
     await page.waitForSelector('#problems');
     const said = (await text(page, '#problems')).replace(/\s+/g, ' ');
     ok(view.problems.every((x) => said.includes(x.path) && said.includes(x.message.replace(/\s+/g, ' '))), 'the overview lists each problem with its file, in the server\'s words: ' + said.trim().slice(0, 200));
+    ok(said.includes(view.problems_total + ' problems in the project\'s files'), 'under the number of problems the server gives: ' + view.problems_total);
     ok(/cannot be read/.test(await text(page, '.spend-more.cutoff summary')), 'the cutoff says that it cannot be read: ' + (await text(page, '.spend-more.cutoff summary')).replace(/\s+/g, ' ').trim());
     await shot(page, 'overview-problems');
     await page.click('.spend-more.cutoff summary');
@@ -1372,6 +1607,10 @@ CHECKS.composer = async ({ page, context }) => {
   ok((await text(page, '.start-est')).includes('$' + limits.model_usd.toFixed(2)), 'the sentence under the box quotes the same limit: ' + (await text(page, '.start-est')).trim().slice(-60));
   const waits = Object.keys(defaults.settings.review).filter((kind) => defaults.settings.review[kind] === 'review');
   ok(JSON.stringify(await page.$$eval('.adv-review input[data-kind]:checked', (boxes) => boxes.map((b) => b.dataset.kind).sort())) === JSON.stringify(waits.slice().sort()), 'what needs a review by default is what the server says: ' + waits.join(', '));
+  /* the efforts and the compute backends that can be chosen are the ones the server says its settings accept */
+  ok(JSON.stringify(await page.$$eval('#opt-effort option', (options) => options.map((o) => o.value))) === JSON.stringify([''].concat(defaults.efforts)) && defaults.efforts.length >= 2, 'the composer offers the model efforts the server lists: ' + JSON.stringify(defaults.efforts));
+  ok(JSON.stringify(await page.$$eval('#opt-compute option', (options) => options.map((o) => o.value))) === JSON.stringify([''].concat(defaults.compute_backends)) && defaults.compute_backends.length >= 1, 'and the compute backends it lists: ' + JSON.stringify(defaults.compute_backends));
+  ok(new RegExp('Default \\(.*' + defaults.settings.models.effort.replace(/^x/, '') + '\\)').test(await page.$eval('#opt-effort option', (o) => o.textContent)), 'with the server\'s default named as the default: ' + (await page.$eval('#opt-effort option', (o) => o.textContent)));
   /* a research cutoff: a year, and a month if wanted */
   await page.selectOption('#opt-cutoff-month', '6');
   await until(page, () => /Give the year/.test((document.querySelector('[data-cutoff]') || {}).textContent || ''), null, 3000, 'a month without a year says that the year is missing');
@@ -1431,6 +1670,29 @@ CHECKS.composer = async ({ page, context }) => {
   await open(page, '#/p/' + pid + '/paper', '.paper-form');
   await page.waitForSelector('.paper-gap');
   ok(/Not ready: no finding is accepted/.test(await text(page, '.paper-gap')) && (await page.locator('.paper-form button[type=submit]').isDisabled()), 'a project with attached results and no accepted finding cannot be written up yet: ' + (await text(page, '.paper-gap')));
+  /* A write-up that is refused. The app does not offer one here, but a second window or the
+     command line can ask for it: its worker ends before it begins and says why. The server
+     keeps that on record (a `paper.finished` event), and the paper view shows the reason
+     from there: the same after a reload, without the server's memory of a worker or its log. */
+  const templates = ((await api('GET', '/api/templates')).data.templates || []).map((t) => t.name);
+  const asked = await api('POST', '/api/projects/' + pid + '/paper', { template: templates[0] });
+  if (ok(asked.status === 202, 'a write-up is asked for through the API although nothing can be written: ' + asked.status)) {
+    await until(page, () => !!document.querySelector('.paper-last[data-ended="refused"]'), null, 60000, 'the paper view says that the last write-up did not start');
+    await idle(pid);
+    const last = (await api('GET', '/api/projects/' + pid + '/paper')).data.last;
+    ok(!!last && last.outcome === 'refused' && !!last.error && last.started_at === null, 'the server has it on record as refused, with the reason: ' + JSON.stringify(last && [last.outcome, last.exit_code]));
+    const told = () => text(page, '.paper-last').then((t) => t.replace(/\s+/g, ' '));
+    ok(/did not start/.test(await told()) && (await told()).includes(String(last && last.error).replace(/\s+/g, ' ')), 'the view gives the server\'s reason: ' + (await told()).trim().slice(0, 170));
+    ok((await count(page, '.top-status.st-failed')) === 0, 'a refused write-up is not the agents stopping unexpectedly');
+    const logs = [];
+    const listenLog = (request) => { if (/\/worker\/log/.test(request.url())) logs.push(request.url()); };
+    page.on('request', listenLog);
+    await page.reload();
+    await page.waitForSelector('.paper-last[data-ended="refused"]');
+    page.off('request', listenLog);
+    ok((await told()).includes(String(last && last.error).replace(/\s+/g, ' ')) && !logs.length, 'after a reload it says the same, and never asked for the worker\'s log: ' + logs.length + ' requests');
+    await shot(page, 'paper-refused');
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   return pid;
 };
@@ -1468,10 +1730,47 @@ CHECKS.paper = async ({ page, pid }) => {
   await until(page, () => /Failed|Finished|Interrupted/.test((document.querySelector('.paper-state .sec-t') || {}).textContent || ''), null, 20000, 'the end of the write-up is shown');
   ok((await count(page, '.paper-stages .ps')) >= 5, 'every stage of the pipeline is listed');
   ok((await count(page, '.top-status.st-failed')) === 0, 'a write-up that failed is not the agents stopping unexpectedly');
-  /* what the write-up said when it started (which findings it was written from, what was left out, which numbers were taken out) */
+  /* How the last write-up went is the server's account of it, from the project's events
+     (`last` of GET .../paper): what it said when it started (which findings it was written
+     from, what was left out, which numbers were taken out) and how it ended. */
+  const last = (await api('GET', '/api/projects/' + pid + '/paper')).data.last;
   const began = (await api('GET', '/api/projects/' + pid + '/activity?limit=300')).data.events.filter((e) => e.type === 'paper.started').pop();
-  if (ok(!!began, 'the write-up announced what it was written from')) ok((await text(page, '.paper-started')).replace(/\s+/g, ' ').includes(began.summary.replace(/\s+/g, ' ')), 'and the paper view repeats that in the server\'s words: ' + (await text(page, '.paper-started')).replace(/\s+/g, ' ').trim().slice(0, 160));
+  if (ok(!!last && !!last.started_summary && !!began && last.started_summary === began.summary && /^(written|failed|stopped)$/.test(last.outcome), 'the server says how the last write-up went, with what it announced when it started: ' + JSON.stringify(last && [last.outcome, last.started_at]))) {
+    ok((await text(page, '.paper-started')).replace(/\s+/g, ' ').includes(last.started_summary.replace(/\s+/g, ' ')), 'and the paper view repeats that in the server\'s words: ' + (await text(page, '.paper-started')).replace(/\s+/g, ' ').trim().slice(0, 160));
+    ok((await count(page, '.paper-last')) === 0, 'a write-up that left its own state is told by that state, not twice');
+    /* the same after a reload: none of it is this window's memory */
+    const logs = [];
+    const listenLog = (request) => { if (/\/worker\/log/.test(request.url())) logs.push(request.url()); };
+    page.on('request', listenLog);
+    await page.reload();
+    await until(page, (summary) => ((document.querySelector('.paper-started') || {}).textContent || '').replace(/\s+/g, ' ').includes(summary), last.started_summary.replace(/\s+/g, ' '), 10000, 'after a reload the paper view says the same about the last write-up');
+    page.off('request', listenLog);
+    ok(!logs.length, 'without reading the worker\'s log for it: ' + logs.join(', '));
+  }
   await shot(page, 'paper-after');
+  /* A write-up whose worker is killed in the middle. It leaves a state that still reads
+     "running" and no account of its own; the server's account of that end (an event of the
+     paper, on file) is what the view says, in the server's sentence, also after a reload. */
+  await idle(pid, 120000);
+  await page.click('.paper-form button[type=submit]');
+  let writing = null;
+  for (let i = 0; i < 150 && !writing; i++) { const paper = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (paper.running && paper.last && paper.last.outcome === 'running' && paper.worker.pid > 0 && paper.worker.kind === 'write') writing = paper.worker; else await sleep(60); }
+  if (ok(!!writing, 'the write-up is under way again, and has said that it started')) {
+    let killed = true;
+    try { process.kill(writing.pid, 'SIGKILL'); } catch (e) { killed = false; notes.push('paper: the worker of the write-up had ended before it could be killed (' + e.message + '); how a killed write-up is shown was not looked at'); }
+    await idle(pid, 60000);
+    if (killed) {
+      let cut = null;
+      for (let i = 0; i < 80 && !(cut && cut.last && cut.last.exit_code != null); i++) { cut = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (!(cut.last && cut.last.exit_code != null)) await sleep(150); }
+      if (ok(!!cut && !!cut.last && cut.last.outcome === 'failed' && cut.last.exit_code < 0 && /killed/.test(cut.last.summary || '') && !cut.running, 'the server says how the killed write-up ended, from the project\'s events: ' + JSON.stringify(cut && cut.last && [cut.last.outcome, cut.last.exit_code]))) {
+        await until(page, (summary) => ((document.querySelector('.paper-last[data-ended="failed"]') || {}).textContent || '').replace(/\s+/g, ' ').includes(summary), cut.last.summary.replace(/\s+/g, ' '), 15000, 'the paper view says in the server\'s sentence that the write-up was cut short');
+        ok(/did not finish/.test(await text(page, '.paper-last')) && !/In progress/.test(await text(page, '.paper-state .sec-t')), 'and does not show it as in progress: ' + (await text(page, '.paper-last')).replace(/\s+/g, ' ').trim().slice(0, 140));
+        await shot(page, 'paper-worker-killed');
+        await page.reload();
+        await until(page, (summary) => ((document.querySelector('.paper-last[data-ended="failed"]') || {}).textContent || '').replace(/\s+/g, ' ').includes(summary), cut.last.summary.replace(/\s+/g, ' '), 10000, 'and the same after a reload');
+      }
+    }
+  }
 };
 
 /* a large project: the map stays usable */
@@ -1676,18 +1975,35 @@ CHECKS.large = async ({ page, pid, large }) => {
   await until(page, () => !document.querySelector('.views .count'), null, 4000, 'accepting all ' + all + ' proposals empties the inbox at once');
   await page.keyboard.press('z');
   await until(page, (n) => (+((document.querySelector('.views .count') || {}).textContent || 0)) === n, all, 4000, 'and one undo brings all of them back');
-  /* an approval taken back before any run: the experiment says so and can be approved again */
+  /* Taking an approval back, where another window is faster. An approved experiment that has
+     not started offers "Take the approval back"; here a run is started elsewhere between the
+     look and the press. The press says what the person was told it does, so the server does
+     that or nothing: it answers that the approval is in use, and the run in flight is not
+     touched. (In the second project, so that the experiment is free for the other checks.) */
   const unrun = (await api('GET', '/api/projects/' + large + '/experiments')).data.experiments.find((x) => x.review === 'accepted' && x.state === 'approved' && !x.runs);
   if (unrun) {
-    await open(page, '#/p/' + large + '/experiments/' + unrun.id, '.callout [data-act="cancel-run"]');
+    ok(unrun.cancel_does === 'withdraw', 'the row of an approved experiment that has not started says that a cancel takes the approval back: ' + unrun.cancel_does);
+    await open(page, '#/p/' + large + '/experiments/' + unrun.id, '.callout [data-act="cancel-run"][data-does="withdraw"]');
+    ok((await text(page, '.callout [data-act="cancel-run"]')).trim() === 'Take the approval back', 'its button says "Take the approval back": ' + (await text(page, '.callout [data-act="cancel-run"]')).trim());
+    const press = '**/api/projects/' + large + '/experiments/' + unrun.id + '/cancel';
+    let sent = null, elsewhere = 0;
+    await page.route(press, async (route) => {
+      sent = JSON.parse(route.request().postData() || '{}');
+      elsewhere = (await api('POST', '/api/projects/' + large + '/experiments/' + unrun.id + '/run')).status;
+      for (let i = 0; i < 80; i++) { const now = (await api('GET', '/api/projects/' + large + '/experiments/' + unrun.id)).data; if (now.page.state !== 'approved' || now.cancel_does !== 'withdraw') break; await sleep(100); }
+      await route.continue();
+    });
     await page.click('.callout [data-act="cancel-run"]');
-    await until(page, () => /Cancelled before it ran/.test((document.querySelector('.callout h2') || {}).textContent || ''), null, 10000, 'an experiment cancelled before it ran says so');
-    ok(/at your request/.test(await text(page, '.callout')) && !/the person/.test(await text(page, '.callout')), 'in the app\'s words: ' + (await text(page, '.callout')).replace(/\s+/g, ' ').trim().slice(0, 100));
-    await page.click('.callout [data-act="reapprove"]');
-    await page.waitForSelector('.approve [data-act="approve"]:not([data-start])');
-    await page.click('.approve [data-act="approve"]:not([data-start])');
-    await until(page, () => /Approved to run/.test((document.querySelector('.callout h2') || {}).textContent || ''), null, 10000, 'and can be approved again');
-  } else notes.push('large: no approved experiment without a run in the large project; "cancelled before it ran" was not looked at');
+    await until(page, () => !!document.querySelector('.toast-error'), null, 20000, 'a press that came after another window started the run is refused, and says so');
+    await page.unroute(press);
+    ok(elsewhere === 202 && !!sent && sent.expect === 'withdraw', 'the run was started elsewhere before the press arrived, and the press said that it meant to take the approval back: ' + elsewhere + ' ' + JSON.stringify(sent));
+    ok(/cannot be taken back|cannot be withdrawn/.test(await text(page, '.toast-error')) && /Nothing was changed|is being run/.test(await text(page, '.toast-error')), 'in the server\'s sentence: ' + (await text(page, '.toast-error')).replace(/\s+/g, ' ').trim().slice(0, 170));
+    await page.click('.toast [data-act="toast-x"]');
+    await idle(large, 120000);
+    const ran = (await api('GET', '/api/projects/' + large + '/experiments/' + unrun.id)).data;
+    ok(ran.runs.length === 1 && ran.runs[0].status !== 'cancelled' && ran.page.state !== 'planned' && ran.page.state !== 'cancelled', 'the run that the other window started was neither cancelled nor lost its approval: ' + ran.page.state + ', run ' + (ran.runs[0] || {}).status);
+    await until(page, () => !document.querySelector('.callout [data-act="cancel-run"]') && !document.querySelector('.run-live'), null, 20000, 'and when it has ended the page offers nothing to take back');
+  } else notes.push('large: no approved experiment without a run in the large project; a press of "Take the approval back" that another window overtook was not looked at');
   /* what is being typed in one project stays in that project */
   await open(page, '#/p/' + pid + '/overview', '#rq-text');
   await page.fill('#rq-text', 'Typed for the first project only.');

@@ -10,7 +10,22 @@ to watch the pages arrive and to stop a phase in the middle.
 It never calls ``verify_paper`` or the web search: those would reach Semantic Scholar and
 the web.  The scout writes a topic and a question from the brief instead.  Intake names a
 project the person left untitled (``name_project`` is offered only then), so that a
-browser can watch the title change.
+browser can watch the title change.  To the stages of the write-up it has nothing useful
+to say, and says so after two pauses: a write-up fails at its outline, late enough for a
+browser to see it under way and to end its worker before it has failed.
+
+An instruction of the person steers it where the browser test needs a state that only an
+agent can bring about.  The marks are words in the text of a request (or of the
+instruction given with a press of Continue):
+
+* ``[scripted-failure]`` makes the phase that reads it fail;
+* ``[scripted-more-research]`` makes the analyst write ``next: research`` into the round's
+  journal page: its recommendation of another look at the literature;
+* ``[scripted-edit]`` makes the analyst suggest an edit to an accepted finding (the first
+  one in its index) that adds a sentence with a number that is on no record.
+
+The last two concern the analyst alone: leave them in a request for the analyst, which
+its next phase is given and closes.  Every other role ignores them.
 """
 
 from __future__ import annotations
@@ -21,9 +36,18 @@ import re
 import time
 
 from paper_orchestra.llm.fake import FakeLLM, FakeRequest
+from paper_orchestra.memory.wiki import split_front_matter
 
 PAUSE = float(os.environ.get("PAPER_ORCHESTRA_E2E_PAUSE", "0.5"))
 FAILURE_MARK = "[scripted-failure]"
+#: In an instruction the analyst reads: its journal page recommends more research.
+RESEARCH_MARK = "[scripted-more-research]"
+#: In an instruction the analyst reads: it suggests an edit to an accepted finding.
+EDIT_MARK = "[scripted-edit]"
+#: What that edit adds to the finding, and the number in it that no record holds.
+EDIT_NUMBER = "73.25"
+EDIT_SENTENCE = f"With the warmup the spike is {EDIT_NUMBER} times smaller."
+EDIT_SUMMARY = "Say how much smaller the spike is with the warmup"
 
 HYPOTHESIS = """---
 title: {title}
@@ -225,6 +249,39 @@ def runner(request: FakeRequest) -> str:
     )
 
 
+def _asked(request: FakeRequest, mark: str) -> bool:
+    """Whether what the role was told (its message, its system prompt) carries ``mark``."""
+    return mark in (request.text or "") or mark in (request.system or "")
+
+
+def _page_text(request: FakeRequest, path: str) -> str:
+    """The text of a page as the memory tool shows it, without the line numbers."""
+    shown = request.memory.view(path).split("\n")[1:]
+    return "\n".join(line.split("\t", 1)[1] if "\t" in line else line for line in shown)
+
+
+def _suggest_edit(request: FakeRequest) -> str | None:
+    """Suggest an edit to the first accepted finding of the index: its text with one
+    sentence more, which names a number that is on no record.  Returns the finding's
+    id, or ``None`` when the index lists no finding."""
+    # As the index lists a page: "- findings/F1-what-it-shows.md [F1, accepted] ...".
+    found = re.search(
+        r"^- (findings/(F\d+)-[\w-]+\.md) \[F\d+, accepted", request.system or "", re.M
+    )
+    if not found:
+        return None
+    _, body = split_front_matter(_page_text(request, f"/memories/wiki/{found.group(1)}"))
+    request.call_tool(
+        "propose_edit",
+        {
+            "target": found.group(2),
+            "summary": EDIT_SUMMARY,
+            "body": body.rstrip() + "\n\n" + EDIT_SENTENCE + "\n",
+        },
+    )
+    return found.group(2)
+
+
 def analyst(request: FakeRequest) -> str:
     if request.history:
         return "The numbers stay as they are."
@@ -244,14 +301,19 @@ def analyst(request: FakeRequest) -> str:
                 "held.\n\n## Limits\n\nOne scripted run.\n",
             )
     _pause()
+    edited = _suggest_edit(request) if _asked(request, EDIT_MARK) else None
     journal = re.search(r"goes to (/memories/wiki/journal/\S+\.md)", request.text)
     if journal:
+        # What the engine repeats at the checkpoint of the analysis, when asked for.
+        recommends = "next: research\n" if _asked(request, RESEARCH_MARK) else ""
         request.memory.create(
             journal.group(1),
-            f"---\ntitle: What this round did\nsummary: {len(results)} result(s) read\n---\n"
+            f"---\ntitle: What this round did\nsummary: {len(results)} result(s) read\n"
+            f"{recommends}---\n"
             "The runs were read and findings proposed by the scripted analyst.\n",
         )
-    return "Wrote the findings and the journal."
+    said = "Wrote the findings and the journal."
+    return f"{said} Suggested an edit to {edited}." if edited else said
 
 
 ROLES = {
@@ -267,12 +329,17 @@ ROLES = {
 def respond(request: FakeRequest) -> str:
     """Answer as the role the request's label names (``hypothesize.theorist``)."""
     role = request.label.rsplit(".", 1)[-1]
-    if FAILURE_MARK in (request.text or "") or FAILURE_MARK in (request.system or ""):
+    if _asked(request, FAILURE_MARK):
         # An instruction the person leaves makes the phase that reads it fail: the
         # browser test looks at a failed phase and retries it once the instruction is gone.
         raise RuntimeError("scripted failure: the instruction asked the phase to fail")
     handler = ROLES.get(role)
     if handler is None:
+        # The stages of the write-up come here.  The answer is of no use to them (the
+        # write-up fails at its outline), but it comes slowly enough for a browser to see
+        # a write-up under way, and to end its worker in the middle of it.
+        _pause()
+        _pause()
         return "The scripted model of the browser test has nothing to say here."
     return handler(request)
 
