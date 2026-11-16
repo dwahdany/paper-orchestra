@@ -1908,6 +1908,23 @@ def test_a_worker_does_not_import_files_of_the_directory_the_server_runs_in(tmp_
         workers.shutdown(grace=1.0)
 
 
+def test_a_worker_is_not_handed_the_apps_access_token(monkeypatch):
+    """Whoever holds the token uses the app as the person.  The server takes the variable
+    out of its own environment at start; a program that builds the app itself may not
+    have, and a worker (and the jobs it starts) has no use for the token either way."""
+    from paper_orchestra.web.security import TOKEN_ENV
+
+    monkeypatch.setenv(TOKEN_ENV, "a-token-of-sixteen-chars")
+    for workers in (Workers(), Workers(environ={TOKEN_ENV: "another-token-16-chars", "KEPT": "1"})):
+        try:
+            environment = workers._environment()
+            assert TOKEN_ENV not in environment
+        finally:
+            workers.shutdown(grace=1.0)
+    assert environment["KEPT"] == "1"
+    assert os.environ[TOKEN_ENV] == "a-token-of-sixteen-chars"  # the server's own is untouched
+
+
 def test_a_worker_of_a_server_run_from_an_uninstalled_checkout_finds_the_package(monkeypatch):
     # `cd src && python -m paper_orchestra ui`: the server imports the package from the
     # directory it was started in, and its workers are to run the same code.

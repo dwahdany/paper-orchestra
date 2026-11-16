@@ -85,7 +85,7 @@ from typing import Any
 from paper_orchestra.research.model import format_stamp, parse_stamp, quotable
 from paper_orchestra.research.project import EVENTS_FILE, STATE_FILE
 from paper_orchestra.utils.common import write_json
-from paper_orchestra.web.security import PathEscape, open_confined, open_for_append
+from paper_orchestra.web.security import TOKEN_ENV, PathEscape, open_confined, open_for_append
 
 try:  # POSIX
     import fcntl
@@ -1314,6 +1314,9 @@ class Workers:
 
     def _environment(self) -> dict[str, str]:
         environment = dict(os.environ if self._environ is None else self._environ)
+        # The app's access token is the server's alone: whoever holds it uses the app as
+        # the person, and neither a worker nor the jobs it starts have a use for it.
+        environment.pop(TOKEN_ENV, None)
         # Unbuffered, so worker.log follows the worker; wide, so that the log lines of the
         # CLI are not folded at eighty columns (a folded line can cut a path in two).
         environment["PYTHONUNBUFFERED"] = "1"
