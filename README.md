@@ -15,8 +15,8 @@ PaperOrchestra began as a multi-agent framework for writing AI research papers f
 - **One place to put an idea.** A text box and any files: notes, data, figures, papers, code. No required file names or formats.
 - **A wiki as the product.** Linked Markdown pages of ten kinds (idea, questions, sources, topics, hypotheses, experiments, results, findings, journal, lessons) in a plain directory you can read, edit and put under version control.
 - **You decide, the agents suggest.** Proposals wait in a review inbox. Accept, edit then accept, or reject with a reason the agents read before they propose again. A change to a page of yours arrives as a suggested edit, shown in the text.
-- **Experiments that really run, when you say so.** Small Python scripts on your machine, GPU jobs on [Modal](https://modal.com), or a command in a copy of your own repository. Each run needs your approval, with the backend, time limit and network access you chose.
-- **Nothing invented.** Sources are verified against Semantic Scholar and written by code. Result records are written by code from the files a run produced. Every number in a finding is checked against those records, the sources and your files, and flagged where it occurs in none.
+- **Experiments that really run, when you say so.** Small Python scripts on your machine, GPU jobs on [Modal](https://modal.com), or a command in a copy of your own repository. Each run needs your approval, and it starts only while the experiment is still what you approved: the same code, run the same way, on the backend and with the time limit and network access you chose.
+- **Nothing invented.** Sources are verified against Semantic Scholar and written by code. Result records are written by code from the files a run produced. The numbers in a finding are looked for in the metrics of the runs, the sources and your files, and flagged where they occur in none.
 - **Rounds with checkpoints.** The agents work one phase at a time and pause for you after each: research, hypotheses, experiment design, runs and analysis.
 - **A web app with several views of the same wiki**: a map from the idea to the findings, the wiki itself, the review inbox, the experiments, and an overview with live activity and spending.
 - **Claude Fable 5.2 by default**, with an API key or keyless Workload Identity Federation. Budgets for model spend and compute are enforced.
@@ -46,7 +46,7 @@ See the app first, without any model call or credential:
 
 ```bash
 uv run paper-orchestra research demo        # builds ./research/demo-warmup
-uv run paper-orchestra ui                   # opens http://127.0.0.1:8600
+uv run paper-orchestra ui                   # prints the app's link and opens it in your browser
 ```
 
 The demonstration project is a small study of learning-rate warmup. Its experiment runs are real (a few seconds of numpy on your machine, with their logs, metrics and figures); its pages and activity were written by hand and say so.
@@ -67,6 +67,8 @@ uv run paper-orchestra research review  <project> --accept H1 --reject H3 --reas
 uv run paper-orchestra research advance <project>             # the agents work to the next checkpoint
 uv run paper-orchestra research approve <project> E1          # your approval of one run
 uv run paper-orchestra research advance <project>             # runs what you approved, then analyses it
+uv run paper-orchestra research request <project> "Also look at schedule-free optimisers" --for scout
+uv run paper-orchestra research cancel  <project> E1          # stop a run, or take an approval back
 ```
 
 `<project>` is the project's directory, its name under `./research`, or its id. Everything the command line does, the web app does too, and both can be used on the same project at the same time.
@@ -88,12 +90,17 @@ A project is a directory; its `wiki/` holds one Markdown page per thing:
 | result | `wiki/results/E1-run1.md` | code | What one run produced: metrics exactly as written, the log's last lines, artifacts. |
 | finding | `wiki/findings/F1-….md` | agents, you | What a result means, and which hypothesis it supports or refutes. |
 | journal | `wiki/journal/round-1.md` | agents | A short account of each round. |
+| lesson | `wiki/lessons/….md` | you, agents | Something about how to work on this project that later rounds should keep in mind. |
 
 Pages point at each other with typed relations in their front matter (`cites`, `about`, `answers`, `motivated_by`, `tests`, `run_of`, `based_on`, `supports`, `refutes`, `follows`) and with `[[links]]` in their text. Those relations are the map.
 
-Every page has a review state. What an agent writes is `proposed` until you decide; what you write is accepted. Rejected pages are kept with your reason, and agents are shown the title and the reason only, so that the same thing is not proposed again. An agent cannot change a page you wrote or accepted: it proposes an edit, which you read in place and accept or turn down. Earlier versions of every page are kept under `history/`.
+**Review.** Every page has a review state. What an agent writes is `proposed` until you decide; what you write is accepted. Editing is not deciding: a proposal you correct stays a proposal, with your corrections in it, until you accept it. Rejected pages are kept with your reason, and agents are shown the title and the reason only, so that the same thing is not proposed again. An agent cannot change a page you wrote, edited or accepted: it proposes an edit, which you read in place and accept or turn down, again with a reason it gets to read. Earlier versions of every page are kept under `history/`.
 
-Which kinds need your review is a setting (`review` in `project.json`): by default sources and journal pages are accepted as they come, everything else waits for you.
+Which kinds need your review is a setting (`review` in `project.json`): by default sources, journal pages and lessons are accepted as they come, everything else waits for you.
+
+**What agents build on.** An agent works from the accepted pages. Of what still awaits your decision it is told the titles and summaries, so that it neither repeats a proposal nor builds on one. The one exception is the scout that runs right after intake, which can read intake's pages before you have, marked as not yet reviewed. A source you delete is not recorded again; to have it back, leave a request that names the paper.
+
+**The number check.** The specific numbers in a finding's title, summary and text are looked for in the metrics of runs that succeeded (of experiments you did not reject), in the accepted sources and in your files. The finding's page and the checkpoint say which were not found, and which were found only outside the records the finding is based on. Short and round numbers are not checked. It is a check of occurrence: it says that a number is on record, not that it is the number the sentence is about.
 
 ### Rounds and checkpoints
 
@@ -106,7 +113,13 @@ Which kinds need your review is a setting (`review` in `project.json`): by defau
 | run | runner | Runs the experiments you approved. A run that fails for a programming error is repaired, a bounded number of times, each repair recorded with its diff. | goes on |
 | analyze | analyst | Writes findings from the result records, proposes verdicts on hypotheses as edits for you to accept, proposes next steps, writes the round's journal. | checkpoint, next round |
 
-At a checkpoint nothing happens until you say so. You can leave an instruction for the agents ("also look at schedule-free optimisers"), edit any page, add pages of your own, and decide what was proposed. A phase that fails is retried once. Stopping the agents (the Stop button, Ctrl-C, or `kill`) leaves the phase resumable: the same command continues it without writing anything twice.
+At a checkpoint nothing happens until you say so. You can edit any page, add pages of your own, decide what was proposed, and leave an instruction ("also look at schedule-free optimisers"). An instruction is for every agent, and then shown to every phase until the round's analysis is done, or for one role (scout, theorist, designer, analyst), and then given to that role's next phase.
+
+`research advance`, and **Continue** in the app, first runs what you approved and analyses results that have no analysis yet. If anything ran, it stops at the checkpoint after that analysis, and the phase that was next stays next. Otherwise it goes on with that phase. `--phase` runs exactly the phase named.
+
+A round after the first begins with hypotheses. Another look at the literature is your choice: `research advance --phase research`, or Continue with research in the app. The analyst can recommend one, and the checkpoints repeat the recommendation until research has run.
+
+A phase that fails is retried once. Stopping the agents (the Stop button, Ctrl-C where `research advance` runs, or `kill -INT` of the worker) ends the phase before its next model request and leaves it resumable: the same command continues it without writing anything twice.
 
 ### Experiments
 
@@ -114,36 +127,48 @@ An experiment is a page (objective, method, metrics and success criteria, resour
 
 | Mode | What runs | Where |
 |---|---|---|
-| `script` | Self-contained Python under `experiments/E1/code/`, entry point `main.py`. | Your machine, or a Modal sandbox. |
+| `script` | Self-contained Python under `experiments/E1/code/`, run as `python main.py`. | Your machine, or a Modal sandbox. |
 | `gpu` | The same, with a GPU and pip packages. | Modal. |
-| `repo` | A command in a copy of your repository, optionally with a patch the designer proposes. Your working tree is never touched. | Your machine, or Modal for a repository that is cloned. |
+| `repo` | A command in a copy of your repository (`repo` in the project's settings), optionally with a patch the designer proposes. Your working tree is never touched, and copying it runs nothing the repository configures (no hooks, no filters). | Your machine, or Modal for a repository that is cloned. |
 
-The contract of an experiment's code: write `metrics.json` (a flat object of numbers, true/false or short strings), put figures and tables under `artifacts/`, print progress, be deterministic given a seed.
+The contract of an experiment's code: write `metrics.json` (a flat object of numbers, true/false or short strings), put figures and tables under `artifacts/`, print progress, be deterministic given a seed. Only what the run itself writes counts as its result: a `metrics.json` or `artifacts/` that was there before is removed before the command starts and noted on the run.
 
-**Approval.** Accepting an experiment's page accepts the plan. It runs only after you approve the run, in the app ("Accept and run", or the approval form) or with `research approve`. You approve the code you read: the approval names its digest, and code that changed since is refused. Whether a run may reach the network is your choice at approval and is never taken from the plan, which an agent may have written.
+**Approval.** Accepting an experiment's page accepts the plan. It runs only after you approve the run, in the app ("Accept and run", or the approval form) or with `research approve`, which shows what would run: the command, the code files, the packages, the backend, the time limit and the network setting. The approval records a digest of the code and of how it runs. A run starts, or resumes after a crash, only while the experiment still has that digest; otherwise it is a plan again and says what changed. (The runner's repairs of a failed run are recorded with their diff and allowed.) One approval is one run.
 
-**Backends.** `local` runs the job as a subprocess in a throw-away copy, with credentials removed from its environment, a time limit, and the whole process tree killed on timeout or cancel. It is not a sandbox: it cannot block the network, and it uses the packages you have installed. `modal` runs each job in its own sandbox with the packages and GPU the plan asks for, no secrets, and no network unless you approved it. Use Modal for code you would not run on your machine.
+Three things are never taken from the plan, which an agent may have written. The backend is the project's (Modal for a GPU) unless you choose another. The network is off unless you allow it, and a plan that asks for it must be answered either way. And an experiment becomes approved only through your approval, never by an edit of its page.
 
-**Records.** Each run keeps a copy of the code it ran, its full log, `metrics.json`, its artifacts and a `run.json`, under `experiments/E1/runs/<k>/`. The result page is generated from those files. Stopping the agents puts a running experiment back in the queue; cancelling an experiment ends it.
+**Backends.** `local` runs the job as a subprocess in a throw-away copy, with credentials removed from its environment and a time limit. When the job ends, times out or is cancelled, its process group and session are killed and, on Linux, every process that still carries the job's mark in its environment (`PAPER_ORCHESTRA_JOB`). It is not a sandbox: a job runs as you, can read what you can read, can reach the network whatever the approval says, and uses the packages you have installed. `modal` runs each job in its own sandbox with the packages and GPU the plan asks for, no secrets, and no network unless you approved it. Use Modal for code you would not run on your machine.
 
-**Limits** (`limits` in `project.json`, or the overview's "Change the limits"): `model_usd` is the total model spend of the research agents (default $25), `experiment_usd` the total estimated compute spend of all runs ($5), `experiment_seconds` the longest time limit one run may be given (900). Reaching a limit stops at a checkpoint that says which. Costs on Modal are estimates from list prices.
+**Records.** Each run keeps a copy of the code it ran, its full log, `metrics.json`, its artifacts and a `run.json`, under `experiments/E1/runs/<k>/`. The result page is generated from those files; the number check and the write-up read `run.json`, so editing a result page changes neither. Credentials the worker knows (its environment, a token in the repository's address) are replaced by `[redacted]` in logs, records, pages and everything the app shows. Stopping the agents puts a run that is still going back in the queue; a run that had finished stays finished. Cancelling ends a run that is queued or running; for an approved experiment that has not started it takes the approval back, and the experiment is a plan again. If a worker is killed in the middle of a run, the next Continue, Run or Cancel ends what its job left running and removes its working directory.
+
+**Limits** (`limits` in `project.json`, or the overview's "Change the limits"): `model_usd` is the total model spend of the research agents (default $25), `experiment_usd` the total estimated compute spend of all runs ($5), `experiment_seconds` the longest time limit one run may be given (900). Reaching a limit stops at a checkpoint that says which. The model budget is looked at before every session and turn and after every model request, so at most the one request that crossed it goes beyond; the phase resumes where it stopped once you raise the limit. Costs on Modal are estimates from list prices. A GPU type without a list price is not approved, because nothing could hold its run to the limit, and a run that was stopped or lost still counts for the time it ran.
 
 ### The web app
 
 ```bash
-uv run paper-orchestra ui [--workspace DIR] [--port 8600] [--no-browser]
+uv run paper-orchestra ui [--workspace DIR] [--port 8600] [--no-browser] [--stop-workers-on-exit]
 ```
 
 The workspace is a directory of projects (default `./research`).
 
 - **Map**: the wiki laid out from the idea to the findings. Proposals are drawn dashed and can be decided on the map; selecting a page traces what it rests on and what it led to.
-- **Wiki**: every page, with an editor (live preview, history, restore), suggested edits marked in the text, and the number check on findings.
-- **Inbox**: everything waiting for you, with the keyboard (`J`/`K`, `A` accept, `E` edit then accept, `R` reject).
-- **Experiments**: plan, code, approval, runs with a live log, metrics and figures, and what to do about a failed run.
+- **Wiki**: every page, with an editor (live preview, history, restore), suggested edits marked in the text, and the number check on findings. Saving keeps a proposal open; "Save and accept" decides.
+- **Inbox**: everything waiting for you, with the keyboard (`J`/`K`, `A` accept, `E` edit, `R` reject, `Z` undo). A suggested edit to a finding that brings a number found on no record is marked in the list.
+- **Experiments**: plan, code, approval, runs with a live log, metrics and figures, and what to do about a failed or interrupted run.
 - **Overview**: the checkpoint, the argument so far (each hypothesis with its experiments and findings), live activity, an instruction box, spending.
 - **Paper**: the optional write-up.
 
-The server listens on your machine only (`127.0.0.1`). The agents run in a separate process per project, so closing the browser or restarting the server does not stop or lose anything; a restarted server finds running workers again. To reach the app from another machine pass `--host`; anything but loopback requires the access token printed at start. Page text is rendered on the server with raw HTML disabled, and the app loads nothing from the network.
+**Access.** The server listens on your machine only (`127.0.0.1`) and still asks for an access token, because other users and programs on the same machine can reach a local port. Once it listens, `ui` prints one link that carries the token (`http://127.0.0.1:8600/?token=...`) and opens it in your browser; from then on a cookie holds it. With `--no-browser`, through `ssh -L`, or where the browser cannot read the file the server hands it (a browser installed as a snap or Flatpak), open the printed link yourself. Every start makes a new token, and a tab left open says that it needs the new link. Set `PAPER_ORCHESTRA_UI_TOKEN` (16 characters or more) for the server's command to keep one token across restarts. A program sends `Authorization: Bearer <token>`.
+
+Without the token nobody can read a project, change anything or start anything, and the token is on no command line, in no file of a project and in no worker's environment. Three things it does not keep out:
+
+- Anything that runs as you. Experiments on the local backend do, and that backend is not a sandbox.
+- A program that listens on another port of the machine your browser runs on. A browser sends a cookie to every port of a host, so such a program receives the token when your browser opens its address, and a link on any web page can lead it there. On a machine you share, keep the browser on your own computer and reach the app with `ssh -L`.
+- Somebody on the network, if you pass `--host`: the token then travels unencrypted. Prefer `ssh -L`.
+
+**Workers.** The agents and experiments of a project run in a process of their own, so closing the browser, Ctrl-C on the server or a closed terminal stops nothing and loses nothing: the server prints which workers keep running, and the next server finds them again. `--stop-workers-on-exit` stops them with the server instead. The app stops only a process it started or can show to be this project's worker. One it cannot verify, such as a worker on another machine that shares the directory, is shown without Stop.
+
+Page text is rendered on the server with raw HTML disabled, the app loads nothing from the network, and it reads a project's files only inside the project directory, never through a link that leads out of it. A request may carry at most 8 MB; the files attached to a new project may have 50 MB each and 500 MB together.
 
 ### Writing it up
 
@@ -151,7 +176,9 @@ The server listens on your machine only (`127.0.0.1`). The agents run in a separ
 uv run paper-orchestra research write <project> --template cvpr2025
 ```
 
-The paper pipeline is given only what you accepted: the idea and the hypotheses with their standing, the method of experiments that ran, metrics copied from the result records, the accepted findings, figures from run artifacts. Text files and images you attached to the project are included as your own material, so a project built on results you brought can be written up without any run. Proposed and rejected pages never reach a paper. The write-up runs in `<project>/paper/` and takes the options of [`write`](#writing-a-paper-directly); its model spend is reported there and is not part of the research budget.
+The paper pipeline is given only what you accepted: the idea and the hypotheses with their standing, the method of experiments that ran, metrics from the runs' own records, the accepted findings, accepted topic pages as background, and figures from run artifacts. The sources you accepted are the papers its literature review starts from, under the keys they have in the wiki and without being looked up again; a source you rejected is never cited; the pipeline's own search adds further verified papers. Text files and images you attached to the project are included as your own material, so a project built on results you brought can be written up without any run.
+
+Proposed and rejected pages never reach a paper. A finding that rests only on a rejected experiment is left out and named, and a number in a finding that is on no record is replaced by "[a number not on record]". The write-up runs in `<project>/paper/` and takes the options of [`write`](#writing-a-paper-directly); its model spend is reported there and is not part of the research budget. Accepting or rejecting a source and starting the write-up again writes the paper again; starting it again with nothing changed resumes.
 
 ### The project directory
 
@@ -170,7 +197,7 @@ The paper pipeline is given only what you accepted: the idea and the hypotheses 
   paper/           the write-up, if you asked for one
 ```
 
-Pages are plain Markdown with `key: value` front matter. You can edit them with any editor while no agent is running; `research status` and the app report what they had to guess in a hand-edited project.
+Pages are plain Markdown with `key: value` front matter. You can edit them with any editor while no agent is running; `research status` and the app report what they had to guess in a hand-edited project. If `state.json` is lost or damaged, the project is not started over: where it stands is read from `events.jsonl`, both say so, and the engine writes the file again when it next works on the project. A copy of a project directory is a project of its own. A project in which `wiki/`, `inputs/` or another of these parts is a symbolic link that leads out of the directory is not opened, and no agent or experiment is started while a link stands in the place of `state.json`, `events.jsonl` or `usage.json`.
 
 ## Models and authentication
 
@@ -293,6 +320,7 @@ Local LaTeX compilation needs TeX Live (`pdflatex` and `bibtex` on `PATH`). With
 | `idea_sparse.md` | The method, contributions and framing (`--idea-filename` to change). |
 | `experimental_log.md` | Raw results: tables, ablations, metrics (`--experimental-log-filename`). |
 | `figures/` + `figures/info.json` | Optional ready-made figures, as `[{"name": "fig.png", "caption": "..."}]`. Used when running without `--plotting`. With `--plotting` every figure is generated and these are ignored, unless you pass `--keep-provided-figures`. |
+| `known_papers.json` | Optional. Papers the bibliography starts from, which are not looked up again, and papers never to cite: `{"version": 1, "papers": [...], "excluded": [...]}`. `research write` produces it from the sources you accepted and rejected; without it nothing changes. A list or an entry that cannot be used is reported as a warning and never stops the run. |
 
 `--template` takes the name of a bundled template (`cvpr2025`, `iclr2025`), or a path to your own template directory containing `template.tex` and `guidelines.md`. A name is also looked up under `$PAPER_ORCHESTRA_TEMPLATES` and `./templates`.
 
@@ -363,18 +391,18 @@ Everything is written under `--output-dir` (for a research project's write-up: `
 |---|---|
 | `final_paper.pdf`, `final_paper.tex` | The result. |
 | `outline.json` | Plotting plan, literature search plan and section plan. |
-| `literature_agent_output/` | `references.bib`, `citation_map.json`, the outline with citation candidates, the template with Introduction and Related Work written, and `collected_papers.json` (the verified papers, kept so that a retried literature stage does not search again). |
+| `literature_agent_output/` | `references.bib`, `citation_map.json`, the outline with citation candidates, the template with Introduction and Related Work written, and `collected_papers.json` (the verified papers, including the ones known beforehand, kept so that a retried literature stage does not search again). |
 | `plotting_results.json`, `figures/` | Generated figures with captions and critic history. |
 | `latex_writeup/` | The LaTeX workspace (`raw_draft_paper.tex`, figures, bibliography). |
 | `content_refinement_workdir/` | Each revision, reviews, worklogs and page screenshots. |
 | `memory/` | The project memory described above. |
-| `state.json` | Per-stage status; drives resume. |
+| `state.json` | Per-stage status; drives resume. The literature stage's record carries its warnings and how many papers were known beforehand and how many candidates were excluded. |
 | `usage.json`, `time_breakdown.json` | Token usage with an estimated cost (refreshed every few seconds while stages run), and time per stage. |
 | `memory_report.json` | What the end-of-run consolidation did, including how many lessons were shared with the lab memory and how many were kept back. |
 
 A failed stage is retried on its own; re-running the same command resumes from the last completed stage. Details worth knowing:
 
-- **What restarts a run.** Resume applies while the inputs and the settings that shape the paper are unchanged: the models and efforts, plotting and its options, the refinement options, memory on or off (and, with memory on, lab memory and the dream mode), and the input file names. If one changes, a warning names it and every stage runs again in that directory, replacing the earlier paper, so use a new output directory to compare settings. The compute backend, timeouts, worker counts and a later research cutoff do not restart a run.
+- **What restarts a run.** Resume applies while the inputs and the settings that shape the paper are unchanged: the models and efforts, plotting and its options, the refinement options, memory on or off (and, with memory on, lab memory and the dream mode), the input file names, and the list of known papers when the materials hold one. If one changes, a warning names it and every stage runs again in that directory, replacing the earlier paper, so use a new output directory to compare settings. The compute backend, timeouts, worker counts and a later research cutoff do not restart a run; the one exception is a later cutoff that lets in a known paper which had been left out as too recent.
 - **Ctrl-C.** The run stops issuing model calls, waits up to ten seconds for literature and plotting when they run side by side, and records itself and the stopped stages as `interrupted` in `state.json`. The same command resumes it.
 - **Plotting is optional.** If it fails, the paper is written without generated figures. Such a failure is tried again when the run is resumed, unless that run had already delivered its paper.
 - **Refinement needs a review.** If the review of the draft fails (a provider outage, a rate limit), the refinement stage fails and is retried; it never passes the unrefined draft off as refined. An error in one refinement iteration costs that iteration only.
@@ -408,7 +436,7 @@ The research workspace is new. The paper pipeline keeps the method of the paper,
 - **Author block.** The section writer is told to keep the manuscript anonymous, where the original asked it to fill in author names if they were missing.
 - **Diagrams.** Without `--image-model`, diagrams are drawn by model-written plotting code instead of an image-generation model. Generated figures are PNG files at 200 dpi.
 - **PaperBanana.** Few-shot figure examples and style guides are read from the checkout named by `PAPER_BANANA_DIR`. The original looked in a sibling `../PaperBanana` directory; without the variable, figures are planned zero-shot with a built-in style guide.
-- **Literature.** Papers without a publication date, and papers dated only by year in the year of the research cutoff, are not cited, since they cannot be shown to precede the cutoff.
+- **Literature.** Papers without a publication date, and papers dated only by year in the year of the research cutoff, are not cited, since they cannot be shown to precede the cutoff. The same holds for the accepted sources of a research project, which are then named in a warning.
 - **Memory.** The memory harness and its consolidation sessions (including a synthesis of the collected literature) are new. `--no-memory` runs the stages on their prompts alone, and `--no-lab-memory` keeps runs independent of each other.
 - **Knowledge isolation.** The rule that the paper is written only from the run's materials is unchanged in substance and reworded: it now explains the reason and says how memory fits in (lessons guide how to write; what the paper claims comes from the run's materials).
 
@@ -446,7 +474,7 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-The test suite never opens a network connection from the test process (the test configuration blocks sockets) and uses scripted models. Experiments in tests are real small jobs on the local backend; Modal is a fake of its SDK that runs real processes. With TeX Live installed the suite also compiles real documents, including an end-to-end run of the whole paper pipeline; CI installs TeX Live so that those tests run there. The web app's browser test (`tests/test_web_e2e.py`) starts a real server on a demonstration project and drives it with Playwright when Node and Playwright are available, and is skipped otherwise; `tests/e2e/README.md` says how to run it by hand.
+The test suite never opens a network connection from the test process (the test configuration blocks sockets) and uses scripted models. Experiments in tests are real small jobs on the local backend; Modal is a fake of its SDK that runs real processes. With TeX Live installed the suite also compiles real documents, including an end-to-end run of the whole paper pipeline; CI installs TeX Live so that those tests run there. The web app's browser test (`tests/test_web_e2e.py`) starts a real server on a demonstration project and drives it with Playwright when Node and Playwright are available, and is skipped otherwise; CI runs it in a job of its own, in the light and the dark theme, and `tests/e2e/README.md` says how to run it by hand.
 
 Nothing in this repository has been run against the live Anthropic, Semantic Scholar or Modal services by its test suite; `paper-orchestra doctor` checks your own setup.
 
