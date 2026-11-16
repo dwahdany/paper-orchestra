@@ -511,7 +511,8 @@ def _requests(
     return blocks
 
 
-#: Where a tag begins.  "p < 0.05" and "a<b" are not tags and stay as they are.
+#: Where a tag begins: an angle bracket with a name (or a slash and a name) right after
+#: it.  "p < 0.05" and "n<5" are not tags and stay as they are.
 _TAG_START = re.compile(r"<(?=[/!?]?[A-Za-z_])")
 
 
