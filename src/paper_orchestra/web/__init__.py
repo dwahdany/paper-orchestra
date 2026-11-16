@@ -3,7 +3,8 @@
 ``paper-orchestra ui`` serves it.  The server never runs the engine itself: it
 starts ``paper-orchestra research ...`` as a separate process per project
 (:mod:`paper_orchestra.web.workers`) and learns everything from the project's
-files.
+files.  Those processes belong to their projects: they go on when the server
+ends, and the next server finds them again.
 
 Importing this package does not import the web stack (FastAPI, uvicorn,
 markdown-it-py), which is an optional extra; :func:`create_app` and

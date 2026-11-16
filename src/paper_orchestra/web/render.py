@@ -234,20 +234,27 @@ def _checked_image(token: Token, context: _Context) -> list[Token]:
 
 
 _CLOSING = {")": "(", "]": "[", "}": "{"}
+_SENTENCE_PUNCTUATION = frozenset(".,;:!?'\"")
 
 
 def _without_trailing_punctuation(address: str) -> str:
     """An address found in running text, without the sentence's punctuation after it.
-    A closing bracket stays when the address itself opened it (``.../Adam_(optimizer)``)."""
-    while address:
-        last = address[-1]
-        if last in ".,;:!?'\"" or (
-            last in _CLOSING and address.count(last) > address.count(_CLOSING[last])
-        ):
-            address = address[:-1]
-        else:
+    A closing bracket stays when the address itself opened it (``.../Adam_(optimizer)``).
+
+    The text is a model's or copied from the web, and a page is rendered at every look:
+    the brackets are counted once and the end is found by walking back with those
+    counts, so the time grows with the length of the address and not with its square.
+    """
+    counts = {bracket: address.count(bracket) for pair in _CLOSING.items() for bracket in pair}
+    end = len(address)
+    while end:
+        last = address[end - 1]
+        if last in _CLOSING and counts[last] > counts[_CLOSING[last]]:
+            counts[last] -= 1  # what is left of the address has one fewer of them
+        elif last not in _SENTENCE_PUNCTUATION:
             break
-    return address
+        end -= 1
+    return address[:end]
 
 
 def _linked_urls(text: str) -> list[Token]:

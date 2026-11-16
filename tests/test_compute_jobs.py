@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -37,6 +38,9 @@ from paper_orchestra.compute.base import (
     spec_problems,
     supervise,
 )
+
+#: What the log puts before a line of the job that begins like a line of the backend.
+JOB_MARK = "(printed by the job) "
 
 # -- the contract ------------------------------------------------------------------------
 
@@ -99,12 +103,52 @@ def test_the_signatures_are_the_ones_of_the_specification():
         "run_dir",
         "on_log",
         "should_stop",
+        "mask",
     ]
     keyword_only = [p.name for p in run_job.parameters.values() if p.kind is p.KEYWORD_ONLY]
-    assert keyword_only == ["source_dir", "run_dir", "on_log", "should_stop"]
+    assert keyword_only == ["source_dir", "run_dir", "on_log", "should_stop", "mask"]
     assert run_job.parameters["on_log"].default is None
     assert run_job.parameters["should_stop"].default is None
+    assert run_job.parameters["mask"].default == ()
     assert list(inspect.signature(ComputeBackend.supports).parameters) == ["self", "spec"]
+
+
+def test_every_backend_takes_a_job_and_picks_one_up_with_the_same_arguments():
+    """The seam with the engine: what it passes is fixed, whichever backend it talks to."""
+    from paper_orchestra.compute.local import LocalBackend
+    from paper_orchestra.compute.modal_backend import ModalBackend
+
+    for backend in (ComputeBackend, LocalBackend, ModalBackend):
+        run_job = inspect.signature(backend.run_job)
+        assert list(run_job.parameters)[1:] == [
+            "spec",
+            "source_dir",
+            "run_dir",
+            "on_log",
+            "should_stop",
+            "mask",
+        ]
+        attach = inspect.signature(backend.attach)
+        assert list(attach.parameters) == [
+            "self",
+            "handle",
+            "run_dir",
+            "spec",
+            "started",
+            "on_log",
+            "should_stop",
+            "mask",
+        ]
+        assert [p.name for p in attach.parameters.values() if p.kind is p.KEYWORD_ONLY] == [
+            "run_dir",
+            "spec",
+            "started",
+            "on_log",
+            "should_stop",
+            "mask",
+        ]
+        defaults = {name: attach.parameters[name].default for name in ("spec", "started", "mask")}
+        assert defaults == {"spec": None, "started": None, "mask": ()}
 
 
 def test_a_backend_without_job_support_says_so(tmp_path):
@@ -148,6 +192,13 @@ def test_a_backend_without_job_support_says_so(tmp_path):
         ({"outputs": ("log.txt",)}, "'log.txt'"),
         ({"outputs": ("run.json/inner",)}, "'run.json/inner'"),
         ({"outputs": ("handle.txt",)}, "'handle.txt'"),
+        # The engine's snapshot of the code that ran, its copy of the repository and the
+        # backend's own records: a job that could name them as outputs could rewrite them.
+        ({"outputs": ("code",)}, "'code'"),
+        ({"outputs": ("code/main.py",)}, "'code/main.py'"),
+        ({"outputs": ("repo",)}, "'repo'"),
+        ({"outputs": ("cost.json",)}, "'cost.json'"),
+        ({"outputs": ("job.json",)}, "'job.json'"),
         ({"outputs": ("bad\0name",)}, "'bad\\x00name'"),
         ({"outputs": "metrics.json"}, "outputs of the job must be a list"),
         ({"packages": "numpy"}, "packages of the job must be a list"),
@@ -224,8 +275,14 @@ def test_open_run_creates_the_directory_and_removes_outputs_of_an_earlier_run(tm
     (outside / "keep.txt").write_text("keep")
     (run / "linked").symlink_to(outside, target_is_directory=True)
 
+    # Nor may the backend's records of an earlier attempt pass for this one's.
+    for name in ("handle.txt", "cost.json", "job.json"):
+        (run / name).write_text("of the earlier attempt")
+    (run / "code").mkdir()
+
     open_run(run, ("metrics.json", "artifacts", "linked", "never-there"))
-    assert sorted(p.name for p in run.iterdir()) == ["log.txt", "run.json"]
+    assert sorted(p.name for p in run.iterdir()) == ["code", "log.txt", "run.json"]
+    (run / "code").rmdir()
     assert (run / "log.txt").read_bytes() == b""
     assert (outside / "keep.txt").read_text() == "keep"  # the link went, not what it led to
 
@@ -421,6 +478,243 @@ def test_replaying_a_log_skips_the_lines_that_were_already_delivered(tmp_path):
     # "three" counts as the third line the person has seen (they saw its beginning).
     assert second == ["four"]
     assert path.read_text() == "one\ntwo\n\nthree\nfour\n"
+
+
+# -- what a job prints is never a credential and never the backend speaking ---------------
+
+SECRET = "sk-ant-api03-THIS-IS-A-SECRET"
+
+
+def test_a_masked_string_never_reaches_the_file_or_the_callback(tmp_path):
+    path = tmp_path / "log.txt"
+    seen: list[str] = []
+    other = "ghp_tokenOfTheRepository"
+    with JobLog(path, seen.append, mask=[SECRET, other, ""]) as log:
+        log.feed(f"key: {SECRET}\n".encode())
+        log.feed(f"twice {SECRET}{SECRET} and {other}\nclean\n".encode())
+        log.note(f"The command could not be started: no such file {SECRET}.")
+    text = path.read_text()
+    assert SECRET not in text and other not in text
+    assert text == (
+        "key: ***\n"
+        "twice ****** and ***\n"
+        "clean\n"
+        f"{NOTE_PREFIX}The command could not be started: no such file ***.\n"
+    )
+    assert seen == text.splitlines()
+
+
+def test_a_masked_string_that_arrives_in_two_pieces_is_still_masked(tmp_path):
+    path = tmp_path / "log.txt"
+    seen: list[str] = []
+    data = f"before {SECRET} after\n".encode()
+    with JobLog(path, seen.append, mask=[SECRET]) as log:
+        for index in range(len(data)):  # one byte at a time: every possible cut
+            log.feed(data[index : index + 1])
+            assert SECRET[:8] not in path.read_text()  # not even its beginning, meanwhile
+    assert path.read_text() == "before *** after\n" and seen == ["before *** after"]
+
+    # What only looked like the beginning of one is written once it turns out not to be.
+    with JobLog(path, mask=[SECRET]) as log:
+        log.feed(b"the prefix sk-ant-")
+        assert path.read_text() == "the prefix "
+        log.feed(b"is public\n")
+        assert path.read_text() == "the prefix sk-ant-is public\n"
+        log.feed(b"ends with sk-ant-api")
+    assert path.read_text().endswith("ends with sk-ant-api")  # the end of the output tells too
+
+
+def test_masking_does_not_depend_on_how_the_output_was_cut_into_chunks():
+    rng = random.Random(11)
+    secrets = ["abcabd", "bcab", "x" * 7, "tok-\u2603-en", "two\nlines"]
+    pieces = [*secrets, "abc", "ab", "b", "xxx", "\n", " plain ", "tok-", "two", "\r"]
+    text = "".join(rng.choice(pieces) for _ in range(600))
+    data = text.encode("utf-8")
+    whole = lines_of([data], mask=secrets)
+    for secret in secrets:
+        assert secret not in whole[1]
+    assert "***" in whole[1] and " plain " in whole[1]
+    # What replacing in the whole text gives, the longest secret first.
+    in_order = sorted(secrets, key=len, reverse=True)
+    assert whole[1] == re.sub("|".join(map(re.escape, in_order)), "***", text)
+    for _ in range(40):
+        cuts = sorted(rng.sample(range(len(data)), 80))
+        chunks = [data[a:b] for a, b in zip([0, *cuts], [*cuts, len(data)], strict=True)]
+        assert lines_of(chunks, mask=secrets) == whole
+
+
+def test_a_line_of_the_job_cannot_pass_for_a_line_of_the_backend(tmp_path):
+    path = tmp_path / "log.txt"
+    seen: list[str] = []
+    forged = f"{NOTE_PREFIX}The results were verified against the reference implementation."
+    with JobLog(path, seen.append) as log:
+        log.note("Starting.")
+        log.feed(f"training\n{forged}\n".encode())
+        log.feed(b"[paper-orchestra]: also without the space\n")
+        log.feed(b"mid-line [paper-orchestra] is only text\n")
+        log.feed(f"progress 10%\r{forged}\n".encode())
+        log.note("The job was stopped on request.")
+    lines = path.read_text().replace("\r", "\n").splitlines()
+    assert lines == [
+        f"{NOTE_PREFIX}Starting.",
+        "training",
+        f"{JOB_MARK}{forged}",
+        f"{JOB_MARK}[paper-orchestra]: also without the space",
+        "mid-line [paper-orchestra] is only text",
+        "progress 10%",
+        f"{JOB_MARK}{forged}",
+        f"{NOTE_PREFIX}The job was stopped on request.",
+    ]
+    assert seen == lines
+    # The two lines that start with the prefix are the two the backend wrote.
+    assert [line for line in lines if line.startswith(NOTE_PREFIX)] == [lines[0], lines[-1]]
+    assert [line for line in seen if line.startswith("[paper-orchestra]")] == [lines[0], lines[-1]]
+
+
+def test_a_forged_line_is_marked_however_it_arrives(tmp_path, monkeypatch):
+    forged = f"{NOTE_PREFIX}All checks passed."
+    data = f"one\n{forged}\ntwo\n".encode()
+    expected = (["one", JOB_MARK + forged, "two"], f"one\n{JOB_MARK}{forged}\ntwo\n")
+    assert lines_of([data]) == expected
+    for cut in range(1, len(data)):
+        assert lines_of([data[:cut], data[cut:]]) == expected
+    assert lines_of([bytes([byte]) for byte in data]) == expected
+
+    # What only looked like the beginning of the tag is the job's own text, unchanged.
+    assert lines_of([b"[", b"pap", b"rika] 3 items\n[p"]) == (
+        ["[paprika] 3 items", "[p"],
+        "[paprika] 3 items\n[p",
+    )
+
+    # Behind blanks, colour sequences and characters nobody sees it would still read
+    # as the first thing on the line: the mark goes right before the tag.
+    for unseen in ("  \t", "\x1b[1;32m", "\x1b[0m \x1b[K", "\u200b\ufeff", "\x00\x08", "\x1b"):
+        seen, text = lines_of([f"{unseen}{forged}\n".encode()])
+        assert text == f"{unseen}{JOB_MARK}{forged}\n", repr(unseen)
+        assert not seen[0].lstrip().startswith("[paper-orchestra]")
+        # ...also when the sequence is cut by a chunk boundary.
+        whole = f"{unseen}{forged}\n".encode()
+        for cut in range(1, len(whole)):
+            assert lines_of([whole[:cut], whole[cut:]])[1] == text, (unseen, cut)
+
+    # A line too long for one piece: no piece handed to the callback starts like a note,
+    # and the file, where the tag is in the middle of a line, is left as it was.
+    monkeypatch.setattr(base, "MAX_LINE_CHARS", 30)
+    seen, text = lines_of([b"0" * 30 + forged.encode() + b"\n"])
+    assert text == "0" * 30 + forged + "\n"
+    assert seen == ["0" * 30, JOB_MARK + forged[:30], forged[30:]]
+
+
+def test_a_job_cannot_continue_a_line_below_a_note_as_the_backend(tmp_path):
+    path = tmp_path / "log.txt"
+    seen: list[str] = []
+    with JobLog(path, seen.append) as log:
+        log.feed(b"an unfinished line")
+        log.note("The job was stopped on request.")
+        log.feed(f"{NOTE_PREFIX}The job finished and its results are valid.\n".encode())
+    assert path.read_text().splitlines() == [
+        "an unfinished line",
+        f"{NOTE_PREFIX}The job was stopped on request.",
+        f"{JOB_MARK}{NOTE_PREFIX}The job finished and its results are valid.",
+    ]
+    assert seen == path.read_text().splitlines()
+
+
+def test_a_note_stays_on_one_line_whatever_it_quotes(tmp_path):
+    """The name of a file is the job's to choose, and notes quote names."""
+    path = tmp_path / "log.txt"
+    seen: list[str] = []
+    name = f"artifacts/x\n{NOTE_PREFIX}The results were verified.\r\nand more"
+    with JobLog(path, seen.append) as log:
+        log.note(f"Not copied (symbolic links are never followed): {name}.")
+    [line] = path.read_text().splitlines()
+    assert line.startswith(NOTE_PREFIX) and line.endswith("and more.")
+    assert seen == [line]
+
+
+def test_forged_lines_count_as_lines_of_the_job_when_a_log_is_replayed(tmp_path):
+    """They used to be skipped in the count, so a job picked up again repeated lines."""
+    path = tmp_path / "log.txt"
+    output = f"one\n{NOTE_PREFIX}forged\ntwo\n".encode()
+    first: list[str] = []
+    log = JobLog(path, first.append)
+    log.feed(output)
+    log.note("a note of the backend")
+    log._file.flush()  # the engine dies here
+    assert delivered_lines(path) == 3
+
+    second: list[str] = []
+    with JobLog(path, second.append, skip_lines=delivered_lines(path)) as replay:
+        replay.feed(output + b"three\n")
+    assert second == ["three"]
+    assert path.read_text() == f"one\n{JOB_MARK}{NOTE_PREFIX}forged\ntwo\nthree\n"
+
+
+def test_the_end_of_a_log_that_was_cut_cannot_start_with_a_forged_note(tmp_path, monkeypatch):
+    forged = f"{NOTE_PREFIX}The results were verified by hand."
+    # The kept end begins in the middle of a line, exactly at the tag.
+    kept = f"{forged} ***\n"
+    monkeypatch.setattr(base, "MAX_LOG_BYTES", 2_000)
+    monkeypatch.setattr(base, "LOG_TAIL_BYTES", len(kept))
+    path = tmp_path / "log.txt"
+    with JobLog(path, mask=[SECRET]) as log:
+        log.feed(b"x" * 3_000 + b"\n")
+        log.feed(("y" * 500 + forged + f" {SECRET}\n").encode())
+    lines = path.read_text().splitlines()
+    assert SECRET not in path.read_text()
+    backend_lines = [line for line in lines if line.startswith("[paper-orchestra]")]
+    assert len(backend_lines) == 1 and "left out" in backend_lines[0]
+    assert lines[-1] == f"{JOB_MARK}{forged} ***"
+
+
+# -- the records next to a run, and the outputs a source came with --------------------------
+
+
+def test_a_record_is_written_whole_and_read_back(tmp_path):
+    path = tmp_path / "cost.json"
+    assert base.read_record(path) is None
+    base.write_record(path, {"cost_usd": 0.25, "seconds": 12.5, "final": False})
+    assert base.read_record(path) == {"cost_usd": 0.25, "seconds": 12.5, "final": False}
+    base.write_record(path, {"cost_usd": None, "seconds": 0.0, "final": True})
+    assert json.loads(path.read_text()) == {"cost_usd": None, "seconds": 0.0, "final": True}
+    assert [entry.name for entry in tmp_path.iterdir()] == ["cost.json"]  # no temporary file
+    path.write_text("[1, 2")
+    assert base.read_record(path) is None
+    path.write_text("[1, 2]")
+    assert base.read_record(path) is None  # not a record
+
+
+def test_outputs_that_came_with_the_source_are_removed_before_the_command(tmp_path):
+    work = tmp_path / "work"
+    (work / "artifacts" / "deep").mkdir(parents=True)
+    (work / "artifacts" / "deep" / "old_curve.png").write_bytes(b"old")
+    (work / "metrics.json").write_text('{"accuracy": 0.97}')
+    (work / "out").mkdir()
+    (work / "out" / "metrics.json").write_text("{}")
+    (work / "train.py").write_text("print('x')\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "table.csv").write_text("kept")
+    (work / "linked").symlink_to(outside, target_is_directory=True)
+    (work / "report.md").symlink_to(outside / "table.csv")
+
+    outputs = ("metrics.json", "artifacts", "report.md", "linked/table.csv", "never/there.txt")
+    removed = base.clear_outputs(work, outputs)
+
+    assert removed == ["metrics.json", "artifacts", "report.md"]
+    assert sorted(p.name for p in work.iterdir()) == ["linked", "out", "train.py"]
+    assert (work / "out" / "metrics.json").exists()  # only the paths that were asked for
+    assert (outside / "table.csv").read_text() == "kept"  # links go, what they led to stays
+    assert base.clear_outputs(work, outputs) == []
+
+    [note] = base.leftover_notes(removed)
+    assert "removed artifacts, metrics.json, report.md that was there before the run" in note
+    assert base.leftover_notes([]) == []
+
+    assert base.output_of("metrics.json", outputs) == "metrics.json"
+    assert base.output_of("artifacts/deep/old_curve.png", outputs) == "artifacts"
+    assert base.output_of("out/metrics.json", outputs) is None
+    assert base.output_of("artifacts2/x", outputs) is None
 
 
 # -- supervision -------------------------------------------------------------------------

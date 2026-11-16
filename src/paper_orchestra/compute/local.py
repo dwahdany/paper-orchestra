@@ -11,6 +11,14 @@ user with network access.  Use the Modal backend for isolation.
 An experiment job runs in a copy of its source directory with the packages
 that are installed here.  It has no GPU, and its network access cannot be
 blocked; ``supports`` and the notes of a result say so.
+
+What a job starts is ended with it: its process group, its session and, on
+Linux, every process that still carries the job's mark in its environment
+(``JOB_ENV``), wherever it went.  A process that left the session *and* dropped
+its environment cannot be found; that is the limit of what is tracked here.
+When the job starts, ``job.json`` in the run directory records its session and
+its working directory, so that :meth:`LocalBackend.end_job` can clean up after
+a worker that was killed and could not.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from paper_orchestra.compute.base import (
+    JOB_NAME,
     BackendUnusable,
     CompileResult,
     ComputeBackend,
@@ -46,6 +55,8 @@ from paper_orchestra.compute.base import (
     JobStopped,
     SourceReport,
     choose_outputs,
+    clear_outputs,
+    leftover_notes,
     open_run,
     refuse_unsafe_document,
     requirement_name,
@@ -54,10 +65,22 @@ from paper_orchestra.compute.base import (
     spec_problems,
     supervise,
     walk_source,
+    write_record,
 )
 from paper_orchestra.utils.latex import latex_commands, summarize_build
 
 _PASSTHROUGH_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TZ")
+#: The variable every process of a job inherits, set to the job's working directory
+#: (a name nobody else has).  It is the mark by which what a job started is found once
+#: it has left the job's process group and session.
+JOB_ENV = "PAPER_ORCHESTRA_JOB"
+#: How the working directories of jobs are named, wherever they are made.
+SCRATCH_PREFIX = "paper-orchestra-job-"
+#: How often in a row the processes of a job are looked up and killed: one that forks
+#: while the others are killed is found the next time.
+_SWEEPS = 3
+#: Seconds processes that were killed are waited for before their directory is removed.
+_REAP_SECONDS = 3.0
 #: Characters of stdout/stderr kept per stream.  Only the tail is kept, so a job
 #: that prints in a loop cannot exhaust the orchestrator's memory.
 _MAX_CAPTURE = 200_000
@@ -166,31 +189,163 @@ def _kill_group(process: subprocess.Popen[bytes], sig: int = signal.SIGKILL) -> 
             process.kill()
 
 
-def _kill_job(process: subprocess.Popen[bytes]) -> None:
-    """Kill the job ``process`` leads: its process group, and what left the group.
+def _on_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _stat_fields(pid: int | str) -> list[bytes] | None:
+    """The fields of ``/proc/<pid>/stat`` from the state on; ``None`` if it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            # "pid (name) state ppid pgrp session ...": the name may hold anything.
+            fields = stat_file.read().rsplit(b")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return fields if len(fields) > 19 else None
+
+
+def _processes() -> Iterator[tuple[int, int]]:
+    """``(pid, session)`` of the processes of this machine that are still alive."""
+    try:
+        entries = [entry.name for entry in os.scandir("/proc") if entry.name.isdigit()]
+    except OSError:
+        return
+    for name in entries:
+        fields = _stat_fields(name)
+        # A zombie only waits to be collected: there is nothing left of it to end.
+        if fields is None or fields[0] == b"Z":
+            continue
+        with contextlib.suppress(ValueError):
+            yield int(name), int(fields[3])
+
+
+def _marked(mark: str) -> set[int]:
+    """The processes whose environment says they belong to the job ``mark``.
+
+    A process inherits its environment whatever group or session it moves to; only
+    one that replaced its environment is not found.  Environments of other users'
+    processes cannot be read and are not the job's.
+    """
+    wanted = f"{JOB_ENV}={mark}".encode()
+    found: set[int] = set()
+    for pid, _ in _processes():
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as environ:
+                if wanted in environ.read().split(b"\0"):
+                    found.add(pid)
+        except OSError:
+            continue  # not ours to read, or gone
+    found.discard(os.getpid())
+    return found
+
+
+def _kill(pid: int) -> bool:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return False  # it ended while we were looking
+    return True
+
+
+def _session_started(pid: int) -> str:
+    """When the process ``pid`` was started, as this machine counts it since it booted,
+    with the boot it was counted in; ``""`` where that cannot be told (not Linux, or no
+    such process).  Two processes that were given the same id differ in this."""
+    fields = _stat_fields(pid) if _on_linux() else None
+    if fields is None:
+        return ""
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except OSError:
+        boot = ""
+    return f"{fields[19].decode('ascii', 'replace')}@{boot}"
+
+
+def _kill_job(process: subprocess.Popen[bytes], mark: str = "") -> set[int]:
+    """Kill the job ``process`` leads: its process group, what left the group and what
+    left the session.  Returns the processes that were found outside the session.
 
     Tools such as coreutils ``timeout`` and shells with job control move what they
     start to a process group of its own, which a signal to the job's group does not
     reach.  The session is still the job's, so on Linux the processes of the session
-    are looked up and killed too.  Only what starts a session of its own (a daemon)
-    gets away.  Call this before the process is reaped: until then its id cannot
-    have been given to an unrelated process group or session.
+    are looked up and killed too.  What started a session of its own (a daemon) is
+    found by the job's ``mark`` in its environment, see :func:`_marked`.  Call this
+    before the process is reaped: until then its id cannot have been given to an
+    unrelated process group or session.
     """
     _kill_group(process)
-    if not sys.platform.startswith("linux"):
-        return
-    with contextlib.suppress(OSError):
-        for entry in os.scandir("/proc"):
-            if not entry.name.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry.name}/stat", "rb") as stat_file:
-                    # "pid (name) state ppid pgrp session ...": the name may hold anything.
-                    fields = stat_file.read().rsplit(b")", 1)[1].split()
-                if int(fields[3]) == process.pid:
-                    os.kill(int(entry.name), signal.SIGKILL)
-            except (OSError, IndexError, ValueError):
-                continue  # it ended while we were looking
+    strays: set[int] = set()
+    if not _on_linux():
+        return strays
+    for _ in range(_SWEEPS):
+        marked = _marked(mark) if mark else set()
+        killed = False
+        for pid, session in list(_processes()):
+            inside = session == process.pid
+            if (inside or pid in marked) and pid != os.getpid() and _kill(pid):
+                killed = True
+                if not inside:
+                    strays.add(pid)
+        if not killed:
+            break
+    return strays
+
+
+def _left_behind(session: int, started: str, scratch: str) -> set[int]:
+    """The processes that still run of a job whose worker died, from its record.
+
+    Processes that carry the job's mark are the job's wherever they are.  The
+    processes of its session are the job's if the session is still the one on record:
+    its leader is the process that was started at ``started``, or, the leader gone, a
+    process in it carries the mark (the number of a session is not given out again
+    while a process of it lives).  A session that cannot be told to be the job's is
+    left alone: its number may have gone to somebody else's processes since.
+    """
+    marked = _marked(scratch) if scratch else set()
+    if session <= 1:
+        return marked
+    members = {pid for pid, of in _processes() if of == session}
+    leader = _session_started(session)
+    same = bool(started) and leader == started if leader else bool(members & marked)
+    return marked | members if same else marked
+
+
+def _job_fields(record: Any) -> tuple[int, str, str]:
+    """``(session, session_started, scratch)`` of a job record, or of a record that holds
+    one under ``"job"``; ``0`` and ``""`` for what is missing or of another type."""
+    job = record.get("job") if isinstance(record, Mapping) else None
+    job = job if isinstance(job, Mapping) else record if isinstance(record, Mapping) else {}
+    session, started, scratch = (job.get(key) for key in ("session", "session_started", "scratch"))
+    return (
+        session if isinstance(session, int) and not isinstance(session, bool) else 0,
+        started if isinstance(started, str) else "",
+        scratch if isinstance(scratch, str) else "",
+    )
+
+
+def _wait_gone(pids: Iterable[int], seconds: float) -> None:
+    """Give killed processes a moment to end, so that they hold no file any more."""
+    deadline = time.monotonic() + seconds
+    waiting = set(pids)
+    while waiting and time.monotonic() < deadline:
+        alive = {pid for pid, _ in _processes()}
+        waiting &= alive
+        if waiting:
+            time.sleep(0.05)
+
+
+def _remove_tree(path: Path) -> bool:
+    """Remove the directory ``path`` and everything in it, also what a job made
+    unreadable; returns whether it is gone.  Links are removed, never followed."""
+    stack = [str(path)]
+    while stack:
+        directory = stack.pop()
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o700)
+            with os.scandir(directory) as entries:
+                stack.extend(e.path for e in entries if e.is_dir(follow_symlinks=False))
+    shutil.rmtree(path, ignore_errors=True)
+    return not os.path.lexists(path)
 
 
 def _spawn(
@@ -556,12 +711,13 @@ class LocalBackend(ComputeBackend):
         run_dir: Path,
         on_log: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
     ) -> JobResult:
         source, run_dir = Path(source_dir), Path(run_dir)
         log_path = open_run(run_dir, spec.outputs)
         result = JobResult(returncode=None, backend=self.name, log_path=log_path)
         result.outputs_dir = run_dir
-        with JobLog(log_path, on_log) as log:
+        with JobLog(log_path, on_log, mask=mask) as log:
             reasons = self.supports(spec)
             if not reasons and not source.is_dir():
                 reasons = [f"The source directory {source} does not exist."]
@@ -584,7 +740,7 @@ class LocalBackend(ComputeBackend):
                 if self.scratch_dir is not None:
                     self.scratch_dir.mkdir(parents=True, exist_ok=True)
                 scratch = tempfile.TemporaryDirectory(
-                    prefix="paper-orchestra-job-", dir=self.scratch_dir, ignore_cleanup_errors=True
+                    prefix=SCRATCH_PREFIX, dir=self.scratch_dir, ignore_cleanup_errors=True
                 )
             except OSError as exc:
                 result.error = f"The local backend could not make a working directory: {exc}."
@@ -595,7 +751,10 @@ class LocalBackend(ComputeBackend):
                     work, home = Path(name, "work"), Path(name, "home")
                     home.mkdir()
                     self._note(result, log, copy_source(source, work, should_stop))
-                    self._execute(spec, work, home, log, should_stop, result)
+                    # A result is what the command writes, not what its source brought.
+                    leftovers = clear_outputs(work, spec.outputs)
+                    self._note(result, log, leftover_notes(leftovers))
+                    self._execute(spec, work, home, run_dir, log, should_stop, result)
                     self._note(result, log, collect_outputs(work, spec.outputs, run_dir))
             except JobStopped:
                 result.cancelled = True
@@ -632,11 +791,52 @@ class LocalBackend(ComputeBackend):
             )
         return caveats
 
+    @staticmethod
+    def end_job(record: Mapping[str, Any]) -> list[str]:
+        """Clean up after a local job whose worker died before it could, and return
+        notes on what was done.
+
+        ``record`` is what the job wrote to ``job.json`` in its run directory when it
+        started (``session``, ``session_started``, ``scratch``), or a record that
+        holds it under ``"job"``.  The processes the job left running are killed: those
+        that carry its mark, and those of its session if that is still the session on
+        record (see :func:`_left_behind`; Linux only).  Then its working directory is
+        removed, if it is one that this backend made.  Nothing is done, and nothing
+        returned, for a record that names neither; calling this twice is safe.
+        """
+        session, started, scratch = _job_fields(record)
+        path = Path(scratch)
+        left = bool(scratch) and path.name.startswith(SCRATCH_PREFIX) and not path.is_symlink()
+        left = left and path.is_dir()
+        notes: list[str] = []
+        if _on_linux():
+            killed = {pid for pid in _left_behind(session, started, scratch) if _kill(pid)}
+            if killed:
+                _wait_gone(killed, _REAP_SECONDS)
+                notes.append(
+                    f"Stopped {len(killed)} process{'es' if len(killed) > 1 else ''} that the "
+                    "run had left running on this machine when its worker stopped."
+                )
+        elif left and session > 1:
+            notes.append(
+                "Whether processes of the run are still running could not be checked on "
+                "this system (they are found through /proc, on Linux). Look for them yourself."
+            )
+        if left and _remove_tree(path):
+            notes.append(f"Removed the working directory {path} that the run had left behind.")
+        elif left:
+            notes.append(
+                f"The working directory {path} that the run left behind could not be "
+                "removed. Remove it yourself."
+            )
+        return notes
+
     def _execute(
         self,
         spec: JobSpec,
         work: Path,
         home: Path,
+        run_dir: Path,
         log: JobLog,
         should_stop: Callable[[], bool] | None,
         result: JobResult,
@@ -650,6 +850,9 @@ class LocalBackend(ComputeBackend):
         env = scrubbed_env(home)
         env["PYTHONUNBUFFERED"] = "1"  # prints reach the person watching as they happen
         env.update(spec.env)
+        # The mark of this job: the directory made for it, which nothing else is called.
+        mark = str(work.parent)
+        env[JOB_ENV] = mark
         preexec = None
         if os.name == "posix":
             # Only a limit the job asked for.  The default cap is sized for a plotting
@@ -673,20 +876,35 @@ class LocalBackend(ComputeBackend):
             result.returncode = 126 if isinstance(exc, PermissionError) else 127
             return
         assert process.stdout is not None
+        strays: set[int] = set()
+
+        def kill() -> None:
+            strays.update(_kill_job(process, mark))
+
         try:
+            # For whoever settles this run if this process is killed: what to end, and
+            # what to remove (see end_job).
+            write_record(
+                run_dir / JOB_NAME,
+                {
+                    "session": process.pid,
+                    "session_started": _session_started(process.pid),
+                    "scratch": mark,
+                },
+            )
             outcome = supervise(
                 _pipe_chunks(process.stdout),
                 log,
                 timeout=spec.timeout,
                 should_stop=should_stop,
                 interrupt=lambda: _kill_group(process, signal.SIGTERM),
-                kill=lambda: _kill_job(process),
+                kill=kill,
                 exited=lambda: _has_exited(process),
             )
         finally:
             # Also on Ctrl-C and on errors of the callbacks: nothing of the job outlives
             # this call.  Killed before it is reaped, see _kill_job.
-            _kill_job(process)
+            kill()
             process.wait()
             process.stdout.close()
         result.seconds = time.monotonic() - started
@@ -701,14 +919,26 @@ class LocalBackend(ComputeBackend):
         elif outcome.cancelled:
             result.cancelled = True
             log.note("The job was stopped on request.")
+        if strays:
+            count = len(strays)
+            self._note(
+                result,
+                log,
+                [
+                    f"{count} process{'es' if count > 1 else ''} that the job had started "
+                    "outside its own session (they would have run on after it) "
+                    f"{'were' if count > 1 else 'was'} stopped when the job ended."
+                ],
+            )
         if outcome.abandoned:
             self._note(
                 result,
                 log,
                 [
                     "Something the job started kept its output open after the job had ended "
-                    "and could not be stopped (it runs in a session of its own). It may still "
-                    "be running on this machine; what it prints from here on is not in the log."
+                    "and could not be found to stop it (it left the job's session and no "
+                    "longer carries the job's mark in its environment). It may still be "
+                    "running on this machine; what it prints from here on is not in the log."
                 ],
             )
         if outcome.failure is not None:
@@ -737,7 +967,8 @@ class LocalBackend(ComputeBackend):
                 "reattach": False,
                 "summary": (
                     "Runs on this machine as your user, with the packages installed here. "
-                    "No GPU, and network access cannot be blocked: it is not a sandbox."
+                    "No GPU, and network access cannot be blocked: it is not a sandbox, and "
+                    "a job can read what you can read."
                 ),
             },
         }

@@ -1,7 +1,7 @@
 """Engine processes, started and stopped by the web server.
 
 The server never runs the engine itself.  For a project it starts
-``python -m paper_orchestra research advance <project>`` (or ``research run``,
+``python -P -m paper_orchestra research advance <project>`` (or ``research run``,
 ``research write``) as a process of its own and learns everything from the
 project's files.  What this module guarantees:
 
@@ -9,21 +9,41 @@ project's files.  What this module guarantees:
 * **A worker does not hang on the server.**  It has its own session and process
   group, writes to ``<project>/worker.log`` instead of a pipe, and is on record
   in the project directory (``.worker.json``, and the engine's own
-  ``state.json["worker"]``).  A server that is killed leaves its workers
-  running; the next server finds them again, shows them as running and can
-  stop them.  A server that shuts down in an orderly way stops them: the ones
-  it started and the ones a server that is gone left behind, not an engine the
-  person started from a terminal (it is shown, and stopped only when asked).
+  ``state.json["worker"]``).  The end of the server, however it comes, leaves
+  its workers running; the next server finds them again, shows them as running
+  and can stop them.  Only a server that was asked to (``stop_on_exit``) stops,
+  when it ends, the workers that are its own: the ones it started and the ones
+  a server that is gone left behind, not an engine the person started from a
+  terminal (it is shown, and stopped only when asked).
+* **Only a process that is shown to be this project's worker is signalled.**
+  The files of a project directory may come from anywhere, and a process
+  number in them may be anybody's by now.  The server signals a process it
+  started itself and still holds, or one that it can show to be a worker of
+  this very directory: the same process as when the record was written (its
+  start time), running ``paper_orchestra research <kind>`` on this directory
+  (its command line) or holding this directory's worker lock (the lock is
+  held, and the process has that file open).  Anything else the files name is,
+  at most, shown as a worker this server cannot verify: it has no Stop, and
+  :meth:`Workers.forget` clears the name.  A copy of a project is not the
+  original: when nobody holds the copy's worker lock, nobody works there,
+  whatever the copied files say.
+* **Workers run the installed package.**  They are started with ``python -P``
+  and the project as an absolute path, so that no file of the directory the
+  server was started in is imported in place of a module.
 * **Stopping is interrupt first, then kill.**  The interrupt lets the engine
   record the phase as interrupted.  Experiment jobs run in sessions of their
   own, so their process groups are looked up while the worker is still alive
   and signalled too; after the grace period everything is killed, whether or
   not the worker itself already went.  Only what the worker is and started is
   signalled: an engine that shares its process group with the script that
-  runs it is reached by its pid.  All of that happens on a thread: a stop
-  returns at once with the state ``stopping``.
+  runs it is reached by its pid, and a process group is signalled only while
+  a process that was seen in it is still there (the number of a group that
+  emptied may be another group's by then).  All of that happens on a thread: a
+  stop returns at once with the state ``stopping``.
 * **A worker that dies is not shown as running.**  Its exit is observed; when it
-  left ``state.json`` at ``running``, the phase is recorded as interrupted here.
+  left ``state.json`` at ``running``, the phase is recorded as interrupted here,
+  and the runs of experiments it left at ``running`` are settled through the
+  experiments module's recovery, without anything being started.
 
 No ``preexec_fn`` (unsafe in a threaded server) and no parent-death signal (it
 follows the thread that started the child, and server threads end): the child
@@ -41,6 +61,7 @@ import os
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -55,18 +76,27 @@ from typing import Any
 from paper_orchestra.research.model import format_stamp, parse_stamp
 from paper_orchestra.research.project import EVENTS_FILE, STATE_FILE
 from paper_orchestra.utils.common import write_json
+from paper_orchestra.web.security import PathEscape, open_for_append
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "GRACE_SECONDS",
+    "HEARTBEAT_AHEAD_SECONDS",
     "HEARTBEAT_STALE_SECONDS",
     "KINDS",
     "RECORD_FILE",
+    "WORKER_LOCK_FILE",
     "WORKER_LOG",
     "Launcher",
     "WorkerBusy",
     "WorkerError",
     "Workers",
     "default_command",
+    "settle_stale_runs",
 ]
 
 log = logging.getLogger(__name__)
@@ -77,6 +107,9 @@ KINDS: tuple[str, ...] = ("advance", "run", "write")
 WORKER_LOG = "worker.log"
 #: The server's record of the worker it started: pid, host, kind, command, start time.
 RECORD_FILE = ".worker.json"
+#: The file every worker of a project holds a kernel lock on while it works (the engine's
+#: ``WORKER_LOCK_FILE``; named here so that the server need not import the engine).
+WORKER_LOCK_FILE = ".worker.lock"
 #: How long a worker gets after the interrupt before it is killed.  Longer than the ten
 #: seconds the engine itself waits for model calls in flight when it is interrupted.
 GRACE_SECONDS = 15.0
@@ -85,11 +118,21 @@ EXIT_GRACE_SECONDS = 2.0
 #: A worker whose heartbeat in ``state.json`` is older than this and whose process is
 #: gone is dead (spec 10.4).
 HEARTBEAT_STALE_SECONDS = 60.0
+#: A heartbeat further ahead of this machine's clock than this is not a sign of life: the
+#: clock was set back, or the file says what it likes.  Written on this machine, a
+#: heartbeat is at most a moment ahead; another machine's clock may differ by more.
+HEARTBEAT_AHEAD_SECONDS = 5.0
+HEARTBEAT_AHEAD_SECONDS_ELSEWHERE = 60.0
 
 _SETTLED_PHASES = frozenset({"completed", "failed", "interrupted", "skipped"})
 _POLL_SECONDS = 0.1
 #: How long a killed process is waited for before the stop gives up on seeing it go.
 _KILL_WAIT_SECONDS = 5.0
+#: How long a start waits for the runs of a dead worker to be settled before it goes on.
+_SETTLE_WAIT_SECONDS = 20.0
+#: No process has a number this large (Linux allows up to 2**22), and one that large in a
+#: file cannot even be asked about.
+_PID_LIMIT = 2**22
 
 #: ``(kind, project directory, options) -> argv`` of the worker process.
 Launcher = Callable[[str, Path, Mapping[str, Any]], Sequence[str]]
@@ -127,11 +170,15 @@ def default_command(kind: str, root: Path, options: Mapping[str, Any]) -> list[s
     ``options``: ``phase`` and ``instruction`` for ``advance``; ``experiments`` (ids)
     for ``run``; ``template`` and ``model`` for ``write``.  Values are passed as ``--name=value`` so
     that a value starting with a dash is still a value.
+
+    ``-P`` keeps the directory the server was started in off the module search
+    path: with a plain ``python -m`` a file there called ``secrets.py`` or
+    ``types.py`` would be imported by every worker, next to the credentials.  The
+    project is given as an absolute path, which says which directory is meant
+    whatever the worker's working directory is, and never reads as an option.
     """
-    # A directory whose name starts with a dash, in a workspace given as ".", would read
-    # as an option of the command.
-    project = str(root) if not str(root).startswith("-") else f"./{root}"
-    command = [sys.executable, "-m", "paper_orchestra", "research", kind, project]
+    project = os.path.abspath(root)
+    command = [sys.executable, "-P", "-m", "paper_orchestra", "research", kind, project]
     if kind == "advance":
         if options.get("phase"):
             command.append(f"--phase={options['phase']}")
@@ -151,6 +198,18 @@ def default_command(kind: str, root: Path, options: Mapping[str, Any]) -> list[s
 # ---------------------------------------------------------------------------
 # Processes: who is alive, what did it start, how to signal it
 # ---------------------------------------------------------------------------
+
+
+def _valid_pid(value: Any) -> int | None:
+    """``value`` as the number of a process that a file may name, else ``None``.
+
+    Not a bool, not 0 or 1 (the system's first process, the ancestor of nearly
+    everything), nothing negative (to ``kill`` that is a whole process group or
+    "everything") and nothing larger than a process number can be.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 < value < _PID_LIMIT else None
 
 
 def _process_table(proc: Path = Path("/proc")) -> list[tuple[int, int, int]]:
@@ -189,31 +248,60 @@ def _process_table(proc: Path = Path("/proc")) -> list[tuple[int, int, int]]:
     return rows
 
 
+def _own_lineage(table: Sequence[tuple[int, int, int]] | None = None) -> set[int]:
+    """This server and every process it descends from: never a worker, never signalled."""
+    parents = {pid: parent for pid, parent, _ in (_process_table() if table is None else table)}
+    lineage: set[int] = set()
+    pid = os.getpid()
+    while pid > 0 and pid not in lineage:
+        lineage.add(pid)
+        pid = parents.get(pid, 0)
+    return lineage
+
+
+def _group_of(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
 @dataclass
 class _Targets:
     """What to signal to reach a worker and everything it started."""
 
-    #: Process groups that hold nothing but the worker's own processes.
-    groups: set[int] = field(default_factory=set)
+    #: Process groups that hold nothing but the worker's own processes, each with the
+    #: processes seen in it (and their start tokens) when it was looked up.
+    groups: dict[int, dict[int, str | None]] = field(default_factory=dict)
     #: Single processes, each with its start token: the ones that sit in a group the
     #: worker did not make, next to processes that are not its own.
     processes: dict[int, str | None] = field(default_factory=dict)
 
     def add(self, other: _Targets) -> None:
-        self.groups |= other.groups
+        for group, members in other.groups.items():
+            known = self.groups.setdefault(group, {})
+            for pid, token in members.items():
+                known.setdefault(pid, token)
         for pid, token in other.processes.items():
             self.processes.setdefault(pid, token)
 
     def signal(self, signum: int) -> None:
-        for group in self.groups:
+        for group, members in self.groups.items():
+            # The kill comes a grace period after the look.  A group whose processes
+            # have all gone since may be somebody else's group under the same number by
+            # now, and a group cannot be asked when it began: its processes can.
+            if not any(
+                _same_process(pid, token) and _group_of(pid) == group
+                for pid, token in members.items()
+            ):
+                continue
             try:
                 os.killpg(group, signum)
             except OSError as exc:
                 # Usually ProcessLookupError: the process group is already gone.
                 log.debug("Could not signal the process group %d: %s", group, exc)
         for pid, token in self.processes.items():
-            # A pid can be given out again within the grace period; a group cannot be
-            # checked that way, a single process can.
+            # A pid can be given out again within the grace period.
             if not _same_process(pid, token):
                 continue
             try:
@@ -234,18 +322,23 @@ def _targets_of(pid: int) -> _Targets:
     its own.  An engine started from a script or a Makefile sits in the group of
     whatever started it: there the worker and its children are signalled one by
     one, so that a stop ends the engine and not the script around it.
+
+    Nothing is returned for a process this server itself descends from, or for
+    one that is no process a file may name: what such a process "started" is the
+    person's whole session.
     """
-    children: dict[int, list[tuple[int, int]]] = {}
-    for child, parent, group in _process_table():
-        children.setdefault(parent, []).append((child, group))
-    try:
-        own = os.getpgid(pid)
-    except OSError:
-        own = None
-    leads = own == pid
     targets = _Targets()
+    table = _process_table()
+    lineage = _own_lineage(table)
+    if _valid_pid(pid) is None or pid in lineage:
+        return targets
+    children: dict[int, list[tuple[int, int]]] = {}
+    for child, parent, group in table:
+        children.setdefault(parent, []).append((child, group))
+    own = _group_of(pid)
+    leads = own == pid
     if leads:
-        targets.groups.add(pid)
+        targets.groups[pid] = {pid: _start_token(pid)}
     else:
         targets.processes[pid] = _start_token(pid)
     seen = {pid}
@@ -259,10 +352,12 @@ def _targets_of(pid: int) -> _Targets:
             if group == own and not leads:
                 targets.processes[child] = _start_token(child)
             else:
-                targets.groups.add(group)
-    # Never this server or its group, whatever a recycled pid may suggest.
-    targets.groups -= {0, 1, os.getpgid(0)}
-    for protected in (0, 1, os.getpid()):
+                targets.groups.setdefault(group, {})[child] = _start_token(child)
+    # Never this server, a process it descends from, or their groups, whatever a
+    # recycled pid may suggest.
+    for protected in (0, 1, *(_group_of(ancestor) or 0 for ancestor in lineage)):
+        targets.groups.pop(protected, None)
+    for protected in (0, 1, *lineage):
         targets.processes.pop(protected, None)
     return targets
 
@@ -283,9 +378,9 @@ def _start_token(pid: int) -> str | None:
 
     On Linux the kernel's own count; elsewhere what ``ps`` prints as the start time.
     """
-    stat = _proc_stat(pid)
-    if stat is not None:
-        return str(stat[1])
+    stat_ = _proc_stat(pid)
+    if stat_ is not None:
+        return str(stat_[1])
     if os.name != "posix" or Path("/proc/self/stat").exists():
         return None
     try:
@@ -301,9 +396,10 @@ def _start_token(pid: int) -> str | None:
     return listing.strip() or None
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether a process with that pid exists and has not already exited."""
-    if pid <= 0:
+def _pid_alive(pid: Any) -> bool:
+    """Whether a process with that pid exists and has not already exited.  A value that
+    is no process number (see :func:`_valid_pid`) names no process."""
+    if _valid_pid(pid) is None:
         return False
     if os.name == "nt":  # pragma: no cover - Windows; ``os.kill(pid, 0)`` would end it
         import ctypes
@@ -317,15 +413,15 @@ def _pid_alive(pid: int) -> bool:
         return bool(alive) and code.value == 259
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except OSError:
         pass  # it exists and is someone else's
-    stat = _proc_stat(pid)
-    return stat is None or stat[0] != "Z"  # a zombie only waits to be collected
+    stat_ = _proc_stat(pid)
+    return stat_ is None or stat_[0] != "Z"  # a zombie only waits to be collected
 
 
-def _same_process(pid: int, token: str | None) -> bool:
+def _same_process(pid: Any, token: str | None) -> bool:
     """Whether ``pid`` is still the process that had it when ``token`` was read."""
     if not _pid_alive(pid):
         return False
@@ -333,16 +429,176 @@ def _same_process(pid: int, token: str | None) -> bool:
     return token is None or now is None or now == token
 
 
-def _mentions(pid: int, root: Path) -> bool:
-    """Whether the command line of ``pid`` names the project: a guard against a pid from
-    an old ``state.json`` that now belongs to an unrelated process.  True when the
-    command line cannot be read."""
+# -- is that process a worker of this project? -----------------------------------
+
+
+def _command_line(pid: int) -> list[str] | None:
+    """The arguments the process was started with, or ``None`` when they cannot be read.
+
+    Exact on Linux.  Elsewhere ``ps`` prints them joined by spaces, so an argument
+    that contains a space comes back in pieces (a project in such a directory is
+    then not recognised by its command line).
+    """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
+        raw = None
+    if raw is not None:
+        parts = raw.split(b"\x00")
+        if parts and not parts[-1]:
+            parts.pop()
+        return [part.decode("utf-8", errors="surrogateescape") for part in parts] or None
+    if os.name != "posix" or Path("/proc/self/stat").exists():
+        return None
+    try:
+        listing = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return listing.split() or None
+
+
+def _working_directory(pid: int) -> str | None:
+    """Where the process runs (Linux), for an argument that is a relative path."""
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
+def _is_cli(argument: str) -> bool:
+    """Whether a command-line argument is this package's command, as a script."""
+    name = os.path.basename(argument.replace("\\", "/")).lower()
+    if name in ("paper-orchestra", "paper-orchestra.exe", "paper-orchestra-script.py"):
         return True
-    command = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
-    return str(root) in command or str(root.resolve()) in command or root.name in command
+    return argument.replace("\\", "/").endswith("paper_orchestra/__main__.py")
+
+
+def _worker_arguments(command: Sequence[str]) -> list[str] | None:
+    """What follows ``research <kind>`` in the command line of a worker of this package
+    (``python -m paper_orchestra research advance ...`` or the ``paper-orchestra``
+    script); ``None`` when the command line is not one."""
+    for index in range(1, len(command) - 1):
+        if command[index] != "research" or command[index + 1] not in KINDS:
+            continue
+        before = command[:index]
+        as_module = any(
+            before[place] == "paper_orchestra" and before[place - 1] == "-m"
+            for place in range(1, len(before))
+        )
+        if as_module or any(_is_cli(argument) for argument in before):
+            return list(command[index + 2 :])
+    return None
+
+
+def _names_directory(arguments: Sequence[str], cwd: str | None, root: Path) -> bool:
+    """Whether one of the arguments is the directory ``root``, however it is spelled:
+    relative to where the process runs, or through a link."""
+    target = os.path.realpath(root)
+    for argument in arguments:
+        if argument.startswith("-"):
+            continue  # an option, with its value
+        if os.path.isabs(argument):
+            candidate = argument
+        elif cwd is not None:
+            candidate = os.path.join(cwd, argument)
+        else:
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            if os.path.realpath(candidate) == target:
+                return True
+    return False
+
+
+def _has_open(pid: int, path: Path) -> bool:
+    """Whether the process has the file open under this very path (Linux; ``False``
+    where that cannot be seen: another system, or a process of another user).
+
+    By path, not by what the file is: a copy of a project made of hard links shares
+    its lock file with the original, and a worker of the original has it open under
+    the original's path.
+    """
+    wanted = os.path.join(os.path.realpath(path.parent), path.name)
+    try:
+        descriptors = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return False
+    for descriptor in descriptors:
+        with contextlib.suppress(OSError):
+            if os.readlink(f"/proc/{pid}/fd/{descriptor}") == wanted:
+                return True
+    return False
+
+
+def _lock_held(root: Path) -> bool | None:
+    """Whether some process holds the project's worker lock.
+
+    ``True``: somebody is at work in this directory.  ``False``: nobody is, whatever
+    the files in it say (the kernel drops the lock with its holder, however that
+    died, and a copy of the directory is another file that nobody locked).
+    ``None``: it cannot be told here (no such locks on this system or file system,
+    or the file cannot be opened).
+
+    The lock is tried without waiting and as a shared one, so that two servers
+    looking at once do not see each other, and given back at once.
+    """
+    if fcntl is None:  # pragma: no cover - Windows
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(root / WORKER_LOCK_FILE, flags)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return None  # no kernel locks here: the engine then goes by the file itself
+    finally:
+        os.close(descriptor)
+
+
+def _is_worker_of(pid: int, root: Path, expected: Sequence[str] | None = None) -> bool:
+    """Whether the live process ``pid`` can be shown to be a worker of the project in
+    ``root``: the only kind of process this server signals without having started it.
+
+    Shown by its command line: exactly ``expected`` (what this server starts for
+    the project), or ``paper_orchestra research <kind>`` with this directory among
+    its arguments.  A worker that was given the project in another way (by its
+    id) is shown by the lock every worker holds: the lock of this directory is
+    held, and the process has that file open.  A file's word is never enough, and
+    neither is a directory name that merely occurs in a command line.  Never this
+    server or a process it descends from.
+    """
+    if _valid_pid(pid) is None or pid in _own_lineage():
+        return False
+    command = _command_line(pid)
+    if command is None:
+        return False
+    if expected:
+        wanted = [str(part) for part in expected]
+        # Joined as well: where the arguments come from ``ps``, they come in pieces.
+        if command == wanted or " ".join(command) == " ".join(wanted):
+            return True
+    arguments = _worker_arguments(command)
+    if arguments is None:
+        return False
+    if _names_directory(arguments, _working_directory(pid), root):
+        return True
+    return _has_open(pid, root / WORKER_LOCK_FILE) and _lock_held(root) is True
 
 
 def _interrupt_signal(pid: int) -> int:
@@ -363,6 +619,23 @@ def _interrupt_signal(pid: int) -> int:
     return signal.SIGINT
 
 
+def _uninstalled_package_path() -> str | None:
+    """The directory this server imports the package from, when it can do so only
+    because it was started there (``cd src && python -m paper_orchestra ui`` in a
+    checkout that is not installed); ``None`` for an installed package.
+
+    A worker is started with ``-P`` and would not find the package then.  It is to
+    run the code its server runs, so that one directory is named to it outright.
+    """
+    import paper_orchestra
+
+    if getattr(sys.flags, "safe_path", False) or not sys.path:
+        return None
+    home = os.path.dirname(os.path.dirname(os.path.abspath(paper_orchestra.__file__)))
+    first = os.path.abspath(sys.path[0] or os.getcwd())
+    return home if os.path.realpath(first) == os.path.realpath(home) else None
+
+
 def _isolation() -> dict[str, Any]:
     """Popen options that give the worker its own session and process group, so that the
     whole tree can be stopped and a Ctrl-C in the server's terminal does not reach it."""
@@ -381,10 +654,29 @@ def _now() -> str:
 
 
 def _read_json(path: Path) -> Any:
+    """What a JSON file of the project holds; ``None`` when it is absent, not JSON, or
+    not an ordinary file.
+
+    Never read through a symbolic link: what ``state.json`` holds is shown in the
+    app, and a project directory that came from somebody else could name any
+    JSON file of the person's that way.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 20):
+            chunks.append(chunk)
+        return json.loads(b"".join(chunks).decode("utf-8"))
     except (OSError, ValueError):
         return None
+    finally:
+        os.close(descriptor)
 
 
 def read_state(root: Path) -> dict[str, Any]:
@@ -394,10 +686,24 @@ def read_state(root: Path) -> dict[str, Any]:
 
 
 def _named_pid(state: Mapping[str, Any]) -> int | None:
-    """The pid of the worker ``state.json`` names, if it names one."""
+    """The pid of the worker ``state.json`` names, if it names a process."""
     worker = state.get("worker")
-    pid = worker.get("pid") if isinstance(worker, dict) else None
-    return pid if isinstance(pid, int) else None
+    return _valid_pid(worker.get("pid")) if isinstance(worker, dict) else None
+
+
+def _heartbeat_fresh(worker: Mapping[str, Any], *, ahead: float) -> bool:
+    """Whether the worker's last heartbeat is a sign of life: written within the last
+    minute, and not more than ``ahead`` seconds after now.
+
+    A heartbeat from the future says that the clock was set back since, or that
+    the file is not an engine's: it would otherwise count as fresh for as long as
+    the difference lasts, however long ago its writer died.
+    """
+    beat = parse_stamp(worker.get("heartbeat"))
+    if beat is None:
+        return False
+    age = (datetime.now(UTC) - beat).total_seconds()
+    return -ahead <= age <= HEARTBEAT_STALE_SECONDS
 
 
 def _size(path: Path) -> int | None:
@@ -444,12 +750,53 @@ def _take_name_off(root: Path, pid: int | None) -> None:
     """
     path = Path(root) / STATE_FILE
     state = _read_json(path)
-    if not isinstance(state, dict) or not isinstance(state.get("worker"), dict):
+    if not isinstance(state, dict) or state.get("worker") is None:
         return
     if pid is not None and _named_pid(state) != pid:
         return
     state["worker"] = None
     write_json(path, state)
+
+
+def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
+    """Settle the runs of experiments that a worker which died left at ``running``.
+
+    Goes through the experiments module's recovery (``experiments.recover``),
+    which starts nothing: a run nobody is running any more is recorded as ended
+    because its worker stopped, and its experiment goes back to the queue (or is
+    failed after several such deaths), so that the app no longer shows a run in
+    progress with a log that never moves.  Experiments a live process is running
+    are left alone.
+
+    A run on a remote backend may still have its job, which recovery would
+    follow to its end for as long as that takes; that is a worker's to do, so a
+    project with such a run is left for the next worker.  Returns the records of
+    the runs that were settled.
+    """
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.project import Project
+
+    project = Project.open(Path(root))
+    stale = False
+    for page in project.pages(kind="experiment", state=("queued", "running")):
+        if not page.id:
+            continue
+        running = [run for run in experiments.runs(project, page.id) if _is_running(run)]
+        if any(run.get("backend") != "local" for run in running):
+            log.info(
+                "A run of %s in %s may still have its job on %s; it is left for the next "
+                "worker to pick up.",
+                page.id,
+                project.root,
+                running[0].get("backend") or "its backend",
+            )
+            return []
+        stale = stale or bool(running) or page.state == "running"
+    return list(experiments.recover(project)) if stale else []
+
+
+def _is_running(run: Any) -> bool:
+    return isinstance(run, Mapping) and run.get("status") == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +811,8 @@ class _Entry:
     root: Path
     kind: str
     options: dict[str, Any]
-    #: ``None`` for a worker on another machine that shares the project directory.
+    #: ``None`` for a worker this server cannot verify: one on another machine that
+    #: shares the project directory, or one the files name without proof.
     pid: int | None
     started: str
     command: list[str] = field(default_factory=list)
@@ -483,10 +831,13 @@ class _Entry:
     events_size: int | None = None
     #: Known through ``state.json["worker"]`` alone: an engine started from a terminal.
     from_state: bool = False
-    #: Whether a shutdown of this server stops it: true for a worker it started and for
-    #: one a server that is gone left behind; false for an engine from a terminal and
-    #: for the worker of another server that still runs.  A person's Stop reaches all.
-    owned: bool = True
+    #: The server that started it, as its record says (pid and start token): while that
+    #: server runs, the worker is its to stop at exit.  ``None`` for a worker this
+    #: server started and for an engine from a terminal.
+    server: tuple[int, str | None] | None = None
+    #: Why this server cannot verify the worker, for the person; ``None`` for a worker
+    #: it started or has shown to be this project's.  Such a worker is never signalled.
+    unverified: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
 
 
@@ -496,8 +847,12 @@ _exit_hook_registered = False
 
 
 def _stop_all_at_exit() -> None:
+    """For a server that was asked to stop its workers when it ends and exits without
+    its shutdown having run (an exception on the way out).  Every other server leaves
+    its workers running."""
     for workers in list(_instances):
-        workers.shutdown(grace=EXIT_GRACE_SECONDS)
+        if workers.stop_on_exit:
+            workers.shutdown(grace=EXIT_GRACE_SECONDS)
 
 
 class Workers:
@@ -505,7 +860,11 @@ class Workers:
 
     Thread-safe.  ``launcher`` builds the command line (default:
     :func:`default_command`); tests substitute a small script.  ``grace`` is how
-    long a worker gets between the interrupt and the kill.
+    long a worker gets between the interrupt and the kill.  ``stop_on_exit`` says
+    whether the end of this server stops its workers (see :meth:`shutdown`); by
+    default it does not (see :meth:`close`).  ``settle_runs`` is called with a
+    project directory when a worker of it is seen to be gone (default:
+    :func:`settle_stale_runs`).
     """
 
     def __init__(
@@ -514,19 +873,24 @@ class Workers:
         launcher: Launcher | None = None,
         grace: float = GRACE_SECONDS,
         environ: Mapping[str, str] | None = None,
+        stop_on_exit: bool = False,
+        settle_runs: Callable[[Path], Any] | None = None,
     ) -> None:
         global _exit_hook_registered
         self.launcher: Launcher = launcher or default_command
         self.grace = grace
+        self.stop_on_exit = stop_on_exit
+        self._settle_runs: Callable[[Path], Any] = settle_runs or settle_stale_runs
         self._environ = environ
         self._guard = threading.RLock()
         self._entries: dict[Path, _Entry] = {}
         self._last_exit: dict[Path, dict[str, Any]] = {}
+        self._settling: dict[Path, threading.Thread] = {}
+        #: Projects whose files could not be judged, so that the log says it once.
+        self._complained: set[Path] = set()
         self._closed = False
         self._host = socket.gethostname()
         with _exit_hook:
-            # A server that exits without its shutdown having run (an exception on the
-            # way out) must not leave workers behind either.
             if not _exit_hook_registered:
                 atexit.register(_stop_all_at_exit)
                 _exit_hook_registered = True
@@ -535,7 +899,8 @@ class Workers:
     # -- public ------------------------------------------------------------------
 
     def reopen(self) -> None:
-        """Accept starts again after a :meth:`shutdown` (a server that is started twice)."""
+        """Accept starts again after a :meth:`shutdown` or :meth:`close` (a server that
+        is started twice)."""
         with self._guard:
             self._closed = False
 
@@ -543,14 +908,18 @@ class Workers:
         """Start a worker for the project in ``root`` and return its status.
 
         ``WorkerBusy`` when the project already has one (started here, found from an
-        earlier server, or started from a terminal); ``WorkerError`` when the
-        process cannot be started.  The project must exist on disk.
+        earlier server, started from a terminal, or one this server cannot
+        verify); ``WorkerError`` when the process cannot be started.  The project
+        must exist on disk.
         """
         root = Path(root)
         if kind not in KINDS:
             raise WorkerError(
                 f"'{kind}' is not a kind of worker; the kinds are: {', '.join(KINDS)}."
             )
+        # What a worker that died left half done is put in order first, so that the new
+        # one does not find an experiment held by the server.
+        self.settled(root, timeout=_SETTLE_WAIT_SECONDS)
         with self._guard:
             if self._closed:
                 raise WorkerError("The server is shutting down; no worker was started.")
@@ -567,6 +936,8 @@ class Workers:
 
         The status returned says ``stopping`` while the interrupt, the grace period
         and the kill run on a thread, and ``idle`` when there was nothing to stop.
+        ``WorkerError`` for a worker this server cannot verify (``verified`` is
+        false in its status): it is not signalled; see :meth:`forget`.
         """
         root = Path(root)
         with self._guard:
@@ -577,34 +948,111 @@ class Workers:
             self._begin_stop(entry, self.grace if grace is None else grace)
             return self._describe(entry)
 
+    def forget(self, root: str | Path) -> dict[str, Any]:
+        """Clear the name of a worker this server cannot verify, and return the status.
+
+        For a project whose files name a worker that is not there, or not one
+        this server can see: the name is taken out of ``.worker.json`` and
+        ``state.json``, a phase that read as running is recorded as interrupted
+        (continuing resumes it), and the project can be started again.  Nothing is
+        signalled.  If a worker is in fact at work elsewhere, it writes its name
+        back with its next heartbeat and is shown again.
+
+        ``WorkerError`` for a worker this server started or has verified: that
+        one is stopped, not forgotten.  With nothing to forget the status is
+        returned as it is.
+        """
+        root = Path(root)
+        with self._guard:
+            status = self.status(root)
+            key = self._key(root)
+            entry = self._entries.get(key)
+            if entry is None:
+                return status
+            if entry.unverified is None:
+                raise WorkerError(
+                    f"The worker of this project (process {entry.pid}) is running and is "
+                    "this server's to stop: stop it instead. It is not forgotten while "
+                    "it runs."
+                )
+            del self._entries[key]
+            record = _read_json(root / RECORD_FILE)
+            if not isinstance(record, dict) or record.get("host") == self._host:
+                _remove_record(root)  # not the record of another machine's server
+            phase = mark_interrupted(root, "Forgotten by you.", by_person=True)
+            if phase is None:
+                _take_name_off(root, None)
+            self._last_exit[key] = {
+                "kind": entry.kind,
+                "code": None,
+                "at": _now(),
+                "stopped": False,
+                "interrupted_phase": phase,
+                "forgotten": True,
+            }
+            self._settle_later(root)
+            return self._nothing(root)
+
     def status(self, root: str | Path) -> dict[str, Any]:
         """What the project's worker is doing.
 
         ``{"state": "idle" | "running" | "stopping", "kind", "phase", "pid",
-        "started", "adopted", "host", "log", "last_exit"}``.  ``adopted`` says the
-        worker was found, not started by this server.  ``last_exit`` describes
-        the last worker seen to end: ``{"kind", "code", "at", "stopped",
-        "interrupted_phase"}``.  Looking is also what notices a worker that
-        died: its phase is then recorded as interrupted.
+        "started", "adopted", "host", "log", "verified", "note", "last_exit"}``.
+        ``adopted`` says the worker was found, not started by this server.
+        ``verified`` is ``True`` for a worker this server started or has shown to
+        be this project's (it can be stopped), ``False`` for one the project's
+        files name without such proof (``pid`` is then ``None``, ``note`` says why
+        and what to do, :meth:`stop` refuses and :meth:`forget` clears it), and
+        ``None`` when the project is idle.  ``last_exit`` describes the last
+        worker seen to end: ``{"kind", "code", "at", "stopped",
+        "interrupted_phase"}`` (and ``"forgotten": True`` after :meth:`forget`).
+        Looking is also what notices a worker that died: its phase is then
+        recorded as interrupted.
+
+        Whatever the project's files hold, this does not raise: a file of one
+        project must not break the listing of all of them.
         """
         root = Path(root)
         with self._guard:
             key = self._key(root)
             entry = self._entries.get(key)
-            if entry is not None and entry.process is None and not self._found_alive(entry):
-                self._finished(entry, None)
-                entry = None
+            if entry is not None and entry.process is None:
+                if entry.unverified is not None:
+                    entry = None  # judged anew at every look, from the files as they are
+                elif not self._found_alive(entry):
+                    self._finished(entry, None)
+                    entry = None
             if entry is not None:
                 return self._describe(entry)
-            entry, dead_pid = self._adopt(root)
-            return self._describe(entry) if entry is not None else self._idle(root, dead_pid)
+            try:
+                entry = self._adopt(root)
+                status = self._describe(entry) if entry is not None else self._idle(root)
+                self._complained.discard(key)
+                return status
+            except Exception:
+                # A file that says something nobody thought of, or a directory that
+                # cannot be written: the project reads as idle, and the log says why
+                # (once, not at every look).
+                self._entries.pop(key, None)
+                if key not in self._complained:
+                    self._complained.add(key)
+                    log.exception("Could not tell whether %s has a worker.", root)
+                return self._nothing(root)
 
     def live(self) -> int:
         """How many workers a :meth:`shutdown` of this server would stop."""
         with self._guard:
-            return sum(
-                1 for entry in self._entries.values() if entry.pid is not None and entry.owned
-            )
+            return sum(1 for entry in self._entries.values() if self._owned(entry))
+
+    def running(self) -> list[dict[str, Any]]:
+        """The workers in this server's books that it started or verified, each as its
+        status plus ``dir`` (the project directory): what goes on when the server ends."""
+        with self._guard:
+            return [
+                {**self._describe(entry), "dir": str(entry.root)}
+                for entry in self._entries.values()
+                if entry.unverified is None and entry.pid is not None
+            ]
 
     def known(self, root: str | Path) -> bool:
         """Whether a worker of the project is in this server's books (no file is read)."""
@@ -631,17 +1079,55 @@ class Workers:
             time.sleep(_POLL_SECONDS)
         return True
 
+    def settled(self, root: str | Path, timeout: float | None = None) -> bool:
+        """Block until the runs a dead worker of the project left behind are settled;
+        ``False`` when ``timeout`` passed first.  Returns at once when nothing is being
+        settled."""
+        thread = self._settling.get(self._key(Path(root)))
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def stopping(self) -> int:
+        """How many workers are being stopped at the moment because somebody asked."""
+        with self._guard:
+            return sum(1 for entry in self._entries.values() if entry.stop_thread is not None)
+
+    def close(self) -> list[dict[str, Any]]:
+        """The server ends and leaves its workers running: accept no more starts, and
+        return the workers that go on (as :meth:`running` gives them).
+
+        They belong to their projects.  Each is on record in its project
+        directory, so the next server finds it again, shows it and can stop it.
+        A stop that was asked for before is carried out first, to its kill if
+        need be: the person was told the worker is stopping.
+        """
+        with self._guard:
+            self._closed = True
+            asked = [entry for entry in self._entries.values() if entry.stop_thread is not None]
+        for entry in asked:
+            thread = entry.stop_thread
+            if thread is not None:
+                remaining = max(0.0, entry.kill_at - time.monotonic())
+                thread.join(timeout=remaining + 2 * _KILL_WAIT_SECONDS)
+            entry.done.wait(timeout=_KILL_WAIT_SECONDS)
+        with self._guard:
+            return self.running()
+
     def shutdown(self, *, grace: float | None = None) -> None:
         """Stop the workers that are this server's and wait until they are gone: the ones
-        it started, and the ones a server that is gone left behind.  An engine the
-        person started from a terminal, and the worker of another server that still
-        runs, are left to whoever started them."""
+        it started, and the ones a server that is gone by now left behind.  An engine
+        the person started from a terminal, the worker of another server that still
+        runs, and a worker this server cannot verify are left to whoever started them.
+
+        This is what ``stop_on_exit`` asks for at the end of the server; without it
+        the end of the server is :meth:`close`.
+        """
         grace = self.grace if grace is None else grace
         with self._guard:
             self._closed = True
-            entries = [
-                entry for entry in self._entries.values() if entry.pid is not None and entry.owned
-            ]
+            entries = [entry for entry in self._entries.values() if self._owned(entry)]
             for entry in entries:
                 self._begin_stop(entry, grace)
         for entry in entries:
@@ -661,6 +1147,13 @@ class Workers:
         # CLI are not folded at eighty columns (a folded line can cut a path in two).
         environment["PYTHONUNBUFFERED"] = "1"
         environment.setdefault("COLUMNS", "200")
+        # As ``-P`` on the command line: the worker imports the installed package, not a
+        # file of the directory the server happens to run in.
+        environment["PYTHONSAFEPATH"] = "1"
+        source = _uninstalled_package_path()
+        if source is not None:
+            known = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = os.pathsep.join(filter(None, [source, known]))
         return environment
 
     def _launch(self, root: Path, kind: str, options: dict[str, Any]) -> _Entry:
@@ -671,7 +1164,12 @@ class Workers:
         launched = time.time() - 1.0  # file times may be a little coarser than the clock
         events_size = _size(root / EVENTS_FILE)
         try:
-            output = (root / WORKER_LOG).open("ab")
+            output = open_for_append(root, WORKER_LOG)
+        except PathEscape as exc:
+            raise WorkerError(
+                f"The worker's log cannot be used ({exc}); no worker was started. Remove "
+                f"{root / WORKER_LOG} (it is not a file the server made) and start again."
+            ) from exc
         except OSError as exc:
             raise WorkerError(
                 f"The worker's log {root / WORKER_LOG} cannot be written ({exc}); no worker "
@@ -743,95 +1241,173 @@ class Workers:
     # -- finding workers this server did not start ---------------------------------
 
     def _found_alive(self, entry: _Entry) -> bool:
-        if entry.pid is None:  # another machine: only its heartbeat can be seen
-            return _engine_alive(read_state(entry.root), entry.root, self._host)
+        """Whether a worker that was found and verified is still there."""
         if entry.from_state and _named_pid(read_state(entry.root)) != entry.pid:
             # The engine takes its name out of state.json when it is done; a process that
             # lingers, or another one under its pid, no longer holds the project.
             return False
         return _same_process(entry.pid, entry.start_token)
 
-    def _adopt(self, root: Path) -> tuple[_Entry | None, int | None]:
-        """The worker a previous server (or a terminal) left running here, if any; and
-        the pid of a worker an earlier server started that is known to be gone."""
-        entry, dead_pid = self._from_record(root)
-        if entry is None:
-            entry = self._from_state(root, dead_pid)
-        if entry is not None:
-            self._entries[self._key(root)] = entry
-        return entry, dead_pid
+    def _owned(self, entry: _Entry) -> bool:
+        """Whether a :meth:`shutdown` of this server stops the worker: one it started, or
+        one whose server is gone by now.  Asked when the shutdown comes, not when the
+        worker was found: the server that started it may have ended since."""
+        if entry.unverified is not None or entry.pid is None or entry.from_state:
+            return False
+        if entry.process is not None or entry.server is None:
+            return True
+        server, token = entry.server
+        return server == os.getpid() or not _same_process(server, token)
 
-    def _from_record(self, root: Path) -> tuple[_Entry | None, int | None]:
+    def _adopt(self, root: Path) -> _Entry | None:
+        """The worker a previous server (or a terminal) left running here, if any.  It
+        takes the place of whatever the books held for the project (a worker that
+        could not be verified at the last look)."""
+        entry = self._from_record(root)
+        if entry is None or entry.unverified is not None:
+            # What the record could not show, the engine's own name in state.json may.
+            entry = self._from_state(root) or entry
+        key = self._key(root)
+        if entry is not None:
+            self._entries[key] = entry
+        else:
+            self._entries.pop(key, None)
+        return entry
+
+    def _expected_command(self, kind: str, root: Path, options: Mapping[str, Any]) -> list[str]:
+        """What this server would start for the project, to compare a process with."""
+        try:
+            return [str(part) for part in self.launcher(kind, root, options)]
+        except Exception:  # a record can ask for anything; a launcher need not take it
+            return []
+
+    def _from_record(self, root: Path) -> _Entry | None:
+        """The worker ``.worker.json`` names, when it is on this machine and alive.
+
+        The record lies in the project directory, which may have come from anywhere
+        (a copy, an archive, a shared folder): it is believed as far as the live
+        process bears it out.  A record whose process is gone, or which names
+        nothing that can be a process, is removed.
+        """
         record = _read_json(root / RECORD_FILE)
         if not isinstance(record, dict):
-            return None, None
-        pid, token = record.get("pid"), record.get("start_token")
-        token = token if isinstance(token, str) else None
-        if record.get("host") != self._host or not isinstance(pid, int):
-            return None, None
-        if not _same_process(pid, token):
-            # Its worker is gone; the record must not outlive it.
-            with contextlib.suppress(OSError):
-                (root / RECORD_FILE).unlink()
-            return None, pid
+            if (root / RECORD_FILE).is_file():
+                _remove_record(root)  # not a record: nothing a server wrote
+            return None
+        if record.get("host") != self._host:
+            return None  # another machine's server wrote it, and it is that server's
+        pid = _valid_pid(record.get("pid"))
+        token = record.get("start_token")
+        token = token if isinstance(token, str) and token else None
+        if pid is None or not _same_process(pid, token):
+            _remove_record(root)  # its worker is gone; the record must not outlive it
+            return None
+        named = record.get("kind")
+        kind = named if isinstance(named, str) and named in KINDS else "advance"
         options = record.get("options")
-        server, server_token = record.get("server_pid"), record.get("server_token")
+        options = dict(options) if isinstance(options, dict) else {}
+        command = record.get("command")
         entry = _Entry(
             root=root,
-            kind=str(record.get("kind") or "advance"),
-            options=dict(options) if isinstance(options, dict) else {},
+            kind=kind,
+            options=options,
             pid=pid,
             started=str(record.get("started") or ""),
-            command=[str(part) for part in record.get("command") or []],
+            command=[str(part) for part in command] if isinstance(command, list) else [],
             start_token=token,
             host=self._host,
-            # The server that started it is still there (a second one on this workspace):
-            # the worker is that server's to stop when it shuts down, not this one's.
-            owned=not (
-                isinstance(server, int)
-                and server != os.getpid()
-                and _same_process(server, server_token if isinstance(server_token, str) else None)
-            ),
         )
-        return entry, None
+        server = _valid_pid(record.get("server_pid"))
+        if server is not None:
+            server_token = record.get("server_token")
+            entry.server = (server, server_token if isinstance(server_token, str) else None)
+        # The start time says it is the process the record was written for; the command
+        # line says that process works on this directory and no other.
+        expected = self._expected_command(kind, root, options)
+        if token is not None and _is_worker_of(pid, root, expected or None):
+            return entry
+        held = _lock_held(root)
+        if held is False:
+            # Nobody works in this directory: the record came with a copy of another
+            # project, or names a process that has nothing to do with this one.
+            _remove_record(root)
+            return None
+        entry.pid = None
+        entry.unverified = _unverified_note(pid, held=bool(held))
+        return entry
 
-    def _from_state(self, root: Path, dead_pid: int | None) -> _Entry | None:
+    def _from_state(self, root: Path) -> _Entry | None:
         """The engine ``state.json`` names as the project's worker, when it is alive.
 
         ``research advance`` sets the status to ``running`` while a phase runs;
         ``research run`` holds the project the same way (its name under ``worker``)
         while the status stays what it was.
+
+        On this machine the process and the project's worker lock decide, not the
+        heartbeat: a worker is this project's when its command line or the lock
+        says so, and when nobody holds the lock nobody works here, however recent
+        the heartbeat and whatever process has the number by now.  On another
+        machine neither can be looked at, and the heartbeat alone tells: such a
+        worker is shown, and is not this server's to stop.
         """
         state = read_state(root)
         worker = state.get("worker")
-        if not isinstance(worker, dict) or not _engine_alive(state, root, self._host, dead_pid):
+        if not isinstance(worker, dict):
             return None
-        host = str(worker.get("host") or self._host)
-        pid = worker.get("pid") if host == self._host else None
-        pid = pid if isinstance(pid, int) and _pid_alive(pid) else None
+        host = worker.get("host")
+        host = host if isinstance(host, str) and host else self._host
         # A worker that is not an engine phase says what it is (a write-up); otherwise the
         # status tells: `advance` sets it to running, `run` leaves it as it was.
         named = worker.get("kind")
         inferred = "advance" if state.get("status") == "running" else "run"
-        return _Entry(
+        entry = _Entry(
             root=root,
-            kind=named if named in KINDS else inferred,
+            kind=named if isinstance(named, str) and named in KINDS else inferred,
             options={},
-            pid=pid,
+            pid=None,
             started=str(worker.get("started") or ""),
-            start_token=_start_token(pid) if pid is not None else None,
             host=host,
             from_state=True,
-            owned=False,
         )
+        pid = _valid_pid(worker.get("pid"))
+        alive = pid is not None and _pid_alive(pid)
+        if pid is not None and alive and _is_worker_of(pid, root):
+            # Whatever machine the file names: the process is here and is this project's
+            # (a laptop is called something else on another network).
+            entry.pid = pid
+            entry.start_token = _start_token(pid)
+            entry.host = self._host
+            return entry
+        if host != self._host:
+            if not _heartbeat_fresh(worker, ahead=HEARTBEAT_AHEAD_SECONDS_ELSEWHERE):
+                return None
+            entry.unverified = (
+                f"The project's files name a worker on another machine ({host}), which "
+                "this server can neither see nor stop. Stop it where it was started. If "
+                "nothing runs there any more, forget it here and the project can be "
+                "continued."
+            )
+            return entry
+        held = _lock_held(root)
+        if held is False:
+            return None
+        if held is None and not (alive and _heartbeat_fresh(worker, ahead=HEARTBEAT_AHEAD_SECONDS)):
+            return None
+        entry.unverified = _unverified_note(pid, held=bool(held))
+        return entry
 
     # -- stopping ----------------------------------------------------------------
 
     def _begin_stop(self, entry: _Entry, grace: float) -> None:
-        if entry.pid is None:
+        if entry.unverified is not None or entry.pid is None:
             raise WorkerError(
-                f"The worker of this project runs on another machine ({entry.host}) or "
-                "cannot be seen from here; stop it where it was started."
+                "This server does not signal a process it cannot show to be this "
+                f"project's worker. {entry.unverified or ''}".strip()
+            )
+        if entry.pid in _own_lineage():
+            raise WorkerError(
+                f"Process {entry.pid} is this server or a process it was started from; "
+                "it is not a worker and is not signalled."
             )
         kill_at = time.monotonic() + grace
         if entry.stop_thread is not None:
@@ -884,8 +1460,24 @@ class Workers:
             log.exception("Stopping the worker %d failed.", pid)
         finally:
             if entry.process is None:
-                # Nobody else observes the end of a worker this server did not start.
-                self._finished(entry, None)
+                self._after_stop_of_found(entry)
+
+    def _after_stop_of_found(self, entry: _Entry) -> None:
+        """Close the books on a worker this server did not start, once it was stopped:
+        nobody else observes its end.  One that could not be ended (it runs as another
+        user) is still the project's worker and is shown as running again; recording
+        its phase as interrupted would say something that is not so."""
+        if not self._found_alive(entry):
+            self._finished(entry, None)
+            return
+        log.warning(
+            "The worker %s of %s could not be stopped; it is still running.",
+            entry.pid,
+            entry.root,
+        )
+        with self._guard:
+            entry.stop_thread = None
+            entry.stop_requested = False
 
     def _stop_on_windows(self, entry: _Entry) -> None:  # pragma: no cover
         assert entry.pid is not None
@@ -922,8 +1514,7 @@ class Workers:
             del self._entries[key]
         record = _read_json(entry.root / RECORD_FILE)
         if isinstance(record, dict) and record.get("pid") == entry.pid:
-            with contextlib.suppress(OSError):
-                (entry.root / RECORD_FILE).unlink()
+            _remove_record(entry.root)
         phase = None
         unexpected = not entry.stop_requested
         try:
@@ -939,6 +1530,10 @@ class Workers:
         }
         if unexpected and (phase is not None or self._ended_badly(entry, code)):
             self._report_death(entry, code, phase)
+        if entry.kind in ("advance", "run") and code != 0:
+            # It may have been in the middle of a run of an experiment, which only the
+            # process that runs it settles: killed, it left the run at "running".
+            self._settle_later(entry.root)
 
     @staticmethod
     def _ended_badly(entry: _Entry, code: int | None) -> bool:
@@ -968,7 +1563,7 @@ class Workers:
 
     def _settle(self, entry: _Entry, code: int | None) -> str | None:
         state = read_state(entry.root)
-        if _named_pid(state) != entry.pid and _engine_alive(state, entry.root, self._host):
+        if _named_pid(state) != entry.pid and self._from_state(entry.root) is not None:
             # The state is another worker's by now (an engine started from a terminal
             # while a write-up ran, or right after this one ended): it is alive and
             # keeps its own account.
@@ -997,17 +1592,46 @@ class Workers:
         except (ProjectError, OSError) as exc:
             log.warning("Could not record the end of the worker in %s: %s", entry.root, exc)
 
+    def _settle_later(self, root: Path) -> None:
+        """Settle, on a thread of its own, the runs the project's dead worker left at
+        ``running``.  Not under the lock of the books: recovery reads pages, writes
+        records and may end what is left of a job, and no look at another project
+        should wait for that.  A start of the same project does (:meth:`settled`)."""
+        key = self._key(root)
+
+        def settle() -> None:
+            try:
+                self._settle_runs(root)
+            except Exception:
+                # The project stays as it was: the next worker's own recovery, or the
+                # person's Run, settles what this could not.
+                log.exception("Could not settle the runs a worker left behind in %s.", root)
+            finally:
+                with self._guard:
+                    if self._settling.get(key) is threading.current_thread():
+                        del self._settling[key]
+
+        with self._guard:
+            earlier = self._settling.get(key)
+            if earlier is not None and earlier.is_alive():
+                return  # one look at the project's runs is under way
+            thread = threading.Thread(target=settle, name="settle-runs", daemon=True)
+            self._settling[key] = thread
+            thread.start()
+
     # -- describing --------------------------------------------------------------
 
-    def _idle(self, root: Path, dead_pid: int | None = None) -> dict[str, Any]:
+    def _idle(self, root: Path) -> dict[str, Any]:
         """Nothing runs here.  A ``state.json`` that still says so is corrected: a phase
         left at running is recorded as interrupted, the name of a worker that is gone
-        is taken off."""
+        is taken off, and the runs it left at running are settled."""
         key = self._key(root)
         state = read_state(root)
         running = state.get("status") == "running"
-        named = isinstance(state.get("worker"), dict)
-        if (running or named) and not _engine_alive(state, root, self._host, dead_pid):
+        named = state.get("worker") is not None
+        # A phase that reads as running without a name: unless somebody holds the
+        # project (an engine between taking the lock and writing its name), it is over.
+        if (running or named) and not (running and not named and _lock_held(root)):
             if running:
                 reason = "The worker of this phase is gone. Continuing resumes the phase."
                 phase = mark_interrupted(root, reason, by_person=False)
@@ -1020,6 +1644,10 @@ class Workers:
                 }
             else:
                 _take_name_off(root, None)
+            self._settle_later(root)
+        return self._nothing(root)
+
+    def _nothing(self, root: Path) -> dict[str, Any]:
         return {
             "state": "idle",
             "kind": None,
@@ -1029,7 +1657,9 @@ class Workers:
             "adopted": False,
             "host": None,
             "log": WORKER_LOG,
-            "last_exit": self._last_exit.get(key),
+            "verified": None,
+            "note": None,
+            "last_exit": self._last_exit.get(self._key(root)),
         }
 
     def _describe(self, entry: _Entry) -> dict[str, Any]:
@@ -1044,8 +1674,31 @@ class Workers:
             "adopted": entry.process is None,
             "host": entry.host,
             "log": WORKER_LOG,
+            "verified": entry.unverified is None,
+            "note": entry.unverified,
             "last_exit": self._last_exit.get(self._key(entry.root)),
         }
+
+
+def _remove_record(root: Path) -> None:
+    with contextlib.suppress(OSError):
+        (root / RECORD_FILE).unlink()
+
+
+def _unverified_note(pid: int | None, *, held: bool) -> str:
+    """Why a worker the files name is shown without a Stop, and what the person can do."""
+    who = f"process {pid}" if pid is not None else "a process"
+    sign = (
+        "Something holds the project's worker lock, so work is going on here"
+        if held
+        else "It showed a sign of life a moment ago"
+    )
+    return (
+        f"The project's files name {who} as its worker, but this server cannot show that "
+        f"it is this project's worker, so it will not signal it. {sign}: if it runs in a "
+        "terminal, stop it there. If nothing is running, forget it here and the project "
+        "can be continued."
+    )
 
 
 def _death_reason(kind: str, code: int | None) -> str:
@@ -1056,32 +1709,3 @@ def _death_reason(kind: str, code: int | None) -> str:
     else:
         how = f"ended with exit code {code}"
     return f"The {kind} worker {how} without finishing. See {WORKER_LOG} in the project directory."
-
-
-def _engine_alive(
-    state: Mapping[str, Any], root: Path, this_host: str, dead_pid: int | None = None
-) -> bool:
-    """Whether the worker ``state.json`` names is alive (spec 10.4).
-
-    It is dead when its heartbeat is older than a minute and its process is gone.
-    A process on another machine cannot be looked at, so there the heartbeat alone
-    decides.  A pid that exists while the heartbeat is stale must also look like a
-    worker of this project: after a reboot the pid may be anyone's.  ``dead_pid``
-    is a process this machine's server started and knows to have ended, however
-    recent its last heartbeat.
-    """
-    worker = state.get("worker")
-    if not isinstance(worker, dict):
-        return False
-    local = worker.get("host") in (None, "", this_host)
-    if dead_pid is not None and worker.get("pid") == dead_pid and local:
-        return False
-    beat = parse_stamp(worker.get("heartbeat"))
-    fresh = (
-        beat is not None and (datetime.now(UTC) - beat).total_seconds() <= HEARTBEAT_STALE_SECONDS
-    )
-    pid = worker.get("pid")
-    host = worker.get("host")
-    if fresh or (host and host != this_host) or not isinstance(pid, int):
-        return fresh
-    return _pid_alive(pid) and _mentions(pid, root)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import random
 import re
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -730,3 +731,69 @@ def test_without_a_budget_a_suggested_edit_reads_as_removed_and_added(monkeypatc
         '<ins class="diff-block"><p>One 2 three.</p>\n</ins>\n'
         "<p>End.</p>\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Rendering time
+# ---------------------------------------------------------------------------
+
+
+def _trimmed_one_by_one(address: str) -> str:
+    """What "without the sentence's punctuation" means, spelled out one character at a
+    time: the definition the fast version is compared with."""
+    closing = {")": "(", "]": "[", "}": "{"}
+    while address:
+        last = address[-1]
+        if last in ".,;:!?'\"" or (
+            last in closing and address.count(last) > address.count(closing[last])
+        ):
+            address = address[:-1]
+        else:
+            break
+    return address
+
+
+def test_the_end_of_an_address_is_found_as_before():
+    from paper_orchestra.web.render import _without_trailing_punctuation
+
+    for address, expected in [
+        ("http://x.example/y).", "http://x.example/y"),
+        (
+            "https://en.wikipedia.org/wiki/Adam_(optimizer)).",
+            "https://en.wikipedia.org/wiki/Adam_(optimizer)",
+        ),
+        ("http://x.example/[a]]", "http://x.example/[a]"),
+        ("http://x.example/a.)!", "http://x.example/a"),
+        ("http://x.example/a(", "http://x.example/a("),
+        ("http://x.example/{a}}};", "http://x.example/{a}"),
+        ("...", ""),
+        ("", ""),
+    ]:
+        assert _without_trailing_punctuation(address) == expected, address
+    rng = random.Random(7)
+    for _ in range(2000):
+        address = "http://a/" + "".join(
+            rng.choice("ab()[]{}.,;:!?'\"") for _ in range(rng.randrange(30))
+        )
+        assert _without_trailing_punctuation(address) == _trimmed_one_by_one(address), address
+
+
+@pytest.mark.parametrize("tail", [")", ")]}", ".)"])
+def test_an_address_followed_by_a_long_run_of_punctuation_renders_in_linear_time(tail):
+    # A page is a model's text or copied from the web, and is rendered at every look.
+    # One character at a time, with a count and a copy for each, this text took minutes;
+    # the bound is far above what it takes now, on a machine that is busy with other work.
+    text = "See http://a.example/x" + tail * (600_000 // len(tail))
+    before = time.perf_counter()
+    rendered = render_markdown(text)
+    assert time.perf_counter() - before < 20.0
+    assert [link["href"] for link in tags_of(rendered, "a")] == ["http://a.example/x"]
+
+
+def test_a_long_run_of_full_stops_after_an_address_is_not_copied_once_per_stop():
+    from paper_orchestra.web.render import _without_trailing_punctuation
+
+    address = "http://a.example/x" + "." * 2_000_000
+    before = time.perf_counter()
+    assert _without_trailing_punctuation(address) == "http://a.example/x"
+    assert time.perf_counter() - before < 20.0

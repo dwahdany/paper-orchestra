@@ -19,6 +19,7 @@ import contextlib
 import fnmatch
 import io
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -44,6 +45,7 @@ from paper_orchestra.llm.base import (
     Text,
     ToolError,
     ToolSpec,
+    Usage,
     UsageTracker,
     WebSearch,
 )
@@ -88,9 +90,12 @@ __all__ = [
     "count_of",
     "describe_event",
     "experiment_problems",
+    "gpu_has_price",
     "make_repair",
     "model_for",
     "model_problems",
+    "named",
+    "priced_gpus",
     "read_inputs",
     "repo_tools",
     "run_analyst",
@@ -98,6 +103,7 @@ __all__ = [
     "run_intake",
     "run_scout",
     "run_theorist",
+    "said",
     "write_code_tool",
 ]
 
@@ -146,6 +152,27 @@ REPO_MAX_ENTRIES = 400
 REPO_MAX_MATCHES = 50
 
 _ID_IN_TEXT = re.compile(r"\b[Hh]\d+\b")
+#: A name or a path that can stand in a sentence as it is: it holds no space and no
+#: punctuation a sentence could end or begin with.
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_/-]*(?:\.[A-Za-z0-9_/-]+)*")
+#: What a reader can take for a quotation mark besides the marks themselves (the Unicode
+#: categories Pi and Pf): straight marks and the accents typed for them, low marks, primes,
+#: modifier letters, Hebrew and CJK marks, ornaments.  Any of them could seem to end the
+#: quotation a model's words are given in.
+_LIKE_QUOTATION_MARKS = frozenset(
+    "\"'`\u00b4\u201a\u201e"
+    "\u2032\u2033\u2034\u2035\u2036\u2037\u2057"
+    "\u02b9\u02ba\u02bb\u02bc\u02bd\u02c8\u02ca\u02cb\u02dd\u02ee"
+    "\u05f3\u05f4\u3003\u301d\u301e\u301f"
+    "\u275b\u275c\u275d\u275e\u275f\u2760\u2e42\uff02\uff07"
+    "\U0001f676\U0001f677\U0001f678"
+)
+_APOSTROPHES = re.compile("'{2,}")
+#: How a model request ended when the client goes on to the next request of the turn.
+#: After ``tool_use`` it runs the tools that were called first; the other two lead
+#: straight to the next request (a paused server tool loop is continued, an answer cut
+#: off at the default length is asked for again).
+_TURN_GOES_ON = ("tool_use", "pause_turn", "max_tokens")
 
 
 # ---------------------------------------------------------------------------
@@ -161,15 +188,27 @@ def _never() -> bool:
     return False
 
 
+def _within_budget(model: str, usage: Usage) -> BaseException | None:
+    return None
+
+
 class SessionStopped(BaseException):
-    """A stop request reached a session between two model calls of one turn.
+    """A session was ended between two model calls of one turn.
 
     Not an ``Exception`` on purpose.  A model client answers an exception raised by
     a tool with an error message to the model and carries on with the turn; a stop
     has to end it, the way an interrupt does.  Whoever runs the phase records it as
     interrupted; what the session wrote until then stays, and a resumed session
     finds it.
+
+    ``reason`` is ``None`` for a stop request.  When the turn was ended because it
+    took the project past a budget, it is what ``AgentContext.over_budget``
+    returned, so that whoever runs the phase can say so instead of "stopped".
     """
+
+    def __init__(self, message: str = "", *, reason: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass
@@ -181,12 +220,17 @@ class AgentContext:
     before it was interrupted, and different for any other run.  ``guard`` is
     called before every session and every turn and raises when the work must
     stop (a stop request, a spent budget).  ``stopping`` says whether a stop was
-    requested; it is asked before every tool call, so that a long turn ends at
-    its next model call instead of running to its end.  ``compute`` is a backend,
-    or a callable choosing one for a plan, as ``research.experiments.run`` takes
-    it.  ``produced`` fills with the paths of the pages this run of the phase
-    created, as they are created, so that an interrupted phase can still say what
-    it left behind.
+    requested; it is asked before every tool call and after every model request
+    that leads to another, so that a long turn ends before its next model request
+    instead of running to its end.  ``over_budget`` is asked after every model
+    request of a turn with the model and what the turn has used so far (which the
+    harness's ledger learns only when the turn ends); it returns why the work must
+    stop, or ``None``, and a turn it stopped ends where a stop request ends one.
+    ``compute`` is a backend, or a
+    callable choosing one for a plan, as ``research.experiments.run`` takes it.
+    ``produced`` fills with the paths of the pages this run of the phase created,
+    as they are created, so that an interrupted phase can still say what it left
+    behind.
     """
 
     project: Project
@@ -198,17 +242,36 @@ class AgentContext:
     instruction: str | None = None
     guard: Callable[[], None] = _no_guard
     stopping: Callable[[], bool] = _never
+    over_budget: Callable[[str, Usage], BaseException | None] = _within_budget
     scholar: SemanticScholar | None = None
     compute: ComputeBackend | Callable[[Any], ComputeBackend] | None = None
     produced: list[str] = field(default_factory=list)
+    #: Why ``over_budget`` said the work must stop, once it has.
+    _spent: BaseException | None = field(default=None, init=False, repr=False)
 
     def session_id(self, role: str) -> str:
         return f"{self.session}-{role}"
 
+    def used(self, model: str, usage: Usage) -> None:
+        """Take note of what the turn in flight has used after one more model request.
+
+        Nothing is raised here.  A turn that is past the budget ends at
+        :meth:`heed_stop`, which the session asks before each of its tool calls and
+        after each model request that leads to another.
+        """
+        if self._spent is None:
+            self._spent = self.over_budget(model, usage)
+
+    def ending(self) -> bool:
+        """Whether the turn in flight ends the next time :meth:`heed_stop` is asked."""
+        return self._spent is not None or self.stopping()
+
     def heed_stop(self) -> None:
-        """Raise :class:`SessionStopped` when a stop was requested."""
+        """Raise :class:`SessionStopped` when a stop was requested or a budget is spent."""
         if self.stopping():
             raise SessionStopped("the phase was asked to stop")
+        if self._spent is not None:
+            raise SessionStopped(str(self._spent), reason=self._spent)
 
     def note(self, paths: Iterable[str]) -> None:
         """Remember pages this run of the phase created."""
@@ -356,21 +419,41 @@ class _SessionBackend(ProjectMemoryBackend):
         self._heed_stop()
         return super().delete(path)
 
+    def rename(self, old_path: str, new_path: str) -> str:
+        # Refused by the project whatever is asked; a turn that must end ends here too.
+        self._heed_stop()
+        return super().rename(old_path, new_path)
+
+    def _refuse_beyond_limit(self, kind: str | None) -> None:
+        """Raise when one more new page of ``kind`` would pass the phase's limit."""
+        cap = self._caps.get(kind or "")
+        if cap is None:
+            return
+        have = len(self.proposed(kind or ""))
+        if have >= cap:
+            raise ToolError(
+                f"This phase proposes at most {count_of(cap, kind or '')}, and {have} are "
+                "proposed. Revise or delete one of yours instead of adding another; the "
+                "researcher can raise the limit in the project's settings."
+            )
+
     def create(self, path: str, file_text: str) -> str:
         self._heed_stop()
         rel = self._rel(path)
-        kind = kind_for_path(rel) if rel else None
-        cap = self._caps.get(kind or "")
-        # Writing to a path that exists revises that page; only a new page counts.
-        if cap is not None and not (self.project.root / rel).is_file():
-            have = len(self.proposed(kind or ""))
-            if have >= cap:
-                raise ToolError(
-                    f"This phase proposes at most {count_of(cap, kind or '')}, and {have} are "
-                    "proposed. Revise or delete one of yours instead of adding another; the "
-                    "researcher can raise the limit in the project's settings."
-                )
+        # Writing to a page this session can see revises it (or is refused, when it is
+        # not the session's own); anything else becomes a new page and counts.  Whether a
+        # file lies at the path decides nothing: one the session cannot see, such as
+        # another session's undecided proposal, is not replaced but joined by a new
+        # page, and the answer must not tell whether it is there.
+        if rel and rel not in self._seen():
+            self._refuse_beyond_limit(kind_for_path(rel))
         return super().create(path, file_text)
+
+    def create_page(self, kind: str, title: str, body: str, **options: Any) -> ResearchPage:
+        """A page written in code on the session's behalf is a new page like any other."""
+        self._heed_stop()
+        self._refuse_beyond_limit(kind)
+        return super().create_page(kind, title, body, **options)
 
 
 def _stoppable(tool: ToolSpec, heed_stop: Callable[[], None]) -> ToolSpec:
@@ -383,9 +466,54 @@ def _stoppable(tool: ToolSpec, heed_stop: Callable[[], None]) -> ToolSpec:
     return replace(tool, handler=handler)
 
 
+def _whole(value: Any) -> int:
+    """A count as a provider's client reported it; nothing for what is not a count."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
 def _short(text: Any, limit: int = 120) -> str:
     line = " ".join(str(text or "").split())
     return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
+def _plain_marks(text: str) -> str:
+    """``text`` with whatever reads as a quotation mark, alone or in a row, made one
+    apostrophe: inside a quotation nothing may look like its end."""
+    plain = "".join(
+        "'" if ch in _LIKE_QUOTATION_MARKS or unicodedata.category(ch) in ("Pi", "Pf") else ch
+        for ch in text
+    )
+    return _APOSTROPHES.sub("'", plain)
+
+
+def said(text: Any, limit: int = 120) -> str:
+    """Words a model chose, as they stand in a sentence the project says to the person.
+
+    In quotation marks, on one line and cut to ``limit`` characters, with quotation
+    marks of their own (and what looks like one) made plain apostrophes and
+    characters that are not shown (or that change the order of what is shown) left
+    out.  Whatever the words say, they read as a quotation, never as a further
+    sentence of the feed or of a checkpoint.
+    """
+    visible = "".join(
+        " " if ch.isspace() else ch
+        for ch in str(text if text is not None else "")
+        if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co")
+    )
+    return f"“{_short(_plain_marks(visible), limit)}”"
+
+
+def named(value: Any, limit: int = 80) -> str:
+    """A name or a path a model gave, as it stands in such a sentence.
+
+    A plain one (letters, digits, ``_``, ``-``, ``/`` and dots inside it) is shown as
+    it is, the way a person writes ``main.py`` or ``wiki/idea.md``; anything else is
+    quoted with :func:`said`.
+    """
+    text = str(value if value is not None else "")
+    if len(text) <= limit and _PLAIN_NAME.fullmatch(text):
+        return text
+    return said(text, limit)
 
 
 def _shown(path: Any) -> str:
@@ -393,15 +521,32 @@ def _shown(path: Any) -> str:
     return str(path or "").removeprefix("/memories").strip("/") or "the wiki"
 
 
+def _described_view(who: str, given: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """The sentence about a ``view`` of the memory tool, and the path it concerns."""
+    path = _shown(given.get("path"))
+    if path == "the wiki":
+        return f"{who} looked through the wiki.", []
+    shown = named(path, 120)
+    # A page or an attached file is a reference of the sentence, where what was given
+    # can be a path at all: one line, and of a length a path has.
+    is_file = path.endswith(".md") or path.startswith(f"{INPUTS_DIR}/")
+    if is_file and len(path) <= 200 and path.isprintable():
+        return f"{who} read {shown}.", [path]
+    return f"{who} looked through {shown}.", []
+
+
 def describe_event(role: str, event: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     """One plain sentence about a session event, with the paths it concerns; or ``None``.
 
     Only what a person following the work would want to see: what was read, looked
     up and checked.  Pages written already announce themselves through the project.
+    What the model chose (a path, a query, a title, the name of a tool) stands in
+    the sentence as a plain name or as a quotation, cut to a length, so that it can
+    never read as a further sentence of the feed.
     """
     who = f"The {role}"
     if event.get("type") == "usage":
-        searches = event.get("web_searches") or 0
+        searches = _whole(event.get("web_searches"))
         if searches:
             plural = "es" if searches != 1 else ""
             return f"{who} searched the web ({searches} search{plural}).", []
@@ -411,26 +556,26 @@ def describe_event(role: str, event: Mapping[str, Any]) -> tuple[str, list[str]]
     name = event.get("name")
     given = event.get("input")
     given = given if isinstance(given, Mapping) else {}
+    # Every argument is the model's: it is shown as a name or as a quotation, never as
+    # words of the sentence it stands in.
     if name == "memory":
-        if given.get("command") != "view":
-            return None
-        path = _shown(given.get("path"))
-        ref = [path] if path.endswith(".md") or path.startswith(f"{INPUTS_DIR}/") else []
-        return (f"{who} read {path}." if ref else f"{who} looked through {path}."), ref
+        return _described_view(who, given) if given.get("command") == "view" else None
     if name == "wiki_search":
-        return f"{who} searched the wiki for “{_short(given.get('query'), 80)}”.", []
+        return f"{who} searched the wiki for {said(given.get('query'), 80)}.", []
     if name == "verify_paper":
-        title = _short(given.get("title"), 100)
-        return f"{who} checked “{title}” against Semantic Scholar.", []
+        return f"{who} checked {said(given.get('title'), 100)} against Semantic Scholar.", []
     if name == "write_code":
-        return f"{who} wrote {_short(given.get('name'), 60)} for {given.get('experiment')}.", []
-    if name in ("repo_list", "repo_read", "repo_search"):
-        what = _short(given.get("path") or given.get("query") or "the top level", 80)
-        verb = {"repo_list": "listed", "repo_read": "read", "repo_search": "searched for"}[name]
+        experiment = named(given.get("experiment"), 60)
+        return f"{who} wrote {named(given.get('name'), 60)} for {experiment}.", []
+    if name == "repo_search":
+        return f"{who} searched for {said(given.get('query'), 80)} in your repository.", []
+    if name in ("repo_list", "repo_read"):
+        what = named(given["path"], 80) if given.get("path") else "the top level"
+        verb = "listed" if name == "repo_list" else "read"
         return f"{who} {verb} {what} in your repository.", []
     if name == "propose_edit":
         return None
-    return f"{who} used {name}.", []
+    return f"{who} used {named(name, 40)}.", []
 
 
 class _Session:
@@ -459,10 +604,16 @@ class _Session:
         offered = [search_tool(project), propose_edit_tool(project, role, ctx.round), *tools]
         index = project.index_text(role, session=self.backend.session_id)
         self._last = ""
+        self._model = model_for(project, role)
+        #: What the turn in flight has used, request by request.  The harness adds a
+        #: turn's usage to its ledger when the turn ends; a budget has to see it before.
+        self._turn = Usage()
+        #: Whether the model request that was reported last leads to another one.
+        self._goes_on = False
         self.conversation = ctx.harness.open(
             agent=role,
             stage=ctx.phase,
-            model=model_for(project, role),
+            model=self._model,
             system=prompts.system_prompt(role, index=index),
             memory=MemoryPolicy.none(),
             memory_backend=self.backend,
@@ -474,14 +625,43 @@ class _Session:
         )
 
     def _watch(self, event: dict[str, Any]) -> None:
+        """Follow the session: count what it uses, tell the feed what it does, and end a
+        turn that must end before its next model request.
+
+        A client reports how each model request ended and then what it used.  Where
+        the turn goes on from there, a stop request or a spent budget ends it here,
+        by :class:`SessionStopped`, which no client and no harness catches.  Waiting
+        for the next tool call of the session would not do: after a paused server
+        tool loop and after an answer cut off at the default length the client sends
+        the next request with no tool call in between, and it answers a call of an
+        unknown tool, or one whose input is not valid, without running anything.
+        """
+        kind = event.get("type")
+        if kind == "assistant":
+            self._goes_on = event.get("stop_reason") in _TURN_GOES_ON
+        if kind == "usage":
+            self._count(event)
+        if kind == "tool_call" and self.ctx.ending():
+            return  # the call is announced, but the turn ends before it is made
         described = describe_event(self.role, event)
         # The same page opened twice in a row is one thing to tell.
         if described is not None and described[0] != self._last:
             self._last = described[0]
             self.ctx.activity(described[0], agent=self.role, refs=described[1])
+        if kind == "usage" and self._goes_on:
+            self._goes_on = False
+            self.ctx.heed_stop()
+
+    def _count(self, event: Mapping[str, Any]) -> None:
+        """Add the usage of one model request to the turn's, and let the budget see it."""
+        self._turn.add(Usage(**{name: _whole(event.get(name)) for name in Usage().to_dict()}))
+        self.ctx.used(self._model, self._turn)
 
     def send(self, parts: Part | Sequence[Part]) -> str:
         self.ctx.guard()
+        # What earlier turns used is in the harness's ledger by now.
+        self._turn = Usage()
+        self._goes_on = False
         try:
             return self.conversation.send(parts).text
         finally:
@@ -770,7 +950,7 @@ def name_project_tool(ctx: AgentContext) -> ToolSpec:
             project.rename(title, by=agent_author("intake"))
         except ProjectError as exc:
             raise ToolError(str(exc)) from exc
-        ctx.activity(f'The intake named the project "{title}".', agent="intake")
+        ctx.activity(f"The intake named the project {said(title, 80)}.", agent="intake")
         return f'The project is now called "{title}". The researcher can rename it.'
 
     return ToolSpec(
@@ -1147,7 +1327,9 @@ def write_code_tool(ctx: AgentContext, backend: ProjectMemoryBackend) -> ToolSpe
             "experiment's code directory (the entry point is main.py unless the page says "
             "otherwise; a change to the researcher's repository is the file patch.diff) and "
             "the whole text of the file. The code is parsed, never run, and the problems "
-            "found are returned. Writing a file again replaces it; earlier versions are kept."
+            "found are returned. Writing a file again replaces it; earlier versions are kept. "
+            "A file the researcher wrote or changed is theirs and is not replaced: say what "
+            "should change with propose_edit instead."
         ),
         input_schema={
             "type": "object",
@@ -1170,13 +1352,44 @@ def _each_problem(message: str) -> list[str]:
     return [" ".join(item.split()) for item in items if item.strip()] or [" ".join(message.split())]
 
 
+def priced_gpus() -> list[str]:
+    """The GPU types a run's cost can be estimated for, cheapest first as the table has them."""
+    from paper_orchestra.compute.modal_backend import MODAL_PRICES_USD_PER_SECOND
+
+    return [str(name) for name in MODAL_PRICES_USD_PER_SECOND["gpu"]]
+
+
+def gpu_has_price(gpu: str) -> bool:
+    """Whether what a run on ``gpu`` (a type, or ``type:count``) costs can be estimated.
+
+    Without a price nothing bounds the cost of a run, so the project's limit for
+    experiments (``settings.limits.experiment_usd``) cannot hold it.
+    """
+    from paper_orchestra.compute.modal_backend import estimate_cost
+
+    try:
+        return estimate_cost(1.0, gpu=str(gpu), cpu=0.0, memory_mb=0) is not None
+    except ValueError:  # not a GPU request the table can read: there is nothing to price
+        return False
+
+
+def _no_price(gpu: str) -> str:
+    return (
+        f"Its GPU type {named(gpu, 40)} has no price estimate, so what a run costs could not "
+        "be held to the project's limit for experiments (settings.limits.experiment_usd). "
+        f"Name a GPU type that has one: {', '.join(priced_gpus())}."
+    )
+
+
 def experiment_problems(ctx: AgentContext, page: ResearchPage) -> list[str]:
     """What would stop the experiment ``page`` from being approved or run; empty when sound.
 
     Checked by code, never by running anything: the page names what it tests, its
-    plan is valid, its code parses and has its entry point, and the backend the
-    project would use can run it.  A warning from the code check (something the
-    person weighs at approval) is not a problem here.
+    plan is valid, its code parses and has its entry point, the backend the
+    project would use can run it, and a GPU it asks for has a price (a run whose
+    cost cannot be estimated cannot be held to the project's cost limit).  A
+    warning from the code check (something the person weighs at approval) is not
+    a problem here.
     """
     problems: list[str] = []
     if not page.relations.get("tests"):
@@ -1196,6 +1409,11 @@ def experiment_problems(ctx: AgentContext, page: ResearchPage) -> list[str]:
     backend = ctx.backend(plan) if plan is not None else None
     if backend is not None and plan is not None:
         problems += backend.supports(experiments.job_spec(plan))
+    # GPUs are Modal's, which bills by the second: also where that backend cannot be
+    # asked here (it is not installed, or none was given), that is where a GPU plan runs.
+    billed = backend is None or getattr(backend, "name", "") == "modal"
+    if plan is not None and plan.gpu and billed and not gpu_has_price(plan.gpu):
+        problems.append(_no_price(plan.gpu))
     return list(dict.fromkeys(problems))
 
 
@@ -1214,7 +1432,7 @@ def _compute_text(ctx: AgentContext) -> str:
         "packages: installed on request"
         if jobs.get("packages")
         else "packages: only what is already installed where it runs",
-        "network: blocked unless approved"
+        "network: blocked unless the researcher grants it when approving the run"
         if jobs.get("network_isolation")
         else "network: cannot be blocked here, so the code itself must not use it",
     ]
@@ -1257,13 +1475,15 @@ def _to_design(ctx: AgentContext) -> list[dict[str, Any]]:
 
 def _design_limits(project: Project, spent: Mapping[str, float]) -> dict[str, Any]:
     """The limits a design has to fit: the longest one run may take (a cap on each run,
-    not a total) and what is left of the project's total for compute."""
+    not a total), what is left of the project's total for compute, and the GPU types
+    whose cost can be estimated and so be held to that total."""
     limits = project.settings.limits
     return {
         "max_experiments": int(limits.max_experiments),
         "experiment_seconds": float(limits.experiment_seconds),
         "experiment_usd": float(limits.experiment_usd),
         "usd_left": max(0.0, limits.experiment_usd - spent.get("experiment_usd", 0.0)),
+        "priced_gpus": priced_gpus(),
     }
 
 
@@ -1298,6 +1518,20 @@ def _record_problems(
     return notes
 
 
+def _network_notes(session: _Session) -> list[str]:
+    """Said at the checkpoint for each proposed experiment whose page asks for the network.
+
+    ``network: true`` on a page is a request and grants nothing: the person decides it
+    when they approve the run, and should know before then that they will be asked.
+    """
+    return [
+        f"{page.id} asks for network access. Its page can only ask: you grant or refuse it "
+        "when you approve the run."
+        for page in session.proposed("experiment")
+        if page.id and str(page.meta.get("network")).strip().lower() in ("true", "yes", "on", "1")
+    ]
+
+
 def run_designer(ctx: AgentContext, *, spent: Mapping[str, float] | None = None) -> AgentReport:
     """Propose experiments, with code, for the hypotheses that want one.
 
@@ -1306,6 +1540,7 @@ def run_designer(ctx: AgentContext, *, spent: Mapping[str, float] | None = None)
     times.  What still fails stays a proposal with the problems listed on its page
     (the ``problems`` field).  ``spent`` is what the project has spent on
     experiments so far, so that the designer is told what is left of the cost limit.
+    The report's notes name what is not sound and what asks for the network.
     """
     project = ctx.project
     root = _repo_root(project)
@@ -1341,7 +1576,7 @@ def run_designer(ctx: AgentContext, *, spent: Mapping[str, float] | None = None)
             break
         session.send(prompts.designer_repair_message(problems, last=attempt == DESIGN_REPAIRS - 1))
         problems = _checked(ctx, session)
-    notes = _record_problems(ctx, session, problems)
+    notes = _record_problems(ctx, session, problems) + _network_notes(session)
     produced = session.created()
     return AgentReport(
         produced=produced, summary=f"The designer proposed {_counted(produced)}.", notes=notes
@@ -1445,17 +1680,20 @@ def make_repair(
             if not isinstance(answer, RepairAnswer):
                 answer = RepairAnswer.model_validate(answer)
         except Exception as exc:  # the run has failed already; a failed repair must not hide that
+            # (An error can carry what the model answered: it is given as a quotation too.)
             ctx.activity(
-                f"No repair of {experiment} was attempted: {_short(exc, 200)}", agent="runner"
+                f"No repair of {experiment} was attempted: {said(exc, 200)}", agent="runner"
             )
             return None
         files = _corrected(answer, current)
-        said = _short(answer.explanation, 300) or "no explanation was given"
+        # The explanation and the file names are the model's: given as what it said.
+        why = said(answer.explanation, 300) if answer.explanation.strip() else "it gave no reason."
         if not files:
-            ctx.activity(f"The runner left {experiment} as it is: {said}", agent="runner")
+            ctx.activity(f"The runner left {experiment} as it is: {why}", agent="runner")
             return None
+        names = _listed([named(name, 60) for name in sorted(files)])
         ctx.activity(
-            f"The runner corrected {_listed(sorted(files))} of {experiment}: {said}",
+            f"The runner corrected {names} of {experiment}: {why}",
             agent="runner",
             refs=[str(plan.path)],
         )

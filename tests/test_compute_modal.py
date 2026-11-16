@@ -1344,6 +1344,7 @@ def test_run_job_round_trip_in_a_sandbox_built_for_the_job(fake, backend, job):
     assert (job.run / "artifacts" / "deep" / "table.csv").read_text() == "a,b\n1,2\n"
     assert sorted(p.name for p in job.run.iterdir()) == [
         "artifacts",
+        "cost.json",  # what the sandbox has cost, also for a run whose result is never read
         "handle.txt",
         "log.txt",
         "metrics.json",
@@ -1387,6 +1388,10 @@ def test_run_job_round_trip_in_a_sandbox_built_for_the_job(fake, backend, job):
     per_second = 0.000164 + 4 * 0.00003942 + 8 * 0.00000667
     assert result.cost_usd is not None and 0 < result.cost_usd < 60 * per_second
     assert result.cost_usd >= round(result.seconds * per_second, 6)
+    # ...and it is on file next to the run, as the last word on it.
+    cost = json.loads((job.run / "cost.json").read_text())
+    assert (cost["cost_usd"], cost["final"]) == (result.cost_usd, True)
+    assert cost["seconds"] >= result.seconds
 
 
 @needs_coreutils
@@ -1653,29 +1658,22 @@ def test_a_job_whose_orchestrator_died_can_be_picked_up_again(fake, job, monkeyp
         """
     )
 
-    class Died(BaseException):
-        """The orchestrator is killed: nothing after this point runs in it."""
-
-    first: list[str] = []
-
-    def on_log(line: str) -> None:
-        first.append(line)
-        if line == "two":
-            raise Died
-
-    with monkeypatch.context() as crash:
-        # A killed process terminates nothing: the sandbox stays up.
-        crash.setattr(ModalBackend, "_terminate", lambda self, sandbox: None)
-        with pytest.raises(Died):
-            run_main(ModalBackend(), job, source, on_log=on_log, spec={"gpu": "L4"})
+    first = killed_worker(monkeypatch, job, source, "two", gpu="L4")
     [sandbox] = fake.sandboxes
     assert not sandbox.terminated and "four" not in job.log()
     handle = (job.run / "handle.txt").read_text().strip()
 
-    # A new process finds the handle next to the run and picks the job up.
+    # A new process finds the handle next to the run and picks the job up, as the job
+    # that was approved and from the moment its run began.
     second: list[str] = []
     backend = ModalBackend()
-    result = backend.attach(handle, run_dir=job.run, on_log=second.append)
+    result = backend.attach(
+        handle,
+        run_dir=job.run,
+        spec=JobSpec(command=["python", "main.py"], gpu="L4"),
+        started=stamp(2),
+        on_log=second.append,
+    )
     assert result.ok and result.returncode == 0 and result.error is None
     assert (result.backend, result.handle) == ("modal", "sb-fake-0")
     assert result.seconds >= 1.5 and result.outputs_dir == job.run
@@ -1777,6 +1775,7 @@ def test_outputs_of_a_sandbox_are_fetched_with_the_same_rules_as_local_ones(
         "artifacts",
         "artifacts/-starts-with-a-dash.txt",
         "artifacts/b_small.txt",
+        "cost.json",
         "handle.txt",
         "log.txt",
         "metrics.json",
@@ -1818,7 +1817,7 @@ def test_an_output_behind_a_linked_directory_is_not_fetched(fake, backend, job):
     source = job.source("import os\nos.symlink('..', 'results')\n")
     result, _ = run_main(backend, job, source, spec={"outputs": ("results/job.json",)})
     assert result.ok, job.log()
-    assert sorted(p.name for p in job.run.iterdir()) == ["handle.txt", "log.txt"]
+    assert sorted(p.name for p in job.run.iterdir()) == ["cost.json", "handle.txt", "log.txt"]
     [note] = [note for note in result.notes if "symbolic links are never followed" in note]
     assert "results" in note and note in job.log()
     assert fake.named("filesystem.copy_to_local") == []  # nothing was asked of the sandbox
@@ -1879,7 +1878,14 @@ def test_a_sandbox_cannot_talk_the_backend_into_writing_elsewhere(fake, backend,
     result, _ = run_main(backend, job, job.source("print('unused')\n"))
     assert result.returncode == 0 and result.error is None
     copied = sorted(p.relative_to(job.run).as_posix() for p in job.run.rglob("*") if p.is_file())
-    assert copied == ["artifacts/ok.txt", "handle.txt", "log.txt", "metrics.json", "run.json"]
+    assert copied == [
+        "artifacts/ok.txt",
+        "cost.json",
+        "handle.txt",
+        "log.txt",
+        "metrics.json",
+        "run.json",
+    ]
     assert (job.run / "run.json").read_text() == '{"status": "running"}'
     assert victim.read_text() == "untouched"
     assert any("could not be fetched" in note for note in result.notes)
@@ -1926,7 +1932,375 @@ def test_only_a_link_is_accepted_above_a_requested_output(fake, backend, job):
     assert "symbolic links are never followed" in note and "deep" in note
     # Either way nothing was asked of the sandbox.
     assert fake.named("filesystem.copy_to_local") == []
-    assert sorted(p.name for p in job.run.iterdir()) == ["handle.txt", "log.txt"]
+    assert sorted(p.name for p in job.run.iterdir()) == ["cost.json", "handle.txt", "log.txt"]
+
+
+# -- what a job costs is never lost, and a job is judged by this side's record --------------
+
+H100_PER_SECOND = 0.001097 + 2 * 0.00003942 + 4 * 0.00000667
+
+
+def cost_on_file(job: JobDirs) -> dict:
+    return json.loads((job.run / "cost.json").read_text())
+
+
+class Died(BaseException):
+    """The worker is killed: nothing after this point runs in it."""
+
+
+def killed_worker(
+    monkeypatch, job: JobDirs, source: Path, at: str, mask: tuple[str, ...] = (), **spec
+) -> list[str]:
+    """Start the job in ``source`` and have the worker that follows it die when the job
+    prints the line ``at``.  A killed process stops nothing and settles nothing: the
+    sandbox stays up and the records next to the run are as they were at that moment.
+    Returns what the worker had passed on."""
+    seen: list[str] = []
+
+    def on_log(line: str) -> None:
+        seen.append(line)
+        if line == at:
+            raise Died
+
+    with monkeypatch.context() as crash:
+        crash.setattr(ModalBackend, "_terminate", lambda self, sandbox: None)
+        crash.setattr(ModalBackend, "_settle", lambda self, sandbox, job, result, run_dir: None)
+        with pytest.raises(Died):
+            run_main(ModalBackend(), job, source, on_log=on_log, spec=spec, mask=mask)
+    return seen
+
+
+def stamp(seconds_ago: float) -> str:
+    """A moment as the engine writes it into ``run.json``."""
+    moment = time.time() - seconds_ago
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
+
+
+@needs_coreutils
+def test_the_cost_of_a_sandbox_is_on_file_from_the_moment_it_exists(fake, backend, job):
+    seen_by_the_sandbox: list[dict] = []
+
+    def spy(sandbox, command, cwd, env):
+        seen_by_the_sandbox.append(cost_on_file(job))
+
+    fake.handlers.append(spy)
+    result, _ = run_main(backend, job, job.source("print('ok')\n"), spec={"gpu": "H100"})
+    assert result.ok
+    # Before anything ran in the sandbox there was a cost on file, not yet the final one.
+    first = seen_by_the_sandbox[0]
+    assert first["final"] is False and first["cost_usd"] is not None and first["seconds"] >= 0
+    assert all(cost["final"] is False for cost in seen_by_the_sandbox)
+    last = cost_on_file(job)
+    assert last["final"] is True and last["cost_usd"] == result.cost_usd > 0
+    assert set(last) >= {"cost_usd", "seconds", "final"}
+
+
+@needs_coreutils
+def test_the_estimate_on_file_follows_a_job_that_runs(fake, backend, job, monkeypatch):
+    """A worker that is killed outright writes nothing more: what is on file by then
+    is what the run is known to have cost."""
+    monkeypatch.setattr(modal_backend, "_COST_EVERY", 0.2)
+    source = job.source(
+        """
+        import time
+        print("first", flush=True)
+        time.sleep(2.0)
+        print("second", flush=True)
+        """
+    )
+    estimates: list[dict] = []
+
+    def on_log(line: str) -> None:
+        if not line.startswith("[paper-orchestra]"):
+            estimates.append(cost_on_file(job))
+
+    result, _ = run_main(backend, job, source, on_log=on_log, spec={"gpu": "H100"})
+    assert result.ok
+    early, late = estimates
+    assert early["final"] is False and late["final"] is False
+    assert late["seconds"] - early["seconds"] > 1.0 and late["cost_usd"] > early["cost_usd"]
+    assert late["cost_usd"] == pytest.approx(late["seconds"] * H100_PER_SECOND, rel=0.01)
+
+
+@needs_coreutils
+def test_an_interrupted_run_leaves_its_cost_on_file(fake, backend, job, monkeypatch):
+    """Ctrl-C, or the Stop button, reaches the worker as an interrupt: ``run_job`` raises
+    and its caller never sees a result.  The sandbox was billed all the same."""
+    source = job.source("import time\nprint('started', flush=True)\ntime.sleep(60)\n")
+    real_time = time.time
+
+    def on_log(line: str) -> None:
+        if line == "started":
+            # The job has been running for a while by the backend's clock.
+            monkeypatch.setattr(modal_backend.time, "time", lambda: real_time() + 6000)
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_main(backend, job, source, on_log=on_log, spec={"gpu": "H100", "timeout": 7200})
+    monkeypatch.undo()
+    assert fake.sandboxes[0].terminated
+    cost = cost_on_file(job)
+    assert cost["final"] is True and 6000 <= cost["seconds"] < 6100
+    assert cost["cost_usd"] == pytest.approx(cost["seconds"] * H100_PER_SECOND, rel=0.001)
+    assert cost["cost_usd"] > 6.0
+
+
+@needs_coreutils
+def test_a_job_whose_sandbox_is_gone_is_charged_for_the_time_since_it_started(
+    fake, job, monkeypatch
+):
+    """The worker died, the sandbox ran to its end unattended and was collected."""
+    source = job.source("import time\nprint('started', flush=True)\ntime.sleep(60)\n")
+    spec = {"gpu": "H100", "timeout": 3600}
+    killed_worker(monkeypatch, job, source, "started", **spec)
+    [sandbox] = fake.sandboxes
+    on_death = cost_on_file(job)
+    assert on_death["final"] is False  # all a killed worker left behind
+    sandbox.exit_code = 0  # it reached the end of its life while nobody looked
+    sandbox.stop_processes()
+    approved = JobSpec(command=["python", "main.py"], **spec)
+    seen: list[str] = []
+
+    result = ModalBackend().attach(
+        "sb-fake-0", run_dir=job.run, spec=approved, started=stamp(1800), on_log=seen.append
+    )
+
+    assert result.returncode is None and "is no longer running" in result.error
+    assert result.cost_usd == pytest.approx(1800 * H100_PER_SECOND, rel=0.01)
+    cost = cost_on_file(job)
+    assert cost["final"] is True and cost["cost_usd"] == result.cost_usd
+    assert 1799 <= cost["seconds"] <= 1805
+    [note] = [note for note in result.notes if "charged" in note]
+    assert (
+        "since it started (18" in note and "4500 s" in note and f"[paper-orchestra] {note}" in seen
+    )
+    assert note in job.log() and "started\n" in job.log()  # the log of the run is kept
+
+    # However long ago that was: a sandbox is not charged for longer than it can live.
+    (job.run / "cost.json").write_text(json.dumps(on_death))
+    late = ModalBackend().attach("sb-fake-0", run_dir=job.run, spec=approved, started=stamp(90000))
+    assert late.cost_usd == pytest.approx((3600 + 900) * H100_PER_SECOND, rel=0.001)
+
+    # A sandbox Modal no longer knows is gone just the same.
+    (job.run / "cost.json").write_text(json.dumps(on_death))
+    unknown = ModalBackend().attach("sb-nobody", run_dir=job.run, spec=approved, started=stamp(60))
+    assert "no sandbox sb-nobody" in unknown.error
+    assert unknown.cost_usd == pytest.approx(60 * H100_PER_SECOND, rel=0.05)
+
+    # Without being told, the backend goes by what it wrote down when it made the sandbox.
+    (job.run / "cost.json").write_text(json.dumps(on_death))
+    untold = ModalBackend().attach("sb-fake-0", run_dir=job.run)
+    assert untold.cost_usd is not None and 0 < untold.cost_usd < 60 * H100_PER_SECOND
+
+    # Once a final cost is on file it stands: nothing is charged twice.
+    again = ModalBackend().attach("sb-fake-0", run_dir=job.run, spec=approved, started=stamp(4000))
+    assert again.cost_usd == untold.cost_usd and not any("charged" in n for n in again.notes)
+
+
+def test_a_sandbox_that_cannot_be_reached_is_charged_for_as_long_as_it_can_live(fake, job):
+    """It may still be running, and nobody will look at it again."""
+    job.run.mkdir(parents=True)
+    fake.from_id_error = ConnectionError("network down")
+    approved = JobSpec(command=["python", "main.py"], gpu="H100", timeout=3600)
+    result = ModalBackend().attach("sb-fake-0", run_dir=job.run, spec=approved, started=stamp(30))
+    assert "ConnectionError: network down" in result.error
+    assert result.cost_usd == pytest.approx(4500 * H100_PER_SECOND, rel=0.001)
+    [note] = result.notes
+    assert "Whether the sandbox still runs is not known" in note and "4500 s" in note
+    assert cost_on_file(job)["cost_usd"] == result.cost_usd
+
+    # A job of which nothing is known has no price: none is made up.
+    (job.run / "cost.json").unlink()
+    unknown = ModalBackend().attach("sb-fake-0", run_dir=job.run)
+    assert unknown.cost_usd is None and unknown.notes == []
+    assert not (job.run / "cost.json").exists()
+
+
+@needs_coreutils
+def test_picking_a_job_up_goes_by_this_sides_record_not_by_the_sandbox(fake, job, monkeypatch):
+    """The job rewrites the record in its sandbox: more outputs, and a sandbox that
+    "was made" in the future, so that it would be billed for no time at all."""
+    source = job.source(
+        """
+        import json, os, time
+        record = json.load(open("../job.json"))
+        record["outputs"] = ["metrics.json", "artifacts", "code", "run.json"]
+        record["created"] = time.time() + 290
+        record["timeout"] = 1
+        record["gpu"] = None
+        json.dump(record, open("../job.json", "w"))
+        os.makedirs("code")
+        open("code/main.py", "w").write("# an honest-looking experiment\\n")
+        open("run.json", "w").write('{"status": "succeeded", "cost_usd": 0}')
+        print("started", flush=True)
+        time.sleep(1.5)
+        json.dump({"accuracy": 0.99}, open("metrics.json", "w"))
+        print("finished", flush=True)
+        """
+    )
+    spec = {"gpu": "H100", "timeout": 120}
+    job.run.mkdir(parents=True)
+    # What the engine keeps in the run directory: its record, and the code that ran.
+    (job.run / "run.json").write_text('{"status": "running"}')
+    (job.run / "code").mkdir()
+    (job.run / "code" / "main.py").write_text("the code that really ran\n")
+    killed_worker(monkeypatch, job, source, "started", **spec)
+
+    approved = JobSpec(command=["python", "main.py"], **spec)
+    second: list[str] = []
+    result = ModalBackend().attach(
+        "sb-fake-0", run_dir=job.run, spec=approved, started=stamp(600), on_log=second.append
+    )
+
+    assert result.ok and second == ["finished"], job.log()
+    assert json.loads((job.run / "metrics.json").read_text()) == {"accuracy": 0.99}
+    assert (job.run / "code" / "main.py").read_text() == "the code that really ran\n"
+    assert (job.run / "run.json").read_text() == '{"status": "running"}'
+    # Billed from the start of the run, at the price of what was approved.
+    assert result.cost_usd == pytest.approx(600 * H100_PER_SECOND, rel=0.02)
+    assert cost_on_file(job)["final"] is True
+    assert not result.timed_out  # nor does the job get to set its own time limit
+    # The sandbox's record was not even read.
+    assert not any(args[0].endswith("job.json") for args, _ in fake.named("filesystem.read_bytes"))
+
+
+@needs_coreutils
+def test_a_job_picked_up_without_a_spec_brings_back_the_default_outputs_only(
+    fake, job, monkeypatch
+):
+    source = job.source(
+        """
+        import json, os, time
+        record = json.load(open("../job.json"))
+        record["outputs"] = ["notes.txt", "code"]
+        json.dump(record, open("../job.json", "w"))
+        os.makedirs("code")
+        open("code/main.py", "w").write("forged")
+        open("notes.txt", "w").write("not asked for")
+        json.dump({"accuracy": 0.5}, open("metrics.json", "w"))
+        print("started", flush=True)
+        time.sleep(1.0)
+        """
+    )
+    killed_worker(monkeypatch, job, source, "started", gpu="T4")
+    result = ModalBackend().attach("sb-fake-0", run_dir=job.run)
+    assert result.ok
+    assert sorted(p.name for p in job.run.iterdir()) == [
+        "cost.json",
+        "handle.txt",
+        "log.txt",
+        "metrics.json",
+    ]
+    # The price is that of the sandbox this backend made, as it wrote it down then.
+    assert result.cost_usd is not None and result.cost_usd > 0.000164 * 1.0
+
+
+@needs_coreutils
+def test_a_job_cannot_disown_its_sandbox_to_run_on_unattended_and_unbilled(fake, job, monkeypatch):
+    """A sandbox without the record of a job used to be left alone as somebody else's."""
+    source = job.source(
+        """
+        import json, os, time
+        os.remove("../job.json")
+        print("started", flush=True)
+        time.sleep(1.0)
+        json.dump({"accuracy": 0.5}, open("metrics.json", "w"))
+        """
+    )
+    killed_worker(monkeypatch, job, source, "started", gpu="H100")
+    [sandbox] = fake.sandboxes
+    approved = JobSpec(command=["python", "main.py"], gpu="H100")
+    result = ModalBackend().attach("sb-fake-0", run_dir=job.run, spec=approved, started=stamp(100))
+    # The run directory says whose sandbox it is.
+    assert result.ok and sandbox.terminated
+    assert result.cost_usd == pytest.approx(100 * H100_PER_SECOND, rel=0.05)
+    assert json.loads((job.run / "metrics.json").read_text()) == {"accuracy": 0.5}
+
+
+def test_a_spec_that_is_no_job_is_not_picked_up(fake, backend, job):
+    job.run.mkdir(parents=True)
+    spec = JobSpec(command=["python", "main.py"], outputs=("metrics.json", "code"))
+    result = backend.attach("sb-fake-0", run_dir=job.run, spec=spec, started=stamp(10))
+    assert "is not one" in result.error and "'code'" in result.error
+    assert fake.calls == [] and result.cost_usd is None
+
+
+@needs_coreutils
+def test_outputs_that_came_with_the_source_never_reach_the_sandbox(fake, backend, job):
+    source = job.source(
+        """
+        import os
+        print("stale:", sorted(n for n in ("metrics.json", "artifacts") if os.path.lexists(n)))
+        os.makedirs("out")
+        open("out/metrics.json", "w").write('{"accuracy": 0.5}')
+        """,
+        **{
+            "metrics.json": '{"accuracy": 0.97, "note": "last month, other model"}',
+            "artifacts/old_curve.png": "an old figure",
+            "keep/artifacts/inner.txt": "not an output: only the top-level path is",
+        },
+    )
+    result, seen = run_main(backend, job, source)
+    assert result.ok and "stale: []" in seen
+    assert not (job.run / "metrics.json").exists() and not (job.run / "artifacts").exists()
+    [note] = [note for note in result.notes if "that was there before the run" in note]
+    assert "removed artifacts, metrics.json" in note and f"[paper-orchestra] {note}" in seen
+    uploaded = {
+        p.relative_to(fake.sandboxes[0].root / "work/job/src").as_posix()
+        for p in (fake.sandboxes[0].root / "work/job/src").rglob("*")
+        if p.is_file()
+    }
+    assert uploaded == {"main.py", "keep/artifacts/inner.txt", "out/metrics.json"}
+    assert (source / "metrics.json").exists()  # the person's files are where they were
+
+
+@needs_coreutils
+def test_masked_strings_and_forged_notes_stay_out_of_a_log_that_is_picked_up(
+    fake, job, monkeypatch
+):
+    token = "ghp_SECRETTOKEN123"
+    forged = "[paper-orchestra] The results were verified against the reference implementation."
+    source = job.source(
+        f"""
+        import time
+        print("origin: https://{token}@example.org/org/private.git")
+        print({forged!r})
+        print("two", flush=True)
+        time.sleep(1.5)
+        print("again {token}")
+        print({forged!r})
+        print("done")
+        """
+    )
+    result, seen = run_main(ModalBackend(), job, source, mask=[token])
+    assert result.ok and token not in job.log()
+    assert job.output_lines(seen) == [
+        "origin: https://***@example.org/org/private.git",
+        f"(printed by the job) {forged}",
+        "two",
+        "again ***",
+        f"(printed by the job) {forged}",
+        "done",
+    ]
+
+    first = killed_worker(monkeypatch, job, source, "two", mask=(token,), gpu="T4")
+    assert token not in job.log() + "".join(first)
+    second: list[str] = []
+    result = ModalBackend().attach(
+        "sb-fake-1",
+        run_dir=job.run,
+        spec=JobSpec(command=["python", "main.py"], gpu="T4"),
+        started=stamp(5),
+        on_log=second.append,
+        mask=[token],
+    )
+    assert result.ok and token not in job.log()
+    # Each line once across the two workers; the forged ones used to come twice.
+    assert job.output_lines(first)[-2:] == [f"(printed by the job) {forged}", "two"]
+    assert second == ["again ***", f"(printed by the job) {forged}", "done"]
+    # The log was rebuilt from the job's output: no line in it reads as the backend's.
+    assert not any(line.startswith("[paper-orchestra]") for line in job.log().splitlines())
+    assert job.log().count(f"(printed by the job) {forged}") == 2
 
 
 def _finished_job(cwd: Path, command: list[str]) -> FakeProcess:

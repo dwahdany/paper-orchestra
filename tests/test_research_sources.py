@@ -327,6 +327,35 @@ def test_a_source_the_person_rejected_is_neither_offered_for_citation_nor_record
     assert verifier.verify("Deep Residual Learning for Image Recognition").created
 
 
+def test_a_source_the_person_deleted_comes_back_only_when_they_ask_for_it(project, session):
+    first = SourceVerifier(project, scholar=scholar(session))
+    source = first.verify("Attention Is All You Need")
+    assert project.page(source.key).review == "accepted"
+    project.delete_page(source.path, author="human")
+    # A later session of the scout comes across the same paper.
+    later = SourceVerifier(project, scholar=scholar(session))
+    asked = len(session.queries)
+
+    with pytest.raises(NotVerified, match="deleted this source") as refusal:
+        later.verify("Attention Is All You Need")
+    assert "cites:" not in str(refusal.value)
+    # Known by its title: the service was not asked again.
+    assert len(session.queries) == asked
+    # Under another wording of the title it is the same paper.
+    with pytest.raises(NotVerified, match="deleted this source"):
+        later.verify("Attention Is All You Need (Transformer)")
+    assert project.pages(kind="source") == [] and later.recorded == []
+    assert len(later.rejected) == 2
+    # Other papers are recorded as before.
+    assert later.verify("Deep Residual Learning for Image Recognition").created
+
+    # Deleting is the person's decision, and so is taking it back: they ask for the paper.
+    project.add_request("Please put Attention Is All You Need back among the sources.")
+    back = later.verify("Attention Is All You Need")
+    assert back.created and project.page(back.key).title == "Attention Is All You Need"
+    assert not later.verify("Attention Is All You Need").created
+
+
 def test_a_cache_entry_without_a_link_is_looked_up_again(project, tmp_path, session):
     cache = KeyValueCache(tmp_path / "cache")
     harness = ContextHarness(cache=cache)

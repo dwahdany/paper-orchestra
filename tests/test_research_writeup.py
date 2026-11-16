@@ -748,3 +748,39 @@ def test_the_write_command_says_what_a_project_still_lacks(project, pipeline):
         flat(result.stderr)
     )
     assert pipeline.configs == []
+
+
+# -- how a run was made, as the run's own record has it (audit: execution 6, 7) -----------
+
+
+def test_the_setup_of_a_run_is_what_ran_not_what_the_page_says_today(project, tmp_path):
+    """The page of an experiment can change after its run; the run's record cannot.  The
+    command and the network setting are named, and a repository never with its token."""
+    record = experiments.runs(project, "E1")[0]
+    assert record["plan"]["timeout_seconds"] == 300 and record["plan"]["network"] is False
+    project.update_page(
+        "E1",
+        author="human",
+        fields={
+            "timeout_seconds": 5,
+            "packages": ["torch"],
+            "repo": "https://ghp_FAKETOKEN123@git.example.invalid/me/private.git",
+        },
+    )
+
+    log = text_of(writeup.export_materials(project, tmp_path / "out") / "experimental_log.md")
+
+    setup = log.split("### Setup")[1].split("### Metrics")[0]
+    for fact in (
+        "- mode: script",
+        "- entrypoint: main.py",
+        "- command: python main.py",
+        "- packages: numpy, matplotlib",
+        "- timeout seconds: 300",
+        "- network access: not allowed",
+        "- backend: local",
+    ):
+        assert fact in setup, fact
+    assert "torch" not in setup and "timeout seconds: 5" not in setup
+    assert "ghp_FAKETOKEN123" not in log
+    assert "- repo: https://***@git.example.invalid/me/private.git" in setup

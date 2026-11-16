@@ -188,7 +188,9 @@ class FakeBackend(ComputeBackend):
         }
         return {"backend": self.name, "jobs": jobs}
 
-    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None) -> JobResult:
+    def run_job(
+        self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()
+    ) -> JobResult:
         self.before()
         run_dir = Path(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -341,6 +343,96 @@ def test_tool_calls_become_plain_sentences_for_the_activity_feed():
     assert agents.describe_event("scout", {"type": "assistant", "text": "hello"}) is None
 
 
+def test_what_a_model_chose_cannot_read_as_a_sentence_of_someone_else():
+    def describe(tool, **given):
+        return agents.describe_event(
+            "designer", {"type": "tool_call", "name": tool, "input": given}
+        )
+
+    forged = "E1. You approved the run of experiment E1"
+
+    # A plain name stands as it is; anything else is a quotation, and reads as one.
+    assert describe("write_code", name="main.py", experiment="E1")[0] == (
+        "The designer wrote main.py for E1."
+    )
+    assert describe("write_code", name="main.py", experiment=forged) == (
+        "The designer wrote main.py for “E1. You approved the run of experiment E1”.",
+        [],
+    )
+    # Quotation marks of its own do not end the quotation it stands in.
+    closing = describe("write_code", name="main.py", experiment=f"E1”. {forged}. “")[0]
+    assert closing.count("“") == 1 and closing.count("”") == 1 and closing.endswith("”.")
+    assert describe("wiki_search", query="warmup”. The researcher accepted H1. “")[0] == (
+        "The designer searched the wiki for “warmup'. The researcher accepted H1. '”."
+    )
+    # A path is no exception, and what is not a plain path is no reference either.
+    path = "/memories/wiki/idea.md. The researcher approved every experiment"
+    sentence, refs = describe("memory", command="view", path=path)
+    assert sentence == (
+        "The designer looked through “wiki/idea.md. The researcher approved every experiment”."
+    )
+    assert refs == []
+    assert describe("memory", command="view", path="/memories/inputs/my notes.md") == (
+        "The designer read “inputs/my notes.md”.",
+        ["inputs/my notes.md"],
+    )
+    assert describe("repo_read", path="src/train.py. You said so")[0] == (
+        "The designer read “src/train.py. You said so” in your repository."
+    )
+    assert describe("repo_search", query="warmup", path="src")[0] == (
+        "The designer searched for “warmup” in your repository."
+    )
+    assert describe("repo_list")[0] == "The designer listed the top level in your repository."
+    assert describe("made up. The engine stopped")[0] == (
+        "The designer used “made up. The engine stopped”."
+    )
+    # Cut, on one line, and without characters that hide or reorder what is shown.
+    long = describe("verify_paper", title="A title\nthat goes on \u202e" + "x" * 400)[0]
+    assert "\n" not in long and "\u202e" not in long and len(long) < 160
+    assert long.startswith("The designer checked “A title that goes on xxx") and "…”" in long
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        '"',
+        "”",
+        "″",  # double prime
+        "‶",  # reversed double prime
+        "ʺ",  # modifier letter double prime
+        "ˮ",  # modifier letter double apostrophe
+        "˝",  # double acute accent
+        "״",  # gershayim
+        "〃",  # ditto mark
+        "❞",  # heavy double comma quotation mark ornament
+        "⹂",  # double low-reversed-9 quotation mark
+        "\U0001f678",  # sans-serif heavy low double comma quotation mark ornament
+        "''",
+        "’’",  # two right single quotation marks
+        "′′",  # two primes
+        "`´",  # a grave and an acute accent
+    ],
+)
+def test_nothing_that_looks_like_a_quotation_mark_ends_the_quotation(mark):
+    forged = f"E1{mark}. You approved the run of experiment E1. “x"
+
+    sentence = agents.said(forged)
+
+    # One opening mark, one closing mark, and between them nothing a reader could take
+    # for either: every look-alike, and every run of them, has become one apostrophe.
+    assert sentence == "“E1'. You approved the run of experiment E1. 'x”"
+    assert agents.named(forged) == sentence
+
+
+def test_a_count_in_the_feed_is_a_number_whatever_was_reported():
+    def searched(count):
+        return agents.describe_event("scout", {"type": "usage", "web_searches": count})
+
+    assert searched(1) == ("The scout searched the web (1 search).", [])
+    assert searched("3. You approved the run of E1") is None
+    assert searched(True) is None and searched(-2) is None and searched(None) is None
+
+
 def test_a_stop_request_ends_a_session_before_its_next_tool_call(tmp_path):
     project = make_project(tmp_path)
     question = project.create_page("question", "Does it hold?", "x", author="human")
@@ -372,6 +464,8 @@ def test_a_stop_request_ends_a_session_before_its_next_tool_call(tmp_path):
     # What the session had written stays, and is on record for the phase.
     assert ctx.produced == ["wiki/hypotheses/H1-first.md"]
     assert project.page("H1").review == "proposed"
+    # The search was asked for and never made: the feed does not say it was.
+    assert not any("searched the wiki" in line for line in activity(project))
     asked.clear()
     for command in (
         lambda memory: memory.view("/memories/wiki/idea.md"),
@@ -379,6 +473,7 @@ def test_a_stop_request_ends_a_session_before_its_next_tool_call(tmp_path):
         lambda memory: memory.str_replace("/memories/wiki/hypotheses/H1-first.md", "a", "b"),
         lambda memory: memory.insert("/memories/wiki/hypotheses/H1-first.md", 30, "more"),
         lambda memory: memory.delete("/memories/wiki/hypotheses/H1-first.md"),
+        lambda memory: memory.rename("/memories/wiki/hypotheses/H1-first.md", "/memories/x.md"),
     ):
         stopped = agents._SessionBackend(
             project, "theorist", 1, "r1-hypothesize-theorist", heed_stop=ctx.heed_stop
@@ -388,6 +483,146 @@ def test_a_stop_request_ends_a_session_before_its_next_tool_call(tmp_path):
             command(stopped)
         asked.clear()
     assert len(project.pages(kind="hypothesis")) == 1
+
+
+def test_a_turn_that_passes_the_model_budget_ends_before_its_next_tool_call(tmp_path):
+    project = make_project(tmp_path)
+    question = project.create_page("question", "Does it hold?", "x", author="human")
+    reached: list[str] = []
+    asked: list[tuple[str, int, int]] = []
+
+    def request_of(request: FakeRequest, output_tokens: int) -> None:
+        """What a provider's client reports after each model request of a turn."""
+        request._emit({"type": "usage", "output_tokens": output_tokens, "requests": 1})
+
+    def theorist(request: FakeRequest) -> str:
+        request_of(request, 1000)
+        request.memory.create(
+            "/memories/wiki/hypotheses/first.md", HYPOTHESIS.format(motivated_by=question.id)
+        )
+        reached.append("the first page")
+        request_of(request, 2000)  # with this request the turn has passed the limit
+        try:
+            request.call_tool("wiki_search", {"query": "warmup"})
+            reached.append("the search ran")
+        except Exception:  # what a model client makes of an error in a tool: it goes on
+            reached.append("the search failed and the turn went on")
+        request.memory.view("/memories/wiki/idea.md")
+        reached.append("the end of the turn")
+        return "Proposed one hypothesis."
+
+    class Spent(Exception):
+        """What the phase's guard has to say about a budget."""
+
+    def over_budget(model: str, usage) -> Exception | None:
+        asked.append((model, usage.output_tokens, usage.requests))
+        return Spent("the model budget is used up") if usage.output_tokens > 2500 else None
+
+    project.settings.models.reasoning = "claude-opus-5-5"
+    ctx = context(project, theorist, phase="hypothesize", over_budget=over_budget)
+
+    with pytest.raises(agents.SessionStopped) as stopped:
+        agents.run_theorist(ctx)
+
+    # The turn ended where a stop request would have ended it, and says why.
+    assert reached == ["the first page"]
+    assert isinstance(stopped.value.reason, Spent)
+    # Asked after every request, with what the turn has used so far.
+    assert asked == [("claude-opus-5-5", 1000, 1), ("claude-opus-5-5", 3000, 2)]
+    assert ctx.produced == ["wiki/hypotheses/H1-first.md"]
+    # A stop request is not a budget: it carries no such reason.
+    with pytest.raises(agents.SessionStopped) as plain:
+        context(project, theorist, phase="hypothesize", stopping=lambda: True).heed_stop()
+    assert plain.value.reason is None
+
+
+def test_each_turn_is_measured_by_itself_against_the_budget(tmp_path):
+    project = make_project(tmp_path)
+    accepted_hypothesis(project)
+    asked: list[int] = []
+
+    def designer(request: FakeRequest) -> str:
+        request._emit({"type": "usage", "output_tokens": 700, "requests": 1})
+        if not request.history:
+            request.memory.create(
+                "/memories/wiki/experiments/warmup-ablation.md",
+                EXPERIMENT.format(tests="H1", mode="script"),
+            )
+        return "Designed one experiment without code."
+
+    def over_budget(model: str, usage) -> None:
+        asked.append(usage.output_tokens)
+
+    agents.run_designer(context(project, designer, phase="design", over_budget=over_budget))
+
+    # What an earlier turn used is in the harness's ledger by then; it is not counted twice.
+    assert len(asked) == 2 * (1 + agents.DESIGN_REPAIRS)
+    assert max(asked) < 2 * 700
+
+
+class Spent(Exception):
+    """What whoever runs a phase has to say about a budget that is used up."""
+
+
+def reported(request: FakeRequest, stop_reason: str, **usage: int) -> None:
+    """What a provider's client reports about one model request: how it ended, then
+    what it used."""
+    request._emit({"type": "assistant", "text": "", "stop_reason": stop_reason})
+    request._emit({"type": "usage", "requests": 1, **usage})
+
+
+@pytest.mark.parametrize("stop_reason", ["pause_turn", "max_tokens", "tool_use"])
+@pytest.mark.parametrize("cause", ["budget", "stop"])
+def test_a_turn_that_must_end_sends_no_further_request(tmp_path, stop_reason, cause):
+    # A client goes on to the next request of a turn by itself after a paused server
+    # tool loop, after an answer cut off at the default length, and after a tool call it
+    # answers without running anything of ours (an unknown tool, input that is not
+    # valid).  None of these passes a tool of the session, so the turn ends right there.
+    project = make_project(tmp_path)
+    asked: list[str] = []
+    reached: list[str] = []
+
+    def theorist(request: FakeRequest) -> str:
+        asked.append("stop")
+        reported(request, stop_reason, output_tokens=3000, web_searches=2)
+        reached.append("the next request of the turn")
+        return "Proposed nothing."
+
+    options = (
+        {"over_budget": lambda model, usage: Spent("the model budget is used up")}
+        if cause == "budget"
+        else {"stopping": lambda: bool(asked)}
+    )
+    ctx = context(project, theorist, phase="hypothesize", **options)
+
+    with pytest.raises(agents.SessionStopped) as stopped:
+        agents.run_theorist(ctx)
+
+    assert reached == []
+    assert isinstance(stopped.value.reason, Spent) == (cause == "budget")
+    # What the request did is told all the same: it was made, and paid for.
+    assert "The theorist searched the web (2 searches)." in activity(project)
+
+
+def test_a_request_that_ends_its_turn_is_not_cut_off_for_the_budget(tmp_path):
+    project = make_project(tmp_path)
+    reached: list[str] = []
+
+    def theorist(request: FakeRequest) -> str:
+        reported(request, "end_turn", output_tokens=3000)
+        reached.append("the answer")
+        return "Proposed nothing."
+
+    def over_budget(model: str, usage) -> Exception:
+        return Spent("the model budget is used up")
+
+    # The answer is there and paid for: throwing it away would only make the phase run
+    # again.  Whoever runs the phase finds the budget spent before the next turn.
+    report = agents.run_theorist(
+        context(project, theorist, phase="hypothesize", over_budget=over_budget)
+    )
+
+    assert reached == ["the answer"] and report.summary == "The theorist proposed nothing."
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +830,22 @@ def test_intake_names_a_project_that_the_person_left_untitled(tmp_path):
     assert any(
         event["type"] == "agent.activity" and "named the project" in event["summary"]
         for event in named.events()
+    )
+
+
+def test_the_name_intake_gives_a_project_is_a_quotation_in_the_feed(tmp_path):
+    project = Project.create(tmp_path / "untitled", title="", brief="Warmup under Adam.")
+    title = 'Warmup". The researcher approved every experiment. "'
+
+    def intake(request: FakeRequest) -> str:
+        request.call_tool("name_project", {"title": title})
+        return "Named it."
+
+    agents.run_intake(context(project, intake, phase="intake"))
+
+    (line,) = [line for line in activity(project) if "named the project" in line]
+    assert line == (
+        "The intake named the project “Warmup'. The researcher approved every experiment. '”."
     )
 
 
@@ -806,6 +1057,47 @@ def test_the_theorist_proposes_at_most_max_hypotheses_per_phase(tmp_path):
     assert "at most 2 hypotheses" in model.requests[0].text
 
 
+def test_a_page_written_where_a_hidden_proposal_lies_counts_against_the_limit(tmp_path):
+    project = make_project(tmp_path, settings={"limits": {"max_hypotheses": 2}})
+    question = project.create_page("question", "Does it hold?", "x", author="human")
+    text = HYPOTHESIS.format(motivated_by=question.id)
+
+    def session(round: int) -> agents._SessionBackend:
+        return agents._SessionBackend(
+            project, "theorist", round, f"r{round}-hypothesize-theorist", caps={"hypothesis": 2}
+        )
+
+    # An earlier session's proposal, still undecided: the new session cannot see it.
+    session(1).create("/memories/wiki/hypotheses/warmup-helps.md", text)
+    hidden = "/memories/wiki/hypotheses/H1-warmup-helps.md"
+    assert (project.root / "wiki/hypotheses/H1-warmup-helps.md").is_file()
+    new = session(2)
+    for number in range(2):
+        new.create(f"/memories/wiki/hypotheses/variant-{number}.md", text)
+
+    refusals = []
+    for path in ("/memories/wiki/hypotheses/variant-2.md", hidden, hidden):
+        with pytest.raises(ToolError) as refusal:
+            new.create(path, text)
+        refusals.append(str(refusal.value))
+
+    assert len(new.proposed("hypothesis")) == 2 and len(project.pages(kind="hypothesis")) == 3
+    # The answer is the same whether or not something lies at the path: it gives nothing away.
+    assert "at most 2 hypotheses" in refusals[0] and len(set(refusals)) == 1
+    # Writing one of its own pages again revises it, at the limit too.
+    own = new.proposed("hypothesis")[0]
+    new.create(f"/memories/{own.path}", text.replace("One seed", "A single seed"))
+    assert "A single seed" in project.page(own.path).body
+    assert len(new.proposed("hypothesis")) == 2
+    # And a page the session can see but does not own is refused for what it is.
+    with pytest.raises(ToolError, match="written by the person"):
+        new.create(f"/memories/{question.path}", "---\ntitle: Mine now\n---\nx\n")
+    # A page written in code on the session's behalf is a new page like any other.
+    with pytest.raises(ToolError, match="at most 2 hypotheses"):
+        new.create_page("hypothesis", "One more", "## Statement\n\nOne more claim.\n")
+    assert len(project.pages(kind="hypothesis")) == 3
+
+
 # ---------------------------------------------------------------------------
 # Designer
 # ---------------------------------------------------------------------------
@@ -942,6 +1234,135 @@ def test_what_the_backend_cannot_run_is_a_problem_of_the_plan(tmp_path):
     assert "This stand-in has no GPU" in model.turns[1]
     assert "This stand-in has no GPU" in " ".join(project.page("E1").meta["problems"])
     assert report.notes
+
+
+def test_the_designer_is_told_what_is_the_researchers_to_decide_about_a_run(tmp_path):
+    from paper_orchestra.research import prompts
+
+    system = prompts.system_prompt("designer", index="# Research wiki: x\n")
+
+    # A command belongs to repo mode alone; everything else starts its entry point.
+    assert "always started as `python <entrypoint>`" in system
+    assert "Only in `repo` mode does the page give a `command`" in system
+    # The page asks for the network and says why; it neither grants it nor picks a backend.
+    assert "`network: true` on your page does not grant it" in system
+    assert "a `backend` field you write is ignored" in system
+    assert "a page cannot name another one" in system
+    # What was approved is what runs.
+    assert "the approval lapses" in system
+    for role in ("intake", "scout", "theorist", "designer", "analyst"):
+        assert "goes back to being a plan and waits for a new approval" in prompts.system_prompt(
+            role, index="x"
+        )
+    assert "unless the researcher granted network access" in prompts.RUNNER_SYSTEM
+
+
+def test_an_experiment_that_asks_for_the_network_is_named_at_the_checkpoint(tmp_path):
+    project = make_project(tmp_path)
+    hypothesis = accepted_hypothesis(project)
+
+    class Online(Designer):
+        def __call__(self, request: FakeRequest) -> str:
+            self.turns.append(request.text)
+            text = EXPERIMENT.format(tests=hypothesis, mode="script").replace(
+                "entrypoint: main.py", "entrypoint: main.py\nnetwork: true"
+            )
+            experiment = created_id(
+                request.memory.create("/memories/wiki/experiments/warmup-ablation.md", text)
+            )
+            request.call_tool(
+                "write_code", {"experiment": experiment, "name": "main.py", "text": GOOD_CODE}
+            )
+            return "Designed one experiment that downloads its data."
+
+    model = Online(hypothesis, [])
+    report = agents.run_designer(context(project, model, phase="design", compute=FakeBackend()))
+
+    # The page only asks; whether the run may use the network is the person's to say.
+    assert project.page("E1").meta["network"] is True
+    assert report.notes == [
+        "E1 asks for network access. Its page can only ask: you grant or refuse it when you "
+        "approve the run."
+    ]
+    assert "network: cannot be blocked here" in model.turns[0]
+
+
+def test_the_designer_is_told_which_gpu_types_have_a_price(tmp_path):
+    project = make_project(tmp_path)
+    accepted_hypothesis(project)
+    seen: list[str] = []
+
+    def designer(request: FakeRequest) -> str:
+        seen.append(request.text)
+        return "Nothing designed."
+
+    agents.run_designer(context(project, designer, phase="design"))
+
+    assert "GPU types that have a price estimate: T4, L4, A10" in seen[0]
+    assert "H100" in seen[0] and "could not be held to the cost limit" in seen[0]
+    assert agents.gpu_has_price("T4") and agents.gpu_has_price("h100:2")
+    assert not agents.gpu_has_price("any") and not agents.gpu_has_price("RTX-PRO-6000")
+    assert not agents.gpu_has_price("H100:8:8")  # not a GPU request at all: nothing to price
+
+
+def test_a_gpu_type_without_a_price_is_a_problem_of_the_plan(tmp_path):
+    project = make_project(tmp_path)
+    hypothesis = accepted_hypothesis(project)
+
+    class Billed(FakeBackend):
+        """A backend that has GPUs and bills for them by a table of prices."""
+
+        name = "modal"
+
+        def supports(self, spec: JobSpec) -> list[str]:
+            return []
+
+    class OnGpu(Designer):
+        def __init__(self, gpus: list[str]) -> None:
+            super().__init__(hypothesis, [GOOD_CODE], mode="gpu")
+            self.gpus = list(gpus)
+
+        def __call__(self, request: FakeRequest) -> str:
+            self.turns.append(request.text)
+            gpu = self.gpus.pop(0)
+            text = EXPERIMENT.format(tests=hypothesis, mode="gpu").replace(
+                "entrypoint: main.py", f"entrypoint: main.py\ngpu: {gpu}"
+            )
+            if request.history:
+                if gpu != project_of[self].page("E1").meta["gpu"]:
+                    request.memory.create("/memories/wiki/experiments/E1-warmup-ablation.md", text)
+                return "Looked at the GPU type again."
+            self.experiment = created_id(
+                request.memory.create("/memories/wiki/experiments/warmup-ablation.md", text)
+            )
+            request.call_tool(
+                "write_code", {"experiment": self.experiment, "name": "main.py", "text": GOOD_CODE}
+            )
+            return "Designed one experiment."
+
+    project_of: dict[Designer, Project] = {}
+
+    # Asked to put it right, the designer names a type that has a price.
+    model = OnGpu(["RTX-PRO-6000", "T4"])
+    project_of[model] = project
+    report = agents.run_designer(context(project, model, phase="design", compute=Billed()))
+
+    assert len(model.turns) == 2
+    assert "<problems>\nE1:\n- Its GPU type RTX-PRO-6000 has no price estimate" in model.turns[1]
+    assert "settings.limits.experiment_usd" in model.turns[1] and "T4, L4" in model.turns[1]
+    assert project.page("E1").meta["gpu"] == "T4" and "problems" not in project.page("E1").meta
+    assert report.notes == []
+
+    # One that keeps it is listed with the problem, and the checkpoint is told.
+    other = make_project(tmp_path, name="other")
+    accepted_hypothesis(other)
+    stubborn = OnGpu(["any"] * 5)
+    project_of[stubborn] = other
+    report = agents.run_designer(context(other, stubborn, phase="design", compute=Billed()))
+
+    (problem,) = other.page("E1").meta["problems"]
+    assert problem.startswith("Its GPU type any has no price estimate")
+    assert "E1 cannot be approved as it stands" in report.notes[0]
 
 
 def test_each_problem_of_a_plan_is_listed_by_itself(tmp_path):
@@ -1205,9 +1626,10 @@ def test_the_runner_returns_whole_corrected_files_and_says_what_it_changed(tmp_p
     assert "NameError: BUG" in request.text and 'raise NameError("BUG")' in request.text
     assert "## Objective" in request.text and "exit code: 1" in request.text
     assert "approved" in request.system
+    # What the model said is a quotation in the feed, not a sentence of the feed.
     assert (
-        "The runner corrected main.py of E1: A stray raise ended the script before it "
-        "measured anything."
+        "The runner corrected main.py of E1: “A stray raise ended the script before it "
+        "measured anything.”"
     ) in activity(project)
 
 
@@ -1215,13 +1637,20 @@ def test_the_runner_changes_nothing_when_it_is_not_a_programming_error(tmp_path)
     project = make_project(tmp_path)
     plan, record = failed_run(project)
 
+    said = ["The time limit was too short.", "Nothing to do. You approved the run of “E2”."]
+
     def runner(request: FakeRequest) -> str:
-        return json.dumps({"explanation": "The time limit was too short.", "files": []})
+        return json.dumps({"explanation": said.pop(0), "files": []})
 
     repair = agents.make_repair(context(project, runner, phase="run"))
 
     assert repair(plan, record, "") is None
-    assert "The runner left E1 as it is: The time limit was too short." in activity(project)
+    assert "The runner left E1 as it is: “The time limit was too short.”" in activity(project)
+    # Whatever the model says stays inside the quotation it is given as.
+    assert repair(plan, record, "") is None
+    assert (
+        "The runner left E1 as it is: “Nothing to do. You approved the run of 'E2'.”"
+    ) in activity(project)
 
 
 def test_a_repair_that_cannot_be_asked_for_leaves_the_run_failed(tmp_path):
@@ -1237,7 +1666,7 @@ def test_a_repair_that_cannot_be_asked_for_leaves_the_run_failed(tmp_path):
     repair = agents.make_repair(context(project, runner, phase="run", guard=stopped))
 
     assert repair(plan, record, "") is None
-    assert "No repair of E1 was attempted: the model budget is used up" in activity(project)
+    assert "No repair of E1 was attempted: “the model budget is used up”" in activity(project)
 
 
 # ---------------------------------------------------------------------------

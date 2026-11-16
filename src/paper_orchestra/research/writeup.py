@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import re
+import shlex
 import shutil
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from paper_orchestra.compute.base import ComputeError, safe_relative
 from paper_orchestra.pipeline import FIGURE_SUFFIXES, PaperResult, prepare_run_dir, run_paper
+from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import IDEA_PATH, ProjectError, ResearchPage, parse_id
 from paper_orchestra.utils.common import write_json, write_text
 
@@ -261,15 +263,38 @@ def _idea_text(project: Project, runs: list[_Run]) -> str:
     return "\n\n".join(part for part in parts if part) + "\n"
 
 
+def _setup_value(name: str, value: Any) -> str:
+    """One setting of a run as the materials state it."""
+    if name == "command" and isinstance(value, list):
+        return shlex.join(map(str, value))
+    if isinstance(value, list):
+        return ", ".join(map(str, value))
+    if name == "repo":
+        # Named, never with the password or token of its URL: the materials are read by
+        # models and travel with the paper.
+        return repositories.display_url(str(value))
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
 def _setup(run: _Run) -> str:
-    """How the run was made: the plan's settings and what the run record says of the run."""
-    plan, record = run.experiment.meta, run.record
+    """How the run was made: its settings and what the run record says of the run.
+
+    What the run's own record holds of its plan (the command, the time limit, the
+    packages, whether it could reach the network) is taken from there: the page of
+    an experiment can be edited after the run, the record of what ran cannot.
+    """
+    record = run.record
+    ran = record.get("plan") if isinstance(record.get("plan"), Mapping) else {}
+    plan = {**run.experiment.meta, **ran}
     facts = []
     for name in _SETUP_FIELDS:
         value = plan.get(name)
         if value:
-            shown = ", ".join(map(str, value)) if isinstance(value, list) else value
-            facts.append(f"- {name.replace('_', ' ')}: {shown}")
+            facts.append(f"- {name.replace('_', ' ')}: {_setup_value(name, value)}")
+    if "network" in ran:
+        facts.append(f"- network access: {'allowed' if ran['network'] else 'not allowed'}")
     for label, key in (
         ("backend", "backend"),
         ("finished", "finished"),

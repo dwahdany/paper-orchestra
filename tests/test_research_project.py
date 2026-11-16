@@ -936,18 +936,6 @@ def test_the_person_decides_on_the_version_they_read(project):
     )
 
 
-def test_accepting_and_approving_in_one_step(project):
-    experiment(project)
-    done = project.review("E1", "accept", edits={"fields": {"state": "approved"}})
-    assert (done.review, done.state) == ("accepted", "approved")
-    assert event_types(project)[-2:] == ["review.decided", "experiment.state"]
-    assert project.events()[-1]["summary"] == 'Experiment E1 "Sweep warmup length" is now approved.'
-    # However the person changes the state, the board hears of it.
-    project.update_page("E1", author="human", fields={"state": "planned"})
-    assert event_types(project)[-2:] == ["page.updated", "experiment.state"]
-    assert project.events()[-1]["data"]["previous"] == "approved"
-
-
 # -- edit proposals -------------------------------------------------------------
 
 
@@ -1959,3 +1947,147 @@ def test_a_writer_interrupted_while_waiting_for_the_lock_does_not_block_the_othe
     writer.join(10)
     assert done == [2] and not writer.is_alive()
     assert hypothesis(project).id == "H1"
+
+
+# -- an approval is made in one place (audit: containment 2, 3, 4; execution 1, 2) ------
+
+
+@pytest.mark.parametrize("state", ["approved", "queued", "running"])
+def test_editing_a_page_cannot_approve_an_experiment(project, state):
+    """``experiments.approve`` is the only way to ``approved``: it records what may run.
+    An edit of the page, by anyone, is told where the approval is made."""
+    experiment(project)
+    project.review("E1", "accept")
+    with pytest.raises(ProjectError, match=r"research approve.*Approve in the app"):
+        project.update_page("E1", author="human", fields={"state": state})
+    assert project.page("E1").state == "planned"
+    assert "experiment.state" not in event_types(project)
+
+
+def test_accepting_with_edits_cannot_approve_an_experiment(project):
+    experiment(project)
+    with pytest.raises(ProjectError, match="research approve"):
+        project.review("E1", "accept", edits={"fields": {"state": "approved"}})
+    page = project.page("E1")
+    assert (page.review, page.state) == ("proposed", "planned")
+
+
+def test_a_new_page_of_the_persons_does_not_start_approved(project):
+    with pytest.raises(ProjectError, match="research approve"):
+        experiment(project, author="human", fields={"state": "approved"})
+    assert project.pages(kind="experiment") == []
+    # Any other state of their own page is still theirs to give.
+    assert experiment(project, author="human", fields={"state": "cancelled"}).state == "cancelled"
+
+
+def test_the_person_still_takes_an_approval_back_by_editing(project):
+    experiment(project)
+    project.review("E1", "accept")
+    project.set_state("E1", "approved", by="human")
+    back = project.update_page("E1", author="human", fields={"state": "planned"})
+    assert back.state == "planned"
+    assert event_types(project)[-2:] == ["page.updated", "experiment.state"]
+    assert project.events()[-1]["data"]["previous"] == "approved"
+
+
+def test_an_edit_cannot_propose_the_record_of_an_approval(project):
+    exp = project.review(experiment(project).path, "accept")
+    for field in sorted(model.APPROVAL_FIELDS):
+        with pytest.raises(NotAllowed, match=f"'{field}'.*approv"):
+            project.propose_edit(
+                exp.path, author="agent:analyst", summary="Tidy", fields={field: "local"}
+            )
+    assert project.proposals() == []
+
+
+def test_a_proposal_file_cannot_carry_the_record_of_an_approval(project):
+    exp = project.review(experiment(project).path, "accept")
+    forged = EditProposal(
+        id="ep-0badc0de",
+        target=exp.path,
+        author="agent:analyst",
+        created="2026-11-15T12:00:00Z",
+        summary="Fix a typo",
+        fields={"backend": "local", "approved_digest": "0" * 64},
+        base_updated=exp.updated,
+    )
+    (project.root / "proposals" / "ep-0badc0de.json").write_text(json.dumps(forged.to_dict()))
+    with pytest.raises(NotAllowed, match="approv"):
+        project.review("ep-0badc0de", "accept")
+    assert "backend" not in project.page("E1").meta
+    assert "approved_digest" not in project.page("E1").meta
+
+
+def test_only_the_approval_writes_its_record(project):
+    experiment(project)
+    project.review("E1", "accept")
+    for field in ("approved_digest", "approved_at", "repaired_digest"):
+        with pytest.raises(ProjectError, match="approv"):
+            project.update_page("E1", author="human", fields={field: "x"})
+        with pytest.raises(ProjectError, match="approv"):
+            project.update_page("E1", author="system", fields={field: "x"})
+    before = len(project.events())
+    noted = project.record_approval(
+        "E1",
+        {"backend": "local", "approved_digest": "a" * 64, "approved_at": "2026-11-15T12:00:00Z"},
+        by="human",
+    )
+    assert noted.meta["approved_digest"] == "a" * 64 and noted.meta["backend"] == "local"
+    assert noted.state == "planned"  # recording is not approving: set_state does that
+    assert [event["type"] for event in project.events()[before:]] == ["page.updated"]
+    assert [version.author for version in project.history("E1")][:1] == ["human"]
+    # ``None`` removes a field, as everywhere.
+    cleared = project.record_approval("E1", {"approved_digest": None}, by="system")
+    assert "approved_digest" not in cleared.meta
+    with pytest.raises(NotAllowed):
+        project.record_approval("E1", {"approved_digest": "b" * 64}, by="agent:designer")
+    with pytest.raises(ProjectError, match="approved_digest"):
+        project.record_approval("E1", {"title": "Another plan"}, by="human")
+    hypothesis(project)
+    with pytest.raises(ProjectError, match="not an experiment"):
+        project.record_approval("H1", {"backend": "local"}, by="human")
+
+
+def test_several_steps_can_be_made_one_under_the_projects_lock(project):
+    """``locked()`` is the lock every change takes: held by one thread, no other writes."""
+    experiment(project)
+    finished = threading.Event()
+
+    def write() -> None:
+        project.update_page("E1", author="agent:designer", fields={"summary": "later"})
+        finished.set()
+
+    with project.locked():
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert not finished.wait(0.3)
+        # The holder goes on writing (the lock is reentrant).
+        project.update_page("E1", author="agent:designer", fields={"summary": "first"})
+    writer.join(10)
+    assert finished.is_set() and project.page("E1").summary == "later"
+
+
+def test_the_feed_says_how_a_run_was_approved(project):
+    experiment(project)
+    project.review("E1", "accept")
+    project.record_approval(
+        "E1",
+        {
+            "backend": "modal",
+            "gpu": "T4",
+            "timeout_seconds": 600,
+            "network": False,
+            "approved_digest": "a" * 64,
+            "approved_at": "2026-11-15T12:00:00Z",
+        },
+        by="human",
+    )
+    assert project.events()[-1]["summary"] == (
+        'You set how experiment E1 "Sweep warmup length" may run: on modal, with a T4 GPU, '
+        "for up to 600 s, without network access."
+    )
+    project.record_approval("E1", {"repaired_digest": "b" * 64}, by="system")
+    assert project.events()[-1]["summary"] == (
+        'The run of experiment E1 "Sweep warmup length" goes on with the code as the runner '
+        "repaired it."
+    )

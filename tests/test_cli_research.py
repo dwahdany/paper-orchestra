@@ -823,6 +823,67 @@ def test_review_decides_an_edit_proposal_by_its_id(project):
     assert f"Accepted {proposal.id}: Sharpen the claim" in result.stdout
 
 
+def test_review_shows_what_an_edit_changes_before_and_when_it_is_accepted(project):
+    """The agent's one-line summary is not what is decided: the fields and the text are."""
+    project.review("H1", "accept")
+    verdict = project.propose_edit(
+        "H1",
+        author="agent:analyst",
+        summary="Add the missing citation",
+        fields={"state": "supported", "summary": "Now with a citation"},
+    )
+    rewrite = project.propose_edit(
+        "wiki/idea.md",
+        author="agent:analyst",
+        summary="Fix spelling",
+        body="The agent's own idea, replacing the person's text.\n",
+    )
+
+    listing = invoke("review", str(project.root))
+
+    assert listing.exit_code == 0, listing.output
+    out = listing.stdout
+    assert "state: open -> supported" in out
+    assert "summary: (not set) -> Now with a citation" in out
+    assert "-With adaptive optimisers it is small batches that need warmup." in out
+    assert "+The agent's own idea, replacing the person's text." in out
+    assert project.page("H1").state == "open"  # listing decides nothing
+
+    accepted = invoke("review", str(project.root), "--accept", verdict.id, "--accept", rewrite.id)
+
+    assert accepted.exit_code == 0, accepted.output
+    out = accepted.stdout
+    assert f"Accepted {verdict.id}: Add the missing citation" in out
+    assert "state: open -> supported" in out
+    assert f"Accepted {rewrite.id}: Fix spelling" in out
+    assert "-With adaptive optimisers it is small batches that need warmup." in out
+    assert "+The agent's own idea, replacing the person's text." in out
+    assert project.page("H1").state == "supported"
+
+
+def test_accepting_an_edit_to_an_approved_experiment_says_that_it_needs_approval_again(project):
+    from paper_orchestra.research import experiments
+
+    experiments.write_code(project, "E1", {"main.py": CODE}, author="agent:designer")
+    project.review("E1", "accept")
+    assert invoke("approve", str(project.root), "E1", "--timeout", "60").exit_code == 0
+    edit = project.propose_edit(
+        "E1",
+        author="agent:analyst",
+        summary="Fix a typo in the method section",
+        fields={"network": True, "timeout_seconds": 600},
+    )
+
+    result = invoke("review", str(project.root), "--accept", edit.id)
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout)
+    assert "network: false -> true" in out and "timeout_seconds: 60 -> 600" in out
+    assert "E1 is no longer what you approved" in out
+    assert "network: false when approved, now true" in out
+    assert f"paper-orchestra research approve {project.root} E1" in out
+
+
 def test_accepting_an_experiment_says_that_its_run_still_needs_approval(project):
     result = invoke("review", str(project.root), "--accept", "E1")
 
@@ -908,28 +969,37 @@ def test_approve_leaves_unset_options_to_the_plan(project, monkeypatch):
     ]
 
 
-def test_a_plan_that_asks_for_the_network_is_approved_only_with_an_explicit_answer(
-    project, monkeypatch
-):
+CODE = "import json\n\njson.dump({'loss': 0.5}, open('metrics.json', 'w'))\n"
+
+
+def test_a_plan_that_asks_for_the_network_is_approved_only_with_an_explicit_answer(project):
     """An agent writes the plan.  Whether its run may reach the network is the person's
-    decision (spec 6.2), so the plan's own word is never what grants it."""
-    approvals = Approvals()
-    stand_in(monkeypatch, "paper_orchestra.research.experiments", approve=approvals)
+    decision (spec 6.2), so the plan's own word is never what grants it.  The rule is
+    the approval's own (``experiments.approve``), the same for the app: the command
+    line only hands on what the person said."""
+    from paper_orchestra.research import experiments
+
     project.update_page("E1", author="agent:designer", fields={"network": True})
+    experiments.write_code(project, "E1", {"main.py": CODE}, author="agent:designer")
+    project.review("E1", "accept")
 
     silent = invoke("approve", str(project.root), "E1")
 
-    assert silent.exit_code == 2
+    assert silent.exit_code == 1
     message = flat(silent.stderr)
     assert "The plan of E1 asks for network access" in message
     assert "--network" in message and "--no-network" in message
-    assert approvals.calls == [] and project.page("E1").state == "planned"
+    assert project.page("E1").state == "planned"
 
     without = invoke("approve", str(project.root), "E1", "--no-network")
+    assert without.exit_code == 0, without.output
+    assert project.page("E1").meta["network"] is False
+    assert "without network access" in flat(without.stdout)
+    experiments.request_cancel(project, "E1")
     granted = invoke("approve", str(project.root), "E1", "--network")
-
-    assert without.exit_code == granted.exit_code == 0, without.output + granted.output
-    assert [options["network"] for _, options in approvals.calls] == [False, True]
+    assert granted.exit_code == 0, granted.output
+    assert project.page("E1").meta["network"] is True
+    assert "and it may reach the network" in flat(granted.stdout)
 
 
 def test_approve_says_what_was_approved(project, monkeypatch):
@@ -964,9 +1034,61 @@ def test_approve_names_the_code_it_approved(project, monkeypatch):
 
     assert result.exit_code == 0, result.output
     out = flat(result.stdout)
-    digest = experiments.code_digest(project, "E1")[:12]
+    # The digest is the approval's: of this code and of how it was approved to run.
+    digest = project.page("E1").meta["approved_digest"]
+    assert digest == experiments.plan_digest(project, "E1")
     assert f"Its code, in {project.root / 'experiments' / 'E1' / 'code'}:" in out
-    assert f"lib/util.py (1 lines), main.py (3 lines); digest {digest}." in out
+    assert f"lib/util.py (1 lines), main.py (3 lines); approved digest {digest[:12]}." in out
+
+
+def test_approve_shows_what_will_run_and_what_the_code_check_warns_of(project):
+    """What is approved is said in full: where, how long, with what reach, the command,
+    the code, and what a reading of the code found worth knowing."""
+    from paper_orchestra.research import experiments
+
+    code = "import requests\n\nprint(requests.get('https://example.invalid').text)\n"
+    experiments.write_code(project, "E1", {"main.py": code}, author="agent:designer")
+    project.review("E1", "accept")
+
+    result = invoke("approve", str(project.root), "E1", "--timeout", "60")
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout)
+    assert "E1 is approved to run on local, for up to 60 s, without network access." in out
+    assert "It runs `python main.py`." in out
+    assert f"approved digest {project.page('E1').meta['approved_digest'][:12]}" in out
+    assert "Warning: main.py, line 1: it imports requests, which uses the network" in out
+    assert "Warning: no file of the code mentions metrics.json" in out
+
+
+def test_approve_names_the_repository_and_the_command_of_a_repo_experiment(project):
+    from paper_orchestra.research import experiments
+
+    token = "ghp_FAKETOKEN123"
+    project.settings.update(
+        {"repo": {"path": f"https://{token}@git.example.invalid/me/private.git", "ref": "main"}}
+    )
+    project.save_settings()
+    project.update_page(
+        "E1",
+        author="agent:designer",
+        fields={"mode": "repo", "command": "sh -c 'python train.py --lr 0.1'", "network": True},
+    )
+    project.review("E1", "accept")
+
+    result = invoke("approve", str(project.root), "E1", "--network")
+
+    assert result.exit_code == 0, result.output
+    out = flat(result.stdout + result.stderr)
+    assert token not in out
+    assert "E1 is approved to run on local" in out and "it may reach the network" in out
+    assert (
+        "It runs `sh -c 'python train.py --lr 0.1'` in a clone of "
+        "https://***@git.example.invalid/me/private.git at main." in out
+    )
+    assert f"approved digest {project.page('E1').meta['approved_digest'][:12]}" in out
+    assert "Warning: the run starts with" in out and "Read the command" in out
+    assert experiments.approval(project, "E1")["matches"] is True
 
 
 def test_approve_reports_a_refusal_and_exits_with_1(project, monkeypatch):

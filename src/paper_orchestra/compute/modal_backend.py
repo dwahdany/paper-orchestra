@@ -17,6 +17,14 @@ The Sandbox is terminated as soon as ``run_job`` or ``attach`` returns or
 raises; one whose orchestrator was killed ends by itself, at the latest
 ``idle_timeout`` seconds after its job has finished.
 
+A job is followed, fetched and billed by what this process knows about it: the
+``JobSpec`` and, next to the run, ``cost.json``.  That file holds the running
+estimate of what the Sandbox has cost from the moment it exists, and the final
+one once it has ended, so that a run whose result never reached its caller (it
+was interrupted, or its worker died) still has a cost.  Nothing that decides
+anything is read back from a file inside the Sandbox: the job could have
+rewritten it.
+
 ``latex="local"`` keeps the Sandbox for Python but compiles with the TeX Live
 install of the current machine.  ``paper_orchestra.modal_app`` offers that mode
 (``PAPER_ORCHESTRA_MODAL_LATEX=local``) for speed; by default it compiles in a
@@ -47,10 +55,12 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from paper_orchestra.compute.base import (
+    COST_NAME,
     HANDLE_NAME,
     LOG_NAME,
     BackendUnusable,
@@ -66,13 +76,17 @@ from paper_orchestra.compute.base import (
     choose_outputs,
     delivered_lines,
     human_size,
+    leftover_notes,
     open_run,
+    output_of,
+    read_record,
     refuse_unsafe_document,
     safe_relative,
     scan_outputs_script,
     spec_problems,
     supervise,
     walk_source,
+    write_record,
 )
 from paper_orchestra.compute.local import LocalBackend
 from paper_orchestra.utils.latex import latex_commands, summarize_build
@@ -190,6 +204,11 @@ _SCAN_ENTRIES = 5000
 _SCAN_CHARS = 150_000
 #: How often in a row following a job's log may fail without any progress.
 _FOLLOW_RETRIES = 3
+#: Seconds between two writes of the running estimate while a job is followed: how far
+#: behind the cost on file can be when the process that follows the job is killed.
+_COST_EVERY = 30.0
+#: What a job is asked to bring back when nobody says otherwise.
+_DEFAULT_OUTPUTS = JobSpec(command=["job"]).outputs
 
 # Runs the job, in its working directory.  The job's output goes to a file and its exit
 # status and times to another, so that neither depends on this process staying alive.
@@ -369,15 +388,19 @@ def pack_source(
     *,
     max_bytes: int,
     should_stop: Callable[[], bool] | None = None,
+    outputs: Sequence[str] = (),
 ) -> list[str]:
     """Write the tar a job sandbox is filled from and return notes on what was left out.
 
     The archive unpacks to ``src`` (what :func:`walk_source` takes from ``source``)
-    and an empty ``home``.  Raises :class:`ComputeError` when the files add up to
-    more than ``max_bytes``, and :class:`JobStopped` when ``should_stop`` turns true
-    on the way.
+    and an empty ``home``.  The paths in ``outputs`` are not packed: what the job is
+    asked to bring back has to be written by its command, not brought along (the
+    notes say when that removed something).  Raises :class:`ComputeError` when the
+    files add up to more than ``max_bytes``, and :class:`JobStopped` when
+    ``should_stop`` turns true on the way.
     """
     report = SourceReport()
+    leftovers: set[str] = set()
     total = 0
     with tarfile.open(archive, "w") as tar:
         for name in ("src", "home"):
@@ -386,6 +409,10 @@ def pack_source(
             directory.mode = 0o755
             tar.addfile(directory)
         for relative, path, kind in walk_source(source, report, should_stop):
+            output = output_of(relative, outputs)
+            if output is not None:
+                leftovers.add(output)
+                continue
             if kind == "file":
                 total += path.stat().st_size
                 if total > max_bytes:
@@ -396,7 +423,7 @@ def pack_source(
                         "let the job download its data."
                     )
             tar.add(path, arcname=f"src/{relative}", recursive=False, filter=_anonymous)
-    return report.notes()
+    return [*report.notes(), *leftover_notes(leftovers)]
 
 
 def unpack_outputs(archive: Path, chosen: Mapping[str, int], run_dir: Path) -> list[str]:
@@ -472,6 +499,14 @@ def _write_handle(run_dir: Path, handle: str) -> None:
     os.replace(temporary, run_dir / HANDLE_NAME)
 
 
+def _handle_on_record(run_dir: Path) -> str | None:
+    """The sandbox id this backend wrote next to the run when it started its job."""
+    try:
+        return (run_dir / HANDLE_NAME).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def _seconds(value: float) -> int:
     # Modal timeouts are uint32 protobuf fields: a float raises TypeError.
     return max(1, math.ceil(value))
@@ -481,6 +516,60 @@ def _ran(job: _Job, since: float) -> float:
     """Seconds a job has run that was stopped from here, and so left no record of its
     own: the time since ``since`` (a ``time.time()``), and no more than its limit allows."""
     return min(max(0.0, time.time() - since), float(job.timeout + _KILL_GRACE))
+
+
+def _epoch(moment: object) -> float | None:
+    """``moment`` as seconds since the epoch: a number is taken as that, a ``datetime``
+    or an ISO 8601 stamp (``2026-11-16T02:25:00Z``) is converted, one without a time
+    zone being read as UTC.  ``None`` for anything else."""
+    if isinstance(moment, bool):
+        return None
+    if isinstance(moment, int | float):
+        return float(moment) if 0 < moment < math.inf else None
+    if isinstance(moment, str):
+        try:
+            moment = datetime.fromisoformat(moment.strip())
+        except ValueError:
+            return None
+    if not isinstance(moment, datetime):
+        return None
+    return (moment if moment.tzinfo else moment.replace(tzinfo=UTC)).timestamp()
+
+
+def _number(value: object, *, least: float = 0.0) -> bool:
+    return (
+        isinstance(value, int | float) and not isinstance(value, bool) and least < value < math.inf
+    )
+
+
+def _kept_job(run_dir: Path) -> _Job | None:
+    """The job as this backend wrote it down next to the run when it started it (in
+    ``cost.json``); ``None`` when there is no such record or it is not whole.
+
+    The run directory is this side's: a job in a sandbox can put nothing there but
+    its outputs, and none of those may be called ``cost.json``.
+    """
+    kept = (read_record(run_dir / COST_NAME) or {}).get("job")
+    if not isinstance(kept, dict):
+        return None
+    gpu = kept.get("gpu")
+    whole = (
+        _number(kept.get("created"))
+        and _number(kept.get("timeout"))
+        and _number(kept.get("cpu"))
+        and _number(kept.get("memory_mb"))
+        and (gpu is None or isinstance(gpu, str))
+    )
+    if not whole:
+        return None
+    return _Job(
+        timeout=_seconds(kept["timeout"]),
+        outputs=_DEFAULT_OUTPUTS,
+        gpu=gpu,
+        cpu=float(kept["cpu"]),
+        memory_mb=int(kept["memory_mb"]),
+        created=float(kept["created"]),
+    )
 
 
 def _read_tail(stream: Iterable[bytes]) -> bytes:
@@ -509,6 +598,14 @@ class _SandboxLost(Exception):
     """The sandbox stopped (lifetime, idle timeout, termination) while a job was using it."""
 
 
+class _JobGone(ComputeError):
+    """The sandbox of a job that was to be picked up has ended; when is not known."""
+
+
+class _NotAJob(ComputeError):
+    """The sandbox that was to be picked up holds no job of this backend."""
+
+
 @dataclass
 class _Completed:
     returncode: int
@@ -519,7 +616,13 @@ class _Completed:
 
 @dataclass
 class _Job:
-    """What ``attach`` has to know about a job, kept in its sandbox as ``job.json``."""
+    """What the backend goes by when it follows, fetches and bills a job.
+
+    Always put together on this side: from the ``JobSpec``, or from what this backend
+    wrote next to the run.  A copy lies in the sandbox as ``job.json``; it marks the
+    sandbox as holding a job and is never read back, because the job could have
+    rewritten it.
+    """
 
     #: Time limit of the command in whole seconds.
     timeout: int
@@ -527,43 +630,23 @@ class _Job:
     gpu: str | None
     cpu: float
     memory_mb: int
-    #: ``time.time()`` when the sandbox was created, for the cost estimate.
-    created: float
+    #: ``time.time()`` from which the sandbox is billed; ``None`` when that, or what
+    #: the sandbox was made of, is not known, and so there is no estimate.
+    created: float | None = None
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self)).encode("utf-8")
 
-    @classmethod
-    def from_json(cls, data: bytes) -> _Job:
-        """Parse a record read back from a sandbox.  Untrusted code ran next to it, so
-        anything but a well-formed record raises ``ValueError``."""
-        try:
-            fields = json.loads(data)
-            job = cls(
-                timeout=int(fields["timeout"]),
-                outputs=tuple(fields["outputs"]),
-                gpu=fields["gpu"],
-                cpu=float(fields["cpu"]),
-                memory_mb=int(fields["memory_mb"]),
-                created=float(fields["created"]),
-            )
-        except (TypeError, KeyError, UnicodeDecodeError) as exc:
-            raise ValueError(f"not a job record: {exc}") from exc
-        problems = spec_problems(
-            JobSpec(
-                command=["job"],
-                timeout=job.timeout,
-                outputs=job.outputs,
-                gpu=job.gpu,
-                cpu=job.cpu,
-                memory_mb=job.memory_mb,
-            )
-        )
-        if problems:
-            raise ValueError(f"not a job record: {problems[0]}")
-        if not 0 < job.created <= time.time() + 300:
-            raise ValueError("not a job record: it was not created in the past")
-        return job
+    def billed(self) -> float:
+        """Seconds the sandbox is billed for so far.  None is billed for longer than it
+        can live, whatever the clocks say, and none for less than nothing."""
+        if self.created is None:
+            return 0.0
+        return min(max(0.0, time.time() - self.created), self.longest())
+
+    def longest(self) -> float:
+        """Seconds the sandbox of the job can live at most."""
+        return float(self.timeout + _JOB_MARGIN)
 
 
 @dataclass
@@ -843,12 +926,13 @@ class ModalBackend(ComputeBackend):
         run_dir: Path,
         on_log: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
     ) -> JobResult:
         source, run_dir = Path(source_dir), Path(run_dir)
         log_path = open_run(run_dir, spec.outputs)
         result = JobResult(returncode=None, backend=self.name, log_path=log_path)
         result.outputs_dir = run_dir
-        with JobLog(log_path, on_log) as job_log:
+        with JobLog(log_path, on_log, mask=mask) as job_log:
             reasons = self.supports(spec)
             if not reasons and not source.is_dir():
                 reasons = [f"The source directory {source} does not exist."]
@@ -874,18 +958,31 @@ class ModalBackend(ComputeBackend):
         handle: str,
         *,
         run_dir: Path,
+        spec: JobSpec | None = None,
+        started: str | float | None = None,
         on_log: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
     ) -> JobResult:
         """Pick up the job in sandbox ``handle`` whose orchestrator died, and finish it
         the way ``run_job`` would have: follow it to its end, fetch its outputs into
         ``run_dir``, terminate the sandbox.
 
+        The job is what this side says it is.  ``spec`` gives its outputs, its time
+        limit and its resources, and ``started`` the moment from which it is billed.
+        Without them the backend goes by what it wrote next to the run when it started
+        the job (``cost.json``), and by the default outputs; a job of which neither is
+        known is followed and ended, and has no cost estimate.  Nothing is taken from
+        the sandbox's own record of the job.
+
         The log in ``run_dir`` is rebuilt from the start of the job, and ``on_log``
         receives only the lines the log there had not delivered yet.  If the sandbox
         is gone (it ends ``idle_timeout`` seconds after a job nobody is attached to)
-        the result has ``error`` set and the log is left as it was.  A sandbox that
-        holds no job of this backend is left alone.
+        the result has ``error`` set, the log is left as it was, and the run is
+        charged for the time since it started, at most for as long as its sandbox
+        could live; the notes say so.  A sandbox that cannot be reached is charged
+        for all of that time, since it may still run.  A sandbox that holds no job
+        of this backend is left alone.
         """
         run_dir = Path(run_dir)
         log_path = run_dir / LOG_NAME
@@ -897,22 +994,30 @@ class ModalBackend(ComputeBackend):
             raise ComputeError(
                 f"The run directory {run_dir} cannot be used: {exc}. Check that it can be written."
             ) from exc
+        # A job that this backend would not have started is not picked up as one either.
+        problems = self.supports(spec) if spec is not None else []
+        job = self._job_on_record(run_dir, None if problems else spec, started)
         try:
-            sandbox, job = self._find_job(handle)
+            if problems:
+                raise _NotAJob("the job that was to be picked up is not one: " + problems[0])
+            sandbox = self._find_job(handle, known=_handle_on_record(run_dir) == handle)
         except BackendUnusable:
             raise
         except (ComputeError, *self._transport_errors) as exc:
             result.error = f"The Modal backend could not pick the job up again: {self._reason(exc)}"
-            with JobLog(log_path, on_log, append=True) as job_log:
+            with JobLog(log_path, on_log, append=True, mask=mask) as job_log:
                 job_log.note(result.error)
+                self._charge_lost(run_dir, job, exc, result, job_log)
             return result
-        with JobLog(log_path, on_log, skip_lines=delivered_lines(log_path)) as job_log:
+        skip = delivered_lines(log_path)
+        with JobLog(log_path, on_log, skip_lines=skip, mask=mask) as job_log:
             try:
                 with tempfile.TemporaryDirectory(prefix="paper-orchestra-job-") as scratch:
                     self._adopt(sandbox)
                     try:
-                        # When the command was started is not known here; the sandbox
-                        # was made shortly before it.
+                        # When the command was started is not known here; the run began
+                        # shortly before it.
+                        since = time.time() if job.created is None else job.created
                         self._finish(
                             sandbox,
                             job,
@@ -921,15 +1026,122 @@ class ModalBackend(ComputeBackend):
                             job_log,
                             should_stop,
                             result,
-                            since=job.created,
+                            since=since,
                         )
                     finally:
-                        self._settle(sandbox, job, result)
+                        self._settle(sandbox, job, result, run_dir)
             except (ComputeError, _SandboxLost, OSError, *self._transport_errors) as exc:
                 result.error = f"The Modal backend could not finish the job: {self._reason(exc)}"
                 job_log.note(result.error)
             result.notes.extend(job_log.notes())
         return result
+
+    def _job_of(self, spec: JobSpec, created: float | None) -> _Job:
+        return _Job(
+            timeout=_seconds(spec.timeout),
+            outputs=tuple(spec.outputs),
+            gpu=spec.gpu,
+            cpu=spec.cpu or self.cpu,
+            memory_mb=spec.memory_mb or self.memory_mb,
+            created=created,
+        )
+
+    def _job_on_record(self, run_dir: Path, spec: JobSpec | None, started: object) -> _Job:
+        """The job that is picked up, from what this side knows about it (see ``attach``)."""
+        kept = _kept_job(run_dir)
+        began = _epoch(started)
+        if began is None and kept is not None:
+            began = kept.created
+        if spec is not None:
+            return self._job_of(spec, began)
+        if kept is not None:
+            kept.created = began
+            return kept
+        # Nothing is known of it: it can be followed and ended, not priced.
+        return _Job(
+            timeout=_MAX_LIFETIME - _JOB_MARGIN,
+            outputs=_DEFAULT_OUTPUTS,
+            gpu=None,
+            cpu=self.cpu,
+            memory_mb=self.memory_mb,
+        )
+
+    def _record_cost(
+        self, run_dir: Path, job: _Job, *, final: bool, seconds: float | None = None
+    ) -> float | None:
+        """Estimate what the job's sandbox has cost, write it next to the run (see
+        ``COST_NAME``) and return it.  ``seconds`` is the time to charge when that is
+        not simply the time since the sandbox was made."""
+        record: dict[str, Any] = {"cost_usd": None, "seconds": 0.0, "final": final}
+        if job.created is not None:
+            seconds = job.billed() if seconds is None else seconds
+            record["cost_usd"] = estimate_cost(
+                seconds, gpu=job.gpu, cpu=job.cpu, memory_mb=job.memory_mb
+            )
+            record["seconds"] = round(seconds, 3)
+            # What the estimate is of.  A later process that picks the job up without
+            # being told goes by this, never by what the sandbox says of itself.
+            record["job"] = {
+                "created": job.created,
+                "timeout": job.timeout,
+                "gpu": job.gpu,
+                "cpu": job.cpu,
+                "memory_mb": job.memory_mb,
+            }
+        try:
+            write_record(run_dir / COST_NAME, record)
+        except OSError as exc:
+            log.warning("Could not write the cost of the job to %s: %s", run_dir / COST_NAME, exc)
+        return record["cost_usd"]
+
+    def _charge_lost(
+        self, run_dir: Path, job: _Job, exc: BaseException, result: JobResult, job_log: JobLog
+    ) -> None:
+        """Put a cost on a job that could not be picked up again.
+
+        Its sandbox was billed whether or not anybody watched.  If the process that
+        ran it wrote the final cost down, that stands.  Otherwise the sandbox is
+        charged from the start of the run until now when it is known to be gone, and
+        for as long as it can live when it could not be reached and may still run.
+        """
+        if isinstance(exc, _NotAJob):
+            return
+        kept = read_record(run_dir / COST_NAME) or {}
+        if kept.get("final") is True:
+            cost = kept.get("cost_usd")
+            result.cost_usd = float(cost) if _number(cost, least=-1.0) else None
+            return
+        if job.created is None:
+            return
+        gone = isinstance(exc, _JobGone)
+        seconds = job.billed() if gone else job.longest()
+        result.cost_usd = self._record_cost(run_dir, job, final=True, seconds=seconds)
+        note = (
+            "When the sandbox ended is not known, so the run is charged for the time since "
+            f"it started ({seconds:.0f} s; its sandbox could live for {job.longest():.0f} s)."
+            if gone
+            else "Whether the sandbox still runs is not known, so the run is charged for as "
+            f"long as its sandbox can live ({seconds:.0f} s)."
+        )
+        job_log.note(note)
+        result.notes.append(note)
+
+    def _metered(
+        self, should_stop: Callable[[], bool] | None, run_dir: Path, job: _Job
+    ) -> Callable[[], bool]:
+        """``should_stop`` for the following of a job, which is asked all the time: it
+        also keeps the estimate on file up to date, so that little of the cost is
+        missing if this process is killed."""
+        next_write = time.monotonic() + _COST_EVERY
+
+        def ask() -> bool:
+            nonlocal next_write
+            if time.monotonic() >= next_write:
+                next_write = time.monotonic() + _COST_EVERY
+                self._record_cost(run_dir, job, final=False)
+            return should_stop is not None and should_stop()
+
+        return ask
 
     def _run_job(
         self,
@@ -944,7 +1156,11 @@ class ModalBackend(ComputeBackend):
         archive = scratch / "source.tar"
         try:
             notes = pack_source(
-                source, archive, max_bytes=_MAX_UPLOAD_BYTES, should_stop=should_stop
+                source,
+                archive,
+                max_bytes=_MAX_UPLOAD_BYTES,
+                should_stop=should_stop,
+                outputs=spec.outputs,
             )
         except JobStopped:
             result.cancelled = True
@@ -957,14 +1173,7 @@ class ModalBackend(ComputeBackend):
             "Starting a Modal sandbox. The first job with a new set of packages builds an "
             "image, which can take several minutes."
         )
-        job = _Job(
-            timeout=_seconds(spec.timeout),
-            outputs=tuple(spec.outputs),
-            gpu=spec.gpu,
-            cpu=spec.cpu or self.cpu,
-            memory_mb=spec.memory_mb or self.memory_mb,
-            created=0.0,
-        )
+        job = self._job_of(spec, created=None)
         try:
             sandbox = self._await(
                 lambda: self._create_job(spec, job), should_stop, undo=self._terminate
@@ -980,6 +1189,8 @@ class ModalBackend(ComputeBackend):
             # First of all: from here on an orchestrator that dies leaves a job behind,
             # and this file is how the next one finds it.
             _write_handle(run_dir, result.handle)
+            # The sandbox costs money from now on, whatever becomes of this process.
+            self._record_cost(run_dir, job, final=False)
             self._await(lambda: self._launch(sandbox, spec, job, archive), should_stop)
             self._finish(
                 sandbox, job, run_dir, scratch, job_log, should_stop, result, since=time.time()
@@ -988,7 +1199,7 @@ class ModalBackend(ComputeBackend):
             result.cancelled = True
             job_log.note("The job was stopped on request, before it had started.")
         finally:
-            self._settle(sandbox, job, result)
+            self._settle(sandbox, job, result, run_dir)
 
     def _await(
         self,
@@ -1110,7 +1321,7 @@ class ModalBackend(ComputeBackend):
                 self._follow(sandbox, seen, job.timeout),
                 job_log,
                 timeout=max(0.0, deadline - time.monotonic()),
-                should_stop=should_stop,
+                should_stop=self._metered(should_stop, run_dir, job),
                 interrupt=lambda: self._release(sandbox),
                 grace=0,
             )
@@ -1267,31 +1478,38 @@ class ModalBackend(ComputeBackend):
         sandbox.filesystem.copy_to_local(remote, archive)
         return [*notes, *unpack_outputs(archive, dict(chosen), run_dir)]
 
-    def _find_job(self, handle: str) -> tuple[Any, _Job]:
-        """The running sandbox ``handle`` and the job in it; :class:`ComputeError` if
-        there is nothing to pick up."""
+    def _find_job(self, handle: str, *, known: bool = False) -> Any:
+        """The running sandbox ``handle``, which holds a job; :class:`ComputeError` if
+        there is nothing to pick up.
+
+        ``known`` says that this side has it on record as the sandbox of the run.  Any
+        other sandbox has to carry the mark of a job, so that one which does something
+        else (it runs figure code) is not taken for one and ended.
+        """
         modal = self._modal
         try:
             sandbox = modal.Sandbox.from_id(handle)
         except modal.exception.AuthError as exc:
             raise self._unauthenticated() from exc
         except modal.exception.NotFoundError as exc:
-            raise ComputeError(
+            raise _JobGone(
                 f"Modal has no sandbox {handle}, so the job and its outputs cannot be "
                 "recovered. Run the experiment again."
             ) from exc
         try:
             code = sandbox.poll()
             if code is not None:
-                raise ComputeError(
+                raise _JobGone(
                     f"the sandbox {handle} is no longer running (it ended with code {code}), "
                     "so the job's outputs cannot be recovered. Run the experiment again."
                 )
             try:
-                record = sandbox.filesystem.read_bytes(f"{_JOB_DIR}/{_JOB_RECORD}")
-                job = _Job.from_json(record)
-            except (modal.exception.SandboxFilesystemNotFoundError, ValueError) as exc:
-                raise ComputeError(
+                # Only that it is there counts, and only for a sandbox this side does
+                # not know: the file is the job's to rewrite, and to remove.
+                if not known:
+                    sandbox.filesystem.stat(f"{_JOB_DIR}/{_JOB_RECORD}")
+            except modal.exception.SandboxFilesystemNotFoundError as exc:
+                raise _NotAJob(
                     f"the sandbox {handle} does not hold a job of this backend."
                 ) from exc
             try:
@@ -1300,11 +1518,11 @@ class ModalBackend(ComputeBackend):
                 # Ours, and of no use: waiting for a job that never began would only
                 # keep the sandbox, and the bill, running.
                 self._terminate(sandbox)
-                raise ComputeError(
+                raise _JobGone(
                     f"the job in sandbox {handle} had not been started when its orchestrator "
                     "died. The sandbox was stopped; run the experiment again."
                 ) from exc
-            return sandbox, job
+            return sandbox
         except BaseException:
             # Not ours to end: only the connection to it is given up.
             with contextlib.suppress(*self._transport_errors):
@@ -1324,12 +1542,11 @@ class ModalBackend(ComputeBackend):
             self._jobs.remove(sandbox)
         self._terminate(sandbox)
 
-    def _settle(self, sandbox: Any, job: _Job, result: JobResult) -> None:
-        """The end of every job, however it went: no sandbox left, and the bill estimated."""
+    def _settle(self, sandbox: Any, job: _Job, result: JobResult, run_dir: Path) -> None:
+        """The end of every job, however it went: no sandbox left, and the bill estimated
+        and on file, where it is found even if the result never reaches the caller."""
         self._release(sandbox)
-        # No sandbox is billed for longer than it can live, whatever the clocks say.
-        billed = min(time.time() - job.created, job.timeout + _JOB_MARGIN)
-        result.cost_usd = estimate_cost(billed, gpu=job.gpu, cpu=job.cpu, memory_mb=job.memory_mb)
+        result.cost_usd = self._record_cost(run_dir, job, final=True)
 
     def _reason(self, exc: BaseException) -> str:
         if isinstance(exc, ComputeError | _SandboxLost):

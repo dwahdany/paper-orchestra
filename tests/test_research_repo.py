@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -264,6 +265,205 @@ def test_a_copy_at_a_ref_that_is_refused_or_stopped_ends_at_once(repository, tmp
     assert isinstance(stopped, JobStopped)
 
 
+def hostile(repository: Path, pwned: Path, **more: str) -> None:
+    """Give ``repository`` a git configuration that starts a program wherever git lets a
+    configuration start one, each of which leaves its environment in ``pwned``."""
+    pwned.mkdir()
+
+    def program(name: str) -> str:
+        return f"sh -c 'env > {pwned}/{name}; cat'"
+
+    (repository / ".gitattributes").write_text("* filter=evil diff=evil\nlib/* filter=other\n")
+    git(repository, "add", "-A")
+    git(repository, "commit", "-q", "-m", "attributes")
+    settings = {
+        "core.fsmonitor": f"sh -c 'env > {pwned}/fsmonitor; echo; false'",
+        "filter.evil.clean": program("filter-clean"),
+        "filter.evil.smudge": program("filter-smudge"),
+        "filter.evil.required": "true",
+        "filter.other.process": program("filter-process"),
+        "diff.evil.textconv": program("textconv"),
+        "diff.external": program("diff-external"),
+        "core.pager": program("pager"),
+        "core.sshCommand": program("ssh"),
+        **more,
+    }
+    for key, value in settings.items():
+        git(repository, "config", key, value)
+    hooks = repository / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    for name in ("post-checkout", "post-index-change", "reference-transaction", "pre-commit"):
+        (hooks / name).write_text(f"#!/bin/sh\nenv > '{pwned}/hook-{name}'\n")
+        (hooks / name).chmod(0o755)
+    # The time stamp differs from the index: to tell whether the file changed, git has
+    # to look at its content, which is what the filters are for.
+    os.utime(repository / "train.py", (1_600_000_000, 1_600_000_000))
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the programs are shell commands")
+def test_reading_a_repository_starts_no_program_its_configuration_names(
+    repository, tmp_path, monkeypatch
+):
+    """The directory may have come from anywhere, and the worker holds the model's key."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-NOT-A-KEY-000")
+    pwned = tmp_path / "pwned"
+    hostile(repository, pwned)
+    committed = git(repository, "rev-parse", "HEAD").strip()
+    before = snapshot(repository)
+
+    made = repo.copy_local(repository, tmp_path / "as-git-sees-it")
+    assert sorted(os.listdir(pwned)) == []
+    # Touched, not changed: git compared the content as it is, without the filter.
+    assert made.method == "git" and made.commit == committed and made.dirty is False
+    assert (tmp_path / "as-git-sees-it" / "train.py").read_text() == TRAIN
+
+    at_ref = repo.copy_local(repository, tmp_path / "at-the-ref", ref="main")
+    assert sorted(os.listdir(pwned)) == []
+    assert at_ref.method == "archive" and at_ref.commit == committed
+    assert (tmp_path / "at-the-ref" / "train.py").read_text() == TRAIN
+    assert (tmp_path / "at-the-ref" / "lib" / "util.py").read_text() == UTIL
+
+    repo.apply_patch(tmp_path / "at-the-ref", PATCH, use_git=True)
+    assert sorted(os.listdir(pwned)) == []
+    assert snapshot(repository) == before
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the programs are shell commands")
+def test_whether_the_tree_is_dirty_is_told_without_running_filters(tree, tmp_path):
+    git(tree, "init", "-q", "-b", "main")
+    git(tree, "add", ".")
+    git(tree, "commit", "-q", "-m", "first")
+    pwned = tmp_path / "pwned"
+    hostile(tree, pwned)
+
+    # Touched, not changed: the content is compared as it is, and it is the same.
+    assert repo.copy_local(tree, tmp_path / "clean").dirty is False
+    (tree / "train.py").write_text(TRAIN + "# changed\n")
+    assert repo.copy_local(tree, tmp_path / "changed").dirty is True
+    assert os.listdir(pwned) == []
+    git(tree, "commit", "-q", "-a", "-m", "second", "--no-verify")
+    for name in os.listdir(pwned):  # what the commit itself started, here in the test
+        (pwned / name).unlink()
+    (tree / "notes.txt").write_text("not committed\n")
+    assert repo.copy_local(tree, tmp_path / "untracked").dirty is True
+    assert os.listdir(pwned) == []
+
+    # A filter that cannot be switched off is not run either: the flag stays unknown, and
+    # a copy at a ref, which git would write through the filter, is refused.
+    (tree / ".gitattributes").write_text("* filter=a=b\n")
+    git(tree, "config", "filter.a=b.clean", f"sh -c 'env > {pwned}/odd-clean; cat'")
+    git(tree, "config", "filter.a=b.smudge", f"sh -c 'env > {pwned}/odd-smudge; cat'")
+    os.utime(tree / "train.py", (1_500_000_000, 1_500_000_000))
+    made = repo.copy_local(tree, tmp_path / "odd")
+    assert made.dirty is None and made.method == "git"
+    assert (tmp_path / "odd" / "train.py").exists()
+    with pytest.raises(repo.RepoError, match="cannot be switched off") as refused:
+        repo.copy_local(tree, tmp_path / "odd-ref", ref="main")
+    assert "Remove the ref" in str(refused.value)
+    assert os.listdir(pwned) == []
+
+
+def partial_clone(tmp_path: Path, repository: Path) -> Path:
+    """A clone of ``repository`` that holds the files of its newest commit only and names
+    the remote git may fetch the others from when it needs them (a "blobless" clone)."""
+    git(repository, "branch", "before")
+    (repository / "train.py").write_text(TRAIN + "# second version\n")
+    git(repository, "commit", "-q", "-a", "-m", "second")
+    git(repository, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "partial"
+    git(tmp_path, "clone", "-q", "--filter=blob:none", f"file://{repository}", str(clone))
+    missing = git(clone, "rev-list", "--objects", "--missing=print", "origin/before")
+    assert "?" in missing, "the clone holds every file, so nothing would be fetched"
+    return clone
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the programs are shell commands")
+@pytest.mark.parametrize("transport", ["uploadpack", "ext", "ssh"])
+def test_a_copy_never_fetches_what_a_partial_clone_lacks(repository, tmp_path, transport):
+    """Where a repository says git may fetch missing files from, git does so by itself
+    when a command needs one, with the program its configuration names for the way
+    there.  A copy runs none of them and contacts nobody: it takes what is on the disk."""
+    clone = partial_clone(tmp_path, repository)
+    pwned = tmp_path / "pwned"
+    pwned.mkdir()
+    if transport == "uploadpack":
+        git(clone, "config", "remote.origin.uploadpack", f"touch {pwned}/ran; git-upload-pack")
+    elif transport == "ext":
+        git(clone, "config", "remote.origin.url", f"ext::sh -c touch% {pwned}/ran")
+        git(clone, "config", "protocol.ext.allow", "always")
+    else:
+        git(clone, "config", "remote.origin.url", "ssh://git.example.invalid/x.git")
+        git(clone, "config", "core.sshCommand", f"touch {pwned}/ran; false")
+    before = snapshot(clone)
+
+    # The newest commit is all there: it is copied, at the ref and as the tree stands.
+    made = repo.copy_local(clone, tmp_path / "newest", ref="main")
+    assert made.method == "archive"
+    assert (tmp_path / "newest" / "train.py").read_text() == TRAIN + "# second version\n"
+    assert repo.copy_local(clone, tmp_path / "as-it-stands").dirty is False
+
+    # The older one is not, and is not fetched: the copy is refused with the way out.
+    with pytest.raises(repo.RepoError) as refused:
+        repo.copy_local(clone, tmp_path / "older", ref="origin/before")
+    assert "partial clone" in str(refused.value) and "nothing is fetched" in str(refused.value)
+    assert os.listdir(pwned) == []
+    assert snapshot(clone) == before
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for git is a shell script")
+def test_a_git_that_hangs_while_exporting_a_ref_is_stopped(repository, tmp_path, monkeypatch):
+    """Nothing is read from it, so nothing came by that asked whether to go on."""
+    (tmp_path / "bin").mkdir()
+    slow = tmp_path / "bin" / "git"
+    slow.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = archive ]; then echo $$ > "$SLOW_GIT_PID"; exec sleep 20; fi\n'
+        "done\n"
+        f'exec {shutil.which("git")} "$@"\n'
+    )
+    slow.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("SLOW_GIT_PID", str(tmp_path / "pid"))
+    monkeypatch.setattr(repo, "_GIT_ENV", (*repo._GIT_ENV, "SLOW_GIT_PID"), raising=False)
+    monkeypatch.setattr(repo, "CHECK_SECONDS", 0.0)
+
+    def gone() -> bool:
+        pid = int((tmp_path / "pid").read_text())
+        (tmp_path / "pid").unlink()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    asked: list[int] = []
+
+    def should_stop() -> bool:
+        asked.append(1)
+        return len(asked) > 5
+
+    started = time.monotonic()
+    stopped = outcome_of(
+        lambda: repo.copy_local(repository, tmp_path / "a", ref="main", should_stop=should_stop),
+        seconds=8,
+    )
+    assert isinstance(stopped, JobStopped), stopped
+    assert time.monotonic() - started < 6 and gone()
+
+    monkeypatch.setattr(repo, "ARCHIVE_SECONDS", 0.5, raising=False)
+    late = outcome_of(lambda: repo.copy_local(repository, tmp_path / "b", ref="main"), seconds=8)
+    assert isinstance(late, repo.RepoError) and "took longer than 0.5 s" in str(late)
+    assert gone()
+
+
 @pytest.mark.parametrize("use_git", [pytest.param(True, marks=needs_git), False])
 def test_a_file_that_cannot_be_copied_is_an_error_a_person_can_act_on(
     tree, tmp_path, monkeypatch, use_git
@@ -393,6 +593,42 @@ def test_a_patch_may_not_reach_outside_the_copy(tree, tmp_path, path):
     assert not (tree / ".git").exists()
 
 
+@pytest.mark.parametrize(
+    "path", ["metrics.json", "./metrics.json", "artifacts/table.csv", "artifacts/deep/fig.png"]
+)
+def test_a_patch_may_not_put_results_where_the_run_writes_them(tree, path):
+    """A number in a file the designer wrote is not a number a run measured."""
+    create = f'--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+{{"accuracy": 0.9731}}\n'
+    for use_git in [True, False] if shutil.which("git") else [False]:
+        with pytest.raises(repo.PatchError, match="results come from running") as refused:
+            repo.apply_patch(tree, PATCH + create, use_git=use_git)
+        assert path in str(refused.value) and "metrics.json" in str(refused.value)
+    # All or nothing: the change to train.py in the same patch was not applied either.
+    assert (tree / "train.py").read_text() == TRAIN
+    assert not (tree / "metrics.json").exists() and not (tree / "artifacts").exists()
+    with pytest.raises(repo.PatchError, match="results come from running"):
+        repo.clone_source(tree.parent / "seed", url="/nowhere", patch=create, command=["true"])
+
+
+def test_a_patch_may_not_touch_results_the_repository_holds(tree):
+    (tree / "metrics.json").write_text('{"accuracy": 0.5}\n')
+    change = (
+        "--- a/metrics.json\n+++ b/metrics.json\n@@ -1 +1 @@\n"
+        '-{"accuracy": 0.5}\n+{"accuracy": 0.999}\n'
+    )
+    delete = '--- a/metrics.json\n+++ /dev/null\n@@ -1 +0,0 @@\n-{"accuracy": 0.5}\n'
+    for patch in (change, delete):
+        with pytest.raises(repo.PatchError, match="results come from running"):
+            repo.parse_patch(patch)
+        with pytest.raises(repo.PatchError, match="removed before it starts"):
+            repo.apply_patch(tree, patch, use_git=False)
+    assert json.loads((tree / "metrics.json").read_text()) == {"accuracy": 0.5}
+
+    # A file of that name further down is the repository's own business.
+    inner = "--- /dev/null\n+++ b/out/metrics.json\n@@ -0,0 +1 @@\n+{}\n"
+    assert repo.apply_patch(tree, inner, use_git=False) == ["out/metrics.json"]
+
+
 def test_a_patch_does_not_write_through_a_link(tree, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -496,6 +732,27 @@ def test_a_url_is_shown_without_its_password_or_token(url, shown):
     assert repo.display_url(url) == shown
 
 
+@pytest.mark.parametrize(
+    ("url", "secret"),
+    [
+        ("https://github.com/owner/project.git", None),
+        ("https://ghp_s3cret@github.com/o/p.git", "ghp_s3cret"),
+        ("https://bot:ghp_s3cret@github.com/o/p.git", "ghp_s3cret"),
+        ("https://bot:p%40ss@github.com/o/p.git", "p%40ss"),
+        ("https://bot:@github.com/o/p.git", None),
+        ("ssh://git@example.org/owner/project", None),
+        ("ssh://me:s3cret@example.org/o/p", "s3cret"),
+        ("git@github.com:owner/project.git", None),
+        ("/home/someone/project", None),
+        ("", None),
+    ],
+)
+def test_the_secret_of_a_url_is_named_for_masking(url, secret):
+    assert repo.userinfo(url) == secret
+    if secret:
+        assert secret not in repo.display_url(url)
+
+
 # -- cloning inside the job --------------------------------------------------------------
 
 
@@ -526,6 +783,42 @@ def test_the_clone_happens_inside_the_job_and_the_command_runs_in_it(repository,
     assert json.loads((tmp_path / "run" / "metrics.json").read_text()) == {"score": 2.5}
     assert f"cloned {repository} at {head}" in log
     assert repo.clone_failure(result.returncode) is None
+
+
+@needs_git
+def test_results_that_came_with_a_cloned_repository_are_not_results_of_the_run(
+    repository, tmp_path
+):
+    (repository / "metrics.json").write_text('{"accuracy": 0.9912, "note": "of last year"}\n')
+    (repository / "artifacts").mkdir()
+    (repository / "artifacts" / "old_curve.png").write_bytes(b"old")
+    git(repository, "add", "metrics.json", "artifacts")
+    git(repository, "commit", "-q", "-m", "results of earlier work")
+    look = (
+        "import os, subprocess\n"
+        "print('stale:', sorted(n for n in ('metrics.json', 'artifacts') if os.path.lexists(n)))\n"
+        "print('fetch head kept:', os.path.exists('.git/FETCH_HEAD'))\n"
+        "print('origin:', subprocess.run(['git', 'remote', 'get-url', 'origin'],\n"
+        "      capture_output=True, text=True).stdout.strip())\n"
+        "print('training... (this script writes no metrics)')\n"
+    )
+    seed = tmp_path / "seed"
+    command = repo.clone_source(
+        seed, url=str(repository), files={"look.py": look.encode()}, command=["python", "look.py"]
+    )
+    result = LocalBackend(scratch_dir=tmp_path / "scratch").run_job(
+        JobSpec(command=command, timeout=60, network=True),
+        source_dir=seed,
+        run_dir=tmp_path / "run",
+    )
+    log = (tmp_path / "run" / "log.txt").read_text()
+    assert result.ok, log
+    assert "stale: []" in log and "fetch head kept: False" in log
+    assert f"origin: {repository}" in log
+    assert not (tmp_path / "run" / "metrics.json").exists()
+    assert not (tmp_path / "run" / "artifacts").exists()
+    [said] = [line for line in repo.clone_lines(log.splitlines()) if line.startswith("Removed")]
+    assert "Removed metrics.json, artifacts that was there before the run" in said
 
 
 @needs_git
@@ -598,49 +891,125 @@ def test_the_clone_job_applies_a_patch_the_way_it_is_applied_here(repository, tm
         repo.clone_source(tmp_path / "other", url=str(repository), patch=mixed, command=["true"])
 
 
-#: Stands in for git in a clone job: no test may reach a network.  It fails the fetch
-#: when asked to, quoting the URL the way git does.
+#: Stands in for git in a clone job: no test may reach a network.  It writes down how it
+#: was called (outside the working directory) and leaves the address where a git might:
+#: in FETCH_HEAD, in a log of its own and, for a remote, in the configuration.  It fails
+#: the fetch when asked to, quoting the URL the way git does.
 FAKE_GIT = """\
 #!/bin/sh
+while [ "$1" = "-c" ]; do shift 2; done
+echo "$@" >> "$FAKE_GIT_CALLS"
 case "$1" in
-  remote) echo "$4" > .fake-git-url ;;
+  init) mkdir -p .git/logs ;;
   fetch) if [ -n "$FAKE_GIT_FAILS" ]; then
-           echo "fatal: unable to access '$(cat .fake-git-url)/': refused"; exit 128
-         fi ;;
+           echo "fatal: unable to access '$5/': refused"
+           echo "fatal: Authentication failed for $FAKE_GIT_FAILS"
+           exit 128
+         fi
+         echo "0123abc branch 'main' of $5" > .git/FETCH_HEAD
+         echo "fetched from $5" > .git/logs/fetches ;;
+  remote) echo "url = $4" > .git/config ;;
   rev-parse) echo 0123abc ;;
 esac
 exit 0
 """
 
+#: What an experiment's command can find out about where its code came from.
+SPY = """\
+import json, os
+print("the command ran")
+print("job:", json.dumps(json.load(open(".paper-orchestra/job.json")), sort_keys=True))
+print("config:", open(".git/config").read().strip())
+print("environment:", json.dumps(dict(os.environ), sort_keys=True))
+for folder, _, names in os.walk("."):
+    for name in names:
+        path = os.path.join(folder, name)
+        print("file:", path, repr(open(path, errors="replace").read()))
+"""
+
+
+def clone_job(tmp_path: Path, url: str, **env: str) -> subprocess.CompletedProcess:
+    """Run the clone job for ``url`` with the stand-in for git, and the spy as its command."""
+    (tmp_path / "bin").mkdir(exist_ok=True)
+    (tmp_path / "bin" / "git").write_text(FAKE_GIT)
+    (tmp_path / "bin" / "git").chmod(0o755)
+    seed = tmp_path / f"seed-{len(list(tmp_path.glob('seed-*')))}"
+    command = repo.clone_source(seed, url=url, command=[sys.executable, "-c", SPY])
+    calls = tmp_path / "git-calls"
+    calls.unlink(missing_ok=True)
+    env = {"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin", "FAKE_GIT_CALLS": str(calls), **env}
+    done = subprocess.run(
+        [sys.executable, command[1]], cwd=seed, env=env, capture_output=True, text=True
+    )
+    done.calls = calls.read_text().splitlines()  # type: ignore[attr-defined]
+    done.seed = seed  # type: ignore[attr-defined]
+    return done
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for git is a shell script")
 def test_the_clone_job_never_prints_the_password_of_its_url(tmp_path):
-    (tmp_path / "bin").mkdir()
-    (tmp_path / "bin" / "git").write_text(FAKE_GIT)
-    (tmp_path / "bin" / "git").chmod(0o755)
     url = "https://bot:s3cret-token@example.org/owner/project.git"
-    seed = tmp_path / "seed"
-    said = [sys.executable, "-c", "print('the command ran')"]
-    command = repo.clone_source(seed, url=url, command=said)
-
-    def job(**env: str) -> subprocess.CompletedProcess:
-        path = f"{tmp_path / 'bin'}:/usr/bin:/bin"
-        return subprocess.run(
-            [sys.executable, command[1]],
-            cwd=seed,
-            env={"PATH": path, **env},
-            capture_output=True,
-            text=True,
-        )
-
-    failed = job(FAKE_GIT_FAILS="1")
+    failed = clone_job(tmp_path, url, FAKE_GIT_FAILS="bot:s3cret-token")
     assert repo.clone_failure(failed.returncode) == repo.clone_failure(repo.EXIT_CLONE_FAILED)
     assert "could not be cloned" in failed.stdout and "https://bot:***@" in failed.stdout
-    done = job()
+    assert "Authentication failed for bot:***" in failed.stdout
+    done = clone_job(tmp_path, url)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "cloned https://bot:***@example.org/owner/project.git at 0123abc" in done.stdout
     assert "the command ran" in done.stdout
     assert "s3cret-token" not in failed.stdout + failed.stderr + done.stdout + done.stderr
+
+    # A password is written into a URL in one form and quoted by git in another.
+    encoded = clone_job(
+        tmp_path, "https://bot:p%40ss-w0rd@example.org/o/p.git", FAKE_GIT_FAILS="p@ss-w0rd"
+    )
+    assert "Authentication failed for ***" in encoded.stdout
+    assert "p@ss-w0rd" not in encoded.stdout and "p%40ss-w0rd" not in encoded.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for git is a shell script")
+@pytest.mark.parametrize(
+    ("url", "secret", "remote"),
+    [
+        (
+            "https://ghp_SECRETTOKEN123@example.org/org/private.git",
+            "ghp_SECRETTOKEN123",
+            "https://example.org/org/private.git",
+        ),
+        (
+            "https://bot:s3cret-token@example.org/org/private.git",
+            "s3cret-token",
+            "https://example.org/org/private.git",
+        ),
+        ("ssh://me:s3cret-token@example.org/o/p", "s3cret-token", "ssh://me@example.org/o/p"),
+    ],
+)
+def test_the_token_of_a_repository_url_is_out_of_the_commands_reach(tmp_path, url, secret, remote):
+    """The job has to be told the token to clone at all.  The experiment's command runs
+    next, in the same directory, and it is code a model wrote."""
+    done = clone_job(tmp_path, url)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "the command ran" in done.stdout
+    # The spy printed every file under its working directory, the job's description, the
+    # remote and its environment: the token is in none of them.
+    assert secret not in done.stdout + done.stderr
+    assert f"config: url = {remote}" in done.stdout
+    assert '"shown": "' + repo.display_url(url) + '"' in done.stdout
+    assert f'"url": "{remote}"' in done.stdout  # what is left of the address in job.json
+    # git was given the address for the fetch, and for nothing else.
+    assert f"fetch -q --depth 1 {url} HEAD" in done.calls
+    assert [call for call in done.calls if secret in call] == [f"fetch -q --depth 1 {url} HEAD"]
+    assert f"remote add origin {remote}" in done.calls
+    # What the stand-in wrote down of the fetch is gone or without the token.
+    left = "".join(
+        path.read_text(errors="replace") for path in done.seed.rglob("*") if path.is_file()
+    )
+    assert secret not in left and not (done.seed / ".git" / "FETCH_HEAD").exists()
+
+    # Also when the clone fails: the job's own description no longer names it.
+    failed = clone_job(tmp_path, url, FAKE_GIT_FAILS="1")
+    assert failed.returncode == repo.EXIT_CLONE_FAILED
+    assert secret not in (failed.seed / ".paper-orchestra" / "job.json").read_text()
 
 
 # -- experiments in repo mode ------------------------------------------------------------
@@ -718,6 +1087,40 @@ def test_an_experiment_runs_in_a_patched_copy_and_the_repository_stays_as_it_was
     assert (run_dir / "code" / "patch.diff").read_text() == PATCH
     result = project.page("E1-run1")
     assert "patch.diff" in result.body and record["repo"]["commit"][:12] in result.body
+
+
+@needs_git
+def test_results_that_lie_in_the_repository_are_not_recorded_as_the_runs(repository, tmp_path):
+    """The repository holds a metrics.json and figures of earlier work, and the command
+    of the experiment writes its own somewhere else, or nowhere."""
+    (repository / "metrics.json").write_text('{"accuracy": 0.97, "note": "last month"}\n')
+    (repository / "artifacts").mkdir()
+    (repository / "artifacts" / "old_curve.png").write_bytes(b"old")
+    git(repository, "add", "metrics.json", "artifacts")
+    git(repository, "commit", "-q", "-m", "results of earlier work")
+    project = project_with(tmp_path, repository)
+    quiet = "import os\nos.makedirs('out')\nopen('out/metrics.json', 'w').write('{}')\n"
+    page = repo_experiment(project, {"quiet.py": quiet}, command="python quiet.py")
+    backend = local(tmp_path)
+    experiments.approve(project, page.id, backends={"local": backend})
+
+    record = experiments.run(project, page.id, compute=backend)
+
+    assert record["status"] == "failed", record
+    assert "metrics.json" in record["error"] and record["metrics"] == {}
+    assert record["artifacts"] == []
+    # ...and the record says what became of them.
+    assert any("before the run" in note and "metrics.json" in note for note in record["notes"])
+    run_dir = project.experiment_dir(page.id) / "runs" / "1"
+    assert not (run_dir / "metrics.json").exists() and not (run_dir / "artifacts").exists()
+    assert (repository / "metrics.json").exists()  # the person's file is where it was
+
+    # A patch that would write the result in the command's place is refused when the
+    # code is checked, before anybody is asked to approve it.
+    forged = '--- /dev/null\n+++ b/metrics.json\n@@ -0,0 +1 @@\n+{"accuracy": 0.999}\n'
+    other = repo_experiment(project, {"patch.diff": forged}, command="python train.py")
+    problems = experiments.check_code(project, other.id)
+    assert any("results come from running" in str(problem) for problem in problems), problems
 
 
 @needs_git
@@ -821,7 +1224,7 @@ class Recording:
     def describe(self):
         return {"backend": self.name, "jobs": {"supported": True, "reattach": False}}
 
-    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None):
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
         names = sorted(p.relative_to(source_dir).as_posix() for p in Path(source_dir).rglob("*"))
         self.jobs.append((spec, names))
         Path(run_dir).mkdir(parents=True, exist_ok=True)

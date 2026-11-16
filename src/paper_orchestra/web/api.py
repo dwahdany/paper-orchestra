@@ -77,6 +77,7 @@ from paper_orchestra.research.project import (
     STATE_FILE,
     Project,
 )
+from paper_orchestra.research.repo import display_url
 from paper_orchestra.web.render import (
     diff_html,
     file_url,
@@ -279,8 +280,27 @@ class Services:
         was put there by hand has no entry."""
         return dict(self._experiments().code_authors(project, experiment_id))
 
+    def plan_digest(self, project: Project, experiment_id: str) -> str:
+        """What identifies everything a run would execute as things are now: the code
+        and the run-defining fields of the plan.  An approval records it."""
+        return str(self._experiments().plan_digest(project, experiment_id))
+
+    def approval(self, project: Project, experiment_id: str) -> dict[str, Any]:
+        """What was approved and whether the experiment still is that:
+        ``{"digest", "at", "matches", "changed", "repaired"}``."""
+        return dict(self._experiments().approval(project, experiment_id))
+
     def approve(self, project: Project, ref: str, **options: Any) -> ResearchPage:
         return self._experiments().approve(project, ref, **options)
+
+    def masked(self, project: Project, text: str) -> str:
+        """``text`` of a log without the credentials it may hold: those of the server's
+        environment, which workers inherit, and the token in the URL of the project's
+        repository, which a job that clones it is handed."""
+        try:
+            return str(self._experiments().mask_credentials(project, text))
+        except ApiError:
+            return mask_secrets(text)
 
     def request_cancel(self, project: Project, ref: str) -> None:
         self._experiments().request_cancel(project, ref)
@@ -637,6 +657,28 @@ def _summary(context: Context, key: str, project: Project) -> dict[str, Any]:
     }
 
 
+def _shown_settings(project: Project) -> dict[str, Any]:
+    """The project's settings as they may leave the server: the URL of the repository
+    without the password or token it carries, which stays in ``project.json``."""
+    settings = project.settings.to_dict()
+    if isinstance(settings.get("repo"), Mapping):
+        repo = dict(settings["repo"])
+        settings["repo"] = {**repo, "path": display_url(str(repo.get("path") or ""))}
+    return settings
+
+
+def _keep_repo_secret(project: Project, changes: dict[str, Any]) -> dict[str, Any]:
+    """``changes`` to the settings, with a repository URL that came back as it was shown
+    (masked) replaced by the stored one: showing the settings must not cost the token."""
+    stored = project.settings.repo
+    repo = changes.get("repo")
+    sent = repo.get("path") if isinstance(repo, Mapping) else repo
+    if stored and isinstance(sent, str) and sent.strip() == display_url(stored.path) != stored.path:
+        kept = {**repo, "path": stored.path} if isinstance(repo, Mapping) else stored.path
+        return {**changes, "repo": kept}
+    return changes
+
+
 def _project_view(context: Context, project: Project) -> dict[str, Any]:
     state, worker = _state_and_worker(context, project.root)
     usage = _read_json(project.root / "usage.json")
@@ -645,7 +687,7 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
         "id": context.workspace.key_of(project),
         "title": project.title,
         "created": project.created,
-        "settings": project.settings.to_dict(),
+        "settings": _shown_settings(project),
         "dir": project.root.name,
         "state": state,
         "counts": project.counts(),
@@ -875,7 +917,7 @@ def patch_project(body: ProjectPatch, project: Proj, context: Ctx) -> dict[str, 
     """Change the title and settings (a partial object is merged in, all or nothing)."""
     try:
         if body.settings is not None:
-            project.settings.update(body.settings)
+            project.settings.update(_keep_repo_secret(project, body.settings))
         if body.title is not None:
             project.title = body.title
         project.save_settings()
@@ -929,12 +971,13 @@ def stop(project: Proj, context: Ctx) -> dict[str, Any]:
 
 
 @router.get("/projects/{pid}/worker/log")
-def worker_log(project: Proj, offset: int = -_LOG_TAIL_BYTES) -> dict[str, Any]:
+def worker_log(project: Proj, context: Ctx, offset: int = -_LOG_TAIL_BYTES) -> dict[str, Any]:
     """What the project's workers wrote (``worker.log``): why one could not start, what
     it said before it died.  The same shape as a run's log; by default its end.  Values
-    of the server's credentials are blanked out, should a library have echoed one."""
+    of the server's credentials and the token in the repository's URL are blanked out,
+    should a library or a job have echoed one."""
     piece = _read_log(project.root / WORKER_LOG, offset, whole_lines=True)
-    return {**piece, "text": mask_secrets(piece["text"])}
+    return {**piece, "text": context.services.masked(project, piece["text"])}
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1509,11 @@ def review(body: ReviewBody, project: Proj, context: Ctx) -> dict[str, Any]:
     optionally with ``"start": true`` to run it at once) accepts an experiment and
     approves its run in one decision; a plain accept leaves it ``planned``.  With
     ``"code_digest"`` among the options (``code.digest`` of the experiment as it was
-    read), code that changed since refuses the whole decision with 409.
+    read), code that changed since refuses the whole decision with 409.  A plan that
+    asks for network access is approved only with ``"network": true`` or ``false``
+    among the options: with ``true`` alone the plan is accepted and its run is not
+    approved (422).  An experiment becomes ``approved`` this way or through its own
+    ``approve`` endpoint only: a ``state`` among the ``edits`` is refused.
 
     Always 200 for a well-formed request: ``{"ok": <all succeeded>, "results":
     [...]}`` with, per item, ``ok`` and the decided ``page`` or ``proposal``, or
@@ -1607,7 +1654,11 @@ def _plan(context: Context, project: Project, page: ResearchPage) -> tuple[Any, 
         plan = context.services.load_plan(project, page.path)
     except ProjectError as exc:
         return None, str(exc)
-    return (dataclasses.asdict(plan) if dataclasses.is_dataclass(plan) else plan), None
+    shown = dataclasses.asdict(plan) if dataclasses.is_dataclass(plan) else plan
+    if isinstance(shown, dict) and shown.get("repo"):
+        # The plan reads the repository from the settings, token and all; a view does not.
+        shown = {**shown, "repo": display_url(str(shown["repo"]))}
+    return shown, None
 
 
 def _experiment_view(context: Context, project: Project, page: ResearchPage) -> dict[str, Any]:
@@ -1643,6 +1694,10 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
             # Sent back with an approval, so that what is approved is what was read.
             "digest": context.services.code_digest(project, experiment_id),
         },
+        # The code and the run-defining fields of the plan as they are now, and what the
+        # last approval recorded: when the two differ, the experiment changed since.
+        "plan_digest": context.services.plan_digest(project, experiment_id),
+        "approval": context.services.approval(project, experiment_id),
         "runs": [
             _run_view(context, project, experiment_id, run)
             for run in context.services.runs(project, experiment_id)
@@ -1660,7 +1715,16 @@ def get_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     the ``digest`` an approval sends back as ``code_digest``), its ``runs``, and
     ``options``: for each backend ``{"backend", "can_run",
     "reasons", "est_minutes", "est_usd", "notes"}``, so the approval form offers
-    only what can run."""
+    only what can run.
+
+    ``approval`` is what the person approved: ``{"digest", "at", "matches",
+    "changed", "repaired"}``.  ``digest`` and ``at`` are ``None`` for an experiment
+    that was never approved; ``matches`` says whether a run would start (the
+    experiment is what was approved, or the runner's recorded repair of it:
+    ``repaired``); ``changed`` lists what differs since the approval, field by
+    field and file by file.  ``plan_digest`` is the digest of the code and the
+    run-defining plan fields as they are now, which an approval records.  The
+    plan's ``repo`` is shown without the token of its URL."""
     return _experiment_view(context, project, _experiment(project, eid))
 
 
@@ -1706,9 +1770,13 @@ def approve(
 ) -> dict[str, Any]:
     """The person approves the experiment's run, with where and how it may run.
 
-    The page must be accepted.  With ``start`` the run begins at once (``worker``),
-    unless the project already has a worker (``worker_error``): an approved
-    experiment is then run by the next run phase.
+    The page must be accepted.  What is left out is decided by the approval, never
+    taken from the plan: without ``backend`` the run goes to the project's backend
+    (Modal for a GPU), and without ``network`` it runs without network access; a plan
+    that asks for the network (``network: true``) is refused (422) until the request
+    says ``"network": true`` or ``false``.  With ``start`` the run begins at once
+    (``worker``), unless the project already has a worker (``worker_error``): an
+    approved experiment is then run by the next run phase.
     """
     body = body or ApproveBody()
     page = _experiment(project, eid)
@@ -1807,19 +1875,22 @@ def get_run(eid: str, number: int, project: Proj, context: Ctx) -> dict[str, Any
     page = _experiment(project, eid)
     run = _find_run(context, project, str(page.id), number)
     tail = _read_log(_run_dir(project, str(page.id), number) / "log.txt", -_LOG_TAIL_BYTES)
+    tail["text"] = context.services.masked(project, tail["text"])
     return {"run": _run_view(context, project, str(page.id), run), "log": tail}
 
 
 @router.get("/projects/{pid}/experiments/{eid}/runs/{number}/log")
-def get_log(eid: str, number: int, project: Proj, offset: int = 0) -> dict[str, Any]:
+def get_log(eid: str, number: int, project: Proj, context: Ctx, offset: int = 0) -> dict[str, Any]:
     """The run's log from byte ``offset``: ``{"offset", "next", "size", "text", "eof",
     "reset"}``.  Ask again with ``offset=next`` to follow it; ``reset`` says the log
     was started anew and ``text`` is from its beginning.  A negative ``offset`` reads
-    that many bytes from the end."""
+    that many bytes from the end.  Credentials a job printed are blanked out in
+    ``text``; the offsets are those of the file."""
     page = _experiment(project, eid)
     if number < 1:
         raise ApiError(404, "not_found", f"{page.id} has no run {number}.")
-    return _read_log(_run_dir(project, str(page.id), number) / "log.txt", offset)
+    piece = _read_log(_run_dir(project, str(page.id), number) / "log.txt", offset)
+    return {**piece, "text": context.services.masked(project, piece["text"])}
 
 
 # ---------------------------------------------------------------------------

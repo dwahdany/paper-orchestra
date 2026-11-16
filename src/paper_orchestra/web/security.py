@@ -14,23 +14,30 @@ things follow, all enforced here:
   Content-Security-Policy that allows the app's own scripts, styles and images
   and nothing else, and tells the browser not to guess content types.
 * **Which files a URL can reach.**  A path from a URL is resolved inside the
-  project directory, symbolic links included, or refused.
+  project directory, symbolic links included, or refused; a file the server
+  opens for a project is opened without following a link out of it.
 * **What an upload may be called.**  Names from the browser are reduced to plain
   relative paths.
+* **How much a request may carry.**  Every request body is counted while it
+  arrives and refused once it is larger than its limit, whatever length the
+  client announced and whatever the endpoint would have made of it.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import ipaddress
 import json
 import os
 import re
 import secrets
+import stat
 import unicodedata
-from collections.abc import Awaitable, Callable, Iterable, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 __all__ = [
@@ -39,6 +46,7 @@ __all__ = [
     "DEFAULT_PORT",
     "FILE_AREAS",
     "FILE_CONTENT_SECURITY_POLICY",
+    "MAX_BODY_BYTES",
     "PDF_CONTENT_SECURITY_POLICY",
     "TOKEN_COOKIE",
     "PathEscape",
@@ -47,6 +55,8 @@ __all__ = [
     "is_loopback",
     "mask_secrets",
     "new_token",
+    "open_confined",
+    "open_for_append",
     "safe_upload_path",
     "security_headers",
 ]
@@ -61,6 +71,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8600
 TOKEN_COOKIE = "po_token"
 TOKEN_PARAM = "token"
+#: The largest body a request may carry unless its endpoint is given a limit of its own
+#: (the upload of a new project is): room for the longest page, code file or preview the
+#: API accepts, written as JSON, and no more.
+MAX_BODY_BYTES = 8 * 1024 * 1024
 
 #: The parts of a project directory the files endpoint serves, and the only places a
 #: rendered page may take an image from.
@@ -172,6 +186,92 @@ def confined(root: Path, relative: str, *, areas: Sequence[str] | None = None) -
     return real
 
 
+def _plain_file(descriptor: int, what: str) -> None:
+    """``PathEscape`` unless the open file is an ordinary one (not a directory, a pipe or
+    a device, which would make the server wait or read without end)."""
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        raise PathEscape(f"{what} is not a file")
+
+
+def open_confined(root: Path, relative: str, *, areas: Sequence[str] | None = None) -> BinaryIO:
+    """Open the file ``relative`` names inside ``root`` for reading, as bytes.
+
+    The path is resolved as :func:`confined` does (``PathEscape`` when it leaves
+    ``root`` through ``..`` or a symbolic link, or names something hidden), and the
+    resolved file is then opened without following a link, so that a link put
+    there between the check and the opening is not followed either.  Raises
+    ``FileNotFoundError`` when there is no such file and ``PathEscape`` when it is
+    not an ordinary file.  This is how a project's logs are read: a project
+    directory may come from somebody else, with ``worker.log`` or a run's
+    ``log.txt`` linked to a file of the person's.
+    """
+    real = confined(root, relative, areas=areas)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(real, flags | getattr(os, "O_BINARY", 0))
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise PathEscape("the path is a link") from exc
+        raise
+    try:
+        _plain_file(descriptor, relative)
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_for_append(root: Path, name: str) -> BinaryIO:
+    """Open the file ``name`` directly in ``root`` for appending, creating it if needed.
+
+    ``name`` is a plain file name.  The file is opened without following a
+    symbolic link, and it must be an ordinary file with no other name anywhere:
+    what the server appends (a worker's command line with the person's
+    instruction, and everything the worker prints) must not land in a file
+    outside the project that a link or a second name stands for.  Raises
+    ``PathEscape`` otherwise, ``OSError`` when the file cannot be written.
+    """
+    if (
+        not isinstance(name, str)
+        or not name
+        or name.startswith(".")
+        or name != os.path.basename(name)
+        or "\x00" in name
+    ):
+        raise PathEscape("not the name of a file in the project directory")
+    path = Path(root) / name
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    # Without waiting: a named pipe put in the file's place would hold the server for ever.
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover - Windows
+        raise PathEscape(f"{path} is a link; the server does not write through it")
+    try:
+        descriptor = os.open(path, flags | getattr(os, "O_BINARY", 0), 0o644)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EISDIR):
+            raise PathEscape(
+                f"{path} is a link or not a file; the server does not write through it"
+            ) from exc
+        raise
+    try:
+        _plain_file(descriptor, str(path))
+        if os.fstat(descriptor).st_nlink > 1:
+            raise PathEscape(
+                f"{path} is another name for a file that exists elsewhere; the server does "
+                "not write to it"
+            )
+        with contextlib.suppress(ImportError, OSError):
+            import fcntl
+
+            # The worker inherits this file as its output: it is to write as to any file.
+            mode = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            fcntl.fcntl(descriptor, fcntl.F_SETFL, mode & ~os.O_NONBLOCK)
+        return os.fdopen(descriptor, "ab")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Upload names
 # ---------------------------------------------------------------------------
@@ -239,8 +339,82 @@ def _plain(status: int, code: str, message: str, *, api: bool) -> tuple[int, byt
     return status, b"text/plain; charset=utf-8", (message + "\n").encode()
 
 
+class _BodyTooLarge(Exception):
+    """A request body passed its limit while it arrived."""
+
+
+#: What the browser sends back as ``Last-Event-ID``: an event's ``seq``, as the stream
+#: wrote it.
+_EVENT_ID = re.compile(rb"[0-9]{1,18}")
+
+
+def _megabytes(count: int) -> str:
+    size = count / (1024 * 1024)
+    return f"{size:.0f} MB" if size >= 10 else f"{size:.1f} MB"
+
+
+def _announced_length(value: str | None) -> int | None:
+    """The body length a request announces, or ``None`` when it announces none that can
+    be read.  A number too long to be a length is one that is too large."""
+    digits = (value or "").strip()
+    if not digits or not digits.isascii() or not digits.isdigit():
+        return None
+    return int(digits) if len(digits) <= 18 else 10**18
+
+
+class _BoundedBody:
+    """The ``receive`` and ``send`` of one request whose body may be at most ``limit``
+    bytes.
+
+    The body is counted as it arrives.  Past the limit the application is not
+    given another byte (its ``receive`` raises), and whatever it then answers,
+    or fails with, the client is told once that the body was too large.
+    """
+
+    def __init__(
+        self, receive: Receive, send: Send, limit: int, refuse: Callable[[], Awaitable[None]]
+    ) -> None:
+        self._receive = receive
+        self._send = send
+        self._refuse = refuse
+        self.limit = limit
+        self.seen = 0
+        self.over = False
+        self.started = False
+        self.refused = False
+
+    async def receive(self) -> Message:
+        if self.over:
+            raise _BodyTooLarge
+        message = await self._receive()
+        if message.get("type") == "http.request":
+            self.seen += len(message.get("body") or b"")
+            if self.seen > self.limit:
+                self.over = True
+                raise _BodyTooLarge
+        return message
+
+    async def refuse(self) -> None:
+        """Answer 413, unless an answer has gone out already."""
+        if self.started or self.refused:
+            return
+        self.refused = True
+        await self._refuse()
+
+    async def send(self, message: Message) -> None:
+        if self.over and not self.started:
+            # The application's own account of a body that was cut off (a parse error,
+            # an unexpected error) is not what happened.
+            await self.refuse()
+            return
+        if message.get("type") == "http.response.start":
+            self.started = True
+        await self._send(message)
+
+
 class SecurityMiddleware:
-    """Checks ``Host``, ``Origin`` and the access token, and adds the security headers.
+    """Checks ``Host``, ``Origin`` and the access token, bounds the request body, and
+    adds the security headers.
 
     Plain ASGI on purpose: nothing here buffers a response, so event streams pass
     through untouched.
@@ -251,6 +425,12 @@ class SecurityMiddleware:
     machine's names cannot be listed, and the token (required off loopback) is
     what stands between a stranger and the API.  ``allowed_hosts`` adds names, for
     a reverse proxy or a test client.
+
+    ``max_body_bytes`` is the most a request body may hold; ``body_limits`` gives
+    single endpoints another limit, as ``{(method, path): bytes}`` (the upload of
+    a new project).  A request that announces more is refused before a byte of it
+    is read, and one that sends more than it announced is cut off where the limit
+    is passed: 413 with the code ``too_large``.
     """
 
     def __init__(
@@ -260,6 +440,8 @@ class SecurityMiddleware:
         host: str = DEFAULT_HOST,
         token: str | None = None,
         allowed_hosts: Iterable[str] = (),
+        max_body_bytes: int = MAX_BODY_BYTES,
+        body_limits: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
         self.app = app
         self.token = token or None
@@ -269,6 +451,10 @@ class SecurityMiddleware:
         if not self.any_host:
             names.add(bound)
         self.hosts = frozenset(names)
+        self.max_body_bytes = max_body_bytes
+        self.body_limits = {
+            (method.upper(), path): limit for (method, path), limit in (body_limits or {}).items()
+        }
 
     # -- checks ------------------------------------------------------------------
 
@@ -396,7 +582,55 @@ class SecurityMiddleware:
                     api=api,
                 )
                 return
-        await self.app(scope, receive, send)
+        await self._bounded(_known_event_id(scope), receive, send, api=api)
+
+    async def _bounded(self, scope: Scope, receive: Receive, send: Send, *, api: bool) -> None:
+        """Hand the request to the application with a body that cannot pass its limit."""
+        method = str(scope.get("method", "GET")).upper()
+        limit = self.body_limits.get((method, str(scope.get("path", "/"))), self.max_body_bytes)
+        message = (
+            f"The request carries more than the {_megabytes(limit)} this server takes at "
+            "once here. Send less: a shorter text, or fewer or smaller files."
+        )
+
+        async def refuse() -> None:
+            await self._refuse(send, 413, "too_large", message, api=api)
+
+        announced = None
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"content-length":
+                announced = _announced_length(value.decode("latin-1"))
+        if announced is not None and announced > limit:
+            await refuse()  # before a byte of it is read
+            return
+        body = _BoundedBody(receive, send, limit, refuse)
+        try:
+            await self.app(scope, body.receive, body.send)
+        except _BodyTooLarge:
+            pass
+        except Exception:
+            if not body.over:
+                raise
+            # What the application made of the body that was cut off is not an error
+            # of the server's.
+        if body.over:
+            await body.refuse()
+
+
+def _known_event_id(scope: Scope) -> Scope:
+    """``scope`` without a ``Last-Event-ID`` that is not one this server gave out.
+
+    The stream numbers its events; a browser sends the last number back when it
+    reconnects.  Anything else under that name (a digit of another script, a
+    number of thousands of places) is no place to resume from.
+    """
+    headers = scope.get("headers", [])
+    kept = [
+        (key, value)
+        for key, value in headers
+        if key.lower() != b"last-event-id" or _EVENT_ID.fullmatch(value.strip())
+    ]
+    return scope if len(kept) == len(headers) else {**scope, "headers": kept}
 
 
 def security_headers(*, api: bool) -> list[tuple[bytes, bytes]]:

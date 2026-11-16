@@ -45,6 +45,7 @@ from paper_orchestra.memory.wiki import (
     split_front_matter,
 )
 from paper_orchestra.research.model import (
+    APPROVAL_FIELDS,
     EVENT_TYPES,
     HUMAN,
     ID_PREFIXES,
@@ -132,6 +133,18 @@ _FIELD_NAME = re.compile(r"^[A-Za-z_][\w\-]*$")
 _RECORD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
 _HISTORY_NAME = re.compile(r"^(\d{8}T\d{6}Z)-(.+)\.md$")
 _DECISIONS = {"accept": "accept", "accepted": "accept", "reject": "reject", "rejected": "reject"}
+#: States an experiment reaches only through its approval and its run.
+_RUN_STATES = ("approved", "queued", "running")
+#: Of the record of an approval, what nobody sets by editing a page.  ``backend`` is the
+#: one field of it the person may also write by hand (an approval decides it anew).
+_APPROVAL_RECORD = APPROVAL_FIELDS - {"backend"}
+#: What ``record_approval`` writes: the options of the approved run and its record.
+_APPROVAL_WRITES = APPROVAL_FIELDS | {"gpu", "timeout_seconds", "network"}
+_HOW_TO_APPROVE = (
+    "A run is approved with `paper-orchestra research approve`, or with Approve in the app: "
+    "that records what may run, and nothing else moves an experiment to approved, queued or "
+    "running."
+)
 _EXTRA_MEDIA_TYPES = {
     ".md": "text/markdown",
     ".tex": "text/x-tex",
@@ -344,6 +357,26 @@ def _what(page: ResearchPage) -> str:
 def _name(page: ResearchPage) -> str:
     """What a message calls the page: its id where it has one, else its path."""
     return page.id or page.path
+
+
+def _approval_sentence(by: str, page: ResearchPage, fields: Mapping[str, Any]) -> str:
+    """What a change to the record of an approval means, for the activity feed."""
+    what = _what(page)
+    if fields.get("approved_digest"):
+        limit = fields.get("timeout_seconds")
+        how = [
+            f"on {fields['backend']}" if fields.get("backend") else "",
+            f"with a {fields['gpu']} GPU" if fields.get("gpu") else "",
+            f"for up to {limit:g} s" if isinstance(limit, int | float) else "",
+            ("with network access" if fields["network"] else "without network access")
+            if "network" in fields
+            else "",
+        ]
+        said = ", ".join(part for part in how if part)
+        return f"{_who(by)} set how {what} may run{': ' + said if said else ''}."
+    if fields.get("repaired_digest"):
+        return f"The run of {what} goes on with the code as the runner repaired it."
+    return f"{_who(by)} changed the record of the approval of {what}."
 
 
 def _media_type(path: Path) -> str:
@@ -1132,19 +1165,13 @@ class Project:
             raise ProjectError("A page needs a title.")
         return changes, relation_changes
 
-    def _check_state(
-        self, page: ResearchPage, state: Any, by: str, *, accepting: bool = False
-    ) -> None:
-        """Raise unless ``by`` may move ``page`` to ``state`` (messages name the page).
-
-        ``accepting`` says the page is being accepted in the same step, which is how
-        the person accepts a plan and approves its run at once.
-        """
+    def _check_state(self, page: ResearchPage, state: Any, by: str) -> None:
+        """Raise unless ``by`` may move ``page`` to ``state`` (messages name the page)."""
         try:
             check_transition(page.kind, page.state, str(state), by)
         except ProjectError as exc:
             raise type(exc)(f"{_name(page)}: {exc}") from None
-        unaccepted = page.review != "accepted" and not accepting
+        unaccepted = page.review != "accepted"
         if page.kind == "experiment" and state == "approved" and unaccepted:
             raise ProjectError(
                 f"{_name(page)} is {page.review}, not accepted. Accept the experiment's page "
@@ -1159,9 +1186,14 @@ class Project:
         body: str | None,
         fields: Mapping[str, Any] | None,
         relations: Mapping[str, Any] | None,
-        accepting: bool = False,
     ) -> tuple[dict[str, Any], str]:
-        """The page's front matter and body with the changes made.  Nothing is written."""
+        """The page's front matter and body with the changes made.  Nothing is written.
+
+        This is every edit of a page: a direct one, the person's edits while
+        accepting, an accepted edit proposal.  None of them approves an experiment
+        or writes the record of an approval; ``set_state`` and ``record_approval``
+        do, for ``research.experiments.approve`` and the run.
+        """
         meta = dict(page.meta)
         changes, relation_changes = self._split_fields(
             page.kind, fields, relations, self._resolver()
@@ -1169,8 +1201,20 @@ class Project:
         state = changes.pop("state", None)
         # A state cannot be removed, so "no state" in a form means "leave it".
         if state is not None and state != page.state:
-            self._check_state(page, state, by, accepting=accepting)
+            if page.kind == "experiment" and state in _RUN_STATES:
+                if by != HUMAN:
+                    self._check_state(page, state, by)  # says whose move it is
+                raise ProjectError(
+                    f"{_name(page)} cannot be made {state} by editing its page. " + _HOW_TO_APPROVE
+                )
+            self._check_state(page, state, by)
             meta["state"] = state
+        for key in sorted(_APPROVAL_RECORD & changes.keys()):
+            if changes[key] != page.meta.get(key):
+                raise ProjectError(
+                    f"{_name(page)}: '{key}' is the record of an approval and is written by "
+                    "the approval itself, not by an edit. " + _HOW_TO_APPROVE
+                )
         for key, value in {**changes, **relation_changes}.items():
             if value is None or value == []:
                 meta.pop(key, None)
@@ -1337,9 +1381,10 @@ class Project:
         name are allocated here.  ``review`` follows from the author and the
         project's policy: a person's page is accepted, an agent's is proposed
         unless the policy for the kind is ``auto``.  An agent's or the pipeline's
-        page starts in the kind's first state whatever ``fields`` says; managed
-        fields in ``fields`` are ignored.  Records are written with
-        :meth:`write_record`.
+        page starts in the kind's first state whatever ``fields`` says, and nobody's
+        experiment starts ``approved``, ``queued`` or ``running``: a run is approved
+        through ``research.experiments.approve``.  Managed fields in ``fields`` are
+        ignored.  Records are written with :meth:`write_record`.
         """
         author = normalize_author(author)
         if kind not in KINDS:
@@ -1383,6 +1428,10 @@ class Project:
                             f"'{wanted}' is not a state of {with_article(kind)}; the states "
                             f"are: {', '.join(STATES[kind])}."
                         )
+                    if kind == "experiment" and wanted in _RUN_STATES:
+                        raise ProjectError(
+                            f"A new experiment cannot start as {wanted}. " + _HOW_TO_APPROVE
+                        )
                     meta["state"] = wanted
             meta["author"] = author
             meta["round"] = self.current_round() if round is None else int(round)
@@ -1414,6 +1463,12 @@ class Project:
         the lifecycle rules); ``relations`` replaces the named relation lists.
         With ``base_updated`` the change is refused as a ``Conflict`` when the page
         is no longer the version the editor started from.
+
+        No edit approves an experiment: ``state`` ``approved``, ``queued`` or
+        ``running`` and the record of an approval (``approved_digest``,
+        ``approved_at``, ``repaired_digest``) are refused for everyone, with a
+        message that says where a run is approved.  The person may still take an
+        approval back (``state: planned``).
 
         A page the person edits becomes accepted.  An agent may change only its
         own page that no person has decided; anything else is ``NotAllowed`` and
@@ -1538,8 +1593,9 @@ class Project:
         ``Conflict`` instead of landing on text they have not read.
 
         Accepting a page leaves its lifecycle state alone (an accepted experiment
-        is still only ``planned``).  Rejecting keeps the page as it was, with the
-        reason.  Accepting an edit proposal applies its fields and added relations
+        is still only ``planned``, and ``edits`` cannot approve it: that is
+        ``research.experiments.approve``).  Rejecting keeps the page as it was, with
+        the reason.  Accepting an edit proposal applies its fields and added relations
         and replaces the body; when the page changed since the edit was proposed,
         the fields still go in but the body does not, and ``Conflict`` is raised
         to say so (``.applied`` tells whether anything was changed).
@@ -1593,7 +1649,6 @@ class Project:
                 body=edits.get("body"),
                 fields=edits.get("fields"),
                 relations=edits.get("relations"),
-                accepting=True,
             )
             edited = meta != page.meta or body != page.body
             # Nothing to decide: already accepted by the person, or their own page.  (A page
@@ -1683,6 +1738,12 @@ class Project:
                     "change the text, the title, the summary, relations and the page's "
                     "own fields."
                 )
+            if key in APPROVAL_FIELDS:
+                raise NotAllowed(
+                    f"'{key}' is part of the record of an approval: where a run goes and "
+                    "what was approved are the person's to decide when they approve the "
+                    "experiment, and cannot be proposed."
+                )
             if key != "state":
                 continue
             if page.kind == "experiment":
@@ -1713,8 +1774,12 @@ class Project:
         ``body`` is the full replacement text or ``None``; ``fields`` are
         front-matter fields to set (relations given there are added, like
         ``relations_add``).  Refused for records (their content comes from data,
-        not from suggestions), for managed fields, and for the state of an
-        experiment, which only the person's approval and the run itself change.
+        not from suggestions), for managed fields, for the state of an
+        experiment, which only the person's approval and the run itself change,
+        and for the record of an approval (``backend``, ``approved_digest``,
+        ``approved_at``, ``repaired_digest``).  Other fields of an experiment's
+        plan may be proposed; accepting such an edit after the run was approved
+        means the experiment needs a new approval before it runs.
         """
         author = normalize_author(author)
         summary = _one_line(summary)
@@ -1785,6 +1850,14 @@ class Project:
             raise NotAllowed(
                 f"{proposal.id} asks to change the state of {_name(page)}. Only the person "
                 "does that, by approving the experiment itself; reject this proposal."
+            )
+        carried = sorted(APPROVAL_FIELDS & proposal.fields.keys())
+        if carried and "fields" not in edits:
+            # A file written around the store: ``propose_edit`` refuses these fields.
+            raise NotAllowed(
+                f"{proposal.id} asks to set {', '.join(carried)} of {_name(page)}, which "
+                "belong to the record of an approval. Only the person's approval of the "
+                "experiment writes them; reject this proposal."
             )
         # The person's own text was written looking at the page as it is; the agent's was
         # written against the text of an earlier version.  A page that already reads as
@@ -1902,7 +1975,9 @@ class Project:
 
         Enforces which moves exist and who makes them (``model.check_transition``):
         an experiment becomes ``approved`` only by the person, and only once its
-        page is accepted; the run's own steps are made by pipeline code; whether a
+        page is accepted (``research.experiments.approve`` is the one caller that
+        does this: it records what was approved, and a run starts only against
+        that record); the run's own steps are made by pipeline code; whether a
         hypothesis held is the person's verdict.  Setting the state a page already
         has changes nothing.  With ``base_updated`` (the page as the person saw
         it) a page that changed since is a ``Conflict``: what gets approved is what
@@ -1943,6 +2018,81 @@ class Project:
                     previous=page.state,
                     reason=_one_line(reason) or None,
                 )
+        return new
+
+    def locked(self) -> _ProjectLock:
+        """The project's lock, for ``with project.locked():`` around several steps that
+        must be one: a check and the write that relies on it.
+
+        It is the lock every changing method takes (reentrant, and it excludes other
+        threads and other processes), so the methods can be called inside it.  Hold it
+        for the steps only, never while something slow runs.
+        """
+        return self._lock
+
+    def record_approval(
+        self,
+        ref: str,
+        fields: Mapping[str, Any],
+        *,
+        by: str,
+        base_updated: str | None = None,
+    ) -> ResearchPage:
+        """Write the record of an approval onto an experiment's page; returns the new version.
+
+        ``fields`` holds the options of the approved run (``backend``, ``gpu``,
+        ``timeout_seconds``, ``network``) and the record itself (``approved_digest``,
+        ``approved_at``, ``repaired_digest``); ``None`` removes a field.  This is how
+        ``research.experiments.approve`` (as the person) and the run (as pipeline
+        code, after a repair) write them: no edit, review or proposal can, and no
+        agent.  It records and does not approve: the state moves with
+        :meth:`set_state`.  With ``base_updated`` a page that changed since is a
+        ``Conflict``.
+        """
+        by = normalize_author(by)
+        if is_agent(by) and by != role_author("runner"):
+            raise NotAllowed(
+                f"The record of an approval is written when the person approves a run; {by} "
+                "cannot write it."
+            )
+        unknown = sorted(set(fields) - _APPROVAL_WRITES)
+        if unknown:
+            raise ProjectError(
+                f"record_approval writes {', '.join(sorted(_APPROVAL_WRITES))}; "
+                f"got {', '.join(unknown)}. Change other fields with update_page."
+            )
+        with self._lock:
+            page, text = self._fresh(ref)
+            if page.kind != "experiment":
+                raise ProjectError(
+                    f"{_name(page)} is {with_article(page.kind)}, not an experiment: only an "
+                    "experiment has a run to approve."
+                )
+            self._check_base(page, base_updated)
+            meta = dict(page.meta)
+            for key, value in fields.items():
+                if value is None:
+                    meta.pop(key, None)
+                else:
+                    meta[key] = value
+            if meta == page.meta:
+                return page
+            new = self._write(
+                page.path,
+                meta,
+                page.body,
+                editor=by,
+                stamp=self._supersede(page, text),
+                previous=page,
+            )
+            self._changed()
+            self._page_event(
+                "page.updated",
+                _approval_sentence(by, new, fields),
+                new,
+                by,
+                approval=sorted(fields),
+            )
         return new
 
     # -- records -----------------------------------------------------------------

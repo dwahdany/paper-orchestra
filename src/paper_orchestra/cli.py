@@ -1281,16 +1281,94 @@ def _kind_named(name: str) -> str:
     return kind
 
 
+def _field_text(value: Any, name: str = "") -> str:
+    """A front-matter value as one piece of a line, written as a page writes it."""
+    if value is None or value == "":
+        return "(not set)"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list | tuple):
+        # A command is one line to read, not a list of words.
+        joined = shlex.join(map(str, value)) if name == "command" else ", ".join(map(str, value))
+        return joined or "(none)"
+    return str(value)
+
+
+def _edit_changes(project: Project, proposal: EditProposal) -> list[str]:
+    """What accepting an edit proposal would change, line by line: every field from and
+    to, every relation it adds, and the unified diff of the text.
+
+    An agent's one-line summary is what it says the edit does.  The person decides on
+    what it does.
+    """
+    import difflib
+
+    from paper_orchestra.research.model import ProjectError
+
+    try:
+        page = project.page(proposal.target)
+    except ProjectError:
+        return ["the page it would change no longer exists; it can only be rejected"]
+    lines = [
+        f"{name}: {_field_text(page.meta.get(name), name)} -> {_field_text(value, name)}"
+        for name, value in proposal.fields.items()
+    ]
+    lines += [
+        f"{name}: adds {_field_text(targets)}" for name, targets in proposal.relations_add.items()
+    ]
+    if proposal.body is None or proposal.body == page.body:
+        return [*lines, "text: unchanged"]
+    diff = difflib.unified_diff(
+        page.body.splitlines(),
+        proposal.body.splitlines(),
+        fromfile=f"{page.path} (now)",
+        tofile=f"{page.path} (proposed by {proposal.author})",
+        lineterm="",
+    )
+    return [*lines, "text:", *diff]
+
+
+def _say_changes(project: Project, proposal: EditProposal, indent: str) -> None:
+    for line in _edit_changes(project, proposal):
+        _say(f"{indent}{line}")
+
+
+def _say_if_no_longer_approved(project: Project, target: str) -> None:
+    """After an accepted edit to an experiment whose run was approved: say when the
+    experiment is no longer what was approved, so that it is not found out at the run."""
+    from paper_orchestra.research.model import ProjectError
+
+    with contextlib.suppress(ProjectError):
+        page = project.page(target)
+        if page.kind != "experiment" or page.state not in ("approved", "queued"):
+            return
+        from paper_orchestra.research import experiments
+
+        standing = experiments.approval(project, str(page.id))
+        if not standing["matches"]:
+            _say(
+                f"  {page.id} is no longer what you approved ({'; '.join(standing['changed'])}). "
+                "It will not run until you approve it again: "
+                f"`paper-orchestra research approve {_quoted(project.root)} {page.id}`"
+            )
+
+
 def _list_pending(project: Project) -> None:
-    waiting = [_pending_item(item) for item in project.pending()]
+    from paper_orchestra.research.model import EditProposal
+
+    pending = project.pending()
+    waiting = [_pending_item(item) for item in pending]
     if not waiting:
         _say(f"Nothing is waiting for your decision in {project.root}.")
         return
     _say(f"{len(waiting)} waiting for your decision in {project.root}:")
     width = max(len(item["ref"]) for item in waiting)
-    for item in waiting:
+    for item, source in zip(waiting, pending, strict=True):
         what = f"edit of {item['target']}:" if item["kind"] == "edit" else item["kind"]
         _say(f"  {item['ref'].ljust(width)}  {what} {item['title']}  [{item['author']}]")
+        if isinstance(source, EditProposal):
+            # Shown here, before anything can be accepted: the summary is the agent's word.
+            _say_changes(project, source, " " * (width + 6))
     _say(
         "Decide with --accept REF, --reject REF (with --reason TEXT) or --accept-all KIND, "
         "or in the web app (`paper-orchestra ui`)."
@@ -1301,6 +1379,11 @@ def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bo
     """Make one decision and say what became of it; ``False`` when it could not be made."""
     from paper_orchestra.research.model import EditProposal, ProjectError
 
+    changes: list[str] = []
+    with contextlib.suppress(ProjectError):
+        # Against the page as it is before the decision: afterwards there is no difference.
+        if decision == "accept" and ref.lower().startswith("ep-"):
+            changes = _edit_changes(project, project.proposal(ref.lower()))
     try:
         outcome = project.review(ref, decision, by="human", reason=reason)
     except ProjectError as exc:
@@ -1310,6 +1393,10 @@ def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bo
     verb = "Accepted" if decision == "accept" else "Rejected"
     if isinstance(outcome, EditProposal):
         _say(f"{verb} {outcome.id}: {outcome.summary} ({outcome.target})")
+        for line in changes:
+            _say(f"    {line}")
+        if decision == "accept":
+            _say_if_no_longer_approved(project, outcome.target)
         return True
     name = outcome.id or outcome.path
     _say(f'{verb} {name}: {outcome.kind} "{outcome.title}"')
@@ -1403,7 +1490,11 @@ def research_approve(
     ],
     backend: Annotated[
         _Compute | None,
-        typer.Option("--backend", help="Where it runs. Default: what the plan or project says."),
+        typer.Option(
+            "--backend",
+            help="Where it runs. Default: the project's backend (Modal for a GPU), or what "
+            "you chose when you approved this experiment before.",
+        ),
     ] = None,
     gpu: Annotated[
         str | None, typer.Option("--gpu", help="GPU type on Modal, for example T4.")
@@ -1416,18 +1507,20 @@ def research_approve(
         bool | None,
         typer.Option(
             "--network/--no-network",
-            help="Let the run reach the network, or not. A plan that asks for the network "
-            "is approved only with one of the two.",
+            help="Let the run reach the network, or not. Default: not; a plan that asks for "
+            "the network is approved only with one of the two.",
             show_default=False,
         ),
     ] = None,
 ) -> None:
     """Approve an experiment's run: your decision, and the only way one gets to run.
 
-    The experiment's page must be accepted first.  Options left out keep what the plan
-    says, with one exception: whether a run may reach the network is never taken from
-    the plan, which an agent may have written.  A plan that asks for it needs --network
-    or --no-network.
+    The experiment's page must be accepted first.  The approval records exactly what may
+    run (the code and how it runs); if either changes afterwards, the experiment needs
+    your approval again.  Where it runs and whether it may reach the network are never
+    taken from the plan, which an agent may have written: without --backend it runs on
+    the project's backend, and a plan that asks for the network needs --network or
+    --no-network.  The time limit and the GPU type left out keep what the plan says.
     """
     from paper_orchestra.research.model import ProjectError
 
@@ -1435,13 +1528,6 @@ def research_approve(
     try:
         from paper_orchestra.research import experiments
 
-        if network is None and _asks_for_network(opened.page(experiment)):
-            _fail(
-                f"The plan of {experiment} asks for network access (network: true on its "
-                "page), and that is yours to grant, not the plan's. Approve it with "
-                "--network to let the run reach the network, or with --no-network to run "
-                "it without."
-            )
         page = experiments.approve(
             opened,
             experiment,
@@ -1458,18 +1544,49 @@ def research_approve(
         f"{root} {name}` runs it now; `paper-orchestra research advance {root}` runs "
         "everything approved and analyses the results."
     )
-    # What was approved is this code; saying so lets the person see that it is the code
-    # they read, and find it.
-    files = experiments.code_files(opened, str(name))
+    for line in _what_was_approved(opened, page):
+        _say(line)
+
+
+def _what_was_approved(project: Project, page: ResearchPage) -> list[str]:
+    """What the approval of ``page`` covers, for the person to hold against what they
+    read: the command (and the repository it runs in), the code files with the
+    approval's digest, and what a reading of the code found worth knowing."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import ProjectError
+
+    name = str(page.id or page.path)
+    lines: list[str] = []
+    with contextlib.suppress(ProjectError):
+        lines.append(_what_runs(experiments.load_plan(project, name)))
+    digest = str(page.meta.get("approved_digest") or "")
+    stamped = f"approved digest {digest[:12]}" if digest else "no digest was recorded"
+    files = experiments.code_files(project, name)
     if files:
         listed = ", ".join(
             f"{file} ({len(text.splitlines())} lines)" for file, text in files.items()
         )
-        digest = experiments.code_digest(opened, str(name))[:12]
-        _say(
-            f"Its code, in {_quoted(experiments.code_dir(opened, str(name)))}: {listed}; "
-            f"digest {digest}."
-        )
+        where = _quoted(experiments.code_dir(project, name))
+        lines.append(f"Its code, in {where}: {listed}; {stamped}.")
+    elif digest:
+        lines.append(f"It has no code files of its own; {stamped}.")
+    with contextlib.suppress(ProjectError):
+        lines += experiments.split_problems(experiments.check_code(project, name))[1]
+    return lines
+
+
+def _what_runs(plan: Any) -> str:
+    """The command a run of ``plan`` executes and, in repo mode, where: the repository
+    as it may be written down (never the token of its URL)."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research import repo as repositories
+
+    told = f"It runs `{shlex.join(experiments.job_command(plan))}`"
+    if plan.mode == "repo" and plan.repo:
+        how = "a clone of" if repositories.is_url(plan.repo) else "a copy of your repository"
+        told += f" in {how} {repositories.display_url(plan.repo)}"
+        told += f" at {plan.repo_ref}" if plan.repo_ref else ""
+    return told + "."
 
 
 def _asks_for_network(page: ResearchPage) -> bool:
@@ -1491,6 +1608,8 @@ def _approved_as(page: ResearchPage) -> str:
         told += f", for up to {limit:g} s"
     if _asks_for_network(page):
         told += ", and it may reach the network"
+    elif "network" in meta:
+        told += ", without network access"
     return told
 
 

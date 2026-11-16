@@ -31,7 +31,7 @@ from paper_orchestra.research.engine import (
     read_state,
     worker_alive,
 )
-from paper_orchestra.research.model import NotAllowed
+from paper_orchestra.research.model import NotAllowed, ProjectError
 from paper_orchestra.research.project import Project
 from test_research_agents import (
     BRIEF,
@@ -363,7 +363,8 @@ def test_a_full_round_pauses_at_each_checkpoint_and_builds_on_what_was_accepted(
     state = advance(project, team, backend)
     assert (state["status"], state["phase"], state["next_phase"]) == ("checkpoint", "run", "run")
     assert "No experiment is approved to run." in state["checkpoint"]["summary"]
-    assert "E1 (Warmup against no warmup" in state["checkpoint"]["summary"]
+    # (The title is the designer's: it stands there as a quotation.)
+    assert "E1 “Warmup against no warmup" in state["checkpoint"]["summary"]
     assert backend.jobs == [] and "analyze.analyst" not in team.calls
     approve(project, "E1")
 
@@ -874,7 +875,7 @@ def test_a_failed_phase_is_tried_once_more(project, team, backend):
     assert (state["status"], record["status"], record["attempts"]) == ("checkpoint", "completed", 2)
     assert state["error"] is None and record["error"] is None
     assert any(
-        "failed (the provider had a bad moment); trying it once more" in line
+        "failed (“the provider had a bad moment”); trying it once more" in line
         for line in activity(project)
     )
     assert events(project, "phase.failed") == []
@@ -900,7 +901,7 @@ def test_a_phase_that_fails_twice_stops_the_engine_with_the_error(project, team,
         "RuntimeError: the provider had a bad moment",
     )
     (failed,) = events(project, "phase.failed")
-    assert "failed twice: the provider had a bad moment" in failed["summary"]
+    assert "failed twice: “the provider had a bad moment”. Run it again" in failed["summary"]
     assert failed["phase"] == "hypothesize" and state["worker"] is None
     assert events(project, "checkpoint")[-1]["phase"] == "research"
 
@@ -957,6 +958,176 @@ def test_a_spent_model_budget_stops_at_a_checkpoint_that_says_how_to_go_on(tmp_p
         "hypothesize",
     )
     assert state["phases"][-1]["status"] == "completed"
+
+
+def test_a_turn_that_passes_the_model_budget_is_cut_short_at_a_checkpoint_that_says_so(
+    tmp_path, team, backend
+):
+    project = make_project(tmp_path, settings={"limits": {"model_usd": 1.0}})
+    original = team.research_scout
+
+    def scout(request: FakeRequest) -> str:
+        # What a provider's client reports after a model request: the first one of this
+        # turn alone costs more than the project allows in all.
+        request._emit({"type": "usage", "output_tokens": 100_000, "requests": 1})
+        return original(request)
+
+    team.research_scout = scout
+
+    state = advance(project, team, backend)
+
+    # The turn ended at its next model call: the scout had no paper verified yet.
+    assert team.calls == ["intake.intake", "research.scout"]
+    assert project.pages(kind="source") == []
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "research",
+        "research",
+    )
+    record = state["phases"][-1]
+    assert (record["phase"], record["status"]) == ("research", "interrupted")
+    summary = state["checkpoint"]["summary"]
+    assert "The model budget ran out in the middle of the scout's work" in summary
+    assert "$4.00 of $1.00 is spent" in summary and "settings.limits.model_usd" in summary
+    assert summary.endswith("(it resumes where it stopped).")
+    (warning,) = events(project, "budget.warning")
+    assert warning["phase"] == "research" and warning["data"]["limit"] == "model_usd"
+    assert warning["data"]["spent"] > 4 and warning["data"]["allowed"] == 1.0
+    assert "was stopped" not in " ".join(activity(project))
+
+    # With a higher limit the same session goes on where it stopped.
+    team.research_scout = original
+    project.settings.update({"limits": {"model_usd": 25}})
+    project.save_settings()
+    state = advance(project, team, backend)
+    record = state["phases"][-1]
+    assert (state["status"], state["next_phase"]) == ("checkpoint", "hypothesize")
+    assert (record["phase"], record["status"], record["attempts"]) == ("research", "completed", 2)
+    assert team.sessions[-2:] == ["r1-research-scout"] * 2
+    assert len(project.pages(kind="source")) == 2
+
+
+def test_the_budget_ends_a_turn_of_the_anthropic_client_before_its_next_request(
+    tmp_path, monkeypatch
+):
+    # The real client against a scripted Messages API: it reports the usage of every
+    # request, and runs the tools a response asks for before it sends the next one.
+    from paper_orchestra.llm.anthropic_client import AnthropicClient
+    from test_llm_anthropic import FakeAPI, msg, text, tool_use
+
+    api = FakeAPI()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-a-key-the-transport-is-scripted")
+    client = AnthropicClient(http_client=api.http_client(), max_retries=0)
+    project = make_project(tmp_path, settings={"limits": {"model_usd": 1.0}})
+    costly = {"input_tokens": 1000, "output_tokens": 100_000}
+    api.script = [
+        msg([text("Nothing to add.")]),  # intake
+        msg([tool_use("tu_1", "wiki_search", {"query": "warmup"})], "tool_use", usage=costly),
+        msg([text("A request that is never sent.")]),
+    ]
+    engine = Engine(
+        project, compute=FakeBackend(), client_for=lambda _: client, scholar=make_scholar()
+    )
+
+    state = engine.advance()
+
+    # The scout's first request passed the limit; the tool it asked for was not run and
+    # no second request went out.
+    assert len(api.requests) == 2 and len(api.script) == 1
+    assert not any("searched the wiki" in line for line in activity(project))
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "research",
+        "research",
+    )
+    assert state["phases"][-1]["status"] == "interrupted"
+    assert "ran out in the middle of the scout's work" in state["checkpoint"]["summary"]
+    (warning,) = events(project, "budget.warning")
+    assert warning["data"]["limit"] == "model_usd" and warning["data"]["spent"] > 4
+    # What the turn used is in the ledger, as the usage of any turn that ended.
+    assert state["spent"]["model_usd"] == pytest.approx(warning["data"]["spent"], abs=1e-3)
+
+
+@pytest.mark.parametrize("cause", ["budget", "stop"])
+def test_a_paused_turn_of_the_anthropic_client_is_not_continued_once_it_must_end(
+    tmp_path, monkeypatch, cause
+):
+    # A server tool loop that pauses (the scout's web searches do) is continued by the
+    # client with a further request, and no tool of the session is called in between.
+    import httpx2
+
+    from paper_orchestra.llm.anthropic_client import AnthropicClient
+    from test_llm_anthropic import SSE_HEADERS, FakeAPI, msg, sse, text
+
+    api = FakeAPI()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-a-key-the-transport-is-scripted")
+    client = AnthropicClient(http_client=api.http_client(), max_retries=0)
+    limit = 1.0 if cause == "budget" else 100.0
+    project = make_project(tmp_path, settings={"limits": {"model_usd": limit}})
+    engine = Engine(
+        project, compute=FakeBackend(), client_for=lambda _: client, scholar=make_scholar()
+    )
+    costly = {"input_tokens": 1000, "output_tokens": 100_000}
+
+    def paused(request: httpx2.Request) -> httpx2.Response:
+        if cause == "stop":
+            engine.stop()  # the person presses Stop while the request is out
+        message = msg([text("Searching.")], "pause_turn", usage=costly)
+        return httpx2.Response(200, content=sse(message), headers=SSE_HEADERS)
+
+    api.script = [
+        msg([text("Nothing to add.")]),  # intake
+        paused,
+        msg([text("Still searching.")], "pause_turn", usage=costly),
+        msg([text("Requests that are never sent.")], usage=costly),
+    ]
+
+    state = engine.advance()
+
+    # Intake's request and the scout's first: its continuation did not go out.
+    assert len(api.requests) == 2 and len(api.script) == 2
+    record = state["phases"][-1]
+    assert (record["phase"], record["status"], state["next_phase"]) == (
+        "research",
+        "interrupted",
+        "research",
+    )
+    assert 4 < state["spent"]["model_usd"] < 5  # one request of the scout, not three
+    if cause == "budget":
+        assert state["status"] == "checkpoint"
+        assert "ran out in the middle of the scout's work" in state["checkpoint"]["summary"]
+        assert len(events(project, "budget.warning")) == 1
+    else:
+        assert state["status"] == "stopped" and events(project, "budget.warning") == []
+        assert "The research phase was stopped; running it again resumes it." in activity(project)
+
+
+def test_a_phase_that_ends_past_the_model_budget_says_so_at_its_checkpoint(tmp_path, team, backend):
+    project = make_project(tmp_path, settings={"limits": {"model_usd": 1.0}})
+    original = team.research_scout
+    # A client that reports a turn's usage when the turn ends: 100,000 output tokens.
+    team.research_scout = lambda request: original(request) + "x" * 400_000
+
+    state = advance(project, team, backend)
+
+    assert (state["status"], state["phase"], state["next_phase"]) == (
+        "checkpoint",
+        "research",
+        "hypothesize",
+    )
+    assert state["phases"][-1]["status"] == "completed" and state["spent"]["model_usd"] > 4
+    summary = state["checkpoint"]["summary"]
+    assert "The model budget is used up: $4.00 of $1.00 is spent." in summary
+    assert "settings.limits.model_usd" in summary
+    assert "2 questions and 2 topics await your review." in summary
+    (warning,) = events(project, "budget.warning")
+    assert warning["phase"] == "research" and warning["data"]["limit"] == "model_usd"
+
+    # Nothing more starts until the limit is raised, as before.
+    accept_all(project)
+    state = advance(project, team, backend)
+    assert state["phases"][-1]["status"] == "interrupted"
+    assert "hypothesize.theorist" not in team.calls
 
 
 def two_approved_experiments(
@@ -1075,7 +1246,9 @@ class Reattachable(FakeBackend):
         described["jobs"]["reattach"] = True
         return described
 
-    def attach(self, handle, *, run_dir, on_log=None, should_stop=None) -> JobResult:
+    def attach(
+        self, handle, *, run_dir, spec=None, started=None, on_log=None, should_stop=None, mask=()
+    ) -> JobResult:
         self.attached.append(handle)
         run_dir = Path(run_dir)
         (run_dir / "log.txt").write_text("measuring the variance of early updates\n")
@@ -1249,6 +1422,56 @@ def test_the_journal_can_send_the_next_round_back_to_the_literature(project, tea
     assert (state["round"], state["phase"], state["next_phase"]) == (2, "research", "hypothesize")
 
 
+@pytest.mark.parametrize("decision", ["accept", "reject", "none"])
+def test_only_an_accepted_journal_page_sends_a_round_back_to_the_literature(
+    tmp_path, team, backend, decision
+):
+    # The person reviews journal pages themselves here.
+    project = make_project(tmp_path, settings={"review": {"journal": "review"}})
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    team.journal_meta = "next: research\n"
+
+    state = advance(project, team, backend)
+
+    journal = project.page("wiki/journal/round-1.md")
+    assert (journal.review, journal.meta["next"]) == ("proposed", "research")
+    # What the analyst wrote is a suggestion: unreviewed, it sends the round nowhere.
+    assert (state["phase"], state["next_phase"]) == ("analyze", "hypothesize")
+    summary = state["checkpoint"]["summary"]
+    assert "asks for another look at the literature" in summary
+    assert "accept it and the next round starts with research" in summary
+    assert summary.endswith("Next: proposing hypotheses from what you accepted.")
+
+    if decision != "none":
+        project.review(journal.path, decision, reason="Not now" if decision == "reject" else None)
+    state = advance(project, team, backend)
+
+    expected = "research" if decision == "accept" else "hypothesize"
+    assert (state["round"], state["phase"]) == (2, expected)
+    if decision == "accept":
+        # Once, not for ever: after the research the round goes on to its hypotheses.
+        state = advance(project, team, backend)
+        assert (state["round"], state["phase"]) == (2, "hypothesize")
+
+
+def test_a_journal_page_rejected_after_the_checkpoint_no_longer_sends_the_round_back(
+    project, team, backend
+):
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    team.journal_meta = "next: research\n"
+    state = advance(project, team, backend)
+    # Journal pages are accepted on creation in this project, so the checkpoint said research.
+    assert (state["phase"], state["next_phase"]) == ("analyze", "research")
+
+    project.review("wiki/journal/round-1.md", "reject", reason="The literature is covered")
+    state = advance(project, team, backend)
+
+    assert (state["round"], state["phase"]) == (2, "hypothesize")
+    assert team.calls.count("research.scout") == 1
+
+
 # ---------------------------------------------------------------------------
 # Experiments: only what the person approved
 # ---------------------------------------------------------------------------
@@ -1319,6 +1542,195 @@ def test_an_experiment_that_cannot_be_run_does_not_keep_the_others_from_running(
     assert "1 experiment ran: E1 succeeded." in summary
     assert "E2 could not be run: The backend chosen for E2 is not installed here." in summary
     assert state["phase"] == "analyze" and project.page("F1").relations["based_on"]
+
+
+def refuse_changed(monkeypatch, changed: str, reason: str) -> None:
+    """Have ``research.experiments.run`` refuse ``changed`` the way it refuses an experiment
+    that is no longer what was approved: back to planned, with the reason, and an error."""
+    real_run = experiments.run
+
+    def run(project, ref, **options):
+        if ref != changed:
+            return real_run(project, ref, **options)
+        project.set_state(ref, "planned", by="system", reason=f"Not run: {reason}")
+        raise ProjectError(f"{ref} was not run: {reason} Approve it again.")
+
+    monkeypatch.setattr(experiments, "run", run)
+
+
+def test_an_experiment_that_changed_since_its_approval_is_named_and_the_others_run(
+    project, team, monkeypatch
+):
+    backend = FakeBackend()
+    two_approved_experiments(project, team, backend)
+    refuse_changed(monkeypatch, "E1", "its plan changed: network was false and is true.")
+
+    state = advance(project, team, backend)
+
+    assert (project.page("E1").state, project.page("E2").state) == ("planned", "succeeded")
+    assert len(backend.jobs) == 1
+    summary = state["checkpoint"]["summary"]
+    assert "1 experiment ran: E2 succeeded." in summary
+    assert (
+        "E1 was not run: its plan changed: network was false and is true. Approve it again. "
+        "It is planned again."
+    ) in summary
+    assert state["phase"] == "analyze" and project.page("F1").relations["based_on"]
+
+
+def test_code_changed_after_the_approval_is_not_run_and_the_checkpoint_says_so(project, team):
+    # The same with nothing standing in: the person edits the code of E1 after approving it.
+    backend = FakeBackend()
+    two_approved_experiments(project, team, backend)
+    experiments.write_code(project, "E1", {"main.py": GOOD_CODE + "# changed\n"}, author="human")
+
+    state = advance(project, team, backend)
+
+    assert (project.page("E1").state, project.page("E2").state) == ("planned", "succeeded")
+    assert len(backend.jobs) == 1 and experiments.runs(project, "E1") == []
+    summary = state["checkpoint"]["summary"]
+    assert "1 experiment ran: E2 succeeded." in summary
+    assert "E1 was not run: " in summary and "main.py" in summary
+    assert "It is planned again." in summary
+    assert state["phase"] == "analyze"
+
+    # Approved again as it now stands, it runs.
+    approve(project, "E1", backend)
+    state = advance(project, team, backend, phase="run")
+    assert project.page("E1").state == "succeeded" and len(backend.jobs) == 2
+
+
+def test_a_changed_experiment_is_named_also_when_the_analysis_ends_in_a_later_call(project, team):
+    backend = FakeBackend()
+    two_approved_experiments(project, team, backend)
+    experiments.write_code(project, "E1", {"main.py": GOOD_CODE + "# changed\n"}, author="human")
+    # The run phase refuses E1 and runs E2; the analysis that follows fails twice, so the
+    # call ends without a checkpoint and with it what the run phase had to say.
+    team.failures["analyze.analyst"] = 2
+
+    state = advance(project, team, backend)
+
+    assert (state["status"], state["phase"]) == ("failed", "analyze")
+    assert (project.page("E1").state, project.page("E2").state) == ("planned", "succeeded")
+
+    state = advance(project, team, backend)
+
+    # The checkpoint the person does get says where E1 stands, once.
+    summary = state["checkpoint"]["summary"]
+    assert (state["status"], state["phase"]) == ("checkpoint", "analyze")
+    assert summary.count("E1 is planned again: Not run: it is not what was approved") == 1
+    assert "main.py" in summary and "Approve it again." in summary
+
+
+def test_a_run_phase_that_only_found_a_changed_experiment_says_which_and_why(
+    project, team, backend, monkeypatch
+):
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+    reason = "main.py was written by agent:designer after the approval."
+    refuse_changed(monkeypatch, "E1", reason)
+
+    state = advance(project, team, backend)
+
+    assert backend.jobs == [] and project.page("E1").state == "planned"
+    assert (state["status"], state["phase"], state["next_phase"]) == ("checkpoint", "run", "run")
+    summary = state["checkpoint"]["summary"]
+    assert summary.startswith(
+        f"No experiment ran. E1 was not run: {reason} Approve it again. It is planned again."
+    )
+
+    # Looked at again later, the run phase still says why nothing is approved.
+    state = advance(project, team, backend)
+    summary = state["checkpoint"]["summary"]
+    assert "No experiment is approved to run." in summary
+    assert f"E1 is planned again: Not run: {reason}" in summary
+    assert "Approve the ones you want run: E1 “Warmup against no warmup" in summary
+
+
+def test_an_experiment_that_lost_its_approval_earlier_is_named_when_the_others_run(project, team):
+    backend = FakeBackend()
+    two_approved_experiments(project, team, backend)
+    # As it stands after its plan was found changed before this phase began (an edit the
+    # person accepted, or an earlier attempt to run it).
+    reason = "Its plan changed since you approved it: timeout_seconds was 300 and is 900."
+    project.set_state("E1", "planned", by="human", reason=reason)
+
+    state = advance(project, team, backend)
+
+    summary = state["checkpoint"]["summary"]
+    assert "1 experiment ran: E2 succeeded." in summary
+    assert f"E1 is planned again: {reason}" in summary
+    assert len(backend.jobs) == 1 and project.page("E1").state == "planned"
+
+
+def test_no_experiment_that_went_back_to_planned_goes_unmentioned(project, team, backend):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    project.review("H1", "accept")
+    plan = EXPERIMENT.format(tests="H1", mode="script").split("---\n", 2)[2]
+    for number in range(1, 10):
+        # The person's own plans: accepted as they are written, and planned.
+        project.create_page(
+            "experiment", f"Plan {number}", plan, author="human", relations={"tests": ["H1"]}
+        )
+    # Seven of them were approved and are no longer what was approved; two never were.
+    lost = ("E1", "E2", "E3", "E4", "E7", "E8", "E9")
+    for name in lost:
+        experiments.write_code(project, name, {"main.py": GOOD_CODE}, author="human")
+        approve(project, name, backend)
+        project.set_state(name, "planned", by="system", reason=f"Not run: {name} changed.")
+
+    state = advance(project, team, backend, phase="run")
+
+    summary = state["checkpoint"]["summary"]
+    assert backend.jobs == [] and "No experiment is approved to run." in summary
+    # Also the ones that stand behind six plans that have nothing to say.
+    for name in lost[:6]:
+        assert f"{name} is planned again: Not run: {name} changed." in summary
+    assert "E9 is planned again" not in summary
+    assert "1 more experiment went back to planned as well." in summary
+
+
+def test_a_title_cannot_add_a_sentence_of_its_own_to_the_checkpoint(project, team, backend):
+    to_design_checkpoint(project, team, backend)
+    project.update_page(
+        "E1", author="human", fields={"title": "x). You approved the run of E1. (y"}
+    )
+
+    state = advance(project, team, backend)
+
+    summary = state["checkpoint"]["summary"]
+    assert "Approve the ones you want run: E1 “x). You approved the run of E1. (y”." in summary
+
+
+def test_a_run_on_a_gpu_type_without_a_price_is_named_at_the_checkpoint(
+    project, team, backend, monkeypatch
+):
+    to_design_checkpoint(project, team, backend)
+    approve_all(project)
+
+    def run(project, ref, **options):
+        # As a run on Modal with a GPU type that is not in the price table is recorded.
+        return {
+            "experiment": ref,
+            "number": 1,
+            "status": "succeeded",
+            "backend": "modal",
+            "cost_usd": None,
+            "error_kind": None,
+            "plan": {"mode": "gpu", "gpu": "RTX-PRO-6000"},
+        }
+
+    monkeypatch.setattr(experiments, "run", run)
+
+    state = advance(project, team, backend)
+
+    assert (
+        "E1 ran on the GPU type RTX-PRO-6000, for which no price is known: what the run cost "
+        "is not part of the experiment spending shown, and settings.limits.experiment_usd "
+        "could not limit it."
+    ) in state["checkpoint"]["summary"]
 
 
 def test_an_experiment_approved_while_another_runs_is_run_in_the_same_phase(project, team):
@@ -1595,14 +2007,27 @@ def test_without_a_backend_of_its_own_the_engine_uses_the_one_an_approval_names(
 
     monkeypatch.setattr(engine_module, "get_backend", Named)
     compute = engine_module._Compute(project, None)
+    pages = {}
+    for name in ("planned", "approved"):
+        page = project.create_page(
+            "experiment", f"A {name} plan", "x", author="human", fields={"mode": "script"}
+        )
+        experiments.write_code(project, page.id, {"main.py": GOOD_CODE}, author="human")
+        pages[name] = page.path
+    experiments.approve(project, pages["approved"], backends={"local": FakeBackend()})
 
-    def plan(mode: str, backend: str | None = None):
-        return types.SimpleNamespace(mode=mode, backend=backend)
+    def plan(mode: str, backend: str | None = None, page: str = "planned"):
+        return types.SimpleNamespace(mode=mode, backend=backend, path=pages[page])
 
     assert compute().name == "local"  # the project's
     assert compute(plan("script")).name == "local"
     assert compute(plan("gpu")).name == "modal"  # what an approval would choose for a GPU
-    assert compute(plan("script", "modal")).name == "modal"  # what the person chose
+    # What the person chose when approving the run.
+    assert compute(plan("script", "modal", "approved")).name == "modal"
+    # A page that was never approved has no say in where it would run: the designer's
+    # check asks the backend the project would use, whatever the page names.
+    assert compute(plan("script", "modal", "planned")).name == "local"
+    assert compute(types.SimpleNamespace(mode="script", backend="modal")).name == "local"
     assert built == ["local", "modal"]  # each is built once
     compute.close()
     assert sorted(closed) == ["local", "modal"]

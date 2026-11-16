@@ -22,6 +22,7 @@ import codecs
 import contextlib
 import fnmatch
 import inspect
+import json
 import math
 import os
 import queue
@@ -134,11 +135,28 @@ def refuse_unsafe_document(workdir: str | Path, tex_name: str) -> CompileResult 
 LOG_NAME = "log.txt"
 #: Where a backend with remote jobs writes the job's handle as soon as it has one.
 HANDLE_NAME = "handle.txt"
-#: Files of a run directory that the backend or the engine writes.  A job's outputs may
-#: not replace them.
-RESERVED_RUN_FILES = frozenset({LOG_NAME, HANDLE_NAME, "run.json"})
-#: Starts every line that a backend adds to a job's log itself.
+#: Where a backend whose jobs are billed keeps its estimate of what the job has cost so
+#: far: ``{"cost_usd": float | null, "seconds": float, "final": bool}``.  It is written
+#: when the job starts to cost and again whenever the job settles, so that a run whose
+#: result never reached its caller (a stop, an interrupt, a dead worker) still has a cost.
+COST_NAME = "cost.json"
+#: Where a backend whose jobs are processes of this machine records what a job started,
+#: for whoever has to clean up after a worker that died:
+#: ``{"session": int, "session_started": str, "scratch": str}``.
+JOB_NAME = "job.json"
+#: Names in a run directory that the backend or the engine writes: the records above,
+#: the engine's ``run.json``, its snapshot of the code that ran (``code``) and its copy of
+#: the repository (``repo``).  A job's outputs may not replace them.
+RESERVED_RUN_FILES = frozenset(
+    {LOG_NAME, HANDLE_NAME, COST_NAME, JOB_NAME, "run.json", "code", "repo"}
+)
+#: Starts every line that a backend adds to a job's log itself, and no line of the job.
 NOTE_PREFIX = "[paper-orchestra] "
+#: Put before what a job printed where a line of its output begins like a line of the
+#: backend, so that no job can speak in the backend's name.
+JOB_MARK = "(printed by the job) "
+#: Stands in a log where the job printed a string that must not be written down.
+MASKED = "***"
 
 #: What ``describe()["jobs"]`` holds for a backend that runs no jobs.
 NO_JOB_FEATURES: Mapping[str, bool] = {
@@ -259,6 +277,7 @@ class ComputeBackend(ABC):
         run_dir: Path,
         on_log: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
     ) -> JobResult:
         """Run ``spec.command`` in a private copy of ``source_dir`` and report how it went.
 
@@ -269,6 +288,13 @@ class ComputeBackend(ABC):
         when ``spec.timeout`` seconds have passed.  Afterwards the paths in
         ``spec.outputs`` that exist are copied into ``run_dir``; outputs of an earlier
         run that were there are removed first, so what is found there is this run's.
+
+        Only what the command wrote is an output: a path of ``spec.outputs`` that
+        came with ``source_dir`` is not in the working directory when the command
+        starts, and the result's notes say that it was removed.  The strings in
+        ``mask`` (credentials) never reach the log or ``on_log``: where the job
+        prints one, ``***`` stands in its place.  A line of the job that begins like
+        a line of the backend (``[paper-orchestra]``) is marked as the job's.
 
         Every outcome that follows from the job, or from the backend failing while it
         worked, is a :class:`JobResult`; ``error`` is set when the backend refused the
@@ -295,13 +321,22 @@ class ComputeBackend(ABC):
         handle: str,
         *,
         run_dir: Path,
+        spec: JobSpec | None = None,
+        started: str | float | None = None,
         on_log: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        mask: Sequence[str] = (),
     ) -> JobResult:
         """Pick up the job ``handle`` (``JobResult.handle``) after the process that ran it died.
 
         Only backends whose jobs outlive the orchestrator have something to pick up;
         ``describe()["jobs"]["reattach"]`` says whether this one does.
+
+        A job is judged, fetched and billed by what this side knows about it, never
+        by what the job could have written where it ran: ``spec`` is the job as it
+        was approved (its outputs, time limit and resources) and ``started`` is when
+        its run began (an ISO 8601 stamp, or seconds since the epoch), from which it
+        is billed.  ``mask`` is as for :meth:`run_job`.
         """
         raise ComputeError(
             f"Jobs of the {self.name or 'compute'} backend cannot be picked up again: they end "
@@ -480,15 +515,16 @@ def spec_problems(spec: JobSpec) -> list[str]:
 def open_run(run_dir: Path, outputs: Sequence[str]) -> Path:
     """Make ``run_dir`` ready for a new run and return the path of its log.
 
-    The log is emptied, and the requested outputs and the handle that an earlier
-    run left there are removed (links are removed, never followed), so that what is
-    found afterwards is this run's.  Outputs that ``spec_problems`` objects to are
-    left alone.  Raises :class:`ComputeError` when the directory cannot be used.
+    The log is emptied, and the requested outputs and the backend's records (handle,
+    cost, job) that an earlier run left there are removed (links are removed, never
+    followed), so that what is found afterwards is this run's.  Outputs that
+    ``spec_problems`` objects to are left alone.  Raises :class:`ComputeError` when the
+    directory cannot be used.
     """
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / LOG_NAME).write_bytes(b"")
-        stale = [run_dir / HANDLE_NAME]
+        stale = [run_dir / name for name in (HANDLE_NAME, COST_NAME, JOB_NAME)]
         for name in () if isinstance(outputs, str) else outputs:
             if _output_problem(name) is None:
                 stale.append(run_dir / safe_relative(name))
@@ -504,24 +540,100 @@ def open_run(run_dir: Path, outputs: Sequence[str]) -> Path:
     return run_dir / LOG_NAME
 
 
+def write_record(path: Path, data: Mapping[str, Any]) -> None:
+    """Write ``data`` as the JSON file ``path``, whole or not at all.
+
+    The records a backend keeps next to a run are read by another process after this
+    one has died, at any moment: a reader finds the old file or the new one, never half
+    of one.  Raises ``OSError`` when the directory cannot be written.
+    """
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def read_record(path: Path) -> dict[str, Any] | None:
+    """The JSON object in ``path``; ``None`` when there is no such file or it holds none."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def output_of(relative: str, outputs: Sequence[str]) -> str | None:
+    """The one of ``outputs`` that the path ``relative`` is or lies in; ``None`` if none.
+
+    ``relative`` is a posix path inside a working directory.  ``outputs`` must have
+    passed :func:`spec_problems`.
+    """
+    parts = Path(relative).parts
+    for name in outputs:
+        wanted = safe_relative(name).parts
+        if parts[: len(wanted)] == wanted:
+            return name
+    return None
+
+
+def clear_outputs(work: Path, outputs: Sequence[str]) -> list[str]:
+    """Remove the requested ``outputs`` from the working directory ``work`` before the
+    job's command starts, and return the ones that were there.
+
+    A result is what the command wrote.  A ``metrics.json`` or an ``artifacts``
+    directory that came with the source would otherwise be collected as if this run
+    had produced it.  A link is removed, never followed; an output behind a linked
+    directory is left alone, because it is never collected either.
+    """
+    removed: list[str] = []
+    for name in outputs:
+        relative = safe_relative(name)
+        path = work / relative
+        behind_link = any(
+            (work / Path(*relative.parts[:depth])).is_symlink()
+            for depth in range(1, len(relative.parts))
+        )
+        if behind_link or not os.path.lexists(path):
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed.append(name)
+    return removed
+
+
+def leftover_notes(names: Iterable[str]) -> list[str]:
+    """The note for a result whose source held ``names`` of the requested outputs."""
+    found = sorted(set(names))
+    if not found:
+        return []
+    return [
+        f"The backend removed {_listed(found)} that was there before the run (it came with "
+        "the source): only what the command itself writes counts as a result."
+    ]
+
+
 class _Lines:
     """Cuts text into the pieces that ``on_log`` receives.
 
     A piece ends at a line feed or carriage return (so a progress bar that redraws
     itself arrives as separate pieces) or after ``MAX_LINE_CHARS`` characters.  Empty
     pieces are dropped.  The pieces depend only on the text, never on how it was cut
-    into chunks; replaying a log relies on that.
+    into chunks; replaying a log relies on that.  ``emit`` is told with each piece
+    whether it continues a line that an earlier piece began.
     """
 
-    def __init__(self, emit: Callable[[str], None]) -> None:
+    def __init__(self, emit: Callable[[str, bool], None]) -> None:
         self._emit = emit
         self._pending = ""
+        self._continues = False
 
     def feed(self, text: str) -> None:
         pending = self._pending + text
         start = 0
         for match in _LINE_END.finditer(pending):
             self._pieces(pending[start : match.start()])
+            self._continues = False
             start = match.end()
         rest = pending[start:]
         whole = len(rest) - len(rest) % MAX_LINE_CHARS
@@ -529,16 +641,193 @@ class _Lines:
         self._pending = rest[whole:]
 
     def flush(self) -> None:
+        """Emit what is left of an unfinished line; what follows starts a new one."""
         pending, self._pending = self._pending, ""
         self._pieces(pending)
+        self._continues = False
 
     def _pieces(self, line: str) -> None:
         for start in range(0, len(line), MAX_LINE_CHARS):
-            self._emit(line[start : start + MAX_LINE_CHARS])
+            self._emit(line[start : start + MAX_LINE_CHARS], self._continues)
+            self._continues = True
 
 
 def _utf8_decoder() -> codecs.IncrementalDecoder:
     return codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+
+class _Mask:
+    """Replaces strings that must not be written down in a text that arrives in pieces.
+
+    A string cut in two by the pieces is still found: the end of a piece that may be
+    the beginning of one is held back until the next piece tells.  What comes out is
+    the same however the text was cut: it is what replacing in the whole text gives,
+    from left to right, the longest string first where several begin at one place.
+    """
+
+    def __init__(self, secrets: Iterable[str]) -> None:
+        # Longest first: where one secret contains another, the whole of it goes.
+        self._secrets = sorted(
+            {secret for secret in secrets if isinstance(secret, str) and secret},
+            key=len,
+            reverse=True,
+        )
+        self._pattern = (
+            re.compile("|".join(map(re.escape, self._secrets))) if self._secrets else None
+        )
+        self._pending = ""
+
+    def whole(self, text: str) -> str:
+        """``text`` without the secrets, for a text that is complete."""
+        return self._pattern.sub(MASKED, text) if self._pattern is not None else text
+
+    def feed(self, text: str) -> str:
+        """What may be written once ``text`` has arrived."""
+        if self._pattern is None:
+            return text
+        text = self._pending + text
+        undecided = self._undecided(text)
+        pieces: list[str] = []
+        position = 0
+        while True:
+            # Where a secret may have begun whose end has not arrived.  A string found
+            # at or after that place has to wait: the longer one may yet take its place.
+            waits = next((index for index in undecided if index >= position), len(text))
+            match = self._pattern.search(text, position)
+            if match is None or match.start() >= waits:
+                break
+            pieces.append(text[position : match.start()])
+            pieces.append(MASKED)
+            position = match.end()
+        pieces.append(text[position:waits])
+        self._pending = text[waits:]
+        return "".join(pieces)
+
+    def flush(self) -> str:
+        """What was held back, once nothing more can follow it."""
+        pending, self._pending = self._pending, ""
+        return self.whole(pending)
+
+    def _undecided(self, text: str) -> list[int]:
+        """The places near the end of ``text`` from which it reads as the beginning of a
+        secret that is longer than what is left of the text, in ascending order."""
+        places: set[int] = set()
+        for secret in self._secrets:
+            index = text.find(secret[0], max(0, len(text) - len(secret) + 1))
+            while index != -1:
+                if secret.startswith(text[index:]):
+                    places.add(index)
+                index = text.find(secret[0], index + 1)
+        return sorted(places)
+
+
+_TAG = NOTE_PREFIX.rstrip()
+_ESCAPE = "\x1b"
+# What a terminal or a page shows nothing of: blanks, control and zero-width characters.
+# The escape character is looked at by itself, because what follows it may go with it.
+_UNSEEN = re.compile(
+    r"[\s\x00-\x1a\x1c-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u2028-\u202f\u2060-\u2064\ufeff]*"
+)
+# A colour or cursor sequence, which a terminal shows nothing of either, and one that
+# the text seen so far may still be in the middle of.
+_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_OPEN_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]{0,32}[ -/]{0,4})?")
+
+
+def _may_become(word: str, text: str, index: int) -> bool:
+    """Whether ``text`` ends, from ``index`` on, with a beginning of ``word`` that is
+    not all of it (the empty beginning included)."""
+    return len(text) - index < len(word) and word.startswith(text[index:])
+
+
+class _Guard:
+    """Keeps a job from printing lines that read as the backend's own.
+
+    A line of the backend starts with ``NOTE_PREFIX``.  Where a line of the job starts
+    with that tag, behind nothing a reader would see, ``JOB_MARK`` is put before the
+    tag.  The text arrives in pieces; the few characters at the start of a line that
+    may be the beginning of the tag are held back until the next piece tells.
+    """
+
+    def __init__(self) -> None:
+        self._pending = ""
+        #: Nothing visible has been printed on the current line yet.
+        self._fresh = True
+
+    def feed(self, text: str) -> str:
+        text = self._pending + text
+        self._pending = ""
+        pieces: list[str] = []
+        index = 0
+        while index < len(text):
+            if not self._fresh:
+                end = _LINE_END.search(text, index)
+                stop = len(text) if end is None else end.end()
+                pieces.append(text[index:stop])
+                index = stop
+                self._fresh = end is not None
+                continue
+            unseen = _UNSEEN.match(text, index)
+            assert unseen is not None  # it matches the empty string
+            pieces.append(unseen.group())
+            index = unseen.end()
+            if index == len(text):
+                break
+            # The rest of the text is only ever copied where it is short: a job prints
+            # megabytes, and this runs at the start of every line of them.
+            if text.startswith(_TAG, index):
+                pieces.append(JOB_MARK)
+                self._fresh = False
+            elif _may_become(_TAG, text, index):
+                self._pending = text[index:]
+                break
+            elif text[index] == _ESCAPE:
+                skipped = self._behind_escape(text, index)
+                if skipped is None:
+                    self._pending = text[index:]
+                    break
+                pieces.append(skipped)
+                index += len(skipped)
+            else:
+                self._fresh = False
+        return "".join(pieces)
+
+    @staticmethod
+    def _behind_escape(text: str, index: int) -> str | None:
+        """What a reader sees nothing of at ``index`` of ``text``, where the escape
+        character stands; ``None`` while more text has to arrive to tell.
+
+        A viewer that drops the escape character alone shows what follows it; a
+        terminal takes a whole sequence with it.  The tag may hide behind either.
+        """
+        if text.startswith(_TAG, index + 1):
+            return _ESCAPE
+        if _may_become(_TAG, text, index + 1):
+            return None
+        sequence = _SEQUENCE.match(text, index)
+        if sequence is not None:
+            return sequence.group()
+        return None if _OPEN_SEQUENCE.fullmatch(text, index) else _ESCAPE
+
+    def flush(self) -> str:
+        pending, self._pending = self._pending, ""
+        return pending
+
+    def new_line(self) -> None:
+        """What comes next starts a line, whatever came before (a note went in between)."""
+        self._fresh = True
+
+
+def _as_the_jobs(piece: str) -> str:
+    """``piece`` of a job's output with ``JOB_MARK`` if it begins like a backend's line."""
+    guard = _Guard()
+    return guard.feed(piece) + guard.flush()
+
+
+def _one_line(text: str) -> str:
+    """``text`` on one line: a note of the backend never spills into lines of its own
+    that lack the prefix, whatever name of a file it quotes."""
+    return " ".join(str(text).splitlines())
 
 
 class JobLog:
@@ -550,6 +839,14 @@ class JobLog:
     (in memory, bounded) and written when the log is closed, and ``on_log`` is told
     once and then left alone.  ``note`` adds a line of the backend's own.  A file that
     cannot be written (a full disk) raises :class:`ComputeError`.
+
+    Two things are changed in what the job printed before it reaches the file or
+    ``on_log``.  The strings in ``mask`` (credentials) are replaced by ``MASKED``,
+    also where one arrives in two pieces.  And a line that begins with the tag of
+    ``NOTE_PREFIX`` gets ``JOB_MARK`` in front of the tag, so that a line starting
+    with the prefix is always the backend's.  For both, a few characters that may be
+    the beginning of such a string are held back until more output, or the end,
+    tells.
 
     ``skip_lines`` withholds that many lines from ``on_log``: a log that is rebuilt
     from the start of a job reports only what was not reported before.  ``append``
@@ -563,6 +860,7 @@ class JobLog:
         *,
         skip_lines: int = 0,
         append: bool = False,
+        mask: Iterable[str] = (),
     ) -> None:
         self.path = Path(path)
         #: Bytes of job output received, before any replacement or truncation.
@@ -573,6 +871,8 @@ class JobLog:
         self._skip = skip_lines
         self._lines = _Lines(self._deliver)
         self._decoder = _utf8_decoder()
+        self._mask = _Mask(mask)
+        self._guard = _Guard()
         self._file: IO[bytes] = open(self.path, "ab" if append else "wb")  # noqa: SIM115
         self._at_line_start = not append or _ends_with_newline(self.path)
         self._written = 0
@@ -585,15 +885,17 @@ class JobLog:
     def feed(self, data: bytes) -> None:
         """Take the next bytes of the job's output."""
         self.raw_bytes += len(data)
-        self._accept(self._decoder.decode(data))
+        self._accept(self._screened(self._decoder.decode(data)))
 
     def note(self, message: str) -> None:
         """Add a line of the backend's own, on a line of its own."""
-        line = NOTE_PREFIX + message
+        line = NOTE_PREFIX + self._mask.whole(_one_line(message))
         if self.truncated:
             self._late_notes.append(line)
         else:
             self._write(("" if self._at_line_start else "\n") + line + "\n")
+        # The job's output goes on below the note: on a new line, which is checked as one.
+        self._guard.new_line()
         if self._on_log is not None:
             self._lines.flush()
             self._on_log(line)
@@ -613,7 +915,7 @@ class JobLog:
             return
         self._closed = True
         try:
-            self._accept(self._decoder.decode(b"", final=True))
+            self._accept(self._screened(self._decoder.decode(b"", final=True), last=True))
             if self.truncated:
                 self._write_tail()
             if self._on_log is not None:
@@ -628,6 +930,14 @@ class JobLog:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def _screened(self, text: str, *, last: bool = False) -> str:
+        """The job's output as it may be written: masked first, then guarded."""
+        text = self._mask.feed(text)
+        if last:
+            text += self._mask.flush()
+        text = self._guard.feed(text)
+        return text + self._guard.flush() if last else text
 
     def _accept(self, text: str) -> None:
         if not text:
@@ -672,20 +982,24 @@ class JobLog:
             f"{NOTE_PREFIX}{human_size(self._beyond - len(tail))} of output are left out "
             f"here: a log keeps the first {human_size(MAX_LOG_BYTES)} and the end."
         )
-        # The cut may have gone through a character; what is left of it is dropped.
-        end = tail.decode("utf-8", errors="ignore")
+        # The cut may have gone through a character; what is left of it is dropped.  It
+        # may also have gone through a line, whose rest now starts one.
+        guard = _Guard()
+        end = guard.feed(tail.decode("utf-8", errors="ignore")) + guard.flush()
         self._write(("" if self._at_line_start else "\n") + marker + "\n" + end)
         for line in self._late_notes:
             self._write(("" if self._at_line_start else "\n") + line + "\n")
 
-    def _deliver(self, piece: str) -> None:
+    def _deliver(self, piece: str, continues: bool) -> None:
         if not piece:
             return
         if self._skip > 0:
             self._skip -= 1
             return
         assert self._on_log is not None
-        self._on_log(piece)
+        # The start of a line was checked when it was written.  A long line reaches the
+        # callback in several pieces, and none of them may read as the backend's either.
+        self._on_log(_as_the_jobs(piece) if continues else piece)
 
 
 def _ends_with_newline(path: Path) -> bool:
@@ -704,12 +1018,14 @@ def delivered_lines(log_path: Path) -> int:
 
     The backend's own notes and an unfinished last line do not count.  This is the
     ``skip_lines`` of a :class:`JobLog` that rebuilds the same log from the start.
+    Only the backend starts a line with ``NOTE_PREFIX`` (see :class:`JobLog`), so a line
+    of the job is never taken for a note, and none is delivered twice.
     """
     count = 0
 
-    def emit(piece: str) -> None:
+    def emit(piece: str, continues: bool) -> None:
         nonlocal count
-        if piece and not piece.startswith(NOTE_PREFIX):
+        if piece and (continues or not piece.startswith(NOTE_PREFIX)):
             count += 1
 
     lines = _Lines(emit)

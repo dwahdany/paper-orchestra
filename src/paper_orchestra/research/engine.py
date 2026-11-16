@@ -10,6 +10,12 @@ it and a later ``advance()`` can pick up where an interrupted one stopped.
 
 One worker per project: ``advance()`` and ``run_experiment()`` hold a kernel lock
 on ``.worker.lock`` and keep ``state.json["worker"]`` fresh with a heartbeat.
+
+The model budget (``settings.limits.model_usd``) is looked at before every session
+and every turn of one, and after every model request inside a turn: a turn that
+takes the project past it ends at its next model call, and the phase stops at a
+checkpoint that says it was cut short.  A phase that ends past the limit says so
+at its checkpoint as well.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ from typing import Any
 
 from paper_orchestra.compute import ComputeBackend, ComputeError, get_backend
 from paper_orchestra.errors import chain, stops_the_run
+from paper_orchestra.llm.base import Usage
+from paper_orchestra.llm.pricing import estimate_cost_usd
 from paper_orchestra.memory.harness import ContextHarness, RunCancelled
 from paper_orchestra.memory.lock import WikiLock
 
@@ -331,7 +339,24 @@ class _Compute:
         default = (
             "modal" if getattr(plan, "mode", None) == "gpu" else self._project.settings.compute
         )
-        return self.named(getattr(plan, "backend", None) or default)
+        return self.named(self._approved_backend(plan) or default)
+
+    def _approved_backend(self, plan: Any) -> str | None:
+        """The backend the person's approval of the plan's experiment named, if it has one.
+
+        Where an experiment runs is the person's choice, made in the project's
+        settings or at approval.  A ``backend`` on a page that is not approved (a
+        proposal the designer's check asks about) is not that choice, whoever wrote
+        it there, and is not followed.
+        """
+        named, path = getattr(plan, "backend", None), getattr(plan, "path", None)
+        if not named or not path:
+            return None
+        try:
+            page = self._project.page(path)
+        except ProjectError:
+            return None
+        return str(named) if page.state in ("approved", "queued", "running") else None
 
     def named(self, name: str) -> ComputeBackend:
         if name not in self._made:
@@ -361,12 +386,21 @@ def _plural(count: int, noun: str) -> str:
 
 
 def _and(parts: Sequence[str]) -> str:
-    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    """``a``, ``a and b``, ``a, b and c``; nothing for no parts."""
+    if len(parts) <= 1:
+        return "".join(parts)
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 def _one_line(text: Any, limit: int = 400) -> str:
     line = " ".join(str(text).split())
     return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
+def _sentence(text: Any, limit: int = 400) -> str:
+    """``text`` on one line, ending the way a sentence ends."""
+    line = _one_line(text, limit)
+    return line if line[-1:] in ".!?…" else line + "."
 
 
 def _money(amount: float) -> str:
@@ -436,11 +470,14 @@ class Engine:
         """Run from the next phase (or ``phase``) up to the next checkpoint; return the state.
 
         ``instruction`` is the person's word for this run, handed to the agents of
-        the phases it covers.  The returned state says how it ended: ``checkpoint``,
-        ``stopped`` (interrupted; the same call resumes) or ``failed`` (a phase failed
-        twice; ``error`` says why).  Raises :class:`WorkerBusy` when another worker
-        has the project, :class:`EngineError` when the project's models cannot serve
-        the agents, and ``KeyboardInterrupt`` after recording the interruption.
+        the phases it covers.  The returned state says how it ended: ``checkpoint``
+        (also when a spent budget ended a phase early: its summary and a
+        ``budget.warning`` event say so, and the same call resumes the phase once
+        the limit is raised), ``stopped`` (interrupted; the same call resumes) or
+        ``failed`` (a phase failed twice; ``error`` says why).  Raises
+        :class:`WorkerBusy` when another worker has the project,
+        :class:`EngineError` when the project's models cannot serve the agents, and
+        ``KeyboardInterrupt`` after recording the interruption.
         """
         if phase is not None and phase not in PHASES:
             raise EngineError(f"{phase!r} is not a phase; the phases are: {', '.join(PHASES)}.")
@@ -618,7 +655,11 @@ class Engine:
             write_json(self.project.root / STATE_FILE, self._state)
 
     def _write_usage(self) -> float:
-        """Bring usage.json and ``spent.model_usd`` up to date; return the model spend."""
+        """Bring usage.json and ``spent.model_usd`` up to date; return the model spend.
+
+        That is what the harness's ledger holds, which learns of a turn's usage when
+        the turn ends; :meth:`_over_budget` adds what a turn in flight has used.
+        """
         with self._lock:
             report = usage_report(self.harness.usage, self._carried, self._baseline)
             write_json(self.project.root / USAGE_FILE, report)
@@ -666,6 +707,34 @@ class Engine:
                 spent=spent,
                 allowed=limit,
             )
+
+    def _over_budget(self, model: str, usage: Usage) -> _BudgetSpent | None:
+        """Asked after every model request of a session's turn: is the model budget spent?
+
+        ``usage`` is what the turn has used so far on ``model``.  The ledger does not
+        hold it yet, so it is priced here and added to what the ledger holds.  A turn
+        that is past the limit is ended at its next model call (``AgentContext``) and
+        the phase stops at a checkpoint, as it does when the limit is found spent
+        before a session; without this, one turn of up to ``agents.MAX_TURNS``
+        requests could spend many times the limit before anything looked.  A model
+        without a known price counts as nothing here, as it does in the ledger.
+        """
+        limit = float(self.project.settings.limits.model_usd)
+        with self._lock:
+            report = usage_report(self.harness.usage, self._carried, self._baseline)
+        spent = _number(report.get("estimated_cost_usd")) + (estimate_cost_usd(model, usage) or 0.0)
+        if spent < limit:
+            return None
+        role = _ROLE.get(str(self._state.get("phase")), "agent")
+        return _BudgetSpent(
+            "model_usd",
+            f"The model budget ran out in the middle of the {role}'s work: {_money(spent)} of "
+            f"{_money(limit)} is spent, so its session was ended at its next model call. What "
+            "it had written until then is kept. Raise settings.limits.model_usd in the "
+            "project's settings to go on; the phase then resumes where it stopped.",
+            spent=spent,
+            allowed=limit,
+        )
 
     def _heed_stop(self) -> None:
         if self._stop.is_set():
@@ -757,6 +826,17 @@ class Engine:
             return "intake"
         return _NEXT[last["phase"]] if last.get("status") == "completed" else last["phase"]
 
+    def _analysed_round(self) -> int | None:
+        """The round whose analysis is the last thing that completed; ``None`` when
+        something has run since, or nothing has been analysed yet."""
+        last = self._state["phases"][-1] if self._state["phases"] else None
+        ended = (
+            isinstance(last, dict)
+            and last.get("phase") == "analyze"
+            and last.get("status") == "completed"
+        )
+        return last.get("round") if ended and isinstance(last.get("round"), int) else None
+
     def _next_phase(self) -> str:
         """The phase ``advance()`` starts with when none is named."""
         name = self._state.get("next_phase")
@@ -764,6 +844,12 @@ class Engine:
             # A state file that does not say (written by hand, or by an older version):
             # going back to intake would do the project's first steps a second time.
             name = self._after_last_record()
+        analysed = self._analysed_round()
+        if analysed is not None and name in ("research", "hypothesize"):
+            # Whether the round begins with the literature was decided at the checkpoint
+            # by what stood then.  The person may have accepted or rejected the journal
+            # page since: it is their decision that counts, so it is looked at again.
+            name = "research" if self._journal_asks_for_research(analysed) else "hypothesize"
         # Asked for after the checkpoint was written: more of the literature comes first.
         if name == "hypothesize" and self._research_requested():
             return "research"
@@ -862,6 +948,7 @@ class Engine:
             instruction=instruction,
             guard=self._guard,
             stopping=self._stopping,
+            over_budget=self._over_budget,
             scholar=self._scholar,
             compute=self._compute,
         )
@@ -896,7 +983,10 @@ class Engine:
                 break
             except _BudgetSpent as exc:
                 return self._budget_stop(record, clock, ctx, exc)
-            except agents.SessionStopped:
+            except agents.SessionStopped as exc:
+                if isinstance(exc.reason, _BudgetSpent):
+                    # The turn in flight took the project past its model budget.
+                    return self._budget_stop(record, clock, ctx, exc.reason)
                 # A stop request, heard in the middle of a session's turn.
                 return self._interrupted(record, clock, ctx)
             except KeyboardInterrupt:
@@ -908,9 +998,11 @@ class Engine:
                 if attempt == 2 or stops_the_run(exc):
                     return self._failed(record, clock, ctx, exc)
                 log.warning("The %s phase failed; trying once more.", name, exc_info=True)
+                # An error can carry text a model wrote: it stands there as a quotation.
                 self._emit(
                     "agent.activity",
-                    f"The {_NOUN[name]} phase failed ({_one_line(exc, 200)}); trying it once more.",
+                    f"The {_NOUN[name]} phase failed ({agents.said(exc, 200)}); trying it once "
+                    "more.",
                     phase=name,
                     round=round,
                 )
@@ -1043,7 +1135,7 @@ class Engine:
             self._state.update(status="failed", next_phase=name, error=error)
             self._save()
         again = " twice" if record["attempts"] > 1 else ""
-        why = _one_line(exc, 300).rstrip(".")
+        why = agents.said(_one_line(exc, 300).rstrip("."), 300)
         self._emit(
             "phase.failed",
             f"The {_NOUN[name]} phase failed{again}: {why}. Run it again once the cause is "
@@ -1065,7 +1157,14 @@ class Engine:
             if name == "run" and self._new_results()
             else ""
         )
-        self._checkpoint(name, record["round"], name, [], [str(exc) + extra])
+        self._checkpoint(
+            name,
+            record["round"],
+            name,
+            [],
+            [str(exc) + extra],
+            budget_said=exc.limit == "model_usd",
+        )
         return _Outcome("budget")
 
     # -- between phases ----------------------------------------------------------
@@ -1082,24 +1181,48 @@ class Engine:
                 return "analyze"
             self._checkpoint(name, round, "run", told, notes)
             return None
+        if name == "analyze" and len(told) < 2:
+            # The run phase reports the experiments that are planned again where its
+            # checkpoint is this one.  Here it did not report in this call (the analysis
+            # was resumed after a stop, a failure or a spent budget, or was asked for by
+            # itself), and what it said then went with that call: said from the pages.
+            notes = [*notes, *self._planned_again()]
         following = _NEXT[name]
         if name == "analyze" and self._journal_asks_for_research(round):
             following = "research"
+        elif name == "analyze" and self._journal_asks_for_research(round, review="proposed"):
+            notes = [
+                *notes,
+                "The journal page of this round asks for another look at the literature "
+                "before new hypotheses (next: research). It awaits your review: accept it "
+                "and the next round starts with research; otherwise it starts with "
+                "hypotheses.",
+            ]
         if following == "hypothesize" and self._research_requested():
             following = "research"
         self._checkpoint(name, round, following, told, notes)
         return None
 
     def _checkpoint(
-        self, name: str, round: int, following: str, told: Sequence[str], notes: Sequence[str]
+        self,
+        name: str,
+        round: int,
+        following: str,
+        told: Sequence[str],
+        notes: Sequence[str],
+        *,
+        budget_said: bool = False,
     ) -> None:
         """Pause for the person: say what was done, what needs their eye, what comes next.
 
         ``told`` is what the phases since the last checkpoint did (each has said so
         in the activity feed already); ``notes`` is what the person has to know
         beyond that.  The state keeps the whole account, the event the part that is
-        new to the feed.
+        new to the feed.  A model budget that the work has passed is said here too,
+        unless ``notes`` already say it (``budget_said``).
         """
+        if not budget_said:
+            notes = [*notes, *self._overrun_note(name)]
         pending = self.project.counts()["pending"]
         waiting = [agents.count_of(count, kind) for kind, count in pending["by_kind"].items()]
         if pending["proposals"]:
@@ -1137,6 +1260,29 @@ class Engine:
                 },
             )
             self._save()
+
+    def _overrun_note(self, name: str) -> list[str]:
+        """What a checkpoint says when the model spend has reached its limit.
+
+        A phase that finishes is not cut short for it: the limit is looked at before a
+        session, before each turn and after each model request, so the work that
+        passed it has ended by now, and the last request may have gone well beyond
+        it.  The person is told here, not only when the next phase finds it out.
+        """
+        limit = float(self.project.settings.limits.model_usd)
+        spent = self._write_usage()
+        if spent < limit:
+            return []
+        exc = _BudgetSpent(
+            "model_usd",
+            f"The model budget is used up: {_money(spent)} of {_money(limit)} is spent. No "
+            "agent starts again until settings.limits.model_usd is raised in the project's "
+            "settings; what awaits your review can be decided all the same.",
+            spent=spent,
+            allowed=limit,
+        )
+        self._warn_budget(exc, phase=name)
+        return [str(exc)]
 
     def _unpriced_note(self) -> list[str]:
         """Said at every checkpoint while it holds: a budget that cannot count is no limit."""
@@ -1282,13 +1428,35 @@ class Engine:
             pages = [project.resolve(f"{experiment}-run{run.get('number')}") for run in new]
             ctx.note(path for path in pages if path)
 
+    def _planned_again(self) -> list[str]:
+        """One sentence for each accepted experiment that went back to ``planned`` with a
+        reason on its page.
+
+        That is how an experiment stands whose plan or code changed after the person
+        approved it: what runs is what was approved, so it waits for a new approval,
+        and the person should hear of it where they are told what ran.
+        """
+        planned = self.project.pages(kind="experiment", review="accepted", state="planned")
+        again = [
+            f"{page.id} is planned again: {_sentence(reason, 300)}"
+            for page in planned
+            if (reason := str(page.meta.get("state_reason") or "").strip())
+        ]
+        # A handful by name and of the rest the number, so that none goes unmentioned.
+        more = len(again) - 6
+        if more > 0:
+            again[6:] = [f"{_plural(more, 'more experiment')} went back to planned as well."]
+        return again
+
     def _nothing_to_run(self) -> str:
         project = self.project
         planned = project.pages(kind="experiment", review="accepted", state="planned")
         if planned:
-            names = _and([f"{page.id} ({_one_line(page.title, 60)})" for page in planned[:6]])
+            # A title is an agent's words more often than not: given as a quotation.
+            names = _and([f"{page.id} {agents.said(page.title, 60)}" for page in planned[:6]])
+            back = "".join(f" {sentence}" for sentence in self._planned_again())
             return (
-                "No experiment is approved to run. Approve the ones you want run: "
+                f"No experiment is approved to run.{back} Approve the ones you want run: "
                 f"{names}{' and others' if len(planned) > 6 else ''}."
             )
         proposed = project.pages(kind="experiment", review="proposed")
@@ -1301,6 +1469,36 @@ class Engine:
             "There is no experiment to run. Run the design phase to have some proposed, or "
             "add one yourself."
         )
+
+    def _not_run(self, page: ResearchPage, exc: BaseException) -> str:
+        """What the checkpoint says about an approved experiment that was refused a run.
+
+        What runs is what the person approved: ``research.experiments`` refuses an
+        experiment whose plan or code is no longer that, and puts it back to
+        ``planned``.  The person has to look at it and approve it again, so the
+        checkpoint names it, gives the reason and says where it stands.
+        """
+        with contextlib.suppress(ProjectError):
+            if self.project.page(page.path).state == "planned":
+                why = _sentence(exc, 400)
+                named = why if why.startswith(f"{page.id} ") else f"{page.id} was not run: {why}"
+                return f"{named} It is planned again."
+        return f"{page.id} could not be run: {_one_line(exc, 300)}"
+
+    @staticmethod
+    def _unbounded_cost_note(page: ResearchPage, record: Mapping[str, Any]) -> list[str]:
+        """Said when a run was billed on a GPU type that has no price: the cost limit
+        for experiments rests on estimates, and for this run there was none."""
+        plan = record.get("plan") if isinstance(record.get("plan"), Mapping) else {}
+        gpu = str(plan.get("gpu") or "").strip()
+        billed = record.get("backend") == "modal" and not _number(record.get("cost_usd"))
+        if not gpu or not billed or agents.gpu_has_price(gpu):
+            return []
+        return [
+            f"{page.id} ran on the GPU type {agents.named(gpu, 40)}, for which no price is "
+            "known: what the run cost is not part of the experiment spending shown, and "
+            "settings.limits.experiment_usd could not limit it."
+        ]
 
     def _run_approved(self, ctx: AgentContext) -> AgentReport:
         """Run every experiment the person approved, one after the other."""
@@ -1315,10 +1513,11 @@ class Engine:
                 return AgentReport(summary=self._nothing_to_run())
             return AgentReport(
                 summary=f"No experiment was waiting to run; {_plural(earlier, 'result')} of "
-                "earlier runs had not been analysed yet."
+                "earlier runs had not been analysed yet.",
+                notes=self._planned_again(),
             )
         outcomes: dict[str, list[str]] = {}
-        notes: list[str] = []
+        notes: list[str] = self._planned_again()
         tried: set[str] = set()
         while waiting:
             page = waiting[0]
@@ -1331,7 +1530,7 @@ class Engine:
                 if stops_the_run(exc):
                     raise
                 # One experiment that cannot run does not keep the others from running.
-                notes.append(f"{page.id} could not be run: {_one_line(exc, 300)}")
+                notes.append(self._not_run(page, exc))
                 record = None
             # Looked up again after every run: the person may approve one more while
             # another is running, and may cancel or change one that was waiting.
@@ -1357,6 +1556,7 @@ class Engine:
                 continue
             self._ran += 1
             outcomes.setdefault(str(record.get("status") or "ended"), []).append(str(page.id))
+            notes += self._unbounded_cost_note(page, record)
             # A run that a stop request cancelled is not a result to analyse.
             self._heed_stop()
         how = _and([f"{_and(ids)} {status}" for status, ids in outcomes.items()])
@@ -1381,10 +1581,17 @@ class Engine:
                 return name
             number += 1
 
-    def _journal_asks_for_research(self, round: int) -> bool:
-        """Whether a journal page of the round says the literature needs another look."""
+    def _journal_asks_for_research(self, round: int, *, review: str = "accepted") -> bool:
+        """Whether a journal page of the round, in that review state, says the literature
+        needs another look.
+
+        Only an accepted page sends a round anywhere (by the person, or on creation
+        where the project accepts journal pages that way).  ``next: research`` on a
+        page that awaits review or was rejected is the analyst's suggestion and no
+        more; the phases that run are the person's to decide.
+        """
         return any(
             str(page.meta.get("next") or "").strip().lower() == "research"
-            for page in self.project.pages(kind="journal")
+            for page in self.project.pages(kind="journal", review=review)
             if page.round == round
         )

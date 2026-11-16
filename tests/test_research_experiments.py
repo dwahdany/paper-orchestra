@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -259,7 +262,7 @@ def test_a_page_written_by_hand_is_read_leniently(project):
     text = (
         "---\ntitle: Hand-made\nkind: experiment\nid: E7\nreview: accepted\nauthor: human\n"
         'timeout_seconds: "120"\nnetwork: yes\ngpu: none\n'
-        "packages:\n- numpy\n- scipy>=1.10\ncommand: python main.py --seed 3\n---\n\nBody.\n"
+        "packages:\n- numpy\n- scipy>=1.10\n---\n\nBody.\n"
     )
     file = project.root / "wiki" / "experiments" / "E7-hand-made.md"
     file.parent.mkdir(parents=True)
@@ -267,8 +270,20 @@ def test_a_page_written_by_hand_is_read_leniently(project):
     plan = experiments.load_plan(project, "E7")
     assert plan.mode == "script" and plan.timeout_seconds == 120.0 and plan.network is True
     assert plan.gpu is None and plan.packages == ("numpy", "scipy>=1.10")
-    assert plan.command == ["python", "main.py", "--seed", "3"]
-    assert experiments.job_spec(plan).command == ["python", "main.py", "--seed", "3"]
+    assert plan.command is None
+    assert experiments.job_spec(plan).command == ["python", "main.py"]
+    # A command is read from one line, as a shell would split it, where a plan may have
+    # one: in the person's repository.
+    (project.root / "repository").mkdir()
+    project.settings.update({"repo": {"path": "repository"}})
+    in_repo = text.replace(
+        "---\n\nBody", "mode: repo\ncommand: python main.py --seed '3 4'\n---\n\nBody"
+    )
+    file.write_text(in_repo)
+    plan = experiments.load_plan(project, "E7")
+    assert plan.command == ["python", "main.py", "--seed", "3 4"]
+    assert experiments.job_spec(plan).command == ["python", "main.py", "--seed", "3 4"]
+    file.write_text(text)
 
     inline = text.replace("packages:\n- numpy\n- scipy>=1.10\n", "packages: [numpy, scipy]\n")
     file.write_text(inline)
@@ -331,12 +346,17 @@ def test_code_is_written_under_the_experiment_and_earlier_versions_are_kept(proj
     kept = sorted((code / ".history" / "lib" / "helpers.py").iterdir())
     assert [path.read_text() for path in kept] == ["X = 1\n", "X = 2\n"]
     assert kept[0].name.endswith("-agent-designer.py") and kept[1].name.endswith("-human.py")
-    # A file someone put there by hand is theirs when it is replaced.
+    # A file someone put there by hand is theirs: not an agent's to replace, and kept
+    # under their name when the runner's repair or they themselves replace it.
     (code / "notes.py").write_text("# by hand\n")
-    experiments.write_code(project, "E1", {"notes.py": "# rewritten\n"}, author="agent:designer")
+    with pytest.raises(NotAllowed, match=r"notes\.py"):
+        experiments.write_code(
+            project, "E1", {"notes.py": "# rewritten\n"}, author="agent:designer"
+        )
+    experiments.write_code(project, "E1", {"notes.py": "# rewritten\n"}, author="agent:runner")
     [by_hand] = (code / ".history" / "notes.py").iterdir()
     assert by_hand.read_text() == "# by hand\n" and by_hand.name.endswith("-human.py")
-    experiments.write_code(project, "E1", {"notes.py": QUICK}, author="agent:designer")
+    experiments.write_code(project, "E1", {"notes.py": QUICK}, author="human")
     # What was kept is not code of the experiment.
     assert set(experiments.code_files(project, "E1")) == {"lib/helpers.py", "main.py", "notes.py"}
     assert (code / "lib" / "helpers.py").read_text() == "X = 3\n"
@@ -765,8 +785,9 @@ def test_a_caller_that_keeps_the_accounts_says_what_a_call_may_spend(tmp_path):
     limits = {"experiment_usd": 1.0}
     project = Project.create(tmp_path / "p", title="Costly", settings={"limits": limits})
     modal = Billing(0.9)
-    for _ in range(3):
-        page = planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    # All of them are approved while the project's dollar is still unspent.
+    for gpu in ("T4", "T4", "T4", "T4", "X9000"):
+        page = planned(project, {"main.py": QUICK}, mode="gpu", gpu=gpu)
         experiments.approve(project, page.id, backends={"modal": modal})
     assert experiments.run(project, "E1", compute=modal)["cost_usd"] == 0.9
 
@@ -798,17 +819,13 @@ def test_a_caller_that_keeps_the_accounts_says_what_a_call_may_spend(tmp_path):
                 returncode=None, backend=self.name, error="The sandbox is gone.", cost_usd=0.4
             )
 
-    page = planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
-    project.set_state(page.path, "approved", by="human")
-    dead_run(project, experiment=str(page.id), backend="modal", handle="sb-4")
+    dead_run(project, experiment="E4", backend="modal", handle="sb-4")
     lost = Lost(0.1)
-    record = experiments.run(project, page.id, compute=lost, limits={"experiment_usd": 0.5})
+    record = experiments.run(project, "E4", compute=lost, limits={"experiment_usd": 0.5})
     assert (record["number"], record["error_kind"]) == (2, "budget") and lost.specs == []
 
     # Nothing left, and a GPU without a known price: not started either.
-    page = planned(project, {"main.py": QUICK}, mode="gpu", gpu="X9000")
-    project.set_state(page.path, "approved", by="human")
-    record = experiments.run(project, page.id, compute=modal, limits={"experiment_usd": 0})
+    record = experiments.run(project, "E5", compute=modal, limits={"experiment_usd": 0})
     assert record["error_kind"] == "budget" and "Nothing is left" in record["error"]
 
 
@@ -824,7 +841,7 @@ def test_options_say_what_each_backend_can_do_with_the_plan(project, backend):
     assert modal["est_minutes"] == 10
     assert modal["est_usd"] == pytest.approx(0.1617, abs=1e-3)  # ten minutes of a T4 sandbox
     assert any("requests" in note for note in modal["notes"])  # what the person should know
-    assert not any("network: true" in note and "Approving" in note for note in modal["notes"])
+    assert not any("network: true" in note and "yours to grant" in note for note in modal["notes"])
     # Nothing was decided by asking.
     assert project.page("E1").state == "planned" and "backend" not in project.page("E1").meta
 
@@ -834,7 +851,7 @@ def test_options_take_backend_names_too(project):
     [choice] = experiments.options(project, "E1", ["local"])
     assert choice["backend"] == "local" and choice["can_run"] is True
     assert choice["est_usd"] == 0 and choice["est_minutes"] == 1
-    assert any("Approving the run approves that" in note for note in choice["notes"])
+    assert any("yours to grant" in note for note in choice["notes"])
     [unknown] = experiments.options(project, "E1", ["tape"])
     assert unknown["can_run"] is False and "tape" in unknown["reasons"][0]
 
@@ -1047,8 +1064,12 @@ def test_a_run_that_exceeds_its_time_limit_fails_and_is_not_repaired(project, ba
     assert project.page("E1").state == "failed" and project.page("E1-run1").state == "failed"
 
 
-def test_a_command_that_cannot_be_started_is_not_something_to_repair(project, backend):
-    page = planned(project, {"main.py": QUICK}, command="no-such-program main.py")
+def test_a_command_that_cannot_be_started_is_not_something_to_repair(tmp_path, project, backend):
+    (tmp_path / "repository").mkdir()
+    (tmp_path / "repository" / "main.py").write_text(QUICK)
+    project.settings.update({"repo": {"path": str(tmp_path / "repository")}})
+    project.save_settings()
+    page = planned(project, mode="repo", command="no-such-program main.py")
     [warning] = experiments.check_code(project, page.id)
     assert warning.startswith(experiments.WARNING) and "no-such-program main.py" in warning
     experiments.approve(project, "E1", backends={"local": backend})
@@ -1121,7 +1142,13 @@ def test_cancelling_an_experiment_whose_run_just_ended_changes_nothing(
 def test_a_stopped_worker_leaves_the_experiment_queued_and_the_same_call_resumes_it(
     project, backend
 ):
-    approved(project, backend, {"main.py": SLOW})
+    # The same code runs both times (what was approved); it is slow until a file exists.
+    resumed = project.root.parent / "resumed"
+    slow_once = (
+        "import os, time\n\nprint('started', flush=True)\n"
+        f"if not os.path.exists({str(resumed)!r}):\n    time.sleep(60)\n" + QUICK
+    )
+    approved(project, backend, {"main.py": slow_once})
     heard = []
     record = experiments.run(
         project, "E1", compute=backend, should_stop=lambda: bool(heard), on_log=heard.append
@@ -1130,7 +1157,7 @@ def test_a_stopped_worker_leaves_the_experiment_queued_and_the_same_call_resumes
     assert record["result"] is None and project.resolve("wiki/results/E1-run1.md") is None
     assert project.page("E1").state == "queued"
 
-    experiments.write_code(project, "E1", {"main.py": QUICK}, author="human")
+    resumed.write_text("")
     record = experiments.run(project, "E1", compute=backend)
     assert (record["number"], record["status"]) == (2, "succeeded")
     assert states(project) == ["approved", "queued", "running", "queued", "running", "succeeded"]
@@ -1273,8 +1300,9 @@ def test_artifacts_are_listed_within_their_size_limit(project, backend, monkeypa
 
 
 def test_a_code_directory_full_of_data_is_not_copied_for_a_run(project, backend, monkeypatch):
-    approved(project, backend, {"main.py": QUICK})
+    planned(project, {"main.py": QUICK})
     (experiments.code_dir(project, "E1") / "data.bin").write_bytes(b"0" * 5000)
+    experiments.approve(project, "E1", backends={"local": backend})
     monkeypatch.setattr(experiments, "MAX_CODE_BYTES", 1000)
     record = experiments.run(project, "E1", compute=backend)
     assert (record["status"], record["error_kind"]) == ("failed", "setup")
@@ -1379,7 +1407,7 @@ def test_only_one_process_runs_an_experiment(project, backend):
 def test_the_handle_of_a_remote_job_is_recorded_while_it_runs(project):
     modal = FakeModal()
     planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4", packages=["torch"], network=True)
-    experiments.approve(project, "E1", backends={"modal": modal})
+    experiments.approve(project, "E1", network=True, backends={"modal": modal})
     record = experiments.run(project, "E1", compute=modal)
 
     assert modal.during["status"] == "running" and modal.during["handle"] == "sb-123"
@@ -1658,3 +1686,1009 @@ def test_only_accepted_records_are_evidence(tmp_path):
     echo = project.create_page("finding", "Echo", "As found, 55.5 points.", author="human")
     other = project.create_page("finding", "Other", "It was 55.5 points.", author="agent:analyst")
     assert experiments.unverified_numbers(project, other) == ["55.5"] and echo.review == "accepted"
+
+
+# ---------------------------------------------------------------------------------------
+# What runs is what the person approved (audit: containment 1-4, 6, 9, 10; execution 1, 2)
+# ---------------------------------------------------------------------------------------
+
+OTHER = QUICK.replace('print("working")', 'print("OTHER ENTRY POINT RAN")')
+NEVER_APPROVED = {"digest": None, "at": None, "matches": False, "changed": [], "repaired": False}
+
+
+def run_dirs(project: Project, experiment: str = "E1") -> list[str]:
+    folder = project.root / "experiments" / experiment / "runs"
+    return sorted(entry.name for entry in folder.iterdir()) if folder.is_dir() else []
+
+
+def test_a_command_belongs_to_repo_mode_only(project, backend):
+    """A script or gpu experiment runs its entry point: the code the person read."""
+    page = planned(project, {"main.py": QUICK}, command=["python", "-c", "print('not main.py')"])
+    with pytest.raises(ProjectError, match=r"command.*mode: repo") as refused:
+        experiments.load_plan(project, page.id)
+    assert "E1" in str(refused.value)
+    with pytest.raises(ProjectError, match="command"):
+        experiments.approve(project, page.id, backends={"local": backend})
+    assert project.page("E1").state == "planned"
+    # Whatever a plan object holds, only repo mode starts anything but the entry point.
+    plan = experiments.ExperimentPlan(
+        id="E1", path="", title="", mode="script", command=["sh", "-c", "anything"]
+    )
+    assert experiments.job_command(plan) == ["python", "main.py"]
+    assert experiments.job_spec(plan).command == ["python", "main.py"]
+    plan.mode = "repo"
+    assert experiments.job_command(plan) == ["sh", "-c", "anything"]
+
+
+def test_an_approval_records_exactly_what_may_run(project, backend):
+    planned(project, {"main.py": QUICK})
+    assert experiments.approval(project, "E1") == NEVER_APPROVED
+    before = experiments.plan_digest(project, "E1")
+
+    done = experiments.approve(project, "E1", timeout_seconds=120, backends={"local": backend})
+
+    digest = experiments.plan_digest(project, "E1")
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert digest != before  # where it runs and for how long are part of what is approved
+    assert digest != experiments.code_digest(project, "E1")
+    assert done.meta["approved_digest"] == digest
+    assert parse_stamp(done.meta["approved_at"]) is not None
+    assert experiments.approval(project, "E1") == {
+        "digest": digest,
+        "at": done.meta["approved_at"],
+        "matches": True,
+        "changed": [],
+        "repaired": False,
+    }
+    # Every field that decides what runs is part of it ...
+    for fields in (
+        {"network": True},
+        {"timeout_seconds": 60},
+        {"entrypoint": "other.py"},
+        {"packages": ["numpy"]},
+        {"backend": "modal"},
+        {"mode": "gpu", "gpu": "T4"},
+    ):
+        project.update_page("E1", author="human", fields=fields)
+        assert experiments.plan_digest(project, "E1") != digest, fields
+        assert experiments.approval(project, "E1")["matches"] is False, fields
+        project.update_page(
+            "E1", author="human", fields={key: done.meta.get(key) for key in fields}
+        )
+        assert experiments.plan_digest(project, "E1") == digest, fields
+    # ... and so is the code; what the page says in words is not.
+    project.update_page(
+        "E1", author="human", body="Other words.\n", fields={"title": "Renamed", "est_minutes": 3}
+    )
+    assert experiments.plan_digest(project, "E1") == digest
+    experiments.write_code(project, "E1", {"lib.py": "X = 1\n"}, author="human")
+    assert experiments.plan_digest(project, "E1") != digest
+
+
+def test_an_accepted_edit_that_changes_what_runs_needs_a_new_approval(project, backend):
+    """The agent's summary says "typo"; its fields change the entry point, the network
+    and the time limit of a run the person already approved."""
+    approved(project, backend, {"main.py": QUICK, "other.py": OTHER}, timeout_seconds=60)
+    proposal = project.propose_edit(
+        "E1",
+        author="agent:analyst",
+        summary="Fix a typo in the method section",
+        fields={"network": True, "timeout_seconds": 600, "entrypoint": "other.py"},
+    )
+    project.review(proposal.id, "accept")
+
+    status = experiments.approval(project, "E1")
+    assert status["matches"] is False and status["repaired"] is False
+    assert status["changed"] == [
+        "entrypoint: main.py when approved, now other.py",
+        "network: false when approved, now true",
+        "timeout_seconds: 60 when approved, now 600",
+    ]
+    with pytest.raises(ProjectError, match="E1 was not run") as refused:
+        experiments.run(project, "E1", compute=backend)
+    message = str(refused.value)
+    for said in ("network: false when approved, now true", "entrypoint", "timeout_seconds"):
+        assert said in message
+    assert "approve it again" in message and "research approve" in message
+
+    page = project.page("E1")
+    assert page.state == "planned" and "network" in page.meta["state_reason"]
+    assert experiments.runs(project, "E1") == [] and run_dirs(project) == []  # nothing ran
+    moved = events_of(project, "experiment.state")[-1]
+    assert (moved["data"]["previous"], moved["data"]["state"]) == ("approved", "planned")
+    assert "network" in moved["data"]["reason"]
+    # A new approval is a decision on what is there now.
+    experiments.approve(project, "E1", network=False, backends={"local": backend})
+    record = experiments.run(project, "E1", compute=backend)
+    assert record["status"] == "succeeded"
+    assert "OTHER ENTRY POINT RAN" in (run_dir(project) / "log.txt").read_text()
+
+
+def test_code_changed_after_the_approval_is_not_run(project, backend):
+    """Also the person's own change: what runs is what was approved, by whoever changed."""
+    approved(project, backend, {"main.py": QUICK, "lib.py": "X = 1\n"})
+    experiments.write_code(project, "E1", {"main.py": OTHER, "extra.py": "Y = 2\n"}, author="human")
+    (experiments.code_dir(project, "E1") / "lib.py").unlink()
+
+    changed = experiments.approval(project, "E1")["changed"]
+    assert len(changed) == 3
+    assert changed[0].startswith("extra.py: added after the approval (written by human at ")
+    assert changed[1] == "lib.py: removed after the approval"
+    assert changed[2].startswith("main.py: changed after the approval (written by human at ")
+    with pytest.raises(ProjectError, match=r"main\.py: changed after the approval"):
+        experiments.run(project, "E1", compute=backend)
+    assert project.page("E1").state == "planned" and run_dirs(project) == []
+
+
+def test_an_experiment_that_reads_approved_without_a_record_does_not_run(project, backend):
+    """A project from before approvals were recorded, or a state set by hand."""
+    page = planned(project, {"main.py": QUICK})
+    project.set_state(page.path, "approved", by="human")
+    assert experiments.approval(project, "E1") == NEVER_APPROVED
+    with pytest.raises(ProjectError, match="no record of what was approved") as refused:
+        experiments.run(project, "E1", compute=backend)
+    assert "approve it again" in str(refused.value)
+    assert project.page("E1").state == "planned" and run_dirs(project) == []
+    # The same for one that was queued when the record was lost.
+    experiments.approve(project, "E1", backends={"local": backend})
+    project.set_state("E1", "queued", by="system")
+    project.record_approval("E1", {"approved_digest": None}, by="human")
+    with pytest.raises(ProjectError, match="no record of what was approved"):
+        experiments.run(project, "E1", compute=backend)
+    assert project.page("E1").state == "planned"
+
+
+def test_a_change_between_two_attempts_ends_the_repairs(project, backend):
+    """The runner's repair is part of the approved run; anyone else's change is not."""
+    approved(project, backend, {"main.py": BROKEN})
+
+    def repair(plan, record, log_tail):
+        # While the model was asked for a correction, the page was given the network.
+        project.update_page("E1", author="human", fields={"network": True})
+        return {"main.py": QUICK}
+
+    record = experiments.run(project, "E1", compute=backend, repair=repair)
+
+    assert (record["number"], record["status"]) == (1, "failed")
+    assert experiments.code_files(project, "E1") == {"main.py": BROKEN}  # not repaired
+    assert any("network: false when approved, now true" in note for note in record["notes"])
+    assert run_dirs(project) == ["1"] and project.page("E1").state == "failed"
+
+
+def test_the_runners_repair_is_recorded_and_the_next_approval_starts_afresh(project, backend):
+    done = approved(project, backend, {"main.py": BROKEN})
+    stopped: list[bool] = []
+
+    def repair(plan, record, log_tail):
+        stopped.append(True)  # the worker is told to stop while the repair is made
+        return {"main.py": QUICK}
+
+    with pytest.raises(KeyboardInterrupt):
+        experiments.run(project, "E1", compute=_Interrupting(backend, after=2), repair=repair)
+    page = project.page("E1")
+    assert page.state == "queued" and stopped
+    assert page.meta["approved_digest"] == done.meta["approved_digest"]
+    repaired = page.meta["repaired_digest"]
+    assert repaired == experiments.plan_digest(project, "E1") != page.meta["approved_digest"]
+    status = experiments.approval(project, "E1")
+    assert status["matches"] is True and status["repaired"] is True
+    assert status["changed"] == [
+        f"main.py: changed after the approval (written by agent:runner at "
+        f"{experiments.code_authors(project, 'E1')['main.py']['written']})"
+    ]
+    # Resumed, the repaired code is what runs: it is the approved run going on.
+    record = experiments.run(project, "E1", compute=backend)
+    assert record["status"] == "succeeded" and project.page("E1").state == "succeeded"
+    # One approval is one run; the next one pins the code as it is then.
+    again = experiments.approve(project, "E1", backends={"local": backend})
+    assert "repaired_digest" not in again.meta
+    assert again.meta["approved_digest"] == repaired
+    assert experiments.approval(project, "E1")["repaired"] is False
+
+
+class _Interrupting:
+    """A backend whose ``after``-th job is interrupted before it starts (Ctrl-C)."""
+
+    def __init__(self, backend, *, after: int) -> None:
+        self._backend, self._after, self._jobs = backend, after, 0
+        self.name = backend.name
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+    def run_job(self, spec, **kwargs):
+        self._jobs += 1
+        if self._jobs >= self._after:
+            raise KeyboardInterrupt
+        return self._backend.run_job(spec, **kwargs)
+
+
+def test_without_a_choice_a_run_goes_where_the_project_says_not_where_the_page_says(
+    tmp_path, backend
+):
+    project = Project.create(tmp_path / "p", title="On Modal", settings={"compute": "modal"})
+    modal = FakeModal()
+    both = {"local": backend, "modal": modal}
+    # A page from before agents were kept from writing ``backend``, or one edited by hand.
+    planned(project, {"main.py": QUICK}, backend="local")
+
+    done = experiments.approve(project, "E1", backends=both)
+
+    assert done.meta["backend"] == "modal"
+    [choice] = [c for c in experiments.options(project, "E1", both) if c["backend"] == "local"]
+    assert choice["can_run"] is True  # the person may still choose it, by saying so
+    # What the person chose is remembered by the approval, for the same experiment.
+    planned(project, {"main.py": QUICK})
+    first = experiments.approve(project, "E2", backend="local", backends=both)
+    assert first.meta["backend"] == "local"
+    assert experiments.run(project, "E2", compute=backend)["status"] == "succeeded"
+    assert experiments.approve(project, "E2", backends=both).meta["backend"] == "local"
+    # A value that only looks like it (the page changed after the approval) is not.
+    experiments.request_cancel(project, "E1")
+    project.update_page("E1", author="human", fields={"backend": "local"})
+    assert experiments.approve(project, "E1", backends=both).meta["backend"] == "modal"
+
+
+def test_network_access_is_granted_by_the_person_never_by_the_plan(project, backend):
+    backends = {"local": backend}
+    planned(project, {"main.py": QUICK}, network=True)
+    with pytest.raises(ProjectError, match="yours to grant") as refused:
+        experiments.approve(project, "E1", backends=backends)
+    said = str(refused.value)
+    assert "E1" in said and "network: true" in said
+    assert "--network" in said and "--no-network" in said and "in the app" in said
+    assert project.page("E1").state == "planned"
+    assert "approved_digest" not in project.page("E1").meta
+
+    without = experiments.approve(project, "E1", network=False, backends=backends)
+    assert (without.state, without.meta["network"]) == ("approved", False)
+    experiments.request_cancel(project, "E1")
+    granted = experiments.approve(project, "E1", network=True, backends=backends)
+    assert granted.meta["network"] is True
+    # Granted for one run is not granted for the next: the page says true again.
+    experiments.request_cancel(project, "E1")
+    with pytest.raises(ProjectError, match="yours to grant"):
+        experiments.approve(project, "E1", backends=backends)
+    # A plan that does not ask runs without the network when nothing is said.
+    planned(project, {"main.py": QUICK})
+    assert experiments.approve(project, "E2", backends=backends).meta["network"] is False
+    [choice] = experiments.options(project, "E1", backends)
+    assert any("yours to grant" in note for note in choice["notes"])
+    assert not any("Approving the run approves that" in note for note in choice["notes"])
+
+
+def test_an_agents_page_runs_in_the_projects_repository_only(tmp_path):
+    mine = "https://ghp_FAKETOKEN123@git.example.invalid/me/private.git"
+    project = Project.create(tmp_path / "p", title="Repo", settings={"repo": {"path": mine}})
+    foreign = planned(
+        project,
+        mode="repo",
+        command="python train.py",
+        network=True,
+        repo="https://git.example.invalid/someone-else/train-with-extras.git",
+    )
+    with pytest.raises(ProjectError, match="someone-else") as refused:
+        experiments.load_plan(project, foreign.id)
+    said = str(refused.value)
+    assert "not the repository this project was given" in said
+    assert "ghp_FAKETOKEN123" not in said and "https://***@git.example.invalid/me" in said
+    # Naming the project's own repository, as an agent sees it, is the project's repository.
+    own = planned(
+        project,
+        mode="repo",
+        command="python train.py",
+        network=True,
+        repo="https://git.example.invalid/me/private.git",
+    )
+    assert experiments.load_plan(project, own.id).repo == mine
+    # The person's own page may name any repository: it is theirs to choose.
+    theirs = project.create_page(
+        "experiment",
+        "In another repository",
+        BODY,
+        author="human",
+        fields={
+            "mode": "repo",
+            "command": "python x.py",
+            "network": True,
+            "repo": "https://git.example.invalid/other/repo.git",
+        },
+    )
+    assert experiments.load_plan(project, theirs.id).repo == (
+        "https://git.example.invalid/other/repo.git"
+    )
+
+    # The same when the project's repository is a directory of this machine.
+    directory = tmp_path / "repository"
+    directory.mkdir()
+    local = Project.create(
+        tmp_path / "local", title="Repo", settings={"repo": {"path": str(directory)}}
+    )
+    page = planned(
+        local,
+        mode="repo",
+        command="python train.py",
+        network=True,
+        repo="https://git.example.invalid/someone-else/train-with-extras.git",
+    )
+    with pytest.raises(ProjectError, match="not the repository this project was given"):
+        experiments.load_plan(local, page.id)
+
+
+def test_code_written_while_the_approval_is_under_way_is_not_approved(
+    tmp_path, backend, monkeypatch
+):
+    """The designer may write until the approval; a write that lands in the middle of
+    one must not become "approved" unread."""
+    settings = {"review": {"experiment": "auto"}}
+    project = Project.create(tmp_path / "auto", title="Auto", settings=settings)
+    planned(project, {"main.py": QUICK}, accept=False)
+    read = experiments.code_digest(project, "E1")
+    unread = QUICK + "open('i-was-not-read.txt', 'w')\n"
+    checked = experiments._refusals
+
+    def then_the_designer_writes(*args, **kwargs):
+        reasons = checked(*args, **kwargs)
+        experiments.write_code(project, "E1", {"main.py": unread}, author="agent:designer")
+        return reasons
+
+    monkeypatch.setattr(experiments, "_refusals", then_the_designer_writes)
+    for options in ({"code_digest": read}, {}):  # the app sends the digest, the CLI none
+        with pytest.raises(Conflict, match="while it was being approved"):
+            experiments.approve(project, "E1", backends={"local": backend}, **options)
+        assert project.page("E1").state == "planned"
+        experiments.write_code(project, "E1", {"main.py": QUICK}, author="agent:designer")
+
+
+def test_writing_code_waits_for_whoever_holds_the_project(project):
+    """``write_code`` checks who may write and writes under the project's lock, so an
+    approval's last look and its change of state cannot be separated by a write."""
+    planned(project, {"main.py": QUICK}, accept=False)
+    finished = threading.Event()
+    outcome: list[object] = []
+
+    def write() -> None:
+        try:
+            outcome.append(
+                experiments.write_code(project, "E1", {"main.py": OTHER}, author="agent:designer")
+            )
+        except ProjectError as exc:
+            outcome.append(exc)
+        finished.set()
+
+    with project.locked():
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert not finished.wait(0.3)
+        # What the holder decides meanwhile is what the writer finds.
+        project.review("E1", "accept")
+    writer.join(10)
+    assert finished.is_set() and isinstance(outcome[0], NotAllowed)
+    assert experiments.code_files(project, "E1") == {"main.py": QUICK}
+
+
+def test_an_agent_does_not_replace_a_file_the_person_wrote(project):
+    """The person corrected the code of a proposal; the designer's session goes on."""
+    planned(project, {"main.py": BROKEN, "lib.py": "X = 1\n"}, accept=False)
+    experiments.write_code(project, "E1", {"main.py": QUICK}, author="human")
+    (experiments.code_dir(project, "E1") / "data.py").write_text("ROWS = []\n")  # put there by hand
+
+    for name in ("main.py", "data.py"):
+        with pytest.raises(NotAllowed, match=rf"{name}.*the person") as refused:
+            experiments.write_code(project, "E1", {name: BROKEN}, author="agent:designer")
+        assert "what should change" in str(refused.value)
+    # Nothing of a refused call is written, not even the files that were the agent's.
+    with pytest.raises(NotAllowed):
+        experiments.write_code(
+            project, "E1", {"lib.py": "X = 2\n", "main.py": BROKEN}, author="agent:designer"
+        )
+    files = experiments.code_files(project, "E1")
+    assert files["main.py"] == QUICK and files["lib.py"] == "X = 1\n"
+    assert experiments.code_authors(project, "E1")["main.py"]["author"] == "human"
+    # Its own files, and new ones, are still the designer's to write; so is the person's
+    # file when the text is the same (nothing is replaced).
+    experiments.write_code(
+        project, "E1", {"lib.py": "X = 3\n", "new.py": "Y = 1\n"}, author="agent:designer"
+    )
+    experiments.write_code(project, "E1", {"main.py": QUICK}, author="agent:designer")
+    assert experiments.code_authors(project, "E1")["main.py"]["author"] == "human"
+    # The runner's repair of an approved run is pipeline code, bounded and recorded.
+    experiments.write_code(project, "E1", {"main.py": QUICK + "#\n"}, author="agent:runner")
+
+
+# ---------------------------------------------------------------------------------------
+# Jobs and their records (audit: execution 4, 5, 6, 8, 9; containment 7, 8, 14)
+# ---------------------------------------------------------------------------------------
+
+FAKE_KEY = "sk-ant-AUDIT-FAKE-KEY-000"
+FAKE_TOKEN = "ghp_FAKETOKEN123"
+PRIVATE_URL = f"https://{FAKE_TOKEN}@git.example.invalid/me/private.git"
+
+
+class Recording(FakeModal):
+    """A remote backend written against the contract of today: it is told which strings
+    must never appear in a log, and what the job it picks up was approved to be."""
+
+    def __init__(self, **options) -> None:
+        super().__init__(**options)
+        self.masks: list[tuple[str, ...]] = []
+        self.picked_up: list[dict] = []
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
+        self.masks.append(tuple(mask))
+        return super().run_job(
+            spec, source_dir=source_dir, run_dir=run_dir, on_log=on_log, should_stop=should_stop
+        )
+
+    def attach(
+        self, handle, *, run_dir, spec=None, started=None, on_log=None, should_stop=None, mask=()
+    ):
+        self.picked_up.append({"spec": spec, "started": started, "mask": tuple(mask)})
+        return super().attach(handle, run_dir=run_dir, on_log=on_log, should_stop=should_stop)
+
+
+def test_the_backend_is_told_what_to_keep_out_of_the_log_and_what_job_it_picks_up(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
+    project = Project.create(
+        tmp_path / "p", title="Private", settings={"repo": {"path": PRIVATE_URL}}
+    )
+    modal = Recording()
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4", timeout_seconds=300)
+    experiments.approve(project, "E1", backends={"modal": modal})
+
+    assert experiments.run(project, "E1", compute=modal)["status"] == "succeeded"
+    [mask] = modal.masks
+    assert FAKE_KEY in mask and FAKE_TOKEN in mask
+
+    # A job that outlived its worker is picked up as what was approved and recorded on
+    # this side: nothing about it is asked of the place where it ran.
+    experiments.approve(project, "E1", backends={"modal": modal})
+    directory = dead_run(project, 2, backend="modal", handle="sb-9")
+    record = json.loads((directory / "run.json").read_text())
+    record["plan"] = {
+        "mode": "gpu",
+        "command": ["python", "main.py"],
+        "timeout_seconds": 300.0,
+        "gpu": "T4",
+        "network": False,
+        "packages": ["torch"],
+    }
+    (directory / "run.json").write_text(json.dumps(record))
+    [settled] = experiments.recover(project, compute=modal)
+    assert settled["status"] == "succeeded"
+    [picked] = modal.picked_up
+    assert picked["started"] == "2026-11-15T12:00:00Z"
+    spec = picked["spec"]
+    assert (spec.command, spec.timeout, spec.gpu, spec.network, spec.packages) == (
+        ["python", "main.py"],
+        300.0,
+        "T4",
+        False,
+        ("torch",),
+    )
+    assert spec.outputs == ("metrics.json", "artifacts")
+    assert FAKE_KEY in picked["mask"] and FAKE_TOKEN in picked["mask"]
+
+
+class Leaky(FakeModal):
+    """A job that found credentials (its parent holds them, its repository's URL carries
+    one) and prints them; written like a backend from before ``mask`` existed."""
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None):
+        self.specs.append(spec)
+        directory = Path(run_dir)
+        lines = [
+            f"from the process that started me: ANTHROPIC_API_KEY={FAKE_KEY}",
+            f"origin {PRIVATE_URL} (fetch)",
+            f"RuntimeError: could not push to {PRIVATE_URL} with {FAKE_KEY}",
+        ]
+        (directory / "log.txt").write_text("\n".join(lines) + "\n")
+        for line in lines:
+            on_log(line)
+        return JobResult(returncode=1, seconds=0.5, backend=self.name, log_path=None)
+
+
+def test_what_a_job_prints_of_a_credential_is_masked_before_it_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
+    project = Project.create(
+        tmp_path / "p", title="Private", settings={"repo": {"path": PRIVATE_URL}}
+    )
+    modal = Leaky()
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    experiments.approve(project, "E1", backends={"modal": modal})
+    seen: list[str] = []
+
+    record = experiments.run(project, "E1", compute=modal, on_log=seen.append)
+
+    assert record["status"] == "failed" and "RuntimeError: could not push" in record["error"]
+    result = project.page("E1-run1")
+    kept = [
+        json.dumps(record),
+        result.body,
+        result.summary,
+        "\n".join(seen),
+        (project.root / "events.jsonl").read_text(),
+        (project.root / "MEMORY.md").read_text(),
+    ]
+    for text in kept:
+        assert FAKE_KEY not in text and FAKE_TOKEN not in text
+    assert "from the process that started me: ANTHROPIC_API_KEY=[redacted]" in result.body
+    assert "origin https://[redacted]@git.example.invalid/me/private.git (fetch)" in result.body
+    assert any("[redacted]" in line for line in seen)
+    [logged] = events_of(project, "run.log")
+    assert any("[redacted]" in line for line in logged["data"]["lines"])
+
+
+class Billed(FakeModal):
+    """A remote backend that leaves its estimate next to the run, as the contract says,
+    and whose job is then interrupted: no result ever reaches the caller."""
+
+    def __init__(self, cost: dict | None) -> None:
+        super().__init__()
+        self.cost = cost
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
+        self.specs.append(spec)
+        (Path(run_dir) / "handle.txt").write_text("sb-77\n")
+        if self.cost is not None:
+            (Path(run_dir) / "cost.json").write_text(json.dumps(self.cost))
+        raise KeyboardInterrupt  # Stop, Ctrl-C, SIGTERM: the sandbox was ended and billed
+
+
+def test_a_run_that_ends_without_a_result_keeps_the_cost_the_backend_left(tmp_path):
+    limits = {"experiment_usd": 0.5}
+    project = Project.create(tmp_path / "p", title="Costly", settings={"limits": limits})
+    modal = Billed({"cost_usd": 0.42, "seconds": 12.0, "final": True})
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    experiments.approve(project, "E1", backends={"modal": modal})
+
+    with pytest.raises(KeyboardInterrupt):
+        experiments.run(project, "E1", compute=modal)
+
+    [record] = experiments.runs(project, "E1")
+    assert (record["status"], record["requeued"]) == ("cancelled", True)
+    assert record["cost_usd"] == 0.42 and record["handle"] == "sb-77"
+    assert project.page("E1").state == "queued"
+    # It counts before the run is started again by itself: $0.42 of $0.50 is spent, and
+    # 900 s of a T4 could cost another $0.24.
+    again = experiments.run(project, "E1", compute=modal)
+    assert (again["number"], again["error_kind"]) == (2, "budget")
+    assert "$0.42" in again["error"] and len(modal.specs) == 1
+
+
+def test_a_sandbox_that_is_gone_is_charged_for_the_time_since_it_started(project):
+    """The worker died, the job ran on unattended and is gone: what it cost is unknown,
+    so it is charged for as long as it can have run."""
+    from paper_orchestra.compute.modal_backend import estimate_cost
+
+    modal = Recording(attach_error="The sandbox sb-9 no longer exists.")
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4", timeout_seconds=600)
+    experiments.approve(project, "E1", backends={"modal": modal})
+    directory = dead_run(project, backend="modal", handle="sb-9")  # started long ago
+    # The estimate from when the worker last looked: not the end of the story.
+    (directory / "cost.json").write_text('{"cost_usd": 0.001, "seconds": 3.0, "final": false}')
+
+    [record] = experiments.recover(project, compute=modal)
+
+    assert (record["status"], record["error_kind"], record["requeued"]) == (
+        "failed",
+        "worker",
+        True,
+    )
+    longest = 600 + experiments.REMOTE_MARGIN_SECONDS
+    assert record["cost_usd"] == pytest.approx(
+        estimate_cost(longest, gpu="T4", cpu=2.0, memory_mb=4096)
+    )
+    assert any("charged" in note and "sb-9" in note for note in record["notes"])
+    # A run that never had a sandbox costs nothing, and a local one is never billed.
+    planned(project, {"main.py": QUICK})
+    experiments.approve(project, "E2", backends={"local": LocalBackend()})
+    dead_run(project, experiment="E2")
+    [other] = experiments.recover(project)
+    assert other["experiment"] == "E2" and other["cost_usd"] is None
+
+
+class LocalJobs:
+    """What the engine sees of the local backend's jobs: a record of what a job started
+    (``job.json``), and a way to end it for whoever finds it after its worker died."""
+
+    name = "local"
+
+    def __init__(self, scratch: Path) -> None:
+        #: No such session exists (it is above any process id), and no such directory.
+        self.job = {
+            "session": 4_194_999,
+            "session_started": "2026-11-15T12:00:00Z",
+            "scratch": str(scratch / "paper-orchestra-job-gone"),
+        }
+        self.during: dict = {}
+        self.ended: list[dict] = []
+
+    def supports(self, spec):
+        return []
+
+    def check(self, **kwargs):
+        return []
+
+    def close(self):
+        pass
+
+    def describe(self):
+        return {"backend": "local", "jobs": {"supported": True, "reattach": False}}
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
+        directory = Path(run_dir)
+        (directory / "job.json").write_text(json.dumps(self.job))
+        for _ in range(200):  # until the engine has seen the record of the job
+            should_stop()
+            self.during = json.loads((directory / "run.json").read_text())
+            if self.during.get("job"):
+                break
+            time.sleep(0.02)
+        (directory / "log.txt").write_text("done\n")
+        (directory / "metrics.json").write_text('{"loss": 0.25}')
+        return JobResult(returncode=0, seconds=0.2, backend=self.name)
+
+    def end_job(self, record):
+        self.ended.append(dict(record))
+        return ["The processes the job left were ended and its working directory removed."]
+
+
+def test_what_a_dead_workers_job_left_is_ended_and_removed_when_the_run_is_settled(
+    tmp_path, project
+):
+    local = LocalJobs(tmp_path)
+    planned(project, {"main.py": QUICK})
+    experiments.approve(project, "E1", backends={"local": local})
+    # While a job runs, what it started is copied into the run's record.
+    assert experiments.run(project, "E1", compute=local)["status"] == "succeeded"
+    assert local.during["job"] == local.job and local.ended == []
+
+    # kill -9: the record still reads running, a copy of the repository is left behind.
+    experiments.approve(project, "E1", backends={"local": local})
+    directory = dead_run(project, 2)
+    (directory / "job.json").write_text(json.dumps(local.job))
+    (directory / "repo" / "data").mkdir(parents=True)
+    (directory / "repo" / "data" / "big.bin").write_bytes(b"\0" * 1024)
+
+    [record] = experiments.recover(project, compute=local)
+
+    assert (record["status"], record["error_kind"]) == ("failed", "worker")
+    assert local.ended == [local.job] and record["job"] == local.job
+    assert not (directory / "repo").exists()
+    assert any("were ended" in note for note in record["notes"])
+    # The same when the person cancels what the dead worker left.
+    directory = dead_run(project, 3)
+    (directory / "job.json").write_text(json.dumps(local.job))
+    (directory / "repo").mkdir()
+    experiments.request_cancel(project, "E1")
+    assert not (directory / "repo").exists()
+    assert experiments.runs(project, "E1")[-1]["status"] == "cancelled"
+
+
+class ManyArtifacts(FakeModal):
+    """A job that writes 150 artifacts with long names."""
+
+    NAMES: tuple[str, ...] = tuple(
+        "artifacts/" + "/".join(["ü" * 100] * 4) + f"/table-{index}.csv" for index in range(150)
+    )
+
+    def _finish(self, directory: Path, handle: str) -> JobResult:
+        for name in self.NAMES:
+            (directory / name).parent.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_text("a,b\n1,2\n")
+        return super()._finish(directory, handle)
+
+
+def test_a_run_with_more_than_fits_on_a_page_still_gets_its_result_record(project):
+    modal = ManyArtifacts()
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    experiments.approve(project, "E1", backends={"modal": modal})
+
+    record = experiments.run(project, "E1", compute=modal)
+
+    assert record["status"] == "succeeded" and len(record["artifacts"]) == 150
+    assert record["result"] == "wiki/results/E1-run1.md"
+    result = project.page("E1-run1")
+    assert (result.state, result.review) == ("succeeded", "accepted")
+    assert len((project.root / result.path).read_bytes()) < 200_000
+    listed = result.body.count("/files/experiments/E1/runs/1/artifacts/")
+    assert 0 < listed < 150
+    assert f"and {150 - listed} more in run.json" in result.body
+    assert "| loss | 0.25 |" in result.body  # what a finding rests on is all there
+
+
+def test_a_result_record_that_cannot_be_written_is_said_aloud(project, backend, monkeypatch):
+    approved(project, backend, {"main.py": QUICK})
+
+    def refuse(*args, **kwargs):
+        raise ProjectError("wiki/results/E1-run1.md would be 371739 bytes; the limit is 200000.")
+
+    monkeypatch.setattr(project, "write_record", refuse)
+    record = experiments.run(project, "E1", compute=backend)
+
+    assert record["status"] == "succeeded" and record["result"] is None
+    assert any("could not be written" in note for note in record["notes"])
+    [event] = events_of(project, "error")
+    assert "E1" in event["summary"] and "result record" in event["summary"]
+    assert "run.json" in event["summary"] and event["data"]["run"] == 1
+
+
+def test_a_result_record_names_the_command_and_the_network_setting(tmp_path, project, backend):
+    approved(project, backend, {"main.py": QUICK})
+    experiments.run(project, "E1", compute=backend)
+    body = project.page("E1-run1").body
+    assert "| Command | python main.py |" in body
+    assert "| Network access | not allowed |" in body
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "train.py").write_text(QUICK)
+    project.settings.update({"repo": {"path": str(repository)}})
+    project.save_settings()
+    planned(project, mode="repo", command="python train.py --lr 0.1", network=True)
+    experiments.approve(project, "E2", network=True, backends={"local": backend})
+    record = experiments.run(project, "E2", compute=backend)
+    assert record["status"] == "succeeded", record["error"]
+    body = project.page("E2-run1").body
+    assert "| Command | python train.py --lr 0.1 |" in body
+    assert "| Network access | allowed |" in body
+
+
+def test_what_came_with_the_repository_is_not_a_result_of_the_run(tmp_path, project, backend):
+    """The person's repository holds a metrics.json and artifacts from earlier work; the
+    command of the experiment writes neither."""
+    repository = tmp_path / "repository"
+    (repository / "artifacts").mkdir(parents=True)
+    (repository / "train.py").write_text("print('training... (this script writes no metrics)')\n")
+    (repository / "metrics.json").write_text('{"accuracy": 0.9912, "note": "last year"}')
+    (repository / "artifacts" / "old_curve.png").write_bytes(PNG)
+    project.settings.update({"repo": {"path": str(repository)}})
+    project.save_settings()
+    planned(project, mode="repo", command="python train.py")
+    experiments.approve(project, "E1", backends={"local": backend})
+
+    record = experiments.run(project, "E1", compute=backend)
+
+    assert (record["status"], record["error_kind"]) == ("failed", "metrics")
+    assert "ended without writing metrics.json" in record["error"]
+    assert record["metrics"] == {} and record["artifacts"] == []
+    assert any("metrics.json" in note and "before the run" in note for note in record["notes"])
+    assert "0.9912" not in project.page("E1-run1").body
+    # The repository itself is as it was.
+    assert (repository / "metrics.json").exists() and (repository / "artifacts").is_dir()
+
+
+@pytest.mark.parametrize("target", ["metrics.json", "artifacts/table.csv"])
+def test_a_patch_cannot_put_results_into_the_repository(tmp_path, project, backend, target):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "train.py").write_text("print('nothing to do')\n")
+    project.settings.update({"repo": {"path": str(repository)}})
+    project.save_settings()
+    patch = f'--- /dev/null\n+++ b/{target}\n@@ -0,0 +1 @@\n+{{"accuracy": 0.9731}}\n'
+    planned(project, {"patch.diff": patch}, mode="repo", command="python train.py")
+
+    errors, _ = experiments.split_problems(experiments.check_code(project, "E1"))
+    assert any(target in error and "patch.diff" in error for error in errors)
+    with pytest.raises(ProjectError, match=re.escape(target)):
+        experiments.approve(project, "E1", backends={"local": backend})
+    assert project.page("E1").state == "planned"
+
+
+# ---------------------------------------------------------------------------------------
+# What a finding's numbers may rest on (audit: containment 11 and the measured 19 s)
+# ---------------------------------------------------------------------------------------
+
+BOASTFUL = """\
+import json
+
+print("expected accuracy 93.85")
+with open("metrics.json", "w") as handle:
+    handle.write('{"acc": 0.5125, "note": "expected 66.66", "p_at_77.77": 1.5}')
+"""
+
+FAILING = """\
+import json
+
+print("accuracy 88.12")
+with open("metrics.json", "w") as handle:
+    json.dump({"acc": 0.6644}, handle)
+raise SystemExit(3)
+"""
+
+
+def test_only_the_metrics_of_a_run_that_succeeded_support_a_finding(project, backend):
+    """Not the plan's title, not what the code printed, not a metric's name or note, and
+    nothing of a run that failed."""
+    page = project.create_page(
+        "experiment",
+        "Warmup reaches 97.31 percent accuracy",
+        BODY,
+        author="agent:designer",
+        fields={"mode": "script"},
+    )
+    experiments.write_code(project, page.id, {"main.py": BOASTFUL}, author="agent:designer")
+    project.review(page.path, "accept")
+    experiments.approve(project, "E1", backends={"local": backend})
+    assert experiments.run(project, "E1", compute=backend)["status"] == "succeeded"
+    approved(project, backend, {"main.py": FAILING})
+    assert experiments.run(project, "E2", compute=backend)["status"] == "failed"
+    finding = project.create_page(
+        "finding",
+        "Warmup works",
+        "Accuracy was 51.25% (0.5125), close to the 97.31% of the plan and the expected "
+        "93.85; the second run saw 88.12 and 0.6644, a note said 66.66, at 77.77.\n",
+        author="agent:analyst",
+    )
+
+    checks = {
+        check["number"]: check["found_in"] for check in experiments.number_check(project, finding)
+    }
+
+    measured = ["wiki/results/E1-run1.md"]
+    assert checks == {
+        "51.25": measured,
+        "0.5125": measured,
+        "97.31": [],
+        "93.85": [],
+        "88.12": [],
+        "0.6644": [],
+        "66.66": [],
+        "77.77": [],
+    }
+    assert experiments.unverified_numbers(project, finding) == [
+        "97.31", "93.85", "88.12", "0.6644", "66.66", "77.77"
+    ]  # fmt: skip
+
+
+def test_the_number_check_stays_fast_on_a_large_project(project):
+    """One finding of the largest size against 40 source records took 19 s: it is run
+    on every look at the page, and in every analysis and write-up."""
+    import random
+
+    rng = random.Random(1)
+    for index in range(40):
+        body = " ".join(f"{rng.random() * 100:.4f}" for _ in range(3000))
+        project.write_record("source", f"Src{index}", f"Source {index}", body + " 12.3456\n")
+    numbers = " ".join(f"{rng.random() * 100:.3f}" for _ in range(24000))
+    finding = project.create_page(
+        "finding", "Many numbers", f"{numbers} and 12.346 but 123456.789\n", author="agent:analyst"
+    )
+
+    started = time.monotonic()
+    checks = experiments.number_check(project, finding)
+    elapsed = time.monotonic() - started
+
+    assert len(checks) > 20_000
+    assert elapsed < 6.0, f"the number check took {elapsed:.1f} s"
+    by_number = {check["number"]: check["found_in"] for check in checks}
+    assert sorted(by_number["12.346"]) == sorted(
+        f"wiki/sources/Src{index}.md" for index in range(40)
+    )
+    assert by_number["123456.789"] == []
+    # Asked again (the page is opened again, the write-up checks every finding), the
+    # evidence that did not change is not read a second time.
+    started = time.monotonic()
+    assert experiments.number_check(project, finding) == checks
+    assert time.monotonic() - started < elapsed + 1.0
+
+
+WORKER = """\
+import sys
+
+from paper_orchestra.compute.local import LocalBackend
+from paper_orchestra.research import experiments
+from paper_orchestra.research.project import Project
+
+project = Project.open(sys.argv[1])
+experiments.run(project, "E1", compute=LocalBackend(scratch_dir=sys.argv[2]))
+"""
+
+
+def _alive(pid: int) -> bool:
+    """Whether the process exists and is not a zombie waiting to be reaped."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="processes are found via /proc")
+def test_a_killed_workers_local_run_leaves_nothing_behind_once_it_is_settled(tmp_path, project):
+    """kill -9 of the worker during a repo-mode run on this machine: the job's children
+    go on running, its working directory and a copy of the repository stay.  Settling
+    the run ends and removes them (the real local backend, a real worker process)."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    child_pid = tmp_path / "child.pid"
+    (repository / "train.py").write_text(
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"open({str(child_pid)!r}, 'w').write(str(child.pid))\n"
+        "print('training', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    project.settings.update({"repo": {"path": str(repository)}})
+    project.save_settings()
+    scratch = tmp_path / "scratch"
+    planned(project, mode="repo", command="python train.py")
+    experiments.approve(project, "E1", backends={"local": LocalBackend(scratch_dir=scratch)})
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER)
+    worker = subprocess.Popen([sys.executable, str(script), str(project.root), str(scratch)])
+    directory = run_dir(project)
+
+    def under_way() -> bool:
+        record = directory / "run.json"
+        return (
+            child_pid.exists()
+            and bool(child_pid.read_text().strip())
+            and record.exists()
+            and bool(json.loads(record.read_text()).get("job"))
+        )
+
+    try:
+        deadline = time.monotonic() + 60
+        while not under_way() and time.monotonic() < deadline:
+            assert worker.poll() is None, "the worker ended before its job was under way"
+            time.sleep(0.05)
+        assert under_way(), "the job did not record what it started"
+        child = int(child_pid.read_text())
+        job = json.loads((directory / "run.json").read_text())["job"]
+        assert Path(job["scratch"]).is_dir() and (directory / "repo").is_dir()
+        worker.kill()
+        worker.wait(30)
+        assert _alive(child), "the job's child outlives the worker that was killed"
+
+        [record] = experiments.recover(project)
+
+        assert (record["status"], record["error_kind"]) == ("failed", "worker")
+        assert record["requeued"] is True and record["job"] == job
+        deadline = time.monotonic() + 15
+        while _alive(child) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(child)
+        assert not Path(job["scratch"]).exists() and not (directory / "repo").exists()
+        assert any("left" in note for note in record["notes"])
+        assert project.page("E1").state == "queued"
+    finally:
+        # Whatever failed above, nothing this test started stays behind.
+        worker.kill()
+        worker.wait(30)
+        if child_pid.exists() and child_pid.read_text().strip().isdigit():
+            with contextlib.suppress(OSError):
+                os.kill(int(child_pid.read_text()), signal.SIGKILL)
+
+
+def test_the_number_check_is_bounded_where_the_evidence_is_dense(tmp_path, monkeypatch):
+    """A number of few digits against a file of 200,000 values: thousands of them round
+    to it.  They are not all walked for every number, and the answer is the same."""
+    import random
+
+    rng = random.Random(7)
+    dense = tmp_path / "dense.csv"
+    dense.write_text("\n".join(f"{rng.random() * 10:.6f}" for _ in range(200_000)) + "\n")
+    sparse = tmp_path / "sparse.csv"
+    sparse.write_text("seed,loss\n3,7.12349\n")
+    project = Project.create(tmp_path / "p", title="Dense", brief=BRIEF, files=[dense, sparse])
+    stated = " ".join(f"{tenths / 10:.1f}" for tenths in range(11, 100) if tenths % 10)
+    finding = project.create_page(
+        "finding", "Few digits", f"Values {stated} and 123456.7.\n", author="agent:analyst"
+    )
+
+    started = time.monotonic()
+    checks = {c["number"]: c["found_in"] for c in experiments.number_check(project, finding)}
+    elapsed = time.monotonic() - started
+
+    assert checks["7.1"] == ["inputs/dense.csv", "inputs/sparse.csv"]
+    assert checks["3.3"] == ["inputs/dense.csv"] and checks["123456.7"] == []
+    # Every value in reach walked, one by one: the same answers.
+    monkeypatch.setattr(experiments, "MAX_EVIDENCE_WALK", 10**9)
+    experiments._INDEX_KEPT.clear()
+    walked = {c["number"]: c["found_in"] for c in experiments.number_check(project, finding)}
+    assert walked == checks
+    assert elapsed < 5.0, f"the number check took {elapsed:.1f} s"

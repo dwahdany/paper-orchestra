@@ -26,8 +26,9 @@ pytest.importorskip("markdown_it")
 from fastapi.testclient import TestClient
 
 from paper_orchestra.research import Project, ProjectError
-from paper_orchestra.research.model import Conflict
+from paper_orchestra.research.model import Conflict, ResearchPage
 from paper_orchestra.web import api as api_module
+from paper_orchestra.web import workers as workers_module
 from paper_orchestra.web.api import LiveSettings, Services, UploadLimits, _Tail
 from paper_orchestra.web.app import create_app
 from paper_orchestra.web.security import (
@@ -211,6 +212,9 @@ def app(workspace, launched, services, live, tmp_path):
         live=live,
         grace=2.0,
         static_dir=tmp_path / "no-frontend",
+        # A server leaves its workers running when it ends, unless it was asked to stop
+        # them.  A test's server is asked to: no test leaves a worker behind.
+        stop_workers_on_exit=True,
     )
 
 
@@ -1711,7 +1715,9 @@ def test_the_workers_log_can_be_read_without_its_secrets(client, project, launch
     assert client.get(url(project, "/worker/log?offset=0")).json()["text"].startswith("[paper-")
 
 
-def test_shutting_the_server_down_stops_its_workers(app, project):
+def test_a_server_asked_to_stops_its_workers_when_it_shuts_down(app, project):
+    # The end of a server leaves its workers running (the next one finds them again);
+    # it stops them when it was started to do so, as the app of these tests is.
     with TestClient(app, base_url=BASE_URL) as client:
         pid = client.post(url(project, "/advance")).json()["worker"]["pid"]
         wait_for(lambda: (project.root / "ready").exists())
@@ -1993,13 +1999,18 @@ def test_the_stream_notices_a_worker_that_died_without_a_word(stream, project):
     assert settled["phases"][0]["status"] == "interrupted" and "gone" in settled["error"]
 
 
-def sleeper() -> subprocess.Popen:
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+def sleeper(project: Project, kind: str = "run") -> subprocess.Popen:
+    """A process that only sleeps, with the command line of a worker of ``project``
+    (``-m paper_orchestra research <kind> <directory>``).  The server goes by that before
+    it shows a process as a project's worker: what the project's files say of a process
+    number is not enough."""
+    asleep = [sys.executable, "-c", "import time; time.sleep(120)"]
+    return subprocess.Popen([*asleep, "-m", "paper_orchestra", "research", kind, str(project.root)])
 
 
 def test_an_experiment_run_from_a_terminal_shows_as_the_projects_worker(client, project):
     # `research run` in a terminal: state.json names the worker, the status stays as it was.
-    engine = sleeper()
+    engine = sleeper(project)
     try:
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         state = {"status": "checkpoint", "round": 1, "phase": "design", "phases": [],
@@ -2020,11 +2031,12 @@ def test_an_experiment_run_from_a_terminal_shows_as_the_projects_worker(client, 
 def test_the_stream_notices_the_end_of_a_run_it_did_not_start(stream, project):
     # A run started by a server that was killed: on record in .worker.json, and nothing
     # in state.json says a phase is running.  Nobody but the stream is looking.
-    run = sleeper()
+    run = sleeper(project)
     try:
         record = {"pid": run.pid, "host": socket.gethostname(), "kind": "run",
                   "options": {"experiments": ["E1"]}, "command": [], "started": "",
-                  "start_token": None, "server_pid": 2**22 + 4321}  # fmt: skip
+                  "start_token": workers_module._start_token(run.pid),
+                  "server_pid": 2**22 + 4321}  # fmt: skip
         (project.root / ".worker.json").write_text(json.dumps(record))
         live = stream(url(project, "/events"))
         wait_for(lambda: live.states(), message="the first state")
@@ -2442,3 +2454,210 @@ def test_the_api_works_without_the_experiments_module(workspace, project, monkey
         assert client.get(url(project, "/pages/H1")).status_code == 200
         refused = client.post(url(project, "/experiments/E1/cancel"))
         assert refused.status_code == 400 and error_of(refused)["code"] == "not_available"
+
+
+# ---------------------------------------------------------------------------
+# What runs is what the person approved (audit: containment 3, 4, 7; execution 1, 2, 7)
+# ---------------------------------------------------------------------------
+
+TOKEN = "ghp_FAKETOKEN123"
+PRIVATE_URL = f"https://{TOKEN}@git.example.invalid/me/private.git"
+SHOWN_URL = "https://***@git.example.invalid/me/private.git"
+
+
+@pytest.fixture
+def real(workspace, launched, live, tmp_path):
+    """The API over the real experiments module, not its stand-in."""
+    app = create_app(
+        workspace,
+        launcher=launched,
+        services=Services(),
+        live=live,
+        grace=2.0,
+        static_dir=tmp_path / "no-frontend",
+        stop_workers_on_exit=True,
+    )
+    with TestClient(app, base_url=BASE_URL) as client:
+        yield client
+
+
+def second_experiment(project: Project, **fields: Any) -> ResearchPage:
+    page = project.create_page(
+        "experiment",
+        "A second plan",
+        "## Objective\n\nMeasure it again.\n",
+        author="agent:designer",
+        fields={"mode": "script", **fields},
+        round=1,
+    )
+    code = project.experiment_dir(str(page.id)) / "code"
+    code.mkdir(parents=True)
+    (code / "main.py").write_text("print('hello')\n")
+    return page
+
+
+def test_the_api_never_grants_network_access_from_the_plan(real, project):
+    """Whichever way an approval arrives, it states the network or runs without it: a
+    plan that asks for the network is not approved by saying nothing."""
+    project.update_page("E1", author="agent:designer", fields={"network": True})
+
+    body = {"items": [{"ref": "E1", "decision": "accept", "approve_run": True}]}
+    (result,) = real.post(url(project, "/review"), json=body).json()["results"]
+    assert result["ok"] is False and result["approved"] is False and result["status"] == 422
+    assert "The plan was accepted, but its run was not approved" in result["error"]["message"]
+    assert "yours to grant" in result["error"]["message"]
+    assert (project.page("E1").review, project.page("E1").state) == ("accepted", "planned")
+
+    silent = real.post(url(project, "/experiments/E1/approve"), json={})
+    assert silent.status_code == 422 and "yours to grant" in error_of(silent)["message"]
+    assert project.page("E1").state == "planned"
+
+    without = real.post(url(project, "/experiments/E1/approve"), json={"network": False})
+    assert without.status_code == 200, without.text
+    page = without.json()["page"]
+    assert page["state"] == "approved" and page["meta"]["network"] is False
+    assert page["meta"]["backend"] == "local" and len(page["meta"]["approved_digest"]) == 64
+
+    real.post(url(project, "/experiments/E1/cancel"))
+    granted = real.post(url(project, "/experiments/E1/approve"), json={"network": True})
+    assert granted.status_code == 200 and granted.json()["page"]["meta"]["network"] is True
+
+    # A plan that does not ask is approved without the network by "accept and run".
+    second_experiment(project)
+    body = {"items": [{"ref": "E2", "decision": "accept", "approve_run": True}]}
+    (result,) = real.post(url(project, "/review"), json=body).json()["results"]
+    assert result["ok"] is True and result["approved"] is True
+    assert result["page"]["meta"]["network"] is False
+
+
+def test_an_experiment_is_approved_through_its_approval_and_nothing_else(real, project):
+    project.review("E1", "accept")
+    edited = real.put(url(project, "/pages/E1"), json={"fields": {"state": "approved"}})
+    assert edited.status_code == 422
+    message = error_of(edited)["message"]
+    assert "research approve" in message and "Approve in the app" in message
+    assert project.page("E1").state == "planned"
+
+    second_experiment(project, network=True)
+    body = {
+        "items": [{"ref": "E2", "decision": "accept", "edits": {"fields": {"state": "approved"}}}]
+    }
+    (result,) = real.post(url(project, "/review"), json=body).json()["results"]
+    assert result["ok"] is False and result["status"] == 422
+    assert "research approve" in result["error"]["message"]
+    page = project.page("E2")
+    assert (page.review, page.state) == ("proposed", "planned")
+
+    created = real.post(
+        url(project, "/pages"),
+        json={"kind": "experiment", "title": "Mine", "body": "x", "fields": {"state": "approved"}},
+    )
+    assert created.status_code == 422 and "research approve" in error_of(created)["message"]
+
+
+def test_an_approval_without_a_backend_goes_to_the_projects_not_the_pages(real, project):
+    """The project is set to Modal (code the person would not run on their machine); a
+    page that carries ``backend: local`` does not move the run onto it."""
+    project.settings.update({"compute": "modal"})
+    project.save_settings()
+    project.update_page("E1", author="human", fields={"backend": "local"})
+    project.review("E1", "accept")
+
+    silent = real.post(url(project, "/experiments/E1/approve"), json={})
+
+    # Modal is not set up in a test: the approval is refused for Modal, not made for local.
+    assert silent.status_code == 422, silent.text
+    assert "modal" in error_of(silent)["message"].lower()
+    assert project.page("E1").state == "planned"
+    chosen = real.post(url(project, "/experiments/E1/approve"), json={"backend": "local"})
+    assert chosen.status_code == 200 and chosen.json()["page"]["meta"]["backend"] == "local"
+
+
+def test_the_experiment_view_says_what_was_approved_and_whether_it_still_is(real, project):
+    never = real.get(url(project, "/experiments/E1")).json()
+    assert never["approval"] == {
+        "digest": None,
+        "at": None,
+        "matches": False,
+        "changed": [],
+        "repaired": False,
+    }
+    assert len(never["plan_digest"]) == 64 and never["plan_digest"] != never["code"]["digest"]
+
+    project.review("E1", "accept")
+    read = never["code"]["digest"]
+    approved = real.post(url(project, "/experiments/E1/approve"), json={"code_digest": read})
+    assert approved.status_code == 200, approved.text
+    view = real.get(url(project, "/experiments/E1")).json()
+    assert view["code"]["digest"] == read  # what an approval sends back, as before
+    assert (
+        view["approval"]["digest"] == view["plan_digest"] == view["page"]["meta"]["approved_digest"]
+    )
+    assert view["approval"]["at"] == view["page"]["meta"]["approved_at"]
+    assert view["approval"]["matches"] is True and view["approval"]["changed"] == []
+
+    # The person edits the code and the time limit afterwards: still "approved" on the
+    # page, and the view says that it is no longer what was approved, and how.
+    real.put(url(project, "/experiments/E1/code/main.py"), json={"text": "print('other')\n"})
+    real.put(url(project, "/pages/E1"), json={"fields": {"timeout_seconds": 30}})
+    view = real.get(url(project, "/experiments/E1")).json()
+    assert view["page"]["state"] == "approved"
+    assert view["approval"]["matches"] is False and view["approval"]["repaired"] is False
+    assert view["plan_digest"] != view["approval"]["digest"]
+    first, second = view["approval"]["changed"]
+    assert first == "timeout_seconds: 900 when approved, now 30"
+    assert second.startswith("main.py: changed after the approval (written by human at ")
+
+
+def test_the_api_never_shows_the_token_of_the_repository_url(real, project):
+    project.settings.update({"repo": {"path": PRIVATE_URL, "ref": "main"}})
+    project.save_settings()
+    project.update_page(
+        "E1",
+        author="agent:designer",
+        fields={"mode": "repo", "command": "python train.py", "network": True},
+    )
+
+    seen = real.get(url(project)).json()
+    assert seen["settings"]["repo"] == {"path": SHOWN_URL, "ref": "main"}
+    view = real.get(url(project, "/experiments/E1"))
+    assert view.json()["plan"]["repo"] == SHOWN_URL
+    listed = real.get(url(project, "/experiments"))
+    for response in (real.get(url(project)), view, listed, real.get("/api/projects")):
+        assert TOKEN not in response.text
+
+    # Settings sent back as they were shown do not replace the token by its mask ...
+    kept = real.patch(url(project), json={"settings": {"repo": {"path": SHOWN_URL, "ref": "dev"}}})
+    assert kept.status_code == 200 and TOKEN not in kept.text
+    assert kept.json()["settings"]["repo"] == {"path": SHOWN_URL, "ref": "dev"}
+    stored = Project.open(project.root).settings.repo
+    assert (stored.path, stored.ref) == (PRIVATE_URL, "dev")
+    # ... and another repository is another repository.
+    real.patch(url(project), json={"settings": {"repo": {"path": "https://example.org/x.git"}}})
+    assert Project.open(project.root).settings.repo.path == "https://example.org/x.git"
+
+
+def test_logs_are_served_without_the_credentials_a_job_printed(real, project, monkeypatch):
+    secret = "sk-ant-test-" + "z" * 40
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    project.settings.update({"repo": {"path": PRIVATE_URL}})
+    project.save_settings()
+    run_dir = add_run(project)
+    (run_dir / "log.txt").write_text(
+        f"step 1\nfrom my parent: ANTHROPIC_API_KEY={secret}\norigin {PRIVATE_URL} (fetch)\ndone\n"
+    )
+    (project.root / "worker.log").write_text(f"cloning {PRIVATE_URL}\nlast line\n")
+
+    run = real.get(url(project, "/experiments/E1/runs/1"))
+    followed = real.get(url(project, "/experiments/E1/runs/1/log"))
+    worker = real.get(url(project, "/worker/log"))
+
+    for response in (run, followed, worker):
+        assert response.status_code == 200
+        assert secret not in response.text and TOKEN not in response.text
+    assert "ANTHROPIC_API_KEY=[redacted]" in run.json()["log"]["text"]
+    assert "origin https://[redacted]@git.example.invalid/me/private.git" in followed.json()["text"]
+    assert followed.json()["text"].endswith("done\n")
+    # Offsets are those of the file: a client that follows the log misses nothing.
+    assert followed.json()["next"] == (run_dir / "log.txt").stat().st_size
+    assert "cloning https://[redacted]@git.example.invalid" in worker.json()["text"]

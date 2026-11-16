@@ -343,8 +343,13 @@ def test_the_accepted_finding_quotes_only_numbers_of_the_result_record(demo):
         assert str(metrics[name]) in finding.body
     checks = experiments.number_check(demo, finding)
     assert checks, "the finding states numbers"
-    for check in checks:
-        assert "wiki/results/E1-run1.md" in check["found_in"], check
+    by_number = {check["number"]: check["found_in"] for check in checks}
+    # Every number it states is on record somewhere; what the run measured is in the
+    # run's record, and a setting such as the batch size is in what the person wrote.
+    assert all(by_number.values()), by_number
+    for name in ("spike_b16_no_warmup", "initial_loss", "final_loss_b16_warmup"):
+        assert "wiki/results/E1-run1.md" in by_number[str(metrics[name])], name
+    assert "256" in by_number and "wiki/results/E1-run1.md" not in by_number["256"]
     # What the finding says is what the run shows.
     assert metrics["spike_b16_no_warmup"] > 0.05
     assert metrics["spike_b16_warmup"] == metrics["spike_b256_no_warmup"] == 0.0

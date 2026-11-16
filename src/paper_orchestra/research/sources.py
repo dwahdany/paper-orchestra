@@ -33,7 +33,8 @@ from paper_orchestra.agents.literature import (
 )
 from paper_orchestra.llm.base import ToolError, ToolSpec
 from paper_orchestra.memory.tools import virtual_path
-from paper_orchestra.research.model import ResearchPage, format_stamp
+from paper_orchestra.memory.wiki import split_front_matter
+from paper_orchestra.research.model import HUMAN, ProjectError, ResearchPage, format_stamp
 from paper_orchestra.research.project import Project
 from paper_orchestra.utils.scholar import (
     PAPER_FIELDS,
@@ -286,6 +287,50 @@ class SourceVerifier:
             )
         return VerifiedSource.from_page(page, created=False)
 
+    def _last_title(self, path: str) -> str:
+        """The title a page that is no longer there had when it was deleted."""
+        try:
+            versions = self.project.history(path)
+            text = self.project.version(path, versions[0].stamp) if versions else ""
+        except ProjectError:
+            return ""
+        return str(split_front_matter(text)[0].get("title") or "")
+
+    def _deleted(self) -> set[str]:
+        """Normalised titles of the sources the person deleted.
+
+        Read from the project's events and the versions it keeps of a deleted page:
+        deleting leaves no page behind that could say so, as a rejection does.
+        """
+        titles: set[str] = set()
+        for event in self.project.events():
+            data = event.get("data")
+            if event.get("type") != "page.deleted" or not isinstance(data, Mapping):
+                continue
+            if data.get("kind") == "source" and data.get("by") == HUMAN:
+                titles.add(normalize_title(self._last_title(str(data.get("path") or ""))))
+        return titles - {""}
+
+    def _asked_for(self, wanted: str) -> bool:
+        """Whether an open request of the person names the paper by its title."""
+        return any(wanted in normalize_title(request.text) for request in self.project.requests())
+
+    def _refuse_deleted(self, title: str, wanted: str, deleted: set[str]) -> None:
+        """Refuse a paper whose record the person deleted, unless they ask for it.
+
+        Deleting a source is a decision of the person like rejecting one, and a later
+        session must not undo it by recording the paper again, accepted, as if nothing
+        had been decided.  The person takes it back by asking for the paper by its
+        title in a request.
+        """
+        if wanted in deleted and not self._asked_for(wanted):
+            raise self._refuse(
+                title,
+                "The researcher deleted this source from the wiki, so it is not recorded "
+                "again and cannot be cited; work without it. It comes back only when the "
+                "researcher asks for the paper by its title in a request.",
+            )
+
     # -- lookup ------------------------------------------------------------------
 
     def _from_cache(self, title: str, year: int | None) -> tuple[dict[str, Any], str] | None:
@@ -378,8 +423,9 @@ class SourceVerifier:
 
         Returns the record, new or already present; raises :class:`NotVerified`
         when the paper is unknown, past the cutoff, cannot be looked up, was
-        rejected by the person, or the project already holds as many sources as
-        its limit allows.
+        rejected or deleted by the person (a deleted one is recorded again when
+        an open request of theirs names its title), or the project already holds
+        as many sources as its limit allows.
         """
         self.candidates += 1
         title = " ".join(str(title or "").split())
@@ -389,6 +435,8 @@ class SourceVerifier:
         known = self._known()
         if wanted in known:
             return self._on_record(known[wanted], title)
+        deleted = self._deleted()
+        self._refuse_deleted(title, wanted, deleted)
         limit = int(self.project.settings.limits.max_sources)
         # What the person turned down is kept, but it is not one of the project's sources.
         kept = sum(1 for page in known.values() if page.review != "rejected")
@@ -403,6 +451,7 @@ class SourceVerifier:
         canonical = normalize_title(record["title"])
         if canonical in known:
             return self._on_record(known[canonical], title)
+        self._refuse_deleted(title, canonical, deleted)
         return VerifiedSource.from_page(self._write(record, link), created=True)
 
 

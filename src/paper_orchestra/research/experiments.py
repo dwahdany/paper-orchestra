@@ -14,10 +14,12 @@ is everything between the two:
   :func:`request_cancel` and :func:`recover` end and settle runs;
 * :func:`number_check` traces the numbers of a finding back to records.
 
-Two rules shape all of it.  Nothing here approves anything: only :func:`approve`
-moves an experiment to ``approved``, and it acts for the person.  And nothing
-here is written by a model: ``run.json`` and the result page are made by code
-from what the run produced, with the values as the run wrote them.
+Three rules shape all of it.  Nothing here approves anything: only :func:`approve`
+moves an experiment to ``approved``, and it acts for the person.  An approval is
+a record of exactly what may run (:func:`plan_digest`), and a run starts only
+while the experiment still is that.  And nothing here is written by a model:
+``run.json`` and the result page are made by code from what the run produced,
+with the values as the run wrote them.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import bisect
 import contextlib
 import difflib
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -44,8 +47,9 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
+from paper_orchestra import doctor
 from paper_orchestra.compute import ComputeError, JobResult, JobSpec, get_backend
 from paper_orchestra.compute.base import (
     HANDLE_NAME,
@@ -66,6 +70,7 @@ from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import (
     COMPUTE_BACKENDS,
     HUMAN,
+    RUN_FIELDS,
     SYSTEM,
     Conflict,
     NotAllowed,
@@ -88,6 +93,7 @@ from paper_orchestra.utils.common import write_json, write_text
 
 __all__ = [
     "ExperimentPlan",
+    "approval",
     "approve",
     "check_code",
     "code_authors",
@@ -97,8 +103,10 @@ __all__ = [
     "job_command",
     "job_spec",
     "load_plan",
+    "mask_credentials",
     "number_check",
     "options",
+    "plan_digest",
     "recover",
     "request_cancel",
     "run",
@@ -122,6 +130,21 @@ AUTHORS_FILE = "authors.json"
 RUN_FILE = "run.json"
 #: The prepared copy of a repository inside a run directory; removed when the run ends.
 REPO_COPY = "repo"
+#: Under ``experiments/E<n>/``: what the last approval pinned, field by field and file by
+#: file, so that a later look can say what changed.  The digest on the page decides; this
+#: only explains.
+APPROVAL_FILE = "approval.json"
+#: In a run directory, written by a backend whose jobs are billed: its estimate of what
+#: the job has cost so far, ``{"cost_usd": float | null, "seconds": float, "final": bool}``.
+COST_FILE = "cost.json"
+#: In a run directory, written by a backend whose jobs are processes of this machine:
+#: ``{"session": int, "session_started": str, "scratch": str}``, what to end and remove
+#: when the worker died.
+JOB_FILE = "job.json"
+#: How long past a job's time limit a remote backend keeps its sandbox at most (Modal's
+#: margin for upload and for fetching the outputs).  A sandbox that is gone when its run
+#: is settled is charged for no longer than the time limit plus this.
+REMOTE_MARGIN_SECONDS = 900.0
 #: The flag :func:`request_cancel` leaves for the process that runs the experiment.
 CANCEL_FLAG = ".cancel"
 #: Held, as a kernel lock, by the process that runs the experiment.
@@ -144,6 +167,11 @@ MAX_METRIC_TEXT_CHARS = 200
 #: An artifact is a figure or a table for the wiki, not a dataset or a checkpoint.
 MAX_ARTIFACT_BYTES = 50 * 1024 * 1024
 MAX_ARTIFACTS = 200
+#: Bytes of a result page that its metrics table, its list of artifacts and its notes may
+#: take: a page has a size limit, and the run record has all of them.
+MAX_METRICS_BYTES_ON_PAGE = 60_000
+MAX_ARTIFACT_LIST_BYTES = 60_000
+MAX_NOTES_BYTES = 20_000
 #: Lines of the log on a result page, and characters of each.
 LOG_TAIL_LINES = 40
 LOG_LINE_CHARS = 500
@@ -163,6 +191,15 @@ HANDLE_CHECK_SECONDS = 0.5
 MAX_WORKER_DEATHS = 3
 #: Text files under ``inputs/`` larger than this are not searched for a finding's numbers.
 MAX_EVIDENCE_BYTES = 2_000_000
+#: Pieces of evidence (records and input files) whose numbers are kept from one check of
+#: a finding to the next, for as long as the file they came from does not change.
+MAX_EVIDENCE_KEPT = 2_000
+#: Values of the evidence that are looked at one by one for a number of a finding before
+#: each piece of evidence is asked on its own instead: the bound on the work per number.
+MAX_EVIDENCE_WALK = 256
+#: The shortest password or token of a repository URL that is blanked out of logs: a
+#: shorter one would blank ordinary words.
+MIN_URL_SECRET_CHARS = 4
 
 _RUNNER = agent_author("runner")
 _DESIGNER = agent_author("designer")
@@ -178,6 +215,8 @@ _TRUE = frozenset({"true", "yes", "on", "1"})
 _FALSE = frozenset({"", "false", "no", "off", "0", "none", "null"})
 _NO_GPU = frozenset({"", "false", "no", "none", "null", "cpu", "0"})
 _WORKER_STOPPED = "The worker stopped while this run was in progress."
+_URL_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)([^/@\s]+)@")
+_HOW_TO_APPROVE = "`paper-orchestra research approve`, or Approve in the app"
 
 #: Modules whose import means the code talks to the network.
 _NETWORK_MODULES = frozenset(
@@ -296,6 +335,51 @@ def _page_or_none(project: Project, experiment_id: str) -> ResearchPage | None:
     return page if page.kind == "experiment" else None
 
 
+# -- what must never be written down ------------------------------------------------------
+
+
+def _url_secrets(url: str) -> list[str]:
+    """The password or token a repository URL carries, as the strings to keep out of
+    logs: ``https://token@host`` and ``scheme://user:password@host``.  The user name of
+    an ssh URL is no secret."""
+    match = _URL_USERINFO.match(str(url or "").strip())
+    if match is None:
+        return []
+    user, colon, password = match.group(2).partition(":")
+    lone_token = not colon and match.group(1).lower().startswith("http")
+    secret = password if colon else user if lone_token else ""
+    found = {secret, unquote(secret)}  # git may print either form
+    if colon and password:
+        found.add(match.group(2))
+    return [text for text in found if len(text) >= MIN_URL_SECRET_CHARS]
+
+
+def _secrets(project: Project, plan: ExperimentPlan | None = None) -> list[str]:
+    """The strings that must never reach a log, a record or an event of a run: the
+    credentials in this process's environment (the rule of ``paper-orchestra doctor``)
+    and what the URL of the repository carries.  Longest first.
+
+    A job's own environment holds none of them.  It can still come by them: a local job
+    runs as the same user as its worker, and a job that clones a private repository is
+    handed its URL.
+    """
+    found = set(doctor.secret_values(os.environ))
+    given = project.settings.repo
+    for url in (given.path if given else "", plan.repo if plan and plan.repo else ""):
+        found.update(_url_secrets(url))
+    return sorted(found, key=len, reverse=True)
+
+
+def _masked(text: str, secrets: Sequence[str]) -> str:
+    return str(doctor.scrub(text, secrets)) if secrets else text
+
+
+def mask_credentials(project: Project, text: str) -> str:
+    """``text`` with the credentials of this process's environment and of the project's
+    repository URL blanked out: for a log before it is shown or written anywhere."""
+    return _masked(text, _secrets(project))
+
+
 # ---------------------------------------------------------------------------
 # Plans
 # ---------------------------------------------------------------------------
@@ -311,7 +395,8 @@ class ExperimentPlan:
     #: ``script`` (CPU, minutes), ``gpu`` (Modal) or ``repo`` (in the person's repository).
     mode: str
     entrypoint: str = DEFAULT_ENTRYPOINT
-    #: The command line as an argv; ``None`` runs ``python <entrypoint>``.
+    #: Repo mode only: the command line as an argv.  ``None``, and every other mode,
+    #: runs ``python <entrypoint>``.
     command: list[str] | None = None
     timeout_seconds: float = DEFAULT_TIMEOUT
     gpu: str | None = None
@@ -475,12 +560,42 @@ def _local_repository(project: Project, location: str) -> Path:
     return path if path.is_absolute() else project.root / path
 
 
+def _same_repository(project: Project, one: str, other: str) -> bool:
+    """Whether two locations name the same repository: the same URL, credentials and a
+    trailing ``.git`` aside, or the same directory."""
+    if repositories.is_url(one) != repositories.is_url(other):
+        return False
+    if repositories.is_url(one):
+        bare = [
+            _URL_USERINFO.sub(r"\1", text.strip()).rstrip("/").removesuffix(".git")
+            for text in (one, other)
+        ]
+        return bare[0] == bare[1]
+    with contextlib.suppress(OSError):
+        first = _local_repository(project, one).resolve()
+        return first == _local_repository(project, other).resolve()
+    return False
+
+
+def _foreign_repository(named: str, given: Any) -> str:
+    theirs = repositories.display_url(given.path) if given else "none"
+    return (
+        f"It names {repositories.display_url(named)} as its repository, which is not the "
+        f"repository this project was given ({theirs}). Only the person chooses which "
+        "repository an experiment copies or clones and runs: set it in the project's "
+        "settings (settings.repo), or write the experiment's page yourself."
+    )
+
+
 def _repository(project: Project, reading: _Reading) -> None:
     """Fill in where a repo-mode plan runs, and vet it."""
     page, plan = reading.page, reading.plan
     given = project.settings.repo
     named = _text(page.meta.get("repo"))
-    location = named or (given.path if given else "")
+    # The project's own repository as a page can name it: the settings hold the form
+    # that works (an agent never sees the token in its URL).
+    own = bool(named) and bool(given) and _same_repository(project, named, given.path)
+    location = given.path if given and (own or not named) else named
     if not location:
         reading.problems.append(
             "It runs in the person's repository (mode: repo), but no repository is named: "
@@ -488,13 +603,18 @@ def _repository(project: Project, reading: _Reading) -> None:
             "(repo: a path or a URL)."
         )
         return
-    ref = _text(page.meta.get("repo_ref")) or (given.ref if given and not named else None)
+    ref = _text(page.meta.get("repo_ref")) or (given.ref if given and (own or not named) else None)
     plan.repo_ref = ref or None
     if ref and (problem := repositories.ref_problem(ref)):
         reading.problems.append(problem)
+    # Which repository an experiment copies or clones, runs, and may send to a remote
+    # backend, is the person's choice.  A page an agent wrote can only name theirs.
+    foreign = bool(named) and not own and page.author != HUMAN
     if repositories.is_url(location):
         plan.repo = location
-        if problem := repositories.url_problem(location):
+        if foreign:
+            reading.problems.append(_foreign_repository(named, given))
+        elif problem := repositories.url_problem(location):
             reading.problems.append(problem)
         elif not plan.network:
             reading.problems.append(
@@ -508,15 +628,8 @@ def _repository(project: Project, reading: _Reading) -> None:
     plan.repo = str(path)
     local = bool(given) and not repositories.is_url(given.path)
     theirs = _local_repository(project, given.path) if given and local else None
-    # Which directory of this machine an experiment copies, and may send to a remote
-    # backend, is the person's choice.  A page an agent wrote can only name theirs.
-    if named and page.author != HUMAN and not (theirs and _within(path, theirs)):
-        reading.problems.append(
-            f"It names {path} as its repository, which is not the repository this project "
-            f"was given ({theirs or 'none'}). Only the person chooses which directory an "
-            "experiment may copy: set it in the project's settings (settings.repo), or "
-            "write the experiment's page yourself."
-        )
+    if foreign and not (theirs and _within(path, theirs)):
+        reading.problems.append(_foreign_repository(str(path), given))
     elif not path.is_dir():
         reading.problems.append(
             f"Its repository {path} does not exist or is not a directory. Correct the path "
@@ -558,6 +671,16 @@ def _read(
         )
         plan.entrypoint = DEFAULT_ENTRYPOINT
     plan.command = _command(meta.get("command"), problems)
+    if plan.command and plan.mode != "repo":
+        # What the person reads and approves of a script or gpu experiment is its code;
+        # a command of the page's own would run instead of it.
+        problems.append(
+            f"It names a command (`{_clip(shlex.join(plan.command), 120)}`), which only an "
+            f"experiment in the person's repository has (mode: repo). A {plan.mode} "
+            f"experiment runs its entry point, `python {plan.entrypoint}`: remove command "
+            "from the page."
+        )
+        plan.command = None
     plan.timeout_seconds = _timeout(
         meta.get("timeout_seconds"), _limits(project, limits), cap, reading
     )
@@ -597,9 +720,10 @@ def load_plan(project: Project, ref: str) -> ExperimentPlan:
     Raises ``NotFound`` when there is no such page and ``ProjectError`` when it
     is not an experiment or when the plan cannot be run as written; the message
     names every problem: an unknown mode, a GPU asked of a backend without one,
-    repo mode without a repository, a time limit above the project's, values
-    that are not what the field holds.  A time limit the page does not give is
-    the default, never more than the project's limit.
+    repo mode without a repository (or, on a page an agent wrote, with another
+    one than the project's), a ``command`` outside repo mode, a time limit above
+    the project's, values that are not what the field holds.  A time limit the
+    page does not give is the default, never more than the project's limit.
     """
     reading = _read(project, _experiment(project, ref))
     if reading.problems:
@@ -610,8 +734,12 @@ def load_plan(project: Project, ref: str) -> ExperimentPlan:
 
 
 def job_command(plan: ExperimentPlan) -> list[str]:
-    """The argv a run of ``plan`` executes in its working directory."""
-    return list(plan.command) if plan.command else ["python", plan.entrypoint]
+    """The argv a run of ``plan`` executes in its working directory: the plan's command
+    in repo mode, and ``python <entrypoint>`` otherwise.  A script or gpu experiment
+    starts its entry point whatever the plan holds as a command."""
+    if plan.mode == "repo" and plan.command:
+        return list(plan.command)
+    return ["python", plan.entrypoint]
 
 
 def job_spec(plan: ExperimentPlan, *, timeout: float | None = None) -> JobSpec:
@@ -701,6 +829,194 @@ def _digest(files: Iterable[tuple[str, Path]]) -> str:
         digest.update(f"{name}\0{len(data)}\0".encode())
         digest.update(data)
     return digest.hexdigest()
+
+
+# -- what an approval pins ----------------------------------------------------------------
+
+
+def _run_fields(plan: ExperimentPlan) -> dict[str, Any]:
+    """The fields of a plan that decide what a run executes, where and for how long
+    (``model.RUN_FIELDS``), in a form that can be hashed and compared."""
+    fields = {
+        "mode": plan.mode,
+        "entrypoint": plan.entrypoint,
+        "command": job_command(plan),
+        "packages": list(plan.packages),
+        "repo": plan.repo,
+        "repo_ref": plan.repo_ref,
+        "gpu": plan.gpu,
+        "network": plan.network,
+        "backend": plan.backend,
+        "timeout_seconds": float(plan.timeout_seconds),
+    }
+    assert tuple(fields) == RUN_FIELDS
+    return fields
+
+
+def _digest_of(fields: Mapping[str, Any], code: str) -> str:
+    """SHA-256 over the run-defining fields of a plan and the digest of its code."""
+    text = json.dumps({"code": code, "plan": dict(fields)}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def plan_digest(project: Project, ref: str) -> str:
+    """SHA-256 over what a run of the experiment would execute as things are now: its
+    code files (as :func:`code_digest`) and the run-defining fields of its plan (mode,
+    entrypoint, command, packages, repo, repo_ref, gpu, network, backend,
+    timeout_seconds), as they are read from the page and the project's settings.
+
+    An approval records it on the page as ``approved_digest``; a run starts only while
+    the two are equal (:func:`approval` says whether they are).
+    """
+    page = _experiment(project, ref)
+    code = _current_digest(project, str(page.id))
+    return _digest_of(_run_fields(_read(project, page).plan), code)
+
+
+def _shown_field(name: str, value: Any) -> str:
+    """A run-defining field as the record of an approval and a message show it."""
+    if value is None or value == []:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if name == "command":
+        return shlex.join(value)
+    if isinstance(value, list):
+        return ", ".join(map(str, value))
+    if name == "repo":
+        return repositories.display_url(str(value))  # never the token of its URL
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def _file_digests(directory: Path) -> dict[str, str]:
+    return {
+        name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in _code_paths(directory)
+    }
+
+
+def _approval_path(project: Project, experiment_id: str) -> Path:
+    return project.experiment_dir(experiment_id) / APPROVAL_FILE
+
+
+def _approval_record(project: Project, page: ResearchPage) -> dict[str, Any] | None:
+    """What the approval on ``page`` pinned, field by field and file by file; ``None``
+    when the record on file is not that approval's."""
+    record = _read_json(_approval_path(project, str(page.id)))
+    approved = _text(page.meta.get("approved_digest"))
+    if not isinstance(record, dict) or not approved or record.get("digest") != approved:
+        return None
+    return record
+
+
+def _write_approval(
+    project: Project, experiment_id: str, digest: str, stamp: str, fields: Mapping[str, Any]
+) -> None:
+    record = {
+        "digest": digest,
+        "at": stamp,
+        "plan": {name: _shown_field(name, value) for name, value in fields.items()},
+        "code": _file_digests(code_dir(project, experiment_id)),
+    }
+    try:
+        write_json(_approval_path(project, experiment_id), record)
+    except OSError as exc:
+        raise ProjectError(
+            f"The approval of {experiment_id} could not be recorded ({exc}), so nothing was "
+            f"approved. Check that {project.experiment_dir(experiment_id)} can be written."
+        ) from exc
+
+
+def _written_by(entry: Mapping[str, str] | None, approved_at: str) -> str:
+    """Who put the current version of a code file there, as far as the project knows."""
+    written = parse_stamp((entry or {}).get("written"))
+    approved = parse_stamp(approved_at)
+    if entry is None or written is None or (approved is not None and written < approved):
+        # ``write_code`` records every write; this one went around it.
+        return " (by hand, not through the project)"
+    return f" (written by {entry.get('author') or 'someone'} at {entry['written']})"
+
+
+def _changes_since(project: Project, page: ResearchPage, fields: Mapping[str, Any]) -> list[str]:
+    """What differs from what was approved, one phrase per field and per code file."""
+    name = str(page.id)
+    record = _approval_record(project, page)
+    if record is None:
+        return [
+            f"what changed cannot be named: the record of the approval "
+            f"({EXPERIMENTS_DIR}/{name}/{APPROVAL_FILE}) is missing"
+        ]
+    then = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    # Outside repo mode the command follows from the entry point, which is named.
+    derived = {"command"} if "repo" not in (then.get("mode"), fields.get("mode")) else set()
+    changes = [
+        f"{field}: {then[field]} when approved, now {_shown_field(field, value)}"
+        for field, value in fields.items()
+        if field in then and field not in derived and then[field] != _shown_field(field, value)
+    ]
+    directory = code_dir(project, name)
+    before = record.get("code") if isinstance(record.get("code"), dict) else {}
+    now, authors = _file_digests(directory), _authors(directory)
+    at = _text(page.meta.get("approved_at"))
+    for file in sorted(set(before) | set(now)):
+        if file not in now:
+            changes.append(f"{file}: removed after the approval")
+        elif file not in before:
+            changes.append(f"{file}: added after the approval{_written_by(authors.get(file), at)}")
+        elif before[file] != now[file]:
+            changes.append(
+                f"{file}: changed after the approval{_written_by(authors.get(file), at)}"
+            )
+    return changes or [
+        "something the record of the approval does not show (for example the credentials "
+        "in the address of the repository)"
+    ]
+
+
+def _departure(
+    project: Project, page: ResearchPage, fields: Mapping[str, Any], code: str
+) -> str | None:
+    """Why the experiment is not what was approved, as the end of a sentence; ``None``
+    when it is, or is the runner's recorded repair of it."""
+    approved = _text(page.meta.get("approved_digest"))
+    if not approved:
+        return (
+            "there is no record of what was approved (it was approved before approvals "
+            "were recorded, or its state was set by hand)"
+        )
+    if _digest_of(fields, code) in (approved, _text(page.meta.get("repaired_digest"))):
+        return None
+    at = _text(page.meta.get("approved_at"))
+    changes = "; ".join(_changes_since(project, page, fields))
+    return f"it is not what was approved{f' at {at}' if at else ''} ({changes})"
+
+
+def approval(project: Project, ref: str) -> dict[str, Any]:
+    """What the person approved of the experiment, and whether it still is that::
+
+        {"digest": "<sha256>", "at": "2026-11-15T12:00:00Z", "matches": True,
+         "changed": [], "repaired": False}
+
+    ``digest`` and ``at`` are the ``approved_digest`` and ``approved_at`` the last
+    approval recorded (``None`` for an experiment without one).  ``matches`` says
+    whether a run would start: the experiment is what was approved, or the
+    runner's own recorded repair of it (``repaired``).  ``changed`` names what
+    differs from the approval: each run-defining field with its value then and
+    now, each code file that was added, removed or changed, and who wrote it.
+    """
+    page = _experiment(project, ref)
+    approved = _text(page.meta.get("approved_digest"))
+    if not approved:
+        return {"digest": None, "at": None, "matches": False, "changed": [], "repaired": False}
+    fields = _run_fields(_read(project, page).plan)
+    current = _digest_of(fields, _current_digest(project, str(page.id)))
+    repaired = current != approved and current == _text(page.meta.get("repaired_digest"))
+    return {
+        "digest": approved,
+        "at": _text(page.meta.get("approved_at")) or None,
+        "matches": current == approved or repaired,
+        "changed": [] if current == approved else _changes_since(project, page, fields),
+        "repaired": repaired,
+    }
 
 
 def _code_name(name: Any) -> str:
@@ -813,6 +1129,23 @@ def _keep_version(directory: Path, name: str, data: bytes, entry: Mapping[str, s
     target.write_bytes(data)
 
 
+def _check_not_the_persons(
+    directory: Path, files: Mapping[str, str], authors: Mapping[str, Mapping[str, str]]
+) -> None:
+    """Raise ``NotAllowed`` when an agent's write would replace a file whose current
+    version the person wrote, or put there by hand (no write of it is on record)."""
+    for name, text in files.items():
+        target = directory / name
+        if not target.is_file() or target.read_bytes() == text.encode("utf-8"):
+            continue  # a new file, or the same text: nothing of the person's is replaced
+        if authors.get(name, {}).get("author", HUMAN) == HUMAN:
+            raise NotAllowed(
+                f"{name} is as the person wrote it, so it is not replaced. Say what should "
+                "change in it (on the experiment's page, or with propose_edit), or put your "
+                "code into a file of another name."
+            )
+
+
 def write_code(
     project: Project, experiment_id: str, files: Mapping[str, str], *, author: str
 ) -> list[str]:
@@ -825,19 +1158,34 @@ def write_code(
     written.  The version a file replaces is kept under
     ``code/.history/<name>/``.  An agent may write only the code of its own
     proposal that nobody has decided on, and the designer the code of a plan
-    the person accepted without any (``NotAllowed`` otherwise); the person and
-    the runner's repair may always.
+    the person accepted without any; in neither case does it replace a file
+    whose current version the person wrote (``NotAllowed`` otherwise).  The
+    person and the runner's repair may always.
+
+    Who may write is checked, and the files are written, under the project's
+    lock: an approval that is under way has either seen this write or keeps it
+    from happening.
     """
     author = normalize_author(author)
     experiment_id = _experiment_id(project, experiment_id)
-    _check_may_write(project, _page_or_none(project, experiment_id), author, experiment_id)
     if not isinstance(files, Mapping) or not files:
         raise ProjectError("No files were given: pass the files to write as {name: text}.")
     if len(files) > MAX_CODE_FILES:
         raise ProjectError(f"An experiment's code is at most {MAX_CODE_FILES} files.")
     checked = {_code_name(name): _code_text(name, text) for name, text in files.items()}
     directory = code_dir(project, experiment_id)
-    for name in checked:
+    with project.locked():
+        _check_may_write(project, _page_or_none(project, experiment_id), author, experiment_id)
+        _check_targets(directory, checked)
+        authors = _authors(directory)
+        if actor_class(author) == "agent":
+            _check_not_the_persons(directory, checked, authors)
+        _write_files(directory, checked, authors, author, experiment_id)
+    return check_code(project, experiment_id)
+
+
+def _check_targets(directory: Path, files: Mapping[str, str]) -> None:
+    for name in files:
         target = directory / name
         if target.is_symlink() or target.is_dir():
             raise ProjectError(f"{name} cannot be written: a link or a directory is there.")
@@ -848,10 +1196,20 @@ def write_code(
                 f"{name} cannot be written: a link in its path leads out of the experiment's "
                 f"code directory {directory}. Replace the link with a real directory."
             )
-    authors = _authors(directory)
+
+
+def _write_files(
+    directory: Path,
+    files: Mapping[str, str],
+    authors: dict[str, dict[str, str]],
+    author: str,
+    experiment_id: str,
+) -> None:
+    """Write the checked ``files``, keeping each version that is replaced and noting who
+    wrote the new one."""
     stamp = _now()
     try:
-        for name, text in checked.items():
+        for name, text in files.items():
             target = directory / name
             data = text.encode("utf-8")
             previous = target.read_bytes() if target.is_file() else None
@@ -867,7 +1225,6 @@ def write_code(
             f"The code of {experiment_id} could not be written ({exc}). Check that "
             f"{directory} can be written."
         ) from exc
-    return check_code(project, experiment_id)
 
 
 def split_problems(problems: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -956,6 +1313,8 @@ def _repo_problems(plan: ExperimentPlan, files: Mapping[str, Path]) -> list[str]
     patch = files.get(repositories.PATCH_NAME)
     if patch is not None:
         try:
+            # Also refuses a patch that writes metrics.json or under artifacts/: results
+            # come from running the experiment, not from a patch.
             repositories.parse_patch(patch.read_text(encoding="utf-8", errors="replace"))
         except repositories.PatchError as exc:
             problems.append(str(exc))
@@ -991,11 +1350,12 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
 
     Errors, which keep the experiment from being approved: no code at all, a
     missing entry point, a Python file that does not parse, a patch that is not
-    one, a file that would replace one of the repository.  Then warnings, each
+    one or that changes what a run writes (``metrics.json``, ``artifacts/``), a
+    file that would replace one of the repository.  Then warnings, each
     starting with ``WARNING``, for what the person should know when approving:
-    obvious use of the network by an experiment that runs without it, and code
-    that never mentions ``metrics.json``.  :func:`split_problems` tells the two
-    apart.
+    obvious use of the network by an experiment that runs without it, code
+    that never mentions ``metrics.json``, and a command that does not start a
+    Python file.  :func:`split_problems` tells the two apart.
     """
     experiment_id = _experiment_id(project, experiment_id)
     plan = _plan_for_code(project, experiment_id)
@@ -1019,25 +1379,26 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
         mentions_metrics = mentions_metrics or "metrics.json" in (_read_code(path) or "")
         if not plan.network:
             warnings.extend(_network_warnings(name, tree))
+    entry = _entry_file(plan)
     if in_repo:
         errors.extend(_repo_problems(plan, files))
-    else:
-        entry = _entry_file(plan)
-        if entry and entry not in files:
-            errors.append(
-                f"The entry point {entry} is missing from the code: the run starts with "
-                f"`{shlex.join(job_command(plan))}`."
-            )
-        if not mentions_metrics:
-            warnings.append(
-                f"{WARNING}no file of the code mentions metrics.json. A run that does not "
-                "write its results there, as a flat JSON object, fails."
-            )
-        if entry is None:
-            warnings.append(
-                f"{WARNING}the run starts with `{shlex.join(job_command(plan))}`, which is "
-                "not a Python file of the experiment. Read the command before approving it."
-            )
+    elif entry and entry not in files:
+        errors.append(
+            f"The entry point {entry} is missing from the code: the run starts with "
+            f"`{shlex.join(job_command(plan))}`."
+        )
+    if not in_repo and not mentions_metrics:
+        warnings.append(
+            f"{WARNING}no file of the code mentions metrics.json. A run that does not "
+            "write its results there, as a flat JSON object, fails."
+        )
+    if entry is None:
+        # Only a repo-mode plan can name such a command; the approval shows it.
+        warnings.append(
+            f"{WARNING}the run starts with `{shlex.join(job_command(plan))}`, which is "
+            "not a Python file of the experiment or the repository. Read the command "
+            "before approving it."
+        )
     return errors + warnings[:20]
 
 
@@ -1097,17 +1458,24 @@ def _chosen(name: str, backends: Any) -> _Choice:
 
 
 def _default_backend(project: Project, page: ResearchPage, gpu: str | None = None) -> str:
-    """Where an experiment runs when nobody said: whatever asks for a GPU on Modal, which
-    is the only backend with GPUs, the others on the project's backend.
+    """Where an experiment runs when the person did not say: whatever asks for a GPU on
+    Modal, which is the only backend with GPUs; the others where an earlier approval of
+    the same experiment put them, else on the project's backend.
 
-    ``gpu`` is the GPU chosen at approval; ``None`` leaves the page's.
+    A ``backend`` that merely stands on the page is not a choice: an agent may have
+    written it there (older projects), and it would move model-written code from the
+    sandbox the person set for the project onto their machine.  ``gpu`` is the GPU
+    chosen at approval; ``None`` leaves the page's.
     """
-    named = _text(page.meta.get("backend")).lower()
-    if named:
-        return named
     asked = _text(page.meta.get("gpu") if gpu is None else gpu).lower()
-    on_gpu = _text(page.meta.get("mode")).lower() == "gpu" or asked not in _NO_GPU
-    return "modal" if on_gpu else project.settings.compute
+    if _text(page.meta.get("mode")).lower() == "gpu" or asked not in _NO_GPU:
+        return "modal"
+    named = _text(page.meta.get("backend")).lower()
+    record = _approval_record(project, page)
+    plan_then = record.get("plan") if record else None
+    if named and isinstance(plan_then, dict) and plan_then.get("backend") == named:
+        return named  # the person's own choice, or default, of last time
+    return project.settings.compute
 
 
 def _cost_bound(plan: ExperimentPlan, backend: Any, seconds: float) -> float | None:
@@ -1217,8 +1585,9 @@ def _backend_notes(
     backend = choice.backend
     if plan.network:
         notes.append(
-            "The page asks for network access (network: true). Approving the run approves "
-            "that too; approve it with network off to run it without."
+            "The page asks for network access (network: true). That is yours to grant: "
+            "approve the run with network access, or without it. An approval that does "
+            "not say is refused."
         )
     if backend is None:
         return notes
@@ -1319,6 +1688,44 @@ def _flag_path(project: Project, experiment_id: str) -> Path:
     return project.experiment_dir(experiment_id) / CANCEL_FLAG
 
 
+def _network_is_theirs(experiment_id: str) -> str:
+    return (
+        f"The plan of {experiment_id} asks for network access (network: true on its page), "
+        "and that is yours to grant, not the plan's. Approve it with --network to let the "
+        "run reach the network, or with --no-network to run it without (in the app: tick "
+        'or clear "Allow network access" before approving).'
+    )
+
+
+def _approval_options(
+    project: Project,
+    page: ResearchPage,
+    *,
+    backend: str | None,
+    gpu: str | None,
+    timeout_seconds: float | None,
+    network: bool | None,
+) -> dict[str, Any]:
+    """What the person decided for this run, as overrides of the page's fields.
+
+    The approval decides; it never inherits a decision from the page.  Whether the
+    run may reach the network is the person's answer, and no answer is "no" unless the
+    plan asks for it: then the approval is refused, because saying nothing would grant
+    or deny it unseen.  The backend is the person's choice or the project's.
+    """
+    wrong: list[str] = []
+    asks = _flag(page.meta.get("network"), "network", wrong)
+    if network is None and asks:
+        raise ProjectError(_network_is_theirs(str(page.id)))
+    return {
+        "backend": (backend or "").strip().lower() or _default_backend(project, page, gpu),
+        "gpu": gpu,
+        "timeout_seconds": timeout_seconds,
+        # A value that is neither true nor false stays on the page, to be reported.
+        "network": None if network is None and wrong else bool(network),
+    }
+
+
 def approve(
     project: Project,
     ref: str,
@@ -1334,28 +1741,43 @@ def approve(
     """The person approves a run of the experiment; returns its page, now ``approved``.
 
     This is the person's decision and nothing else calls it for them: it is what
-    the command line and the web app do when the person says so.  The options
-    are recorded on the page (``backend``, ``gpu``, ``timeout_seconds``,
-    ``network``; ``None`` keeps what the page says, and an experiment without a
-    backend gets the project's, one that asks for a GPU Modal).  Then the page moves
-    ``planned -> approved`` (also from ``succeeded``, ``failed`` and
-    ``cancelled``: one approval is one run) and the accepted hypotheses it tests
-    move to ``testing``.
+    the command line and the web app do when the person says so, and it is the
+    only way an experiment becomes ``approved``.
+
+    The approval decides how the run may happen and never takes that from the
+    page, which an agent may have written.  ``network``: ``True`` or ``False``
+    is the person's answer; ``None`` means they said nothing, which approves
+    the run without network access, unless the plan asks for the network
+    (``network: true``): then it is refused, saying that this is theirs to
+    grant.  ``backend``: ``None`` is the project's (``settings.compute``;
+    Modal for what needs a GPU), or what an earlier approval of the same
+    experiment chose, never a ``backend`` that merely stands on the page.
+    ``gpu`` and ``timeout_seconds``: ``None`` keeps the plan's.
+
+    What was approved is recorded on the page: the options (``backend``,
+    ``gpu``, ``timeout_seconds``, ``network``), ``approved_at`` and
+    ``approved_digest``, the :func:`plan_digest` of the code and the
+    run-defining fields as approved.  :func:`run` starts only while the
+    experiment still has that digest.  Then the page moves ``planned ->
+    approved`` (also from ``succeeded``, ``failed`` and ``cancelled``: one
+    approval is one run) and the accepted hypotheses it tests move to
+    ``testing``.
 
     Refused with ``ProjectError``, saying why, when the page is not accepted, is
     queued or running, when the plan or its code has errors, when the chosen
     backend cannot run it (``ComputeBackend.supports`` and ``check``), or when
     it could cost more than is left of what the project allows for all its runs
-    together.  ``base_updated`` is the page's
-    ``updated`` stamp as the person saw it and ``code_digest`` the digest
-    (:func:`code_digest`) of the code they read: a page or code changed since
-    is a ``Conflict``, because what is approved is what was read.  ``backends``
-    (``{name: backend}``) supplies the backend to ask instead of one built with
-    its defaults.
+    together.  ``base_updated`` is the page's ``updated`` stamp as the person
+    saw it and ``code_digest`` the digest (:func:`code_digest`) of the code
+    they read: a page or code changed since is a ``Conflict``, because what is
+    approved is what was read; so is one that changes while it is being
+    approved.  ``backends`` (``{name: backend}``) supplies the backend to ask
+    instead of one built with its defaults.
     """
     page = _experiment(project, ref)
     name = str(page.id)
-    if code_digest is not None and code_digest != _current_digest(project, name):
+    read = _current_digest(project, name)
+    if code_digest is not None and code_digest != read:
         raise Conflict(
             f"The code of {name} changed after the version that was read. Look at the code "
             "as it is now, and approve again.",
@@ -1370,13 +1792,10 @@ def approve(
         raise ProjectError(
             f"{name} is {page.state}. Cancel that run, or wait for it, before approving another."
         )
-    chosen = (backend or "").strip().lower() or _default_backend(project, page, gpu)
-    overrides = {
-        "backend": chosen,
-        "gpu": gpu,
-        "timeout_seconds": timeout_seconds,
-        "network": network,
-    }
+    overrides = _approval_options(
+        project, page, backend=backend, gpu=gpu, timeout_seconds=timeout_seconds, network=network
+    )
+    chosen = overrides["backend"]
     reading = _read(project, page, overrides=overrides)
     # A plan that cannot run anywhere is refused without a backend being made for it.
     choice = _Choice(chosen) if reading.problems else _chosen(chosen, backends)
@@ -1386,24 +1805,63 @@ def approve(
         choice.close()
     if reasons:
         raise ProjectError(f"{name} cannot be approved:\n- " + "\n- ".join(reasons))
-    plan = reading.plan
-    fields = {
-        "backend": chosen,
-        "gpu": plan.gpu,
-        "timeout_seconds": _plain_number(plan.timeout_seconds),
-        "network": plan.network,
-    }
-    noted = project.update_page(page.path, author=HUMAN, fields=fields, base_updated=base_updated)
-    # Once the options are on the page it is a new version; the person's is the one before.
-    unchanged = noted.updated == page.updated
-    project.set_state(
-        page.path, "approved", by=HUMAN, base_updated=base_updated if unchanged else None
-    )
+    approved = _record_approval(project, page, reading.plan, read, base_updated)
     with contextlib.suppress(OSError):
         _flag_path(project, name).unlink(missing_ok=True)  # of a run cancelled earlier
-    approved = project.page(page.path)
     _mark_testing(project, approved)
     return approved
+
+
+def _record_approval(
+    project: Project,
+    page: ResearchPage,
+    plan: ExperimentPlan,
+    code: str,
+    base_updated: str | None,
+) -> ResearchPage:
+    """Write what was approved onto the page and move it to ``approved``, as one step.
+
+    ``page`` and ``code`` are what the checks of the approval looked at.  Under the
+    project's lock, which every write of a page and of code takes, they are compared
+    with what is there now: a change that landed meanwhile is a ``Conflict`` and
+    nothing is approved.
+    """
+    name = str(page.id)
+    stamp = _now()
+    fields = _run_fields(plan)
+    digest = _digest_of(fields, code)
+    with project.locked():
+        current = project.page(page.path)
+        if current.updated != page.updated or _current_digest(project, name) != code:
+            raise Conflict(
+                f"{name} changed while it was being approved (its page or its code was "
+                "written in that moment). Look at it as it is now, and approve again.",
+                page=current,
+            )
+        noted = project.record_approval(
+            page.path,
+            {
+                "backend": plan.backend,
+                "gpu": plan.gpu,
+                "timeout_seconds": _plain_number(plan.timeout_seconds),
+                "network": plan.network,
+                "approved_at": stamp,
+                "approved_digest": digest,
+                "repaired_digest": None,  # of the run an earlier approval allowed
+            },
+            by=HUMAN,
+            base_updated=base_updated,
+        )
+        if _digest_of(_run_fields(_read(project, noted).plan), code) != digest:
+            # The page does not read back as what was approved: better no approval
+            # than one that the run would then refuse without anything having changed.
+            raise ProjectError(
+                f"The approval of {name} could not be recorded: its page reads differently "
+                "once the approved options are written on it. Correct the page's fields "
+                f"({', '.join(RUN_FIELDS)}) and approve again."
+            )
+        _write_approval(project, name, digest, stamp, fields)
+        return project.set_state(page.path, "approved", by=HUMAN)
 
 
 # ---------------------------------------------------------------------------
@@ -1477,6 +1935,12 @@ class _Attempt:
     began: float | None = None
     result: JobResult | None = None
     notes: list[str] = field(default_factory=list)
+    #: The plan the run was made from and the backend that ran it, where they are known:
+    #: what a job costs whose result never came back is worked out from them.
+    plan: ExperimentPlan | None = None
+    backend: Any = None
+    #: Strings that must not be written into the record, the result page or an event.
+    secrets: Sequence[str] = ()
 
     def save(self) -> None:
         write_json(self.directory / RUN_FILE, self.record)
@@ -1490,7 +1954,8 @@ class _Outcome:
     error: str | None = None
     #: Why it failed: ``exit``, ``metrics``, ``code``, ``patch`` (the code's own, which a
     #: repair can cure), ``command`` (it could not be started), ``timeout``, ``backend``,
-    #: ``budget``, ``setup``, ``worker``, ``internal``.
+    #: ``budget``, ``setup``, ``approval`` (the code changed between the check of the
+    #: approval and the copy that would have run), ``worker``, ``internal``.
     kind: str | None = None
     #: The run did not get to finish for a reason outside the experiment, and the
     #: experiment is back in the queue.
@@ -1535,6 +2000,9 @@ def _new_record(
             "packages": list(plan.packages),
         },
         "worker": {"pid": os.getpid(), "host": socket.gethostname()},
+        # What a job of this machine started (its process session and its working
+        # directory), copied from the backend's job.json: recovery ends and removes it.
+        "job": None,
     }
 
 
@@ -1669,8 +2137,12 @@ def _artifacts(directory: Path) -> tuple[list[str], list[str]]:
     return sorted(kept), notes
 
 
-def _log_tail(directory: Path, lines: int = LOG_TAIL_LINES) -> list[str]:
-    """The last lines of a run's log, cleaned of terminal control sequences."""
+def _log_tail(
+    directory: Path, lines: int = LOG_TAIL_LINES, *, secrets: Sequence[str] = ()
+) -> list[str]:
+    """The last lines of a run's log, cleaned of terminal control sequences and of the
+    ``secrets``: what is returned goes into records, pages, events and a repairer's
+    prompt, whatever the job managed to print."""
     try:
         with open(directory / LOG_NAME, "rb") as stream:
             size = stream.seek(0, os.SEEK_END)
@@ -1679,6 +2151,7 @@ def _log_tail(directory: Path, lines: int = LOG_TAIL_LINES) -> list[str]:
     except OSError:
         return []
     text = _CONTROL.sub("", _ANSI.sub("", data.decode("utf-8", errors="replace")))
+    text = _masked(text, secrets)  # after the cleaning: colour codes do not hide one
     tail = [line.rstrip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
     return [line[:LOG_LINE_CHARS] for line in tail[-lines:]]
 
@@ -1698,6 +2171,52 @@ def _read_handle(directory: Path) -> str | None:
         return None
 
 
+def _read_job(directory: Path) -> dict[str, Any] | None:
+    """What the backend recorded of a job it started on this machine (``job.json``)."""
+    job = _read_json(directory / JOB_FILE)
+    return job if isinstance(job, dict) and job else None
+
+
+def _is_amount(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and 0 <= value < math.inf
+
+
+def _cost_without_result(attempt: _Attempt) -> float | None:
+    """What a run cost whose job did not report it: stopped, interrupted, or gone when a
+    dead worker's run was settled.  ``None`` when nothing was billed or nothing is known.
+
+    A billed backend leaves its estimate next to the run (``cost.json``).  A final one
+    is the cost.  Without it the job may have run on unattended, so the run is charged
+    for the time since it started, at most its time limit plus the backend's margin.
+    """
+    record = attempt.record
+    on_file = _read_json(attempt.directory / COST_FILE)
+    on_file = on_file if isinstance(on_file, dict) else None
+    known = float(on_file["cost_usd"]) if on_file and _is_amount(on_file.get("cost_usd")) else None
+    if on_file and on_file.get("final") is True:
+        return known
+    handle = record.get("handle") or _read_handle(attempt.directory)
+    started = parse_stamp(record.get("started"))
+    if not (handle or on_file) or started is None or attempt.plan is None:
+        return known  # no job was ever started for this run
+    then = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    limit = then.get("timeout_seconds")
+    limit = float(limit) if _is_amount(limit) else attempt.plan.timeout_seconds
+    plan = replaced(attempt.plan, gpu=then.get("gpu", attempt.plan.gpu))
+    elapsed = max(0.0, (datetime.now(UTC) - started).total_seconds())
+    seconds = min(elapsed, limit + REMOTE_MARGIN_SECONDS)
+    bound = _cost_bound(plan, attempt.backend, seconds)
+    if bound is None:
+        return known
+    attempt.notes.append(
+        f"What the job {handle or 'of this run'} cost is not known: it had not reported "
+        f"its end when the run was settled. The run is charged for the {seconds:.0f} s "
+        f"since it started (at most its time limit plus {REMOTE_MARGIN_SECONDS:g} s), "
+        f"about ${bound:.2f}."
+    )
+    return max(bound, known or 0.0)
+
+
 # -- the result record --------------------------------------------------------------------
 
 
@@ -1712,10 +2231,15 @@ def _cell(text: Any) -> str:
     return _one_line(text).replace("|", "\\|")
 
 
+def _plain(text: Any) -> str:
+    """One line in which nothing starts a link, markup or a code span in Markdown."""
+    return re.sub(r"([\\\[\]<`*])", r"\\\1", _one_line(text))
+
+
 def _inert(text: Any) -> str:
     """Text a job, a page or a file name supplied, as one line that is only text: what
     would start a link, markup or a code span in Markdown is escaped."""
-    return _cell(re.sub(r"([\\\[\]<`*])", r"\\\1", _one_line(text)))
+    return _cell(_plain(text))
 
 
 def _decimal_form(written: str) -> str:
@@ -1766,6 +2290,12 @@ def _facts(record: Mapping[str, Any]) -> list[str]:
         ("Exit status", "none" if record.get("exit_code") is None else record["exit_code"]),
         ("Estimated cost", _cost_text(record)),
     ]
+    plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    if plan.get("command"):
+        # What was executed, and with what reach: the code digest alone does not say.
+        rows.append(("Command", _plain(shlex.join(map(str, plan["command"])))))
+    if "network" in plan:
+        rows.append(("Network access", "allowed" if plan["network"] else "not allowed"))
     if record.get("handle"):
         rows.append(("Remote job", f"`{record['handle']}`"))
     if record.get("code_digest"):
@@ -1775,7 +2305,24 @@ def _facts(record: Mapping[str, Any]) -> list[str]:
     return ["| | |", "|---|---|", *(f"| {name} | {_cell(value)} |" for name, value in rows)]
 
 
-def _metrics_section(record: Mapping[str, Any], directory: Path) -> list[str]:
+def _fitting(lines: Sequence[str], room: int) -> tuple[list[str], int]:
+    """As many of ``lines`` as fit into ``room`` bytes, and how many did not: a page has
+    a size limit, and ``run.json`` holds everything."""
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        used += len(line.encode("utf-8")) + 1
+        if used > room:
+            break
+        kept.append(line)
+    return kept, len(lines) - len(kept)
+
+
+def _and_more(more: int) -> str:
+    return f"… and {more} more in run.json."
+
+
+def _metrics_section(record: Mapping[str, Any], directory: Path, room: int) -> list[str]:
     metrics = record.get("metrics") or {}
     if not metrics:
         if record.get("status") != "succeeded" and (directory / "metrics.json").is_file():
@@ -1785,28 +2332,37 @@ def _metrics_section(record: Mapping[str, Any], directory: Path) -> list[str]:
             ]
         return ["The run reported no metrics."]
     written = record.get("metrics_text") or {}
-    lines = ["| metric | value |", "|---|---|"]
+    rows = []
     for name, value in metrics.items():
         text = str(written.get(name, json.dumps(value, ensure_ascii=False)))
-        lines.append(f"| {_inert(name)} | {_inert(text)}{_decimal_form(text)} |")
-    return lines
+        rows.append(f"| {_inert(name)} | {_inert(text)}{_decimal_form(text)} |")
+    shown, more = _fitting(rows, room)
+    return ["| metric | value |", "|---|---|", *shown, *(["", _and_more(more)] if more else [])]
 
 
 def _artifact_lines(record: Mapping[str, Any], directory: Path) -> list[str]:
     base = f"{FILES_URL}experiments/{record['experiment']}/{RUNS_DIR}/{record['number']}/"
-    lines: list[str] = []
+    entries: list[str] = []
     for path in record.get("artifacts") or []:
         # The name is the job's to choose.  On the page it is one line of link text and
         # nothing else: no line of its own, no bracket that ends the link early.
         name = _CONTROL.sub("", _one_line(path.removeprefix("artifacts/")))
         label = name.replace("\\", "\\\\").replace("[", "(").replace("]", ")")
         if PurePosixPath(path).suffix.lower() in _IMAGE_SUFFIXES:
-            lines += [f"![{label}]({base}{quote(path)})", ""]
+            entries.append(f"![{label}]({base}{quote(path)})\n")
         else:
             with contextlib.suppress(OSError):
                 label_size = human_size((directory / path).stat().st_size)
-                lines.append(f"- [{label}]({base}{quote(path)}) ({label_size})")
-    return lines
+                entries.append(f"- [{label}]({base}{quote(path)}) ({label_size})")
+    shown, more = _fitting(entries, MAX_ARTIFACT_LIST_BYTES)
+    lines = [line for entry in shown for line in entry.split("\n")]
+    return [*lines, *([f"- {_and_more(more)}"] if more else [])]
+
+
+def _note_lines(record: Mapping[str, Any]) -> list[str]:
+    notes = [f"- {_inert(_clip(note, 2000))}" for note in record.get("notes") or []]
+    shown, more = _fitting(notes, MAX_NOTES_BYTES)
+    return [*shown, *([f"- {_and_more(more)}"] if more else [])]
 
 
 def _repair_lines(record: Mapping[str, Any]) -> list[str]:
@@ -1832,26 +2388,46 @@ def _repair_lines(record: Mapping[str, Any]) -> list[str]:
 
 
 def _result_body(
-    record: Mapping[str, Any], experiment: ResearchPage, directory: Path, tail: Sequence[str]
+    record: Mapping[str, Any],
+    experiment: ResearchPage,
+    directory: Path,
+    tail: Sequence[str],
+    *,
+    brief: bool = False,
 ) -> str:
     """The text of a result page.  Every word of it follows from the run record, the
-    run directory and the log; no model has a part in it."""
+    run directory and the log; no model has a part in it.
+
+    What a job can make long (its artifacts, the notes, the metrics) is listed as far
+    as it fits, with a line that says how many more ``run.json`` holds.  ``brief``
+    leaves out everything but the facts and the metrics: the page that is written when
+    even that did not fit.
+    """
     status = record["status"]
     took = _seconds_text(record.get("seconds"))
     lines = [
         f"Run {record['number']} of [[{experiment.link}|{record['experiment']}]] "
-        f"({_inert(experiment.title)}) {status} after {took} on the "
+        f"({_inert(_clip(experiment.title, 300))}) {status} after {took} on the "
         f"{_inert(record.get('backend') or 'no')} backend.",
         "",
     ]
     if record.get("error"):
         lines += [*_fenced(str(record["error"])), ""]
-    lines += [*_facts(record), "", "## Metrics", "", *_metrics_section(record, directory), ""]
+    room = MAX_METRICS_BYTES_ON_PAGE // (2 if brief else 1)
+    lines += [*_facts(record), "", "## Metrics", "", *_metrics_section(record, directory, room)]
+    lines.append("")
+    if brief:
+        where = f"{EXPERIMENTS_DIR}/{record['experiment']}/{RUNS_DIR}/{record['number']}"
+        lines += [
+            "The artifacts, notes, repairs and the log of this run are not shown: together "
+            f"they did not fit on a page. They are in {where}/ ({RUN_FILE}, {LOG_NAME}).",
+        ]
+        return "\n".join(lines) + "\n"
     artifacts = _artifact_lines(record, directory)
     if artifacts:
         lines += ["## Artifacts", "", *artifacts, ""]
     if record.get("notes"):
-        lines += ["## Notes", "", *(f"- {_inert(note)}" for note in record["notes"]), ""]
+        lines += ["## Notes", "", *_note_lines(record), ""]
     if record.get("repairs"):
         lines += ["## Repairs", "", *_repair_lines(record)]
     lines += [f"## Log (last {LOG_TAIL_LINES} lines)", ""]
@@ -1872,16 +2448,30 @@ def _result_summary(record: Mapping[str, Any]) -> str:
 def _write_result(
     project: Project, experiment: ResearchPage, attempt: _Attempt, tail: Sequence[str]
 ) -> ResearchPage:
+    """Write the result record of a settled run.  When the page with everything on it
+    is refused (a page has a size limit), the facts and the metrics are written alone:
+    a run without a record would never be analysed."""
     record = attempt.record
-    return project.write_record(
-        "result",
-        f"{record['experiment']}-run{record['number']}",
-        f"{record['experiment']} run {record['number']}: {experiment.title}",
-        _result_body(record, experiment, attempt.directory, tail),
-        summary=_result_summary(record),
-        fields={"state": record["status"], "run": record["number"], "backend": record["backend"]},
-        relations={"run_of": [record["experiment"]]},
-    )
+
+    def write(body: str) -> ResearchPage:
+        return project.write_record(
+            "result",
+            f"{record['experiment']}-run{record['number']}",
+            f"{record['experiment']} run {record['number']}: {_clip(experiment.title, 300)}",
+            body,
+            summary=_result_summary(record),
+            fields={
+                "state": record["status"],
+                "run": record["number"],
+                "backend": record["backend"],
+            },
+            relations={"run_of": [record["experiment"]]},
+        )
+
+    try:
+        return write(_result_body(record, experiment, attempt.directory, tail))
+    except ProjectError:
+        return write(_result_body(record, experiment, attempt.directory, tail, brief=True))
 
 
 def _shorten(error: str | None) -> str | None:
@@ -1903,13 +2493,19 @@ def _finish(
     """Settle a run: its record, its result page, the event.  Returns the record.
 
     The record is written first and by itself: whatever fails afterwards, the run
-    no longer reads as running.
+    no longer reads as running.  Nothing a job printed that is a credential gets
+    into either (``attempt.secrets``).
     """
-    record, result = attempt.record, attempt.result
+    record, result, secrets = attempt.record, attempt.result, attempt.secrets
     artifacts, dropped = _artifacts(attempt.directory)
     seconds = result.seconds if result is not None and result.seconds else None
     if seconds is None and attempt.began is not None:
         seconds = time.monotonic() - attempt.began
+    cost = result.cost_usd if result is not None else None
+    if cost is None and (result is None or result.error or result.cancelled):
+        cost = _cost_without_result(attempt)  # the job's own account never came back
+    error = _shorten(_masked(outcome.error, secrets) if outcome.error else outcome.error)
+    notes = [*attempt.notes, *(result.notes if result else []), *dropped]
     record.update(
         status=outcome.status,
         finished=_now(),
@@ -1918,12 +2514,15 @@ def _finish(
         timed_out=bool(result is not None and result.timed_out),
         metrics=outcome.metrics,
         artifacts=artifacts,
-        error=_shorten(outcome.error),
-        cost_usd=result.cost_usd if result is not None else None,
-        handle=record.get("handle") or (result.handle if result else None),
+        error=error,
+        cost_usd=cost,
+        handle=record.get("handle")
+        or (result.handle if result else None)
+        or _read_handle(attempt.directory),
         error_kind=outcome.kind,
         requeued=outcome.requeued,
-        notes=list(dict.fromkeys([*attempt.notes, *(result.notes if result else []), *dropped])),
+        notes=list(dict.fromkeys(_masked(str(note), secrets) for note in notes)),
+        job=record.get("job") or _read_job(attempt.directory),
     )
     # A record found on disk may be older than these fields, or written by hand.
     record.setdefault("repairs", [])
@@ -1935,17 +2534,13 @@ def _finish(
     if not outcome.requeued:
         # A run that only ended because its worker did is no outcome of the experiment;
         # the run that follows it will have the record.
-        try:
-            page = _write_result(project, experiment, attempt, _log_tail(attempt.directory))
-        except ProjectError as exc:
-            record["notes"].append(f"The result page could not be written: {exc}")
-        else:
-            record["result"] = page.path
+        page = _record_result(project, experiment, attempt)
+        if page is not None:
             refs.append(page.path)
         attempt.save()
     what = f"Run {record['number']} of experiment {record['experiment']}"
     took = _seconds_text(record["seconds"])
-    why = f": {_clip(outcome.error, 200)}" if outcome.error else ""
+    why = f": {_clip(error, 200)}" if error else ""
     ending = "." if not why or why[-1] not in ".!?…" else ""
     _emit(
         project,
@@ -1957,7 +2552,7 @@ def _finish(
             "run": record["number"],
             "status": outcome.status,
             "seconds": record["seconds"],
-            "error": outcome.error,
+            "error": error,
             "requeued": outcome.requeued,
             "result": record["result"],
         },
@@ -1965,15 +2560,54 @@ def _finish(
     return record
 
 
+def _record_result(
+    project: Project, experiment: ResearchPage, attempt: _Attempt
+) -> ResearchPage | None:
+    """Write the result record of a settled run and note its path in the run's record.
+
+    A run without a record is one the analysis never sees.  When the page cannot be
+    written even in its shortest form, the run's record says so and so does an
+    ``error`` event: it must not pass in silence.
+    """
+    record = attempt.record
+    tail = _log_tail(attempt.directory, secrets=attempt.secrets)
+    try:
+        page = _write_result(project, experiment, attempt, tail)
+    except ProjectError as exc:
+        record["notes"].append(f"The result page could not be written: {exc}")
+        where = f"{EXPERIMENTS_DIR}/{record['experiment']}/{RUNS_DIR}/{record['number']}/{RUN_FILE}"
+        _emit(
+            project,
+            "error",
+            f"Run {record['number']} of experiment {record['experiment']} "
+            f"{record['status']}, but its result record could not be written, so the "
+            f"analysis will not see it: {_clip(exc, 300)} What the run produced is in {where}.",
+            refs=[experiment.path],
+            data={
+                "experiment": record["experiment"],
+                "run": record["number"],
+                "error": str(exc),
+            },
+        )
+        return None
+    record["result"] = page.path
+    return page
+
+
 # -- how a job ended ----------------------------------------------------------------------
 
 
 def _judge(
-    result: JobResult, directory: Path, plan: ExperimentPlan, *, cancelled_by_person: bool
+    result: JobResult,
+    directory: Path,
+    plan: ExperimentPlan,
+    *,
+    cancelled_by_person: bool,
+    secrets: Sequence[str] = (),
 ) -> _Outcome:
     """Read a job's result the way the compute contract says: the backend's own failure
     first, then a stop or the clock, then the exit status, then what it wrote."""
-    tail = _log_tail(directory)
+    tail = _log_tail(directory, secrets=secrets)
     if result.error:
         return _Outcome("failed", result.error, kind="backend")
     if result.cancelled:
@@ -2056,9 +2690,36 @@ class _Setup(Exception):
         self.kind = kind
 
 
-def _backend_of(compute: Any, plan: ExperimentPlan) -> Any:
+def _backend_of(compute: Any, plan: ExperimentPlan | None) -> Any:
     """``compute`` is a backend, or a function that chooses one for a plan."""
     return compute if hasattr(compute, "run_job") else compute(plan)
+
+
+def _backend_of_record(compute: Any, plan: ExperimentPlan | None, record: Mapping[str, Any]) -> Any:
+    """The backend that ran the job of ``record``: ``compute``'s choice for the plan as
+    the record names its backend, whatever the page says today."""
+    named = str(record.get("backend") or "")
+    if plan is not None and named in COMPUTE_BACKENDS:
+        plan = replaced(plan, backend=named)
+    return _backend_of(compute, plan)
+
+
+def _call(method: Callable[..., Any], *args: Any, **options: Any) -> Any:
+    """Call a backend's ``run_job`` or ``attach`` with the options it takes.
+
+    ``mask``, ``spec`` and ``started`` joined the contract later than the rest.  A
+    backend written before them is called without: what it writes into the log is
+    then masked here before any of it is kept, and a job it picks up is described by
+    what the job's own side says.
+    """
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return method(*args, **options)
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return method(*args, **options)
+    taken = {parameter.name for parameter in parameters}
+    return method(*args, **{name: value for name, value in options.items() if name in taken})
 
 
 def _snapshot(source: Path, dest: Path) -> str:
@@ -2080,6 +2741,27 @@ def _snapshot(source: Path, dest: Path) -> str:
         (dest / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, dest / name)
     return _digest(_code_paths(dest))
+
+
+def _clear_results(copy: Path) -> list[str]:
+    """Remove what a run writes its results to (``metrics.json``, ``artifacts/``) from
+    the copy of a repository, and return what was there.
+
+    A result is what the command wrote.  A file of those names that came with the
+    repository, from someone's earlier work, would be recorded as this run's.
+    """
+    removed: list[str] = []
+    for name in ("metrics.json", "artifacts"):
+        path = copy / name
+        if not os.path.lexists(path):
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(f"{name}/")
+        else:
+            path.unlink(missing_ok=True)
+            removed.append(name)
+    return removed
 
 
 def _unified_diff(before: Mapping[str, str], after: Mapping[str, str]) -> str:
@@ -2108,25 +2790,24 @@ class _Session:
     def __init__(
         self,
         project: Project,
-        reading: _Reading,
-        backend: Any,
+        page: ResearchPage,
+        compute: Any,
         *,
         should_stop: Callable[[], bool] | None,
         repair: Callable[..., Mapping[str, str] | None] | None,
         on_log: Callable[[str], None] | None,
-        limits: _Limits,
-        usd_is_for_this_call: bool = False,
+        limits: Mapping[str, Any] | None,
     ) -> None:
         self.project = project
-        self.page = reading.page
-        self.plan = reading.plan
-        self.reading = reading
-        self.backend = backend
-        self.backend_name = str(getattr(backend, "name", "") or "")
-        self.limits = limits
+        self._compute = compute
+        self._limits_given = limits
+        self.limits = _limits(project, limits)
         #: Whether ``limits.usd`` is what this call may spend (its caller keeps the
         #: project's accounts) rather than the project's total.
-        self._usd_is_for_this_call = usd_is_for_this_call
+        self._usd_is_for_this_call = limits is not None and "experiment_usd" in limits
+        #: The backend the attempts run on: chosen once the approval has been checked.
+        self.backend: Any = None
+        self.backend_name = ""
         #: What the runs settled in this call have cost.
         self._cost = 0.0
         self._user_stop = should_stop
@@ -2138,11 +2819,55 @@ class _Session:
         self._stopped = False
         #: Why a failure that could have been repaired was not: ``cancel`` or ``stop``.
         self._interrupted: str | None = None
-        self._flag = _flag_path(project, self.plan.id)
+        self._flag = _flag_path(project, str(page.id))
         self._guard = threading.Lock()
-        self._next_handle_check = 0.0
+        self._next_record_check = 0.0
         self._pending: deque[str] = deque(maxlen=LOG_EVENT_LINES)
         self._last_log_event = -math.inf
+        self._adopt(page)
+
+    def _adopt(self, page: ResearchPage) -> None:
+        """Read from ``page`` what this session runs and what it holds against the
+        approval."""
+        self.page = page
+        self.reading = _read(self.project, page, limits=self._limits_given, cap=True)
+        self.plan = self.reading.plan
+        #: The run-defining fields as an approval pins them: read like the plan that
+        #: runs, but with the time limit the page has, before today's cap.
+        self._fields = _run_fields(_read(self.project, page).plan)
+        self._mask = _secrets(self.project, self.plan)
+
+    # -- the approval ------------------------------------------------------------
+
+    def _departure(self, code: str | None = None) -> str | None:
+        """Why what this session is about to run is not what was approved, as the end
+        of a sentence; ``None`` when it is.  ``code`` is the digest of the code that
+        would run (the code directory's, unless it is given)."""
+        page = self.project.page(self.page.path)  # the approval as the page records it now
+        fields = _run_fields(_read(self.project, page).plan)
+        if code is None:
+            code = _current_digest(self.project, self.plan.id)
+        reason = _departure(self.project, page, fields, code)
+        if reason is None and fields != self._fields:
+            reason = "its page changed while it was being run"
+        return reason
+
+    def _check_approval(self) -> None:
+        """Raise ``ProjectError``, with the experiment back at ``planned``, unless it is
+        still what the person approved (or the runner's recorded repair of that)."""
+        reason = self._departure()
+        if reason is None:
+            return
+        _move(
+            self.project,
+            self.page.path,
+            "planned",
+            f"Not run: {reason}. Approve it again.",
+        )
+        raise ProjectError(
+            f"{self.plan.id} was not run: {reason}. Look at the experiment as it is now and "
+            f"approve it again ({_HOW_TO_APPROVE})."
+        )
 
     # -- stopping ----------------------------------------------------------------
 
@@ -2157,8 +2882,8 @@ class _Session:
 
     def _should_stop(self) -> bool:
         # Asked about once a second whether or not the job prints: the one place to
-        # notice the handle of a remote job that stays silent.
-        self._watch_handle()
+        # notice what a backend left next to a job that stays silent.
+        self._watch_records()
         return self._stop_reason() is not None
 
     def _stopped_outcome(self) -> _Outcome:
@@ -2168,28 +2893,40 @@ class _Session:
             self._current.directory if self._current else Path(),
             self.plan,
             cancelled_by_person=self._flag.exists(),
+            secrets=self._mask,
         )
 
     # -- while the job runs ------------------------------------------------------
 
-    def _watch_handle(self) -> None:
-        """Copy the handle of a remote job into ``run.json`` as soon as there is one, so
-        that a worker that dies leaves behind what is needed to pick the job up."""
+    def _watch_records(self) -> None:
+        """Copy what the backend recorded of the job into ``run.json`` as soon as it is
+        there: the handle of a remote job, or the process session and working directory
+        of a local one.  A worker that dies then leaves behind what is needed to pick
+        the job up, or to end it and remove what it left."""
         attempt = self._current
         now = time.monotonic()
-        if attempt is None or attempt.record.get("handle") or now < self._next_handle_check:
+        if attempt is None or now < self._next_record_check:
+            return
+        record = attempt.record
+        if record.get("handle") or record.get("job"):
             return
         with self._guard:
-            self._next_handle_check = now + HANDLE_CHECK_SECONDS
-            handle = _read_handle(attempt.directory)
-            if handle and not attempt.record.get("handle"):
-                attempt.record["handle"] = handle
+            self._next_record_check = now + HANDLE_CHECK_SECONDS
+            found = {
+                "handle": _read_handle(attempt.directory),
+                "job": _read_job(attempt.directory),
+            }
+            new = {name: value for name, value in found.items() if value and not record.get(name)}
+            if new:
+                record.update(new)
                 attempt.save()
 
     def _on_log(self, line: str) -> None:
+        # Whatever the backend let through: a credential the job printed stops here.
+        line = _masked(line, self._mask)
         if self._user_log is not None:
             self._user_log(line)
-        self._watch_handle()
+        self._watch_records()
         attempt = self._current
         if attempt is None:
             return
@@ -2214,7 +2951,15 @@ class _Session:
         number, directory = _new_run_dir(self.project, self.plan.id)
         record = _new_record(self.plan, number, self.backend_name, self._repairs)
         record["code_digest"] = code_digest(self.project, self.plan.id)
-        attempt = _Attempt(number, directory, record, began=time.monotonic())
+        attempt = _Attempt(
+            number,
+            directory,
+            record,
+            began=time.monotonic(),
+            plan=self.plan,
+            backend=self.backend,
+            secrets=self._mask,
+        )
         attempt.notes.extend(self.reading.notes)
         attempt.save()
         self._current = attempt
@@ -2281,6 +3026,15 @@ class _Session:
         plan, directory, record = self.plan, attempt.directory, attempt.record
         code = directory / CODE_DIR
         record["code_digest"] = _snapshot(code_dir(self.project, plan.id), code)
+        # The copy is what runs.  It is held against the approval once more: a write
+        # that landed between the look at the code directory and the copy is not run.
+        changed = self._departure(record["code_digest"])
+        if changed is not None:
+            raise _Setup(
+                "approval",
+                f"The run was not started: {changed}. Look at the experiment as it is now "
+                f"and approve it again ({_HOW_TO_APPROVE}).",
+            )
         spec = job_spec(plan)
         if plan.mode != "repo":
             return code, spec
@@ -2320,6 +3074,12 @@ class _Session:
             raise _Setup("patch", str(exc)) from None
         except repositories.RepoError as exc:
             raise _Setup("setup", str(exc)) from None
+        removed = _clear_results(copy)
+        if removed:
+            attempt.notes.append(
+                f"Removed from the copy of the repository before the run: {', '.join(removed)}. "
+                "It came with the repository; only what the run itself writes is its result."
+            )
         return copy, spec
 
     def _execute(self, attempt: _Attempt) -> _Outcome:
@@ -2345,12 +3105,14 @@ class _Session:
                 attempt.save()
             if self._stop_reason():
                 return self._stopped_outcome()
-            attempt.result = self.backend.run_job(
+            attempt.result = _call(
+                self.backend.run_job,
                 spec,
                 source_dir=source,
                 run_dir=attempt.directory,
                 on_log=self._on_log,
                 should_stop=self._should_stop,
+                mask=tuple(self._mask),
             )
         finally:
             shutil.rmtree(attempt.directory / REPO_COPY, ignore_errors=True)
@@ -2359,6 +3121,7 @@ class _Session:
             attempt.directory,
             self.plan,
             cancelled_by_person=self._flag.exists(),
+            secrets=self._mask,
         )
 
     def _attempt(self) -> dict[str, Any]:
@@ -2386,18 +3149,39 @@ class _Session:
         record["notes"].append(note)
         write_json(_runs_dir(self.project, self.plan.id) / str(record["number"]) / RUN_FILE, record)
 
+    def _still_approved(self, record: dict[str, Any]) -> bool:
+        """Whether the experiment is still what was approved; if not, the failed run's
+        record says why its failure is not repaired."""
+        changed = self._departure()
+        if changed is not None:
+            self._note(
+                record,
+                f"The failure was not repaired: {changed}. Approve the experiment again to run it.",
+            )
+        return changed is None
+
     def _repaired(self, record: dict[str, Any]) -> bool:
         """Ask for corrected files after ``record`` failed and write them as the runner.
-        True when the code changed, so that running again can end differently."""
+        True when the code changed, so that running again can end differently.
+
+        The repair is part of the run the person approved, and only of that: when
+        the experiment changed since (before the repairer was asked, or while it
+        worked), nothing is written and the run ends as it failed.
+        """
         assert self._repair is not None
+        if not self._still_approved(record):
+            return False
         self._rounds += 1
         directory = _runs_dir(self.project, self.plan.id) / str(record["number"])
         before = code_files(self.project, self.plan.id)
         try:
-            files = self._repair(self.plan, dict(record), "\n".join(_log_tail(directory, 200)))
-            if not files:
+            tail = "\n".join(_log_tail(directory, 200, secrets=self._mask))
+            files = self._repair(self.plan, dict(record), tail)
+            if not files or not self._still_approved(record):
                 return False
-            write_code(self.project, self.plan.id, files, author=_RUNNER)
+            with self.project.locked():
+                write_code(self.project, self.plan.id, files, author=_RUNNER)
+                self._record_repair()
         except Exception as exc:
             if stops_the_run(exc):
                 raise
@@ -2419,6 +3203,12 @@ class _Session:
         )
         return True
 
+    def _record_repair(self) -> None:
+        """Note on the page what the experiment is after the runner's repair, so that the
+        attempt that follows (also one resumed by another worker) finds it approved."""
+        digest = _digest_of(self._fields, _current_digest(self.project, self.plan.id))
+        self.project.record_approval(self.page.path, {"repaired_digest": digest}, by=SYSTEM)
+
     # -- the whole of it ---------------------------------------------------------
 
     def run(self) -> dict[str, Any]:
@@ -2428,12 +3218,15 @@ class _Session:
             self._abandon(exc)
             raise
 
+    def _backend_for(self, record: Mapping[str, Any]) -> Any:
+        return _backend_of_record(self._compute, self.plan, record)
+
     def _run(self) -> dict[str, Any]:
         settled = _settle_stale(
             self.project,
             self.page,
             self.plan,
-            lambda record: self.backend,
+            self._backend_for,
             should_stop=self._should_stop,
             on_log=self._user_log,
         )
@@ -2444,6 +3237,12 @@ class _Session:
             if settled:
                 return settled[-1]
             raise ProjectError(_not_runnable(page))
+        # From here on a run is started: of the page as it is now, and only if that is
+        # what was approved.  This holds for a resumed, a recovered and a repeated run.
+        self._adopt(page)
+        self._check_approval()
+        self.backend = _backend_of(self._compute, self.plan)
+        self.backend_name = str(getattr(self.backend, "name", "") or "")
         _move(self.project, page.path, "queued")
         _mark_testing(self.project, page)
         record = self._attempt()
@@ -2477,7 +3276,7 @@ class _Session:
         if attempt is not None and attempt.record.get("status") == "running":
             outcome = self._abandoned(exc, requeue, said)
             try:
-                _finish(self.project, self.page, attempt, outcome)
+                self._count(_finish(self.project, self.page, attempt, outcome))
             except Exception:
                 # Even that could not be written in full: the bare minimum, then.
                 attempt.record.update(status=outcome.status, error=outcome.error, finished=_now())
@@ -2541,8 +3340,19 @@ def run(
     ``experiment.state``, ``run.started``, ``run.log`` (at most one every two
     seconds), ``run.finished``.
 
+    A run starts only if the experiment is still what the person approved: the
+    :func:`plan_digest` of its code and run-defining fields is compared with the
+    ``approved_digest`` on the page (or with ``repaired_digest``, which the run
+    itself writes when the runner's repair changed the code).  This holds for a
+    resumed, a recovered and a repeated run alike.  On a mismatch, or without a
+    recorded approval, nothing runs: the experiment goes back to ``planned`` with
+    a ``state_reason`` naming what changed (which field, or which file and who
+    wrote it), and ``ProjectError`` says the same and to approve it again.
+
     ``compute`` is a ``ComputeBackend`` or a function ``(plan) -> ComputeBackend``.
-    ``on_log`` gets every line of output.  A run fails when the backend fails,
+    ``on_log`` gets every line of output, with the credentials of this process's
+    environment and of the repository's URL blanked out; the backend is given the
+    same strings to keep out of the log.  A run fails when the backend fails,
     when it exceeds its time limit (the page's, capped at the project's), exits
     with a non-zero status, or does not leave a valid ``metrics.json``.  When it
     failed for an error of its own code and ``repair(plan, run_record, log_tail)``
@@ -2578,8 +3388,6 @@ def run(
     page = _experiment(project, ref)
     if page.review != "accepted" or page.state not in ("approved", "queued", "running"):
         raise ProjectError(_not_runnable(page))
-    reading = _read(project, page, limits=limits, cap=True)
-    backend = _backend_of(compute, reading.plan)
     with _RunLock(project.experiment_dir(str(page.id))) as lock:
         if not lock.acquired:
             raise ProjectError(
@@ -2590,13 +3398,12 @@ def run(
             )
         session = _Session(
             project,
-            reading,
-            backend,
+            page,
+            compute,
             should_stop=should_stop,
             repair=repair,
             on_log=on_log,
-            limits=_limits(project, limits),
-            usd_is_for_this_call=limits is not None and "experiment_usd" in limits,
+            limits=limits,
         )
         return session.run()
 
@@ -2625,6 +3432,22 @@ def _can_reattach(backend: Any) -> bool:
         return False
 
 
+def _spec_of_record(record: Mapping[str, Any], plan: ExperimentPlan) -> JobSpec:
+    """The job of a run as this side recorded it when the run started (the ``plan`` of
+    ``run.json``); where the record does not say, as the page's plan has it."""
+    then = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    try:
+        return JobSpec(
+            command=[str(part) for part in then.get("command") or job_command(plan)],
+            timeout=float(then.get("timeout_seconds") or plan.timeout_seconds),
+            gpu=then.get("gpu", plan.gpu),
+            network=bool(then["network"]) if "network" in then else plan.network,
+            packages=tuple(then["packages"]) if "packages" in then else tuple(plan.packages),
+        )
+    except (TypeError, ValueError):
+        return job_spec(plan)  # a record edited by hand
+
+
 def _pick_up(
     project: Project,
     plan: ExperimentPlan,
@@ -2636,24 +3459,39 @@ def _pick_up(
     """Follow the remote job of a run whose worker died to its end, where that can be
     done; ``None`` when there is nothing to pick up.
 
-    The person's cancel ends a job that is followed here as it ends one that was
-    started here: it may run, and be billed, for hours yet.
+    The job is described to the backend by what this side recorded of it (the plan
+    it was started with, and when), never by what the job could have written where
+    it ran.  The person's cancel ends a job that is followed here as it ends one that
+    was started here: it may run, and be billed, for hours yet.
     """
     handle = attempt.record.get("handle") or _read_handle(attempt.directory)
     if not handle:
         return None
     attempt.record["handle"] = handle
     flag = _flag_path(project, plan.id)
+    secrets = attempt.secrets
 
     def stop() -> bool:
         return flag.exists() or (should_stop is not None and should_stop())
+
+    def log(line: str) -> None:
+        if on_log is not None:
+            on_log(_masked(line, secrets))
 
     try:
         backend = backend_for(attempt.record)
         if backend is None or not _can_reattach(backend):
             return None
-        attempt.result = backend.attach(
-            handle, run_dir=attempt.directory, on_log=on_log, should_stop=stop
+        attempt.backend = backend
+        attempt.result = _call(
+            backend.attach,
+            handle,
+            run_dir=attempt.directory,
+            spec=_spec_of_record(attempt.record, plan),
+            started=attempt.record.get("started"),
+            on_log=log if on_log is not None else None,
+            should_stop=stop,
+            mask=tuple(secrets),
         )
     except ComputeError as exc:
         if exc.unusable:
@@ -2662,7 +3500,32 @@ def _pick_up(
     result = attempt.result
     if result.error:
         return _Outcome("failed", f"{_WORKER_STOPPED} {result.error}", kind="worker")
-    return _judge(result, attempt.directory, plan, cancelled_by_person=flag.exists())
+    return _judge(
+        result, attempt.directory, plan, cancelled_by_person=flag.exists(), secrets=secrets
+    )
+
+
+def _clean_up(attempt: _Attempt, backend_for: Callable[[Mapping[str, Any]], Any]) -> list[str]:
+    """End and remove what the job of a run left on this machine when its worker died:
+    its processes and its working directory (through the backend that started it, which
+    recorded them in ``job.json``), and the run's copy of the repository.  Returns notes
+    for the run's record."""
+    notes: list[str] = []
+    job = attempt.record.get("job") or _read_job(attempt.directory)
+    if isinstance(job, dict) and job:
+        attempt.record["job"] = job
+        try:
+            end = getattr(backend_for(attempt.record), "end_job", None)
+            if callable(end):
+                notes += [str(note) for note in end(dict(job)) or []]
+        except Exception as exc:  # cleaning up must not keep the run from being settled
+            notes.append(
+                "What the job left on this machine could not be cleaned up "
+                f"({type(exc).__name__}: {exc}). Its record names the process session and "
+                f"the working directory: session {job.get('session')}, {job.get('scratch')}."
+            )
+    shutil.rmtree(attempt.directory / REPO_COPY, ignore_errors=True)
+    return notes
 
 
 def _settle_stale(
@@ -2681,15 +3544,19 @@ def _settle_stale(
     does.  A remote job that outlived its worker is followed to its end; any
     other run is failed with "the worker stopped", and the experiment goes back
     to the queue unless that keeps happening.  With ``cancel`` the person has
-    cancelled the experiment: the runs end ``cancelled`` instead.
+    cancelled the experiment: the runs end ``cancelled`` instead.  Either way
+    what the dead worker's job left on this machine is ended and removed, and a
+    job whose cost never came back is charged for the time it can have run.
     """
     settled: list[dict[str, Any]] = []
+    secrets = _secrets(project, plan)
     for number, record in _numbered_runs(project, plan.id):
         if record.get("status") != "running":
             continue
         # The directory says which run it is, whatever a record edited by hand says.
         record.update(experiment=plan.id, number=number)
-        attempt = _Attempt(number, _runs_dir(project, plan.id) / str(number), record)
+        directory = _runs_dir(project, plan.id) / str(number)
+        attempt = _Attempt(number, directory, record, plan=plan, secrets=secrets)
         if cancel:
             _stop_remote(attempt, backend_for)
             outcome: _Outcome | None = _Outcome(
@@ -2709,6 +3576,10 @@ def _settle_stale(
                     "experiment in a row, so it is not started again by itself. Approve it "
                     "again to retry."
                 )
+        attempt.notes += _clean_up(attempt, backend_for)
+        if attempt.backend is None:
+            with contextlib.suppress(Exception):
+                attempt.backend = backend_for(record)  # to price a job that is gone
         settled.append(_finish(project, page, attempt, outcome))
     current = project.page(page.path)
     if cancel or current.state not in ("queued", "running"):
@@ -2733,7 +3604,17 @@ def _stop_remote(attempt: _Attempt, backend_for: Callable[[Mapping[str, Any]], A
     with contextlib.suppress(Exception):
         backend = backend_for(attempt.record)
         if backend is not None and _can_reattach(backend):
-            backend.attach(handle, run_dir=attempt.directory, should_stop=lambda: True)
+            attempt.backend = backend
+            spec = _spec_of_record(attempt.record, attempt.plan) if attempt.plan else None
+            attempt.result = _call(
+                backend.attach,
+                handle,
+                run_dir=attempt.directory,
+                spec=spec,
+                started=attempt.record.get("started"),
+                should_stop=lambda: True,
+                mask=tuple(attempt.secrets),
+            )
 
 
 class _Backends:
@@ -2747,7 +3628,7 @@ class _Backends:
 
     def for_record(self, record: Mapping[str, Any]) -> Any:
         if self._compute is not None:
-            return _backend_of(self._compute, self.plan)
+            return _backend_of_record(self._compute, self.plan, record)
         name = str(record.get("backend") or "")
         if name not in self._built:
             self._built[name] = _build(name)
@@ -2814,6 +3695,14 @@ def recover(
     waits for the person.  A page left at ``running`` without any run goes back
     to ``queued``.
 
+    What the dead worker's job left on this machine is ended and removed as its
+    run is settled: the processes of the job's session and its working directory
+    (through the backend that started it, from the ``job`` its record holds) and
+    the run's copy of the repository.  A remote job that is gone without having
+    reported its cost is charged for the time since it started, at most its time
+    limit plus ``REMOTE_MARGIN_SECONDS``, so that the project's budget counts it
+    before the experiment is started again.
+
     ``compute`` is what :func:`run` takes; without it the backend named in a
     run's record is built with its defaults when a remote job has to be picked
     up.  Experiments that a live process is running are left alone.
@@ -2846,42 +3735,162 @@ def recover(
 # ---------------------------------------------------------------------------
 
 
-class _Evidence:
-    """The numbers of one record, source or input, and whether a given number is among
-    them: as written, rounded the way a person rounds when quoting, or as a percentage."""
+class _Index:
+    """The numbers of every piece of evidence, indexed once for a check: which pieces
+    hold a given number as written, rounded the way a person rounds when quoting, or
+    as a percentage of a fraction.
 
-    def __init__(self, path: str, text: str) -> None:
-        self.path = path
-        self._exact = numbers_in(text)
-        self._values = sorted({float(number) for number in self._exact})
+    One index over all the evidence instead of one search per piece: a finding with
+    thousands of numbers is checked against dozens of records in one pass.
+    """
 
-    def has(self, number: str) -> bool:
-        if number in self._exact:
-            return True
+    def __init__(self, evidence: Sequence[tuple[str, frozenset[str]]]) -> None:
+        #: In the order the evidence was given: results, then sources, then inputs.
+        self.paths = [path for path, _ in evidence]
+        self._exact: dict[str, list[int]] = {}
+        self._where: dict[float, list[int]] = {}
+        for position, (_, numbers) in enumerate(evidence):
+            for number in numbers:
+                self._exact.setdefault(number, []).append(position)
+                with contextlib.suppress(ValueError):
+                    self._where.setdefault(float(number), []).append(position)
+        self._values = sorted(self._where)
+        #: value -> (the value as a decimal, how many decimal places it is written with).
+        self._decimals: dict[float, tuple[Decimal, int]] = {}
+        self._per_piece: list[list[float]] | None = None
+
+    def found_in(self, number: str, parts: Sequence[str] = ()) -> list[str]:
+        """The pieces of evidence that hold ``number``, or every one of ``parts``
+        (``12,345`` is one number, or the two items of a list)."""
+        holders = self._holding(number)
+        if parts:
+            holders |= set.intersection(*(self._holding(part) for part in parts))
+        return [self.paths[position] for position in sorted(holders)]
+
+    def _holding(self, number: str) -> set[int]:
+        holders = set(self._exact.get(number, ()))
         try:
             value = Decimal(number)
         except InvalidOperation:
-            return False
-        return any(self._rounds_to(scaled) for scaled in (value, value / 100, value * 100))
+            return holders
+        for scaled in (value, value / 100, value * 100):
+            if len(holders) == len(self.paths):
+                break  # everything holds it already
+            # The same value written another way (51.25% of a fraction 0.5125), or one
+            # with more digits that rounds to it.
+            holders.update(self._where.get(float(scaled), ()))
+            self._add_rounding_to(scaled, holders)
+        return holders
 
-    def _rounds_to(self, value: Decimal) -> bool:
-        """Whether a number here, written with more digits, rounds to ``value``."""
+    def _rounds(self, candidate: float, value: Decimal, places: int, half: Decimal) -> bool:
+        """Whether ``candidate`` is written with more digits than ``value`` and rounds to it."""
+        known = self._decimals.get(candidate)
+        if known is None:
+            exact = Decimal(repr(candidate))
+            known = (exact, -int(exact.normalize().as_tuple().exponent))
+            self._decimals[candidate] = known
+        return known[1] > places and abs(known[0] - value) <= half
+
+    def _pieces(self) -> list[list[float]]:
+        """The values of each piece of evidence on its own, sorted; made when first needed."""
+        if self._per_piece is None:
+            per_piece: list[list[float]] = [[] for _ in self.paths]
+            for value in self._values:
+                for position in self._where[value]:
+                    per_piece[position].append(value)
+            self._per_piece = per_piece
+        return self._per_piece
+
+    def _add_rounding_to(self, value: Decimal, holders: set[int]) -> None:
+        """Add to ``holders`` the pieces that hold a number which, written with more
+        digits, rounds to ``value``.
+
+        The values in reach are walked across all the evidence at once.  Where there
+        are very many of them (dense evidence, a number of few digits), the walk stops
+        and each piece not yet found is asked on its own, so that the work for one
+        number stays bounded however much evidence there is.
+        """
         value = value.normalize()
         places = max(0, -int(value.as_tuple().exponent))
         half = Decimal(5).scaleb(-(places + 1))
-        low = bisect.bisect_left(self._values, float(value - half) - 1e-12)
-        for candidate in self._values[low:]:
-            if candidate > float(value + half) + 1e-12:
+        low, high = float(value - half) - 1e-12, float(value + half) + 1e-12
+        values = self._values
+        position = bisect.bisect_left(values, low)
+        stop = position + MAX_EVIDENCE_WALK
+        while position < len(values) and values[position] <= high:
+            if position == stop or len(holders) == len(self.paths):
                 break
-            exact = Decimal(repr(candidate))
-            more_digits = -int(exact.normalize().as_tuple().exponent) > places
-            if more_digits and abs(exact - value) <= half:
-                return True
-        return False
+            if self._rounds(values[position], value, places, half):
+                holders.update(self._where[values[position]])
+            position += 1
+        else:
+            return  # everything in reach was looked at
+        for piece, own in enumerate(self._pieces()):
+            at = bisect.bisect_left(own, low) if piece not in holders else len(own)
+            while at < len(own) and own[at] <= high:
+                if self._rounds(own[at], value, places, half):
+                    holders.add(piece)
+                    break
+                at += 1
 
 
-def _input_texts(project: Project) -> Iterator[tuple[str, str]]:
-    """``(path, text)`` of the text files the person gave the project."""
+#: The numbers of a piece of evidence, by what identifies its content: a record's path
+#: and version, an input file's path, time of change and size.  A finding is checked on
+#: every look at its page, three times in an analysis and once more in a write-up; what
+#: did not change is not read and searched again.
+_NUMBERS_KEPT: dict[tuple[Any, ...], frozenset[str]] = {}
+#: The index last built for a project, with the evidence it was built from.
+_INDEX_KEPT: dict[str, tuple[tuple[tuple[Any, ...], ...], _Index]] = {}
+_KEPT_GUARD = threading.Lock()
+
+
+def _numbers_of(key: tuple[Any, ...], text: Callable[[], str]) -> frozenset[str]:
+    """The numbers in a piece of evidence; ``text`` is only called when ``key`` is new."""
+    with _KEPT_GUARD:
+        known = _NUMBERS_KEPT.get(key)
+    if known is not None:
+        return known
+    numbers = frozenset(numbers_in(text()))
+    with _KEPT_GUARD:
+        if len(_NUMBERS_KEPT) >= MAX_EVIDENCE_KEPT:
+            _NUMBERS_KEPT.clear()  # rare, and cheaper than keeping an order
+        _NUMBERS_KEPT[key] = numbers
+    return numbers
+
+
+def _measured(body: str) -> str:
+    """The values of the metrics table of a result page, one per line: what the run
+    measured.  Nothing else on the page counts as a result: not its first line with the
+    plan's title, not an error, a repair's diff or the log, which hold whatever a plan
+    or a job chose to say."""
+    values: list[str] = []
+    fence: str | None = None
+    in_metrics = False
+    for line in body.splitlines():
+        ticks = re.match(r"`{3,}", line)
+        if fence is not None:
+            fence = None if line.strip() == fence else fence
+            continue
+        if ticks:
+            fence = ticks.group()  # a block of quoted text: an error, a diff, the log
+            continue
+        if line.startswith("## "):
+            if in_metrics:
+                break
+            in_metrics = line.strip() == "## Metrics"
+            continue
+        cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line)[1:-1]]
+        if not in_metrics or len(cells) != 2:
+            continue
+        written = cells[1].split(" (", 1)[0]  # `1e-05 (0.00001)`: as written, then in digits
+        with contextlib.suppress(ValueError):
+            float(written)  # true/false and texts are not measurements
+            values.append(cells[1])
+    return "\n".join(values)
+
+
+def _input_numbers(project: Project) -> Iterator[tuple[tuple[Any, ...], str, frozenset[str]]]:
+    """``(key, path, numbers)`` of the text files the person gave the project."""
     root = project.inputs_dir
     for folder, dirs, names in os.walk(root):
         dirs[:] = sorted(name for name in dirs if not (Path(folder) / name).is_symlink())
@@ -2891,16 +3900,41 @@ def _input_texts(project: Project) -> Iterator[tuple[str, str]]:
             if relative == MANIFEST_FILE or path.is_symlink() or not path.is_file():
                 continue  # the manifest holds sizes and digests, not the person's material
             with contextlib.suppress(OSError, UnicodeDecodeError):
-                if path.stat().st_size <= MAX_EVIDENCE_BYTES:
-                    yield f"{INPUTS_DIR}/{relative}", path.read_bytes().decode("utf-8")
+                status = path.stat()
+                if status.st_size > MAX_EVIDENCE_BYTES:
+                    continue
+                key = ("file", str(path), status.st_mtime_ns, status.st_size)
+                numbers = _numbers_of(key, lambda path=path: path.read_bytes().decode("utf-8"))
+                yield key, f"{INPUTS_DIR}/{relative}", numbers
 
 
-def _evidence(project: Project) -> list[_Evidence]:
-    """Where a result may come from: accepted result and source records, and the inputs."""
-    records = project.pages(kind=("result", "source"), review="accepted")
-    found = [_Evidence(page.path, f"{page.title}\n{page.summary}\n{page.body}") for page in records]
-    found.sort(key=lambda evidence: not evidence.path.startswith("wiki/results/"))
-    return found + [_Evidence(path, text) for path, text in _input_texts(project)]
+def _evidence(project: Project) -> _Index:
+    """Where a number of a finding may come from: the metrics of runs that succeeded (as
+    their accepted result records give them), accepted source records, and the inputs."""
+    root = str(project.root.resolve())
+    found: list[tuple[tuple[Any, ...], str, frozenset[str]]] = []
+    for page in project.pages(kind=("result", "source"), review="accepted"):
+        if page.kind == "result" and page.state != "succeeded":
+            continue  # what a run that failed or was cancelled wrote is not a result
+        if page.kind == "result":
+            text = _measured(page.body)
+        else:
+            text = f"{page.title}\n{page.summary}\n{page.body}"
+        key = ("page", root, page.path, page.updated, len(text))
+        found.append((key, page.path, _numbers_of(key, lambda text=text: text)))
+    found.sort(key=lambda item: not item[1].startswith("wiki/results/"))
+    found += _input_numbers(project)
+    keys = tuple(key for key, _, _ in found)
+    with _KEPT_GUARD:
+        kept = _INDEX_KEPT.get(root)
+    if kept is not None and kept[0] == keys:
+        return kept[1]
+    index = _Index([(path, numbers) for _, path, numbers in found])
+    with _KEPT_GUARD:
+        if len(_INDEX_KEPT) >= 8:
+            _INDEX_KEPT.clear()
+        _INDEX_KEPT[root] = (keys, index)
+    return index
 
 
 def number_check(project: Project, page: ResearchPage | str) -> list[dict[str, Any]]:
@@ -2913,16 +3947,22 @@ def number_check(project: Project, page: ResearchPage | str) -> list[dict[str, A
 
         {"number": "2.37", "found_in": ["wiki/results/E1-run1.md"]}
 
-    ``number`` is the number as the page writes it.  ``found_in`` lists the
-    accepted result records, accepted source records and text files under
-    ``inputs/`` that contain it: as written, rounded to the digits the page
-    gives (0.8765 is quoted as 0.88), or as a percentage of a fraction.  An
-    empty list means that nothing on record supports the number.  ``page`` is a
-    page or a reference to one.
+    ``number`` is the number as the page writes it.  ``found_in`` lists what
+    holds it: accepted result records of runs that succeeded, accepted source
+    records and text files under ``inputs/``.  Of a result record only the
+    metrics count (the values of its metrics table, which are the run's own
+    ``metrics.json``): not the plan's title, the log, an error or a repair's
+    diff, and nothing of a run that failed.  A number is held as written,
+    rounded to the digits the page gives (0.8765 is quoted as 0.88), or as a
+    percentage of a fraction.  An empty list means that nothing on record
+    supports the number.  ``page`` is a page or a reference to one.
+
+    The evidence is indexed once per call and kept between calls for as long as
+    it does not change, so the check stays quick on a project with many records.
     """
     if not isinstance(page, ResearchPage):
         page = project.page(str(page))
-    evidence = _evidence(project)
+    index = _evidence(project)
     checks: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in NUMBER.findall(page.body):
@@ -2931,17 +3971,11 @@ def number_check(project: Project, page: ResearchPage | str) -> list[dict[str, A
         if number in seen or not is_identifying(number):
             continue
         seen.add(number)
-        found = [
-            source.path
-            for source in evidence
-            # `12,345` is one number, or the two items of a list.
-            if source.has(number) or (parts and all(source.has(part) for part in parts))
-        ]
-        checks.append({"number": raw, "found_in": found})
+        checks.append({"number": raw, "found_in": index.found_in(number, parts)})
     return checks
 
 
 def unverified_numbers(project: Project, page: ResearchPage | str) -> list[str]:
-    """The numbers in a finding that occur in no result record, source or input file
-    (see :func:`number_check`), as the page writes them."""
+    """The numbers in a finding that no metric of a succeeded run, no source and no input
+    file holds (see :func:`number_check`), as the page writes them."""
     return [check["number"] for check in number_check(project, page) if not check["found_in"]]

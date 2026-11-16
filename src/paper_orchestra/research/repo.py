@@ -8,10 +8,15 @@ makes the copy and applies the patch; it knows nothing about projects or runs.
 * A local directory is copied as git sees it where git is at hand (tracked
   files and untracked ones that are not ignored), and walked otherwise.  Either
   way version-control data, caches, environments, ``.env`` files and files
-  above a size limit stay behind, and what stayed behind is reported.
+  above a size limit stay behind, and what stayed behind is reported.  Reading
+  the repository runs git and nothing else: no program that the repository's
+  configuration names (a file-system monitor, a hook, a filter) is started, and
+  git itself gets an environment without credentials.
 * A repository behind a URL is not fetched here at all.  :func:`clone_source`
   writes a small directory that makes the *job* clone it, so that the network
-  is used only where, and only if, the person approved it.
+  is used only where, and only if, the person approved it.  A password or
+  token in the URL is used for that fetch and is gone from the job's working
+  directory before the experiment's command starts.
 * :func:`apply_patch` uses ``git apply`` and falls back to a small applier of
   its own, which also reads the patches a model writes: right in what they
   change, often wrong in their line counts.
@@ -24,13 +29,14 @@ import fnmatch
 import json
 import os
 import re
+import selectors
 import shutil
 import stat
 import subprocess
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -54,6 +60,13 @@ MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 #: How many of the files left behind are listed by name.
 MAX_SKIPPED_LISTED = 200
 
+#: What a run brings back.  These paths hold what the experiment's command wrote, so a
+#: patch may not put them there, and a clone job removes them before the command starts.
+RESULT_PATHS = ("metrics.json", "artifacts")
+#: Seconds ``git archive`` may take to write the tree of a commit: a copy is at most
+#: ``MAX_TOTAL_BYTES``, read from a local disk.
+ARCHIVE_SECONDS = 1800.0
+
 #: Where the files of a clone job live inside its working directory.
 SEED_DIR = ".paper-orchestra"
 #: Exit statuses of the clone job's own steps (see :func:`clone_failure`).
@@ -70,6 +83,36 @@ _REF = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./\-~^]*$")
 _USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)([^/@\s]+)@")
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _GIT_SECONDS = 120.0
+# The name of a filter driver, from a key of git's configuration such as
+# ``filter.lfs.smudge``.  The name may itself hold dots.
+_FILTER_KEY = re.compile(r"filter\.(.+)\.(?:clean|smudge|process|required)", re.DOTALL)
+#: What git gets of this process's environment: enough to find itself, the person's own
+#: configuration (their ignore file, the directories they declared safe) and a place for
+#: temporary files.  No credentials, and nothing that redirects git (``GIT_DIR``, ...).
+_GIT_ENV = (
+    "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    # Which of the person's own configuration files git reads is theirs to say.
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+)
+#: Options for every call of git: nothing a repository's configuration names is started
+#: on its behalf.  A file-system monitor would be run by any command that reads the
+#: index, a hook by some that write it, a pager by none here.
+_GIT_INERT = (
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+)
 
 _BY_NAME = "left out by name (version-control data, caches, environments and .env files)"
 _OWN_FILES = "the research project's own files, which are not part of the repository"
@@ -116,6 +159,37 @@ def url_problem(url: str) -> str | None:
     )
 
 
+def userinfo(location: str) -> str | None:
+    """The secret in the address of a repository, for masking; ``None`` if it has none.
+
+    That is the token of ``https://token@host/...`` and the password of
+    ``scheme://user:password@host/...``, exactly as written in the URL.  A path has
+    none, and the user name of an ssh address (``ssh://git@host``, ``git@host:...``)
+    is not one.  Where the secret is printed, :func:`display_url` shows ``***``.
+    """
+    text = str(location or "").strip()
+    match = _USERINFO.match(text)
+    if match is None:
+        return None
+    user, colon, password = match.group(2).partition(":")
+    if colon:
+        return password or None
+    return user if match.group(1).lower().startswith("http") else None
+
+
+def _without_secret(location: str) -> str:
+    """A URL as a tool may be told it: without its password, and over http(s) without
+    any user information, where a lone user name is how a token is passed."""
+    text = str(location or "").strip()
+    match = _USERINFO.match(text)
+    if match is None or userinfo(text) is None:
+        return text
+    rest = text[match.end() :]
+    if match.group(1).lower().startswith("http"):
+        return match.group(1) + rest
+    return f"{match.group(1)}{match.group(2).partition(':')[0]}@{rest}"
+
+
 def display_url(location: str) -> str:
     """``location`` as it may be written down: without the password or token of a URL.
 
@@ -156,30 +230,41 @@ def git_available() -> bool:
     return shutil.which("git") is not None
 
 
-def _git(
-    args: list[str], *, cwd: Path, ceiling: Path | None = None
-) -> subprocess.CompletedProcess[bytes]:
-    """Run git without ever asking for input or taking a lock in the repository.
+def _git_env(ceiling: Path | None = None) -> dict[str, str]:
+    """The environment git runs in: see ``_GIT_ENV``.
 
     ``GIT_OPTIONAL_LOCKS=0`` keeps read-only commands (``status``) from
     refreshing the index: the person's repository is looked at, never written.
     ``ceiling`` stops git from finding a repository above that directory.
     """
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+    env = {key: os.environ[key] for key in _GIT_ENV if key in os.environ}
+    env.setdefault("PATH", os.defpath)
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C", GIT_PAGER="cat")
     if ceiling is not None:
         env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
+    return env
+
+
+def _git(
+    args: list[str], *, cwd: Path, ceiling: Path | None = None, quiet: Sequence[str] = ()
+) -> subprocess.CompletedProcess[bytes]:
+    """Run git without ever asking for input, taking a lock in the repository or
+    starting a program the repository names (``_GIT_INERT``), in an environment
+    without credentials.  ``quiet`` are further options that switch such programs off
+    (see :func:`_quiet_filters`)."""
+    command = ["git", *_GIT_INERT, *quiet, *args]
     try:
         return subprocess.run(
-            ["git", *args],
+            command,
             cwd=cwd,
-            env=env,
+            env=_git_env(ceiling),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=_GIT_SECONDS,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return subprocess.CompletedProcess(["git", *args], 1, b"", str(exc).encode())
+        return subprocess.CompletedProcess(command, 1, b"", str(exc).encode())
 
 
 def _said(done: subprocess.CompletedProcess[bytes]) -> str:
@@ -189,6 +274,51 @@ def _said(done: subprocess.CompletedProcess[bytes]) -> str:
 def _in_work_tree(directory: Path) -> bool:
     done = _git(["rev-parse", "--is-inside-work-tree"], cwd=directory)
     return done.returncode == 0 and done.stdout.strip() == b"true"
+
+
+def _quiet_filters(source: Path) -> list[str] | None:
+    """Options that switch off every filter the configuration in force in ``source``
+    defines; ``None`` when one cannot be switched off this way.
+
+    A filter is a program that git runs on a file's content: when it compares the
+    working tree with the index (``status``) and when it writes files out
+    (``archive``).  Which files go through which filter is said by ``.gitattributes``
+    in the tree; what the program is, by the configuration, that of the repository
+    included.  Copying a repository must not start programs it names, so each driver's
+    commands are replaced by nothing for the one call.  The option that does this
+    (``-c name=value``) cannot carry a name with ``=`` in it.
+    """
+    done = _git(["config", "--includes", "--list", "-z"], cwd=source)
+    if done.returncode != 0:
+        return None
+    names: set[str] = set()
+    for entry in done.stdout.split(b"\0"):
+        key = entry.split(b"\n", 1)[0].decode("utf-8", errors="surrogateescape")
+        match = _FILTER_KEY.fullmatch(key)
+        if match:
+            names.add(match.group(1))
+    if any("=" in name for name in names):
+        return None
+    options: list[str] = []
+    for name in sorted(names):
+        for command in ("clean", "smudge", "process"):
+            options += ["-c", f"filter.{name}.{command}="]
+        # A filter that "must succeed" would otherwise fail every file it is not run on.
+        options += ["-c", f"filter.{name}.required=false"]
+    return options
+
+
+def _is_dirty(source: Path, quiet: Sequence[str] | None) -> bool | None:
+    """Whether the working tree differs from its last commit; ``None`` when not known.
+
+    git compares content where a file's time stamp differs from the index.  That is
+    done with the filters switched off, and not at all when they cannot be: the flag
+    is a note on the run's record and not worth running a repository's programs for.
+    """
+    if quiet is None:
+        return None
+    status = _git(["status", "--porcelain", "--ignore-submodules=all"], cwd=source, quiet=quiet)
+    return bool(status.stdout.strip()) if status.returncode == 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -468,28 +598,79 @@ def _extract(
             os.chmod(dest / relative, member.mode & 0o777 or 0o644)
 
 
+class _Watched:
+    """The output of a git process, read with a deadline and an ear for a stop request.
+
+    Reading a pipe blocks while the other side is silent.  This reader waits in short
+    turns instead and, between them, asks ``stop`` (which raises ``JobStopped``) and
+    looks at the clock (:class:`RepoError` once ``seconds`` have passed), so that a
+    git that hangs cannot hold a run for ever.  It runs on the caller's thread.
+    """
+
+    def __init__(self, stream: Any, stop: _Stopper, seconds: float, what: str) -> None:
+        self._stream = stream
+        self._stop = stop
+        self._seconds = seconds
+        self._deadline = time.monotonic() + seconds
+        self._what = what
+        self._selector: selectors.BaseSelector | None = None
+        if os.name == "posix":  # elsewhere a pipe cannot be waited for; reads then block
+            self._selector = selectors.DefaultSelector()
+            self._selector.register(stream.fileno(), selectors.EVENT_READ)
+
+    def read(self, size: int = -1) -> bytes:
+        if self._selector is None:
+            return self._stream.read(size)
+        while not self._selector.select(max(CHECK_SECONDS, 0.05)):
+            self._stop.check()
+            if time.monotonic() >= self._deadline:
+                raise RepoError(
+                    f"{self._what} took longer than {self._seconds:g} s and was stopped. "
+                    "Check that the repository's disk responds, or copy the working tree "
+                    "as it is by removing the ref from the project's repository settings."
+                )
+        self._stop.check()
+        return os.read(self._stream.fileno(), size if size > 0 else 1 << 16)
+
+    def close(self) -> None:
+        if self._selector is not None:
+            self._selector.close()
+
+
 def _copy_archived(
-    source: Path, dest: Path, commit: str, copy: RepoCopy, budget: _Budget, stop: _Stopper
+    source: Path,
+    dest: Path,
+    commit: str,
+    copy: RepoCopy,
+    budget: _Budget,
+    stop: _Stopper,
+    quiet: Sequence[str],
 ) -> None:
-    """Extract the tree of ``commit`` as ``git archive`` writes it, member by member."""
+    """Extract the tree of ``commit`` as ``git archive`` writes it, member by member.
+
+    The files are taken as they are stored: with ``quiet`` no filter is run on them.
+    """
     # What git says goes to a file: a pipe nobody reads while the archive is read would
     # fill up and stop git.
     with tempfile.TemporaryFile() as said:
         process = subprocess.Popen(
-            ["git", "archive", "--format=tar", commit],
+            ["git", *_GIT_INERT, *quiet, "archive", "--format=tar", commit],
             cwd=source,
+            env=_git_env(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=said,
         )
         assert process.stdout is not None
+        what = f"Exporting {commit[:12]} of {source} with git"
+        output = _Watched(process.stdout, stop, ARCHIVE_SECONDS, what)
         failed: Exception | None = None
         finished = False
         try:
-            with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+            with tarfile.open(fileobj=output, mode="r|", bufsize=1 << 16) as archive:
                 _extract(archive, dest, copy, budget, stop)
             # git pads the archive after its last member; let it finish writing.
-            while process.stdout.read(1 << 16):
+            while output.read(1 << 16):
                 pass
             finished = True
         except tarfile.TarError as exc:
@@ -499,6 +680,7 @@ def _copy_archived(
             # writing into a pipe nobody reads any more.  Waiting for it would never end.
             if not finished:
                 process.kill()
+            output.close()
             process.stdout.close()
             status = process.wait()
         said.seek(0)
@@ -558,13 +740,21 @@ def copy_local(
         if ref:
             copy.method = "archive"
             copy.commit = _resolve_ref(source, ref)
-            _copy_archived(source, dest, copy.commit, copy, budget, stop)
+            quiet = _quiet_filters(source)
+            if quiet is None:
+                raise RepoError(
+                    f"The git configuration of {source} defines a filter that cannot be "
+                    "switched off for a copy (its name holds '=', or the configuration "
+                    "cannot be read), and a copy never runs a repository's programs. Remove "
+                    "the ref from the project's repository settings to copy the working "
+                    "tree as it is, or rename the filter."
+                )
+            _copy_archived(source, dest, copy.commit, copy, budget, stop, quiet)
         elif with_git:
             copy.method = "git"
             head = _git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd=source)
             copy.commit = head.stdout.decode("ascii", errors="replace").strip() or None
-            status = _git(["status", "--porcelain"], cwd=source)
-            copy.dirty = bool(status.stdout.strip()) if status.returncode == 0 else None
+            copy.dirty = _is_dirty(source, _quiet_filters(source))
             _copy_listed(source, dest, copy, budget, stop, own)
         else:
             _copy_walked(source, dest, copy, budget, should_stop, own)
@@ -708,13 +898,43 @@ def _check_patch_path(path: str) -> None:
         )
 
 
+def _is_result(path: str) -> bool:
+    """Whether ``path`` is one of ``RESULT_PATHS`` or lies in one."""
+    parts = PurePosixPath(path).parts
+    return any(parts[: len(wanted)] == wanted for wanted in map(_result_parts, RESULT_PATHS))
+
+
+def _result_parts(name: str) -> tuple[str, ...]:
+    return PurePosixPath(name).parts
+
+
+def _check_not_a_result(patch: FilePatch) -> None:
+    """Refuse a patch that touches where a run's results go.
+
+    Creating or changing such a file would put numbers and figures on record that no
+    run produced.  Deleting one has no effect, since they are removed before the
+    command starts anyway; it is refused all the same, so that the rule is one a
+    person can remember: a patch does not name these paths.
+    """
+    for path in filter(None, (patch.old, patch.new)):
+        if _is_result(path):
+            raise PatchError(
+                f"{PATCH_NAME} changes {path!r}. {', '.join(RESULT_PATHS[:-1])} and "
+                f"{RESULT_PATHS[-1]}/ hold what the experiment's command produces when it "
+                "runs, and are removed before it starts: results come from running the "
+                "experiment, not from a file put there beforehand. Take that change out "
+                "of the patch."
+            )
+
+
 def parse_patch(text: str) -> list[FilePatch]:
     """The file changes in a unified diff.
 
     Understands what ``git diff`` and ``diff -u`` write for text files.
     Raises :class:`PatchError` for a patch without changes, one that renames
     files or carries binary data (which only git can apply, and which an
-    experiment has no need for), and one that names a path outside the tree.
+    experiment has no need for), one that names a path outside the tree, and one
+    that touches a result of the run (``RESULT_PATHS``).
     """
     lines = text.replace("\r\n", "\n").split("\n")
     while lines and lines[-1] == "":
@@ -747,6 +967,7 @@ def parse_patch(text: str) -> list[FilePatch]:
     for patch in patches:
         for path in filter(None, (patch.old, patch.new)):
             _check_patch_path(path)
+        _check_not_a_result(patch)
     return patches
 
 
@@ -969,6 +1190,11 @@ _BOOTSTRAP = '''\
 
 Written by paper-orchestra into the job's working directory.  It runs where the
 job runs, so the clone uses the network of the job and of nothing else.
+
+The address of the repository may carry a password or a token.  It is read from
+job.json, taken out of that file at once and handed to git for the one fetch.
+No remote is set up with it, and what git wrote down of the fetch is removed, so
+that the experiment's command, which runs next in this directory, finds it nowhere.
 """
 
 import json
@@ -976,6 +1202,7 @@ import os
 import shutil
 import subprocess
 import sys
+from urllib.parse import unquote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PREFIX = @PREFIX@
@@ -988,8 +1215,10 @@ def stop(status, message):
 
 def git(*args):
     # A repository that wants a password is a failure to report, not a question to ask.
+    # And no helper is asked for one or told one: a helper that the system configures
+    # would keep the token of the address where the command could ask for it later.
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "credential.helper=", *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -999,28 +1228,94 @@ def git(*args):
     )
 
 
-def main():
-    with open(os.path.join(HERE, "job.json"), encoding="utf-8") as handle:
+def take_address():
+    """The job as job.json describes it, and the address to fetch from, which the file
+    no longer holds once this returns."""
+    path = os.path.join(HERE, "job.json")
+    with open(path, encoding="utf-8") as handle:
         job = json.load(handle)
+    url, secret = job["url"], job.pop("secret", None)
+    job["url"] = job["remote"]  # what a tool may be told: the address without its secret
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(job, handle, indent=2)
+    return job, url, secret
+
+
+def forget(secrets):
+    """Remove what git kept of the fetch, and the secret from whatever else it wrote."""
+    try:
+        os.remove(os.path.join(".git", "FETCH_HEAD"))
+    except OSError:
+        pass
+    wanted = [secret.encode("utf-8") for secret in secrets]
+    for folder, folders, names in os.walk(".git") if wanted else ():
+        if folder == ".git" and "objects" in folders:
+            folders.remove("objects")  # what was fetched, not what was said about it
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if os.path.islink(path) or os.path.getsize(path) > 1024 * 1024:
+                    continue
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                if any(secret in data for secret in wanted):
+                    for secret in wanted:
+                        data = data.replace(secret, b"***")
+                    with open(path, "wb") as handle:
+                        handle.write(data)
+            except OSError:
+                continue
+
+
+def clear_results(names):
+    """A result is what the command writes: what the repository, the patch or the
+    experiment's files brought under those names is removed before it starts."""
+    removed = []
+    for name in names:
+        if not os.path.lexists(name):
+            continue
+        if os.path.isdir(name) and not os.path.islink(name):
+            shutil.rmtree(name)
+        else:
+            os.remove(name)
+        removed.append(name)
+    if removed:
+        said = "Removed " + ", ".join(removed) + " that was there before the run (it came "
+        said += "with the repository): only what the command itself writes counts as a result."
+        print(PREFIX + said, flush=True)
+
+
+def main():
+    job, url, secret = take_address()
     if shutil.which("git") is None:
         stop(@NO_GIT@, "git is not installed where this job runs; the repository cannot be cloned.")
+    # git quotes a password as it was sent, which is not always how the URL spells it.
+    spelled = {text for text in (secret, unquote(secret or "")) if text}
+    secrets = sorted(spelled, key=len, reverse=True)
 
     def shown(text):
         # The log is kept and read; the password or token of the URL is not for it.
-        return text.replace(job["url"], job["shown"])
+        text = text.replace(url, job["shown"])
+        for text_secret in secrets:
+            text = text.replace(text_secret, "***")
+        return text
 
     steps = (
         ("init", "-q", "."),
-        ("remote", "add", "origin", job["url"]),
-        ("fetch", "-q", "--depth", "1", "origin", job["ref"] or "HEAD"),
+        # The address goes to git for this one command, and into no file.
+        ("fetch", "-q", "--depth", "1", url, job["ref"] or "HEAD"),
         ("checkout", "-q", "FETCH_HEAD"),
     )
     for step in steps:
         done = git(*step)
         if done.returncode != 0:
+            forget(secrets)
             said = "(git " + step[0] + "): " + shown(done.stdout.strip())
             stop(@CLONE_FAILED@, "The repository could not be cloned " + said)
     head = git("rev-parse", "HEAD").stdout.strip()
+    # For tools that note where the code came from: the address without its secret.
+    git("remote", "add", "origin", job["remote"])
+    forget(secrets)
     print(PREFIX + "cloned " + job["shown"] + " at " + head, flush=True)
     patch = os.path.join(HERE, @PATCH@)
     if os.path.exists(patch):
@@ -1037,6 +1332,7 @@ def main():
                 stop(@FILE_EXISTS@, @EXISTS@.replace("{name}", relative))
             os.makedirs(os.path.dirname(relative) or ".", exist_ok=True)
             shutil.copyfile(source, relative)
+    clear_results(job["outputs"])
     command = list(job["command"])
     if command[0] in ("python", "python3"):
         command[0] = sys.executable
@@ -1088,18 +1384,27 @@ def clone_source(
     patch: str | None = None,
     files: Mapping[str, bytes] | None = None,
     command: Iterable[str],
+    outputs: Sequence[str] = RESULT_PATHS,
 ) -> list[str]:
     """Write the source directory of a job that clones ``url`` itself, and return the
     command of that job.
 
     Nothing is fetched here.  The job clones the repository at ``ref`` (depth 1)
     into its working directory, applies ``patch``, adds ``files`` (refusing a name
-    the repository already has) and then runs ``command`` there.  When one of its
-    own steps fails it prints why on a line that starts with ``CLONE_PREFIX`` and
-    exits with a status :func:`clone_failure` knows.  What it prints names the
-    repository without the password or token of its URL (:func:`display_url`).
-    The job needs git and network access; ``url`` and ``ref`` must have passed
-    :func:`url_problem` and :func:`ref_problem`.
+    the repository already has), removes the paths in ``outputs`` that all this
+    brought along (a result is what the command writes) and then runs ``command``
+    there.  When one of its own steps fails it prints why on a line that starts
+    with ``CLONE_PREFIX`` and exits with a status :func:`clone_failure` knows; it
+    says on such a line, too, which outputs it removed.  The job needs git and
+    network access; ``url`` and ``ref`` must have passed :func:`url_problem` and
+    :func:`ref_problem`.
+
+    A password or token in ``url`` reaches the job in ``job.json`` in the seed, which
+    is the only place it is written to.  The job takes it out of that file before it
+    does anything else, gives it to git for the fetch alone and leaves no trace of it
+    in the working directory for ``command`` to find; what the job prints names the
+    repository as :func:`display_url` does.  The seed directory itself still holds
+    the URL until its owner removes it.
 
     Raises :class:`PatchError` for a ``patch`` that is not one, or that git cannot
     be told how to apply: inside the job there is only ``git apply``.
@@ -1110,17 +1415,27 @@ def clone_source(
             f"{PATCH_NAME} cannot be applied in a job that clones the repository: "
             f"{_MIXED_PREFIXES}. Write every path the same way, as `git diff` does."
         )
+    for name in outputs:
+        parts = PurePosixPath(name).parts
+        if not parts or PurePosixPath(name).is_absolute() or ".." in parts:
+            raise RepoError(f"{name!r} is not a relative path inside the repository.")
     home = Path(seed) / SEED_DIR
     home.mkdir(parents=True, exist_ok=True)
     (home / "bootstrap.py").write_text(_bootstrap(), encoding="utf-8")
     job = {
         "url": url,
+        "secret": userinfo(url),
         "shown": display_url(url),
+        "remote": _without_secret(url),
         "ref": ref or None,
         "apply": options,
         "command": list(command),
+        "outputs": [PurePosixPath(name).as_posix() for name in outputs],
     }
-    (home / "job.json").write_text(json.dumps(job, indent=2) + "\n", encoding="utf-8")
+    description = home / "job.json"
+    description.write_text(json.dumps(job, indent=2) + "\n", encoding="utf-8")
+    # It may hold a token until the job has taken it out: for nobody else on this machine.
+    description.chmod(0o600)
     if patch is not None:
         (home / PATCH_NAME).write_text(patch, encoding="utf-8")
     for name, data in (files or {}).items():

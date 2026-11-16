@@ -999,3 +999,50 @@ def test_an_agent_session_fills_the_wiki_with_proposals(project):
     with pytest.raises(ToolError, match="does not exist"):
         session.view("/memories/transcripts")
     assert json.loads((project.root / "project.json").read_text())["id"] == project.id
+
+
+# -- the record of an approval (audit: containment 3; execution 2) ---------------------
+
+
+def test_an_agents_page_cannot_say_where_its_run_goes_or_that_it_was_approved(project):
+    """``backend`` and the digests an approval leaves are the person's to decide: what
+    the designer writes into its page for them is dropped, on creation and on revision."""
+    designer = backend(project, "designer")
+    result = designer.create(
+        "/memories/wiki/experiments/sweep.md",
+        "---\n"
+        "title: Sweep warmup length\n"
+        "mode: script\n"
+        "backend: local\n"
+        f"approved_digest: {'0' * 64}\n"
+        "approved_at: 2026-11-15T12:00:00Z\n"
+        f"repaired_digest: {'1' * 64}\n"
+        "---\n"
+        "## Objective\n\nMeasure it.\n",
+    )
+    listed_as_ignored = result.split("were left as they are:")[1]
+    for name in ("approved_at", "approved_digest", "backend", "repaired_digest"):
+        assert name in listed_as_ignored
+    page = project.page("E1")
+    assert page.meta["mode"] == "script"
+    assert not {"backend", "approved_digest", "approved_at", "repaired_digest"} & set(page.meta)
+
+    path = f"/memories/{page.path}"
+    with pytest.raises(ToolError, match=r"No change was made.*backend"):
+        designer.insert(path, 1, "backend: local")
+    revised = designer.create(
+        path, "---\ntitle: Sweep warmup length\nmode: script\nbackend: local\n---\nNew plan.\n"
+    )
+    assert "were left as they are: backend" in revised
+    assert "backend" not in project.page("E1").meta and project.page("E1").body == "New plan.\n"
+
+
+def test_an_agent_cannot_propose_where_a_run_goes(project):
+    exp = project.review(
+        project.create_page("experiment", "Sweep", "x", author="agent:designer").path, "accept"
+    )
+    tool = propose_edit_tool(project, "agent:analyst", 1)
+    for field in ("backend", "approved_digest", "approved_at", "repaired_digest"):
+        with pytest.raises(ToolError, match=f"'{field}' is part of the record of an approval"):
+            tool.handler({"target": exp.id, "summary": "Tidy", "fields": {field: "local"}})
+    assert project.proposals() == [] and project.page(exp.id) == exp

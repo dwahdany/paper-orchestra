@@ -777,8 +777,11 @@ def propose_edit_tool(project: Project, role: str, round: int) -> ToolSpec:
             "now supports, or relation fields such as cites, which are added to the ones the "
             "page has), or both. Records (sources and results) cannot be edited, and the "
             "state of an experiment is not something to propose: only the person approves a "
-            "run. To change a page you created in this session, edit it with the memory tool "
-            "instead."
+            "run, and where it runs (`backend`) is theirs to choose then. An edit to the "
+            "plan of an experiment whose run is already approved (its mode, entry point, "
+            "command, packages, repository, GPU, network or time limit) means the person "
+            "has to approve the run again. To change a page you created in this session, "
+            "edit it with the memory tool instead."
         ),
         input_schema={
             "type": "object",

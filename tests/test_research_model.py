@@ -664,3 +664,43 @@ def test_stamps():
         model.stamp_after("2026-11-15T12:00:09Z", "2026-11-15T12:00:05Z") == "2026-11-15T12:00:09Z"
     )
     assert model.stamp_after("2026-11-15T12:00:09Z", "") == "2026-11-15T12:00:09Z"
+
+
+# -- what an approval pins (audit: containment 2, 3; execution 2) -----------------
+
+
+def test_the_record_of_an_approval_is_not_an_agents_to_write():
+    """Where a run goes and what was approved are written by the approval itself: an
+    agent's page cannot carry them, whatever its text says."""
+    assert sorted(model.APPROVAL_FIELDS) == [
+        "approved_at",
+        "approved_digest",
+        "backend",
+        "repaired_digest",
+    ]
+    assert model.APPROVAL_FIELDS <= model.AGENT_LOCKED_FIELDS
+    # The fields a plan is made of are named once, for the digest and for every view.
+    assert model.RUN_FIELDS == (
+        "mode",
+        "entrypoint",
+        "command",
+        "packages",
+        "repo",
+        "repo_ref",
+        "gpu",
+        "network",
+        "backend",
+        "timeout_seconds",
+    )
+
+
+def test_code_takes_an_approval_back_but_never_gives_one():
+    """A run that finds the experiment changed since its approval puts it back to
+    ``planned``; approving stays the person's alone."""
+    for current in ("approved", "queued"):
+        model.check_transition("experiment", current, "planned", "system")
+        model.check_transition("experiment", current, "planned", "agent:runner")
+        with pytest.raises(NotAllowed):
+            model.check_transition("experiment", current, "planned", "agent:designer")
+    with pytest.raises(NotAllowed):
+        model.check_transition("experiment", "planned", "approved", "system")

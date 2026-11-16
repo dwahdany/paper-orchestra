@@ -305,16 +305,17 @@ _EITHER = _PERSON | _CODE
 
 #: Every legal move of an experiment and who makes it.  Approval is the person's alone, from
 #: any state: it is what spends their money.  Code only carries an approved experiment
-#: through its run, and puts an interrupted one back in the queue.
+#: through its run, puts an interrupted one back in the queue, and takes an approval back
+#: when the experiment is no longer what was approved (never the other way round).
 _EXPERIMENT_MOVES: dict[tuple[str, str], frozenset[str]] = {
     ("planned", "approved"): _PERSON,
     ("planned", "cancelled"): _PERSON,
-    ("approved", "planned"): _PERSON,
+    ("approved", "planned"): _EITHER,
     ("approved", "queued"): _CODE,
     ("approved", "running"): _CODE,
     ("approved", "failed"): _CODE,
     ("approved", "cancelled"): _EITHER,
-    ("queued", "planned"): _PERSON,
+    ("queued", "planned"): _EITHER,
     ("queued", "running"): _CODE,
     ("queued", "failed"): _CODE,
     ("queued", "cancelled"): _EITHER,
@@ -549,9 +550,34 @@ MANAGED_FIELDS: frozenset[str] = frozenset(
         "decision_reason",
     }
 )
+#: The fields of an experiment page that decide what a run executes, where and for how
+#: long.  An approval pins them (with the code) in ``approved_digest``; a run starts only
+#: while they are what was approved.
+RUN_FIELDS: tuple[str, ...] = (
+    "mode",
+    "entrypoint",
+    "command",
+    "packages",
+    "repo",
+    "repo_ref",
+    "gpu",
+    "network",
+    "backend",
+    "timeout_seconds",
+)
+#: The record of an approval on an experiment page: where the run goes, the digest of
+#: what was approved and when, and the digest after the runner's own repair.  Only the
+#: approval (``research.experiments.approve``) and the run write them; no agent writes or
+#: proposes them, and of these only ``backend`` is a field the person may edit by hand.
+APPROVAL_FIELDS: frozenset[str] = frozenset(
+    {"backend", "approved_digest", "approved_at", "repaired_digest"}
+)
 #: What a model session cannot set by writing it into a page: the managed fields, the
-#: lifecycle state (approval is the person's) and the session the page belongs to.
-AGENT_LOCKED_FIELDS: frozenset[str] = MANAGED_FIELDS | {"state", "state_reason", "session"}
+#: lifecycle state (approval is the person's), the session the page belongs to and the
+#: record of an approval.
+AGENT_LOCKED_FIELDS: frozenset[str] = (
+    MANAGED_FIELDS | {"state", "state_reason", "session"} | APPROVAL_FIELDS
+)
 
 _FIELD_ORDER: tuple[str, ...] = (
     "title",
@@ -570,6 +596,9 @@ _FIELD_ORDER: tuple[str, ...] = (
     "decided_by",
     "decided_at",
     "decision_reason",
+    "approved_at",
+    "approved_digest",
+    "repaired_digest",
     *RELATIONS,
 )
 
