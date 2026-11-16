@@ -1485,6 +1485,28 @@ class Engine:
                 return f"{named} It is planned again."
         return f"{page.id} could not be run: {_one_line(exc, 300)}"
 
+    def _refused_note(self, page: ResearchPage, record: Mapping[str, Any]) -> str | None:
+        """What the checkpoint says about a run that was refused before any job started;
+        ``None`` for a run that did start.
+
+        ``research.experiments`` settles two refusals as a failed record: the worst
+        case of the run's cost would pass what is left of the project's limit
+        (``budget``), and the code changed between the look at the approval and the
+        copy that was about to run (``approval``).  Neither is an experiment that ran.
+        """
+        kind = record.get("error_kind")
+        if kind == "budget":
+            limits = self.project.settings.limits
+            return (
+                f"{page.id} was not run: {_one_line(record.get('error'), 400)} (It was "
+                f"measured against what is left of the project's "
+                f"{_money(float(limits.experiment_usd))} for experiments, of which "
+                f"{_money(self._state['spent']['experiment_usd'])} is spent.)"
+            )
+        if kind == "approval":
+            return f"{page.id} was not run: {_sentence(record.get('error'), 400)}"
+        return None
+
     @staticmethod
     def _unbounded_cost_note(page: ResearchPage, record: Mapping[str, Any]) -> list[str]:
         """Said when a run was billed on a GPU type that has no price: the cost limit
@@ -1543,16 +1565,10 @@ class Engine:
             ]
             if record is None:
                 continue
-            if record.get("error_kind") == "budget":
-                # Refused before it started, by the worst case of its cost: said at the
-                # checkpoint, not only in the record of a run that never ran.
-                limits = self.project.settings.limits
-                notes.append(
-                    f"{page.id} was not run: {_one_line(record.get('error'), 400)} (It was "
-                    f"measured against what is left of the project's "
-                    f"{_money(float(limits.experiment_usd))} for experiments, of which "
-                    f"{_money(self._state['spent']['experiment_usd'])} is spent.)"
-                )
+            refused = self._refused_note(page, record)
+            if refused is not None:
+                # Said at the checkpoint, not only in the record of a run that never ran.
+                notes.append(refused)
                 continue
             self._ran += 1
             outcomes.setdefault(str(record.get("status") or "ended"), []).append(str(page.id))

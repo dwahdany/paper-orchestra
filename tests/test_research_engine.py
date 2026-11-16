@@ -1622,6 +1622,44 @@ def test_a_changed_experiment_is_named_also_when_the_analysis_ends_in_a_later_ca
     assert "main.py" in summary and "Approve it again." in summary
 
 
+def test_a_run_refused_while_it_was_being_set_up_did_not_run(project, team, monkeypatch):
+    backend = FakeBackend()
+    two_approved_experiments(project, team, backend)
+    real_run = experiments.run
+    error = (
+        "The run was not started: it is not what was approved at 2026-11-16T03:56:12Z "
+        "(main.py: changed after the approval). Look at the experiment as it is now and "
+        "approve it again."
+    )
+
+    def run(project, ref, **options):
+        if ref != "E1":
+            return real_run(project, ref, **options)
+        # As `research.experiments` settles a run whose code changed between its look at
+        # the approval and the copy it was about to start: a record, and no job.
+        project.set_state(ref, "failed", by="system", reason=error)
+        return {
+            "experiment": ref,
+            "number": 1,
+            "status": "failed",
+            "backend": "local",
+            "error": error,
+            "error_kind": "approval",
+            "cost_usd": None,
+            "plan": {"mode": "script", "gpu": None},
+        }
+
+    monkeypatch.setattr(experiments, "run", run)
+
+    state = advance(project, team, backend)
+
+    assert len(backend.jobs) == 1 and project.page("E2").state == "succeeded"
+    summary = state["checkpoint"]["summary"]
+    # It is not counted among the experiments that ran, and the checkpoint says why.
+    assert "1 experiment ran: E2 succeeded." in summary and "E1 failed" not in summary
+    assert f"E1 was not run: {error}" in summary
+
+
 def test_a_run_phase_that_only_found_a_changed_experiment_says_which_and_why(
     project, team, backend, monkeypatch
 ):
@@ -1659,7 +1697,8 @@ def test_an_experiment_that_lost_its_approval_earlier_is_named_when_the_others_r
 
     summary = state["checkpoint"]["summary"]
     assert "1 experiment ran: E2 succeeded." in summary
-    assert f"E1 is planned again: {reason}" in summary
+    # Said by the run phase, and not once more by the analysis that follows it at once.
+    assert summary.count(f"E1 is planned again: {reason}") == 1
     assert len(backend.jobs) == 1 and project.page("E1").state == "planned"
 
 
