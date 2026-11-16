@@ -583,6 +583,35 @@ def test_a_command_that_cannot_be_started_is_the_jobs_failure(backend, job):
     assert "could not be started" in job.log() and "definitely-not-a-program" in job.log()
 
 
+def test_a_program_that_is_nowhere_is_not_found_whatever_the_search_ran_into(
+    backend, job, tmp_path
+):
+    """With a directory on PATH that may not be read, the system reports "permission
+    denied" for a program that does not exist.  (Root may read everything, so only an
+    ordinary user sees the difference.)"""
+    closed = tmp_path / "closed"
+    closed.mkdir()
+    closed.chmod(0o000)
+    try:
+        spec = JobSpec(
+            command=["definitely-not-a-program"],
+            env={"PATH": os.pathsep.join([str(closed), os.environ.get("PATH", os.defpath)])},
+        )
+        missing = backend.run_job(spec, source_dir=job.source(), run_dir=job.run)
+    finally:
+        closed.chmod(0o700)
+    assert missing.returncode == 127 and "could not be started" in job.log()
+
+    # A file that is there and may not be run is another matter.
+    source = job.source()
+    (source / "tool.sh").write_text("#!/bin/sh\necho ran\n")
+    (source / "tool.sh").chmod(0o644)
+    denied = backend.run_job(
+        JobSpec(command=["./tool.sh"]), source_dir=source, run_dir=tmp_path / "run2"
+    )
+    assert denied.returncode == 126 and not denied.ok
+
+
 def test_output_is_streamed_while_the_job_runs(backend, job):
     source = job.source(
         """

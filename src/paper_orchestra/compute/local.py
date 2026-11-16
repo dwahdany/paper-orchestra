@@ -156,6 +156,19 @@ def _prctl() -> Any:
         return None
 
 
+def _program_exists(program: str, env: Mapping[str, str], cwd: Path) -> bool:
+    """Whether there is a file the command's first word names, as far as can be seen.
+
+    The system says "permission denied" for a program that is nowhere when the search
+    along PATH met a directory it may not read.  A shell looks for itself and says
+    "not found"; so does this.
+    """
+    if os.sep in program:
+        return (cwd / program).exists()
+    folders = env.get("PATH", os.defpath).split(os.pathsep)
+    return any(os.path.exists(os.path.join(folder or ".", program)) for folder in folders)
+
+
 def _limit_resources(cpu_seconds: int, memory_bytes: int | None, *, die_with_parent: bool = False):
     """What a child does before it becomes the job: take its resource limits.
 
@@ -1303,9 +1316,11 @@ class LocalBackend(ComputeBackend):
             process = _spawn(argv, cwd=work, env=env, preexec=preexec, merge_stderr=True)
         except OSError as exc:
             # The command is the job's own, so this is the job failing, with the status
-            # a shell would give it.
+            # a shell would give it: 126 for a program that may not be run, 127 for one
+            # that is not there.
+            denied = isinstance(exc, PermissionError) and _program_exists(argv[0], env, work)
             log.note(f"The command could not be started: {exc}.")
-            result.returncode = 126 if isinstance(exc, PermissionError) else 127
+            result.returncode = 126 if denied else 127
             return
         assert process.stdout is not None
         strays: set[int] = set()
