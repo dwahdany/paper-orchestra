@@ -16,7 +16,12 @@
 
 Exit codes: 0 on success, 1 when the pipeline (or a check) failed, 2 for a
 usage or validation error, 130 when the command was interrupted (Ctrl-C or
-SIGTERM).
+SIGTERM).  For ``research advance`` that reads: 0 at a checkpoint, 1 when the
+engine failed, 130 when it was stopped.
+
+The research commands and ``ui`` import what they drive (the project store, the
+engine, the web app) when they run, so that every other command starts without
+them and without the optional extras.
 """
 
 from __future__ import annotations
@@ -26,12 +31,13 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -59,6 +65,9 @@ from paper_orchestra.utils.common import read_json
 if TYPE_CHECKING:
     from paper_orchestra.memory.harness import ContextHarness
     from paper_orchestra.memory.wiki import Wiki
+    from paper_orchestra.pipeline import PaperResult
+    from paper_orchestra.research.model import EditProposal, ResearchPage
+    from paper_orchestra.research.project import Project
 
 MODAL_MODULE = "paper_orchestra.modal_app"
 MANUAL_DREAM_FOCUS = (
@@ -82,6 +91,8 @@ LEGACY_OPTIONS = {
 }
 #: The original ``--use_plotting`` took a value; it maps onto an on/off flag pair.
 LEGACY_USE_PLOTTING = "--use_plotting"
+#: Exit code of a command that was interrupted (Ctrl-C or SIGTERM).
+INTERRUPTED = 130
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
 
@@ -155,12 +166,40 @@ app = typer.Typer(
 )
 memory_app = typer.Typer(help="Inspect and maintain the wiki memory.", no_args_is_help=True)
 modal_app = typer.Typer(help="Run the pipeline on Modal.", no_args_is_help=True)
+research_app = typer.Typer(
+    help="Research projects: give an idea, let agents fill a wiki, decide what stands.",
+    no_args_is_help=True,
+)
 app.add_typer(memory_app, name="memory")
 app.add_typer(modal_app, name="modal")
+app.add_typer(research_app, name="research")
+
+
+#: Control characters other than the newline and the tab: what a terminal acts on.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _printable(text: object) -> str:
+    """``text`` without control characters.
+
+    Titles, summaries, errors and the output of runs are written by models and by the
+    code they wrote.  Printed as they are, an escape sequence in one of them could
+    rewrite what the terminal shows of the lines around it, in the very list the
+    person decides from.
+    """
+    return _CONTROL.sub("", str(text))
+
+
+def _say(message: object, *, err: bool = False, fg: str | None = None) -> None:
+    """Print a line that may quote a page, an event, an error or a run."""
+    if fg is None:
+        typer.echo(_printable(message), err=err)
+    else:
+        typer.secho(_printable(message), fg=fg, err=err)
 
 
 def _fail(message: str, code: int = 2) -> NoReturn:
-    typer.secho(f"Error: {message}", fg=typer.colors.RED, err=True)
+    _say(f"Error: {message}", fg=typer.colors.RED, err=True)
     raise typer.Exit(code)
 
 
@@ -336,61 +375,74 @@ def _role_models(
     }
 
 
-def _config(
+def build_config(
     *,
     base_dir: Path,
     template: str,
-    idea_filename: str,
-    experimental_log_filename: str,
-    model: str | None,
-    writer_model: str | None,
-    reflection_model: str | None,
-    plotting_model: str | None,
-    fast_model: str | None,
-    image_model: str | None,
-    effort: _Effort,
-    research_cutoff: str | None,
-    use_plotting: bool,
-    keep_provided_figures: bool,
-    plotting_max_critic_rounds: int,
-    compute: _Compute,
-    memory: bool,
-    memory_dir: Path | None,
-    lab_memory: bool,
-    lab_memory_dir: Path | None,
-    dream: _Dream,
-    resume: bool,
+    idea_filename: str = "idea_sparse.md",
+    experimental_log_filename: str = "experimental_log.md",
+    model: str | None = None,
+    writer_model: str | None = None,
+    reflection_model: str | None = None,
+    plotting_model: str | None = None,
+    fast_model: str | None = None,
+    image_model: str | None = None,
+    effort: str = "high",
+    research_cutoff: str | None = None,
+    use_plotting: bool = False,
+    keep_provided_figures: bool = False,
+    plotting_max_critic_rounds: int = 3,
+    compute: str = "local",
+    memory: bool = True,
+    memory_dir: Path | None = None,
+    lab_memory: bool = True,
+    lab_memory_dir: Path | None = None,
+    dream: str = "stages",
+    resume: bool = True,
 ) -> PipelineConfig:
-    try:
-        template_dir = resolve_template_dir(template)
-    except FileNotFoundError as exc:
-        _fail(str(exc))
+    """The pipeline configuration the options of ``write`` stand for.
+
+    The parameters are the command's options under the names they have there, with
+    the same defaults.  It is the one place that turns them into a
+    :class:`PipelineConfig`: ``write``, ``batch`` and the write-up of a research
+    project (``research.writeup.write_paper``) all go through it.  Raises
+    ``FileNotFoundError`` when ``template`` names no bundled template or directory.
+    """
     cfg = PipelineConfig(
         base_dir=base_dir,
-        template_dir=template_dir,
+        template_dir=resolve_template_dir(template),
         idea_filename=idea_filename,
         experimental_log_filename=experimental_log_filename,
         models=ModelConfig(
             **_role_models(model, writer_model, reflection_model, plotting_model, fast_model),
             image=image_model or None,
-            effort=effort.value,
+            # ``str`` of a StrEnum member is its value, so both spellings are taken.
+            effort=str(effort),
         ),
         memory=MemoryConfig(
             enabled=memory,
             project_dir=memory_dir,
             lab=lab_memory,
             lab_dir=lab_memory_dir,
-            dream=dream.value,
+            dream=str(dream),
         ),
         use_plotting=use_plotting,
         keep_provided_figures=keep_provided_figures,
         plotting_max_critic_rounds=plotting_max_critic_rounds,
-        compute=compute.value,
+        compute=str(compute),
         resume=resume,
     )
     if research_cutoff:
         cfg.research_cutoff = research_cutoff
     return cfg
+
+
+def _config(**options: Any) -> PipelineConfig:
+    """:func:`build_config` for a command: an unknown template is a usage error."""
+    try:
+        return build_config(**options)
+    except FileNotFoundError as exc:
+        _fail(str(exc))
 
 
 @app.command(cls=_LegacyFlagsCommand)
@@ -462,11 +514,16 @@ def write(
         result = run_paper(cfg)
     except (FileNotFoundError, ValueError, ComputeError) as exc:
         _fail(str(exc))
+    _report_paper(result, cfg.base_dir)
+
+
+def _report_paper(result: PaperResult, base_dir: Path) -> None:
+    """Print where the paper is and what it cost; exit with 1 when it was not written."""
     if not result.success:
         # The log above has the whole story; repeat only its headline.
         headline = (result.error or "unknown error").splitlines()[0]
         _fail(
-            f"the paper was not written: {headline} (details: {cfg.base_dir / 'state.json'})",
+            f"the paper was not written: {headline} (details: {base_dir / 'state.json'})",
             code=1,
         )
 
@@ -477,7 +534,7 @@ def write(
         f"Usage: {total.get('requests', 0)} requests, {total.get('input_tokens', 0)} input and "
         f"{total.get('output_tokens', 0)} output tokens"
         + (f", about ${cost:.2f}" if cost is not None else "")
-        + f" (details: {cfg.base_dir / 'usage.json'})"
+        + f" (details: {base_dir / 'usage.json'})"
     )
 
 
@@ -600,6 +657,1093 @@ def doctor(
         render(report, Console())
     if not report["ok"]:
         raise typer.Exit(1)
+
+
+# -- research ----------------------------------------------------------------------
+
+#: Where projects live unless a command is told otherwise; also the web app's default.
+WORKSPACE = Path("research")
+#: Name of the demonstration project's directory in the workspace.
+DEMO_NAME = "demo-warmup"
+#: How often the events of a working command are read to be printed, in seconds.
+EVENT_POLL_SECONDS = 0.5
+#: How many metrics of a run `research run` prints; the result record has them all.
+RUN_LINE_METRICS = 6
+
+
+class _Phase(StrEnum):
+    """The engine's phases (``research.engine.PHASES``), spelled out so that reading the
+    arguments of a command does not import the engine."""
+
+    intake = "intake"
+    research = "research"
+    hypothesize = "hypothesize"
+    design = "design"
+    run = "run"
+    analyze = "analyze"
+
+
+ProjectArgument = Annotated[
+    str,
+    typer.Argument(
+        metavar="PROJECT",
+        help="The project: its directory, its name in ./research, or its id.",
+        show_default=False,
+    ),
+]
+
+
+def _quoted(path: Path | str) -> str:
+    """A path as it can be pasted into a shell."""
+    return shlex.quote(str(path))
+
+
+def _sentence(text: str) -> str:
+    text = " ".join(str(text).split())
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _project_dirs(workspace: Path) -> list[Path]:
+    """The project directories directly inside ``workspace``, by name."""
+    from paper_orchestra.research.project import PROJECT_FILE
+
+    if not workspace.is_dir():
+        return []
+    return sorted(entry for entry in workspace.iterdir() if (entry / PROJECT_FILE).is_file())
+
+
+def _project_root(ref: str) -> Path | None:
+    """The directory ``ref`` names: a path, a name in the workspace, or a project's id."""
+    from paper_orchestra.research.project import PROJECT_FILE
+
+    for candidate in (Path(ref), WORKSPACE / ref):
+        if (candidate / PROJECT_FILE).is_file():
+            return candidate
+    for candidate in _project_dirs(WORKSPACE):
+        try:
+            if read_json(candidate / PROJECT_FILE).get("id") == ref:
+                return candidate
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def _open_project(ref: str | Path) -> Project:
+    """Open the project a command names, or end the command with what to do instead."""
+    from paper_orchestra.research.model import ProjectError
+    from paper_orchestra.research.project import Project
+
+    root = _project_root(str(ref))
+    if root is None:
+        _fail(
+            f"There is no research project at {ref}, and none with that name or id in "
+            f"./{WORKSPACE}. `paper-orchestra research status` lists the projects there; "
+            "`paper-orchestra research new` starts one."
+        )
+    try:
+        return Project.open(root)
+    except ProjectError as exc:
+        _fail(str(exc))
+
+
+def _free_dir(wanted: Path) -> Path:
+    """``wanted``, or ``wanted-2`` and so on: a default location never lands in a directory
+    that is already in use.  Nothing is created."""
+    candidate, number = wanted, 1
+    while candidate.exists():
+        number += 1
+        candidate = wanted.with_name(f"{wanted.name}-{number}")
+    return candidate
+
+
+def _engine_state(project: Project) -> dict[str, Any]:
+    """``state.json`` as the engine last wrote it; empty before the first phase."""
+    from paper_orchestra.research.project import STATE_FILE
+
+    try:
+        state = json.loads((project.root / STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _worker_alive(state: Mapping[str, Any]) -> bool | None:
+    """Whether the worker of a phase that reads as running is still there; ``None`` when
+    nothing is said to be running."""
+    if state.get("status") != "running":
+        return None
+    # Telling a live worker from a dead one is the engine's knowledge; it is only
+    # loaded for a project that claims to have one.
+    from paper_orchestra.research.engine import worker_alive
+
+    return worker_alive(state)
+
+
+def _state_as_it_is(project: Project) -> dict[str, Any]:
+    """The engine's state for a summary: a phase whose worker died reads as stopped,
+    which is what the engine makes of it when it next starts."""
+    state = _engine_state(project)
+    if _worker_alive(state) is False:
+        return {**state, "status": "stopped", "worker_gone": True}
+    return state
+
+
+def _restore_interrupt() -> None:
+    """Have an interrupt stop this command even where the process was started ignoring it.
+
+    The web server stops a worker with SIGINT, so that the engine can record the phase
+    as interrupted.  A server that was itself started in the background (``nohup``, ``&``,
+    some launchers) ignores SIGINT, its children inherit that, and Python then installs
+    no handler: the Stop button would do nothing.
+    """
+    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+        return
+    if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+class _EventPrinter:
+    """Prints a project's new events to stderr, one line each, while a command works.
+
+    It follows ``events.jsonl`` rather than hooking into the engine, so a worker's log
+    shows everything that happened to the project in that time, whoever wrote it.
+    """
+
+    def __init__(self, project: Project) -> None:
+        from paper_orchestra.research.project import EVENTS_FILE
+
+        self._project = project
+        self._file = project.root / EVENTS_FILE
+        earlier = project.events()
+        self._seen = earlier[-1]["seq"] if earlier else 0
+        self._size = self._file_size()
+        self._done = threading.Event()
+        #: The follower and the command both print; no event is printed twice.
+        self._printing = threading.Lock()
+        self._thread = threading.Thread(target=self._follow, name="events", daemon=True)
+
+    def __enter__(self) -> _EventPrinter:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._done.set()
+        self._thread.join(timeout=10)
+        # Once more from this thread: what the last step wrote, an interrupt included.
+        self.flush()
+
+    def flush(self) -> None:
+        """Print what has happened up to now, before the command says something itself."""
+        self._print_new(force=True)
+
+    def _file_size(self) -> int:
+        try:
+            return self._file.stat().st_size
+        except OSError:
+            return 0
+
+    def _follow(self) -> None:
+        while not self._done.wait(EVENT_POLL_SECONDS):
+            self._print_new()
+
+    def _print_new(self, *, force: bool = False) -> None:
+        with self._printing:
+            size = self._file_size()
+            if size == self._size and not force:
+                return  # the stream only grows; reading it again would find nothing
+            self._size = size
+            for event in self._project.events(after=self._seen):
+                self._seen = event["seq"]
+                _say(_event_line(event), err=True)
+
+
+def _event_line(event: Mapping[str, Any]) -> str:
+    """``12:03:41 research (scout): Verified 12 of 15 candidate papers.``"""
+    where = str(event.get("phase") or str(event.get("type") or "").split(".")[0])
+    agent = f" ({event['agent']})" if event.get("agent") else ""
+    clock = str(event.get("ts") or "")[11:19]
+    return f"{clock} {where}{agent}: {event.get('summary', '')}"
+
+
+@contextlib.contextmanager
+def _working(project: Project, command: str = "advance") -> Iterator[_EventPrinter]:
+    """A command that does the work of a worker: it can be stopped, its events are shown
+    (by the printer this yields), and a refusal by the project, a model or a backend
+    ends it with the reason and exit code 1.  ``command`` is the research command that
+    is at work, which is the one that goes on after a stop."""
+    from paper_orchestra.llm.base import LLMError
+    from paper_orchestra.research.model import ProjectError
+
+    _restore_interrupt()
+    try:
+        with _EventPrinter(project) as events:
+            yield events
+    except KeyboardInterrupt:
+        _stopped(project, command)
+    except (ProjectError, ComputeError, LLMError) as exc:
+        _fail(str(exc), code=1)
+
+
+def _stopped(project: Project, command: str = "advance") -> NoReturn:
+    """Say that the command was stopped and what goes on from there; exit with 130."""
+    root = _quoted(project.root)
+    if command == "run":
+        # `advance` would start the project's next phase, which need not be the run.
+        how = (
+            "The run that was in flight is back in the queue; "
+            f"`paper-orchestra research run {root}` runs it again."
+        )
+    else:
+        how = (
+            "What was in flight is on record as interrupted; "
+            f"`paper-orchestra research advance {root}` continues from there."
+        )
+    _say(f"Stopped. {how}", fg=typer.colors.YELLOW, err=True)
+    raise typer.Exit(INTERRUPTED)
+
+
+def _plural(count: int, kind: str) -> str:
+    """``1 hypothesis``, ``3 hypotheses``, ``2 edit proposals``."""
+    from paper_orchestra.research.model import SECTIONS
+
+    if count == 1:
+        return f"1 {kind}"
+    many = SECTIONS.get(kind) or f"{kind}s"
+    return f"{count} {many if many != kind else kind + ' pages'}"
+
+
+def _waiting(counts: Mapping[str, Any]) -> str:
+    """What is waiting for the person, by kind: ``2 hypotheses, 1 experiment``."""
+    from paper_orchestra.research.model import KINDS
+
+    pending = counts["pending"]
+    parts = [
+        _plural(pending["by_kind"][kind], kind) for kind in KINDS if pending["by_kind"].get(kind)
+    ]
+    if pending["proposals"]:
+        parts.append(_plural(pending["proposals"], "edit proposal"))
+    return ", ".join(parts)
+
+
+def _where_it_stands(state: Mapping[str, Any]) -> str:
+    """One line on the engine: the round, the phase and what became of it."""
+    status = state.get("status")
+    if status in (None, "", "idle"):
+        return "Not started: no phase has run yet."
+    phase = state.get("phase") or "no phase"
+    line = f"Round {state.get('round', 0)}, "
+    following = f"; next: {state['next_phase']}" if state.get("next_phase") else ""
+    if status == "checkpoint":
+        return line + f"checkpoint after {phase}{following}"
+    if status == "running":
+        worker = state.get("worker") or {}
+        return (
+            line + f"{phase} is running" + (f" (pid {worker['pid']})" if worker.get("pid") else "")
+        )
+    if status == "failed":
+        return line + f"failed in {phase}: {_sentence(state.get('error') or 'no error recorded')}"
+    if status == "stopped":
+        gone = " (its worker is gone)" if state.get("worker_gone") else ""
+        return line + f"stopped during {phase}{gone}"
+    return line + f"{status}{following}"
+
+
+def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str, Any]) -> str:
+    """What the person can do now, as commands they can paste."""
+    root = _quoted(project.root)
+    advance = f"`paper-orchestra research advance {root}`"
+    status = state.get("status")
+    if status in (None, "", "idle"):
+        return f"Next: {advance} starts the research and stops at the first checkpoint."
+    if status == "running":
+        return "A worker is at work on it; follow along in the web app (`paper-orchestra ui`)."
+    if status == "failed":
+        return f"Next: once the cause is dealt with, {advance} tries the phase again."
+    if status == "stopped":
+        return f"Next: {advance} continues the phase that was stopped."
+    steps = []
+    if counts["pending"]["total"]:
+        steps.append(
+            "decide what is waiting, in the web app (`paper-orchestra ui`) or with "
+            f"`paper-orchestra research review {root}`"
+        )
+    planned = project.pages(kind="experiment", review="accepted", state="planned")
+    if planned:
+        ids = ", ".join(page.id or page.path for page in planned)
+        steps.append(
+            f"approve the experiments you want run ({ids} planned) with "
+            f"`paper-orchestra research approve {root} {planned[0].id or planned[0].path}`"
+        )
+    steps.append(f"{'then ' if steps else ''}{advance} goes on")
+    return "Next: " + "; ".join(steps) + "."
+
+
+def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
+    """The compact summary of a project: where it stands, what waits, what it cost."""
+    counts = project.counts()
+    lines = [f"  {_where_it_stands(state)}"]
+    checkpoint = state.get("checkpoint") or {}
+    if state.get("status") == "checkpoint" and checkpoint.get("summary"):
+        lines.append(f"  {_sentence(checkpoint['summary'])}")
+    if counts["pending"]["total"]:
+        lines.append(f"  Waiting for you: {_waiting(counts)}")
+    board = [f"{count} {name}" for name, count in counts["experiments"].items() if count]
+    if board:
+        lines.append(f"  Experiments: {', '.join(board)}")
+    if counts["requests"]["open"]:
+        lines.append(f"  {_plural(counts['requests']['open'], 'open request')} for the agents")
+    spent, limits = state.get("spent") or {}, project.settings.limits
+    # The two budgets are totals; the time limit is per run, so the time used is only told.
+    lines.append(
+        f"  Spent: ${float(spent.get('model_usd') or 0):.2f} of ${limits.model_usd:.2f} on "
+        f"models; ${float(spent.get('experiment_usd') or 0):.2f} of "
+        f"${limits.experiment_usd:.2f} on experiments, which ran for "
+        f"{float(spent.get('experiment_seconds') or 0):.0f} s in all (one run may take up to "
+        f"{limits.experiment_seconds:.0f} s)"
+    )
+    lines.append(_next_steps(project, state, counts))
+    return lines
+
+
+def _pending_item(item: ResearchPage | EditProposal) -> dict[str, Any]:
+    """One thing waiting for a decision, as ``status --json`` and ``review`` list it."""
+    from paper_orchestra.research.model import EditProposal
+
+    if isinstance(item, EditProposal):
+        return {
+            "ref": item.id,
+            "kind": "edit",
+            "title": item.summary,
+            "target": item.target,
+            "author": item.author,
+            "round": item.round,
+        }
+    return {
+        "ref": item.id or item.path,
+        "kind": item.kind,
+        "title": item.title,
+        "summary": item.summary,
+        "path": item.path,
+        "author": item.author,
+        "round": item.round,
+    }
+
+
+def _status_data(project: Project) -> dict[str, Any]:
+    """Everything ``status`` knows, for ``--json``.  ``state`` is ``state.json`` as it
+    is; ``worker_alive`` says whether a phase that reads as running really is."""
+    state = _engine_state(project)
+    return {
+        "project": {
+            "id": project.id,
+            "title": project.title,
+            "root": str(project.root),
+            "created": project.created,
+        },
+        "state": state,
+        "worker_alive": _worker_alive(state),
+        "counts": project.counts(),
+        "pending": [_pending_item(item) for item in project.pending()],
+        "limits": project.settings.limits.to_dict(),
+    }
+
+
+def _advance(project: Project, *, phase: str | None, instruction: str | None) -> None:
+    """Run the engine up to its next checkpoint and say how that ended.
+
+    Returns at a checkpoint; exits with 1 when the engine failed and with 130 when it
+    was stopped, by Ctrl-C, SIGTERM or a stop request that reached the engine itself.
+    """
+    with _working(project):
+        from paper_orchestra.research.engine import Engine
+
+        state = Engine(project).advance(phase=phase, instruction=instruction)
+    status = state.get("status")
+    root = _quoted(project.root)
+    if status == "failed":
+        _fail(
+            f"The {state.get('phase') or 'current'} phase failed: "
+            f"{_sentence(state.get('error') or 'no error was recorded')} The activity above "
+            f"and {project.root / 'state.json'} have the details. Once the cause is dealt "
+            f"with, `paper-orchestra research advance {root}` tries the phase again.",
+            code=1,
+        )
+    if status == "stopped":
+        _stopped(project)
+    checkpoint = state.get("checkpoint") or {}
+    if status == "checkpoint" and checkpoint:
+        _say(
+            f"Checkpoint after {checkpoint.get('phase') or state.get('phase')} "
+            f"(round {checkpoint.get('round', state.get('round', 0))}): "
+            f"{_sentence(checkpoint.get('summary') or 'the phase is complete')}"
+        )
+    else:
+        _say(_where_it_stands(state))
+    counts = project.counts()
+    if counts["pending"]["total"]:
+        _say(f"Waiting for you: {_waiting(counts)}")
+    _say(_next_steps(project, state, counts))
+
+
+def _brief_text(brief: str | None, brief_file: Path | None) -> str:
+    """The idea as the person gave it, from exactly one of the two options."""
+    if (brief is None) == (brief_file is None):
+        _fail(
+            "Give the idea with --brief TEXT or --brief-file FILE. Exactly one of them is needed."
+        )
+    if brief_file is not None:
+        try:
+            brief = brief_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            _fail(f"The brief file {brief_file} does not exist.")
+        except (OSError, UnicodeDecodeError) as exc:
+            _fail(f"The brief file {brief_file} cannot be read as text ({exc}).")
+    if not (brief or "").strip():
+        _fail("The brief is empty: say in a few sentences what the idea is.")
+    return brief or ""
+
+
+def _default_project_dir(title: str | None, brief: str) -> Path:
+    """``./research/<slug>``, named after the title or else the brief's first words."""
+    from paper_orchestra.memory.wiki import slugify
+
+    first_line = next((line for line in brief.splitlines() if line.strip()), "")
+    name = title or " ".join(first_line.split()[:8])
+    return _free_dir(WORKSPACE / slugify(name, 48))
+
+
+@research_app.command("new")
+def research_new(
+    paths: Annotated[
+        list[Path] | None,
+        typer.Argument(
+            metavar="PATHS",
+            help="Files and folders to attach: notes, data, figures, papers.",
+            show_default=False,
+        ),
+    ] = None,
+    brief: Annotated[
+        str | None, typer.Option("--brief", help="The idea, in a few sentences.")
+    ] = None,
+    brief_file: Annotated[
+        Path | None, typer.Option("--brief-file", help="A text file that holds the idea.")
+    ] = None,
+    title: Annotated[
+        str | None,
+        typer.Option("--title", help="The project's title. Default: the brief's first line."),
+    ] = None,
+    directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir",
+            help="The project's directory (new or empty). Default: ./research/<name taken "
+            "from the title or the brief>.",
+        ),
+    ] = None,
+    run: Annotated[
+        bool,
+        typer.Option(
+            "--run/--no-run",
+            help="Start the research right away and stop at the first checkpoint.",
+        ),
+    ] = True,
+) -> None:
+    """Start a research project from an idea, and advance it to its first checkpoint.
+
+    The agents read what you gave, research prior work and fill the project's wiki.
+    Everything they write is a suggestion until you accept it.
+    """
+    from paper_orchestra.research.model import ProjectError
+    from paper_orchestra.research.project import Project
+
+    text = _brief_text(brief, brief_file)
+    root = directory or _default_project_dir(title, text)
+    try:
+        project = Project.create(root, title=title or "", brief=text, files=paths or ())
+    except ProjectError as exc:
+        _fail(str(exc))
+    _say(f'Created the research project "{project.title}" in {root}')
+    attached = len(project.attachments())
+    if attached:
+        _say(f"{attached} file{'s' if attached != 1 else ''} attached.")
+    shown = _quoted(root)
+    if not run:
+        _say(
+            "Next:\n"
+            f"  paper-orchestra research advance {shown}   start the research; it stops at "
+            "the first checkpoint\n"
+            "  paper-orchestra ui   open the web app"
+        )
+        return
+    _say(
+        "Starting the first round. Ctrl-C stops it; "
+        f"`paper-orchestra research advance {shown}` continues."
+    )
+    _advance(project, phase=None, instruction=None)
+
+
+@research_app.command("status")
+def research_status(
+    project: Annotated[
+        str | None,
+        typer.Argument(
+            metavar="PROJECT",
+            help="The project: its directory, its name in ./research, or its id. Default: "
+            "the project in the current directory, or else every project in ./research.",
+            show_default=False,
+        ),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the summary as JSON.")] = False,
+) -> None:
+    """Show where a project stands: round, phase, what waits for you, experiments, cost."""
+    from paper_orchestra.research.project import PROJECT_FILE
+
+    if project is None and not (Path.cwd() / PROJECT_FILE).is_file():
+        _workspace_status(as_json)
+        return
+    opened = _open_project(project or Path.cwd())
+    if as_json:
+        typer.echo(json.dumps(_status_data(opened), indent=2, ensure_ascii=False, default=str))
+        return
+    _say(f"{opened.title} ({opened.id}) in {opened.root}")
+    for line in _status_lines(opened, _state_as_it_is(opened)):
+        _say(line)
+
+
+def _workspace_status(as_json: bool) -> None:
+    """One line per project in the default workspace.
+
+    A project that cannot be opened is named on stderr with the reason and makes the
+    exit code 1; the others are listed all the same.
+    """
+    from paper_orchestra.research.model import ProjectError
+    from paper_orchestra.research.project import Project
+
+    projects: list[Project] = []
+    unreadable: list[str] = []
+    for root in _project_dirs(WORKSPACE):
+        try:
+            projects.append(Project.open(root))
+        except ProjectError as exc:
+            unreadable.append(f"{root} cannot be opened: {exc}")
+    if as_json:
+        data = [_status_data(project) for project in projects]
+        typer.echo(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+    elif not projects and not unreadable:
+        _say(
+            f"There are no research projects in ./{WORKSPACE}. Start one with "
+            '`paper-orchestra research new --brief "..."`.'
+        )
+    else:
+        for project in projects:
+            waiting = project.counts()["pending"]["total"]
+            where = _where_it_stands(_state_as_it_is(project)).rstrip(".")
+            _say(
+                f'{project.root}  "{project.title}"  {where}'
+                + (f"  ({waiting} waiting for you)" if waiting else "")
+            )
+    for problem in unreadable:
+        _say(f"Error: {problem}", fg=typer.colors.RED, err=True)
+    if unreadable:
+        raise typer.Exit(1)
+
+
+@research_app.command("advance")
+def research_advance(
+    project: ProjectArgument,
+    phase: Annotated[
+        _Phase | None,
+        typer.Option(
+            "--phase", help="Start from this phase instead of the next one.", show_default=False
+        ),
+    ] = None,
+    instruction: Annotated[
+        str | None,
+        typer.Option("--instruction", help="What you want the agents to do in this phase."),
+    ] = None,
+) -> None:
+    """Let the agents work up to the next checkpoint.
+
+    Prints one line per event to stderr as it goes.  Ctrl-C (or SIGTERM) stops at the
+    next model call or ends the running job; the same command continues afterwards.
+    Exit codes: 0 at a checkpoint, 1 when the engine failed, 130 when it was stopped.
+    """
+    _advance(_open_project(project), phase=phase.value if phase else None, instruction=instruction)
+
+
+def _kind_named(name: str) -> str:
+    """A kind of page from how a person writes it: ``hypothesis`` or ``hypotheses``."""
+    from paper_orchestra.research.model import KIND_OF_SECTION, KINDS
+
+    kind = KIND_OF_SECTION.get(name.strip().lower(), name.strip().lower())
+    if kind not in KINDS:
+        _fail(f"'{name}' is not a kind of page; the kinds are: {', '.join(KINDS)}.")
+    return kind
+
+
+def _list_pending(project: Project) -> None:
+    waiting = [_pending_item(item) for item in project.pending()]
+    if not waiting:
+        _say(f"Nothing is waiting for your decision in {project.root}.")
+        return
+    _say(f"{len(waiting)} waiting for your decision in {project.root}:")
+    width = max(len(item["ref"]) for item in waiting)
+    for item in waiting:
+        what = f"edit of {item['target']}:" if item["kind"] == "edit" else item["kind"]
+        _say(f"  {item['ref'].ljust(width)}  {what} {item['title']}  [{item['author']}]")
+    _say(
+        "Decide with --accept REF, --reject REF (with --reason TEXT) or --accept-all KIND, "
+        "or in the web app (`paper-orchestra ui`)."
+    )
+
+
+def _decide(project: Project, ref: str, decision: str, reason: str | None) -> bool:
+    """Make one decision and say what became of it; ``False`` when it could not be made."""
+    from paper_orchestra.research.model import EditProposal, ProjectError
+
+    try:
+        outcome = project.review(ref, decision, by="human", reason=reason)
+    except ProjectError as exc:
+        # Also a conflict: its message says what was and was not applied.
+        _say(f"{ref}: {exc}", fg=typer.colors.RED, err=True)
+        return False
+    verb = "Accepted" if decision == "accept" else "Rejected"
+    if isinstance(outcome, EditProposal):
+        _say(f"{verb} {outcome.id}: {outcome.summary} ({outcome.target})")
+        return True
+    name = outcome.id or outcome.path
+    _say(f'{verb} {name}: {outcome.kind} "{outcome.title}"')
+    if decision == "accept" and outcome.kind == "experiment" and outcome.state == "planned":
+        _say(
+            f"  {name} is accepted as a plan; nothing runs until you approve it: "
+            f"`paper-orchestra research approve {_quoted(project.root)} {name}`"
+        )
+    return True
+
+
+@research_app.command("review")
+def research_review(
+    project: ProjectArgument,
+    accept: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--accept", metavar="REF", help="Accept a page (H2, E1 or a path) or an edit (ep-...)."
+        ),
+    ] = None,
+    reject: Annotated[
+        list[str] | None,
+        typer.Option("--reject", metavar="REF", help="Reject a page or an edit proposal."),
+    ] = None,
+    accept_all: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--accept-all",
+            metavar="KIND",
+            help="Accept every proposed page of a kind (for example hypothesis) that is "
+            "not rejected in the same command.",
+        ),
+    ] = None,
+    reason: Annotated[
+        str | None,
+        typer.Option(
+            "--reason",
+            help="Why. Recorded with the rejections (the agents read it before they propose "
+            "again), or with the acceptances when nothing is rejected.",
+        ),
+    ] = None,
+) -> None:
+    """Accept or reject what the agents proposed; without a decision, list what is waiting.
+
+    Accepting an experiment accepts its plan only: it runs once you approve it
+    (`research approve`).
+    """
+    opened = _open_project(project)
+    accepts, rejects = list(accept or ()), list(reject or ())
+    kinds = [_kind_named(name) for name in accept_all or ()]
+
+    def named(ref: str) -> str:
+        """What ``ref`` stands for: the page's path, or the id of an edit proposal."""
+        return opened.resolve(ref) or ref.lower()
+
+    both = {named(ref) for ref in accepts} & {named(ref) for ref in rejects}
+    if both:
+        twice = next(ref for ref in accepts if named(ref) in both)
+        _fail(f"{twice} is named for both --accept and --reject.")
+    if not (accepts or rejects or kinds):
+        if reason:
+            _fail("--reason goes with a decision: add --accept, --reject or --accept-all.")
+        _list_pending(opened)
+        return
+    # Rejections first, so that "--accept-all hypothesis --reject H4" means all but H4.
+    made = [_decide(opened, ref, "reject", reason) for ref in rejects]
+    accept_reason = None if rejects else reason
+    made += [_decide(opened, ref, "accept", accept_reason) for ref in accepts]
+    for kind in kinds:
+        proposed = opened.pages(kind=kind, review="proposed")
+        if not proposed:
+            _say(f"No {kind} is waiting for a decision.")
+        made += [_decide(opened, page.path, "accept", accept_reason) for page in proposed]
+    left = opened.counts()["pending"]["total"]
+    _say(
+        (f"{left} still waiting for your decision. " if left else "Nothing else is waiting. ")
+        + f"`paper-orchestra research advance {_quoted(opened.root)}` goes on from here."
+    )
+    if not all(made):
+        raise typer.Exit(1)
+
+
+@research_app.command("approve")
+def research_approve(
+    project: ProjectArgument,
+    experiment: Annotated[
+        str,
+        typer.Argument(
+            metavar="EXPERIMENT", help="The experiment, for example E1.", show_default=False
+        ),
+    ],
+    backend: Annotated[
+        _Compute | None,
+        typer.Option("--backend", help="Where it runs. Default: what the plan or project says."),
+    ] = None,
+    gpu: Annotated[
+        str | None, typer.Option("--gpu", help="GPU type on Modal, for example T4.")
+    ] = None,
+    timeout: Annotated[
+        float | None,
+        typer.Option("--timeout", min=1, help="Time limit of the run in seconds."),
+    ] = None,
+    network: Annotated[
+        bool | None,
+        typer.Option(
+            "--network/--no-network",
+            help="Let the run reach the network, or not. A plan that asks for the network "
+            "is approved only with one of the two.",
+            show_default=False,
+        ),
+    ] = None,
+) -> None:
+    """Approve an experiment's run: your decision, and the only way one gets to run.
+
+    The experiment's page must be accepted first.  Options left out keep what the plan
+    says, with one exception: whether a run may reach the network is never taken from
+    the plan, which an agent may have written.  A plan that asks for it needs --network
+    or --no-network.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    try:
+        from paper_orchestra.research import experiments
+
+        if network is None and _asks_for_network(opened.page(experiment)):
+            _fail(
+                f"The plan of {experiment} asks for network access (network: true on its "
+                "page), and that is yours to grant, not the plan's. Approve it with "
+                "--network to let the run reach the network, or with --no-network to run "
+                "it without."
+            )
+        page = experiments.approve(
+            opened,
+            experiment,
+            backend=backend.value if backend else None,
+            gpu=gpu,
+            timeout_seconds=timeout,
+            network=network,
+        )
+    except (ProjectError, ComputeError) as exc:
+        _fail(str(exc), code=1)
+    name, root = page.id or page.path, _quoted(opened.root)
+    _say(
+        f"{name} is approved to run{_approved_as(page)}. `paper-orchestra research run "
+        f"{root} {name}` runs it now; `paper-orchestra research advance {root}` runs "
+        "everything approved and analyses the results."
+    )
+
+
+def _asks_for_network(page: ResearchPage) -> bool:
+    """Whether an experiment's page says that its run reaches the network."""
+    value = page.meta.get("network")
+    return value is True or str(value).strip().lower() in _TRUE
+
+
+def _approved_as(page: ResearchPage) -> str:
+    """What the approval recorded on the page: where the run goes, with what, for how
+    long at most, and whether it may reach the network."""
+    meta = page.meta
+    told = f" on {meta['backend']}" if meta.get("backend") else ""
+    gpu = str(meta.get("gpu") or "").strip()
+    if gpu and gpu.lower() not in _FALSE | {"none", "null", "cpu"}:
+        told += f" with a {gpu} GPU"
+    limit = meta.get("timeout_seconds")
+    if isinstance(limit, int | float) and not isinstance(limit, bool):
+        told += f", for up to {limit:g} s"
+    if _asks_for_network(page):
+        told += ", and it may reach the network"
+    return told
+
+
+def _run_line(project: Project, record: Mapping[str, Any]) -> str:
+    """What became of one run, with where to read more."""
+    from paper_orchestra.compute.base import LOG_NAME
+    from paper_orchestra.research.model import page_path
+
+    experiment, number = str(record.get("experiment")), record.get("number")
+    status = str(record.get("status"))
+    took = f"{float(record.get('seconds') or 0):.1f} s"
+    head = f"{experiment} run {number}"
+    if status == "succeeded":
+        metrics = [f"{name}={value}" for name, value in (record.get("metrics") or {}).items()]
+        more = len(metrics) - RUN_LINE_METRICS
+        shown = ", ".join(metrics[:RUN_LINE_METRICS]) + (f" and {more} more" if more > 0 else "")
+        result = page_path("result", name=f"{experiment}-run{number}")
+        return (
+            f"{head} succeeded in {took}."
+            + (f" Metrics: {shown}." if metrics else "")
+            + f" Result: {project.root / result}"
+        )
+    run_dir = project.experiment_dir(experiment) / "runs" / str(number)
+    why = record.get("error") or (
+        "it ran out of time" if record.get("timed_out") else f"exit code {record.get('exit_code')}"
+    )
+    verb = "was cancelled" if status == "cancelled" else status
+    return f"{head} {verb} after {took}: {_sentence(str(why))} Log: {run_dir / LOG_NAME}"
+
+
+@research_app.command("run")
+def research_run(
+    project: ProjectArgument,
+    experiments: Annotated[
+        list[str] | None,
+        typer.Argument(
+            metavar="EXPERIMENT",
+            help="Experiments to run, for example E1 E4. Default: every approved one.",
+            show_default=False,
+        ),
+    ] = None,
+) -> None:
+    """Run approved experiments now and write their result records.
+
+    No model is involved unless a run fails for a programming error and the code is
+    repaired.  `research advance` then analyses the results.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    root = _quoted(opened.root)
+    # Also what reads as running: a worker that died leaves its experiment that way, and
+    # the engine settles such a run and starts it again.  One that a live worker is
+    # running is refused by the engine, which says so.
+    waiting = opened.pages(
+        kind="experiment", review="accepted", state=["approved", "queued", "running"]
+    )
+    refs = list(experiments or ()) or [page.id or page.path for page in waiting]
+    if not refs:
+        _say(
+            "No experiment is approved to run. Approve one with "
+            f"`paper-orchestra research approve {root} E<n>`; "
+            f"`paper-orchestra research status {root}` shows the experiments."
+        )
+        return
+    outcomes: list[str | None] = []
+    with _working(opened, "run") as events:
+        from paper_orchestra.research.engine import Engine, WorkerBusy
+
+        engine = Engine(opened)
+        for ref in refs:
+            try:
+                record = engine.run_experiment(ref)
+            except WorkerBusy:
+                raise  # true of the project, so of every experiment: said once
+            except (ProjectError, ComputeError) as exc:
+                # One experiment that cannot run does not keep the others from running.
+                events.flush()
+                _say(f"Error: {exc}", fg=typer.colors.RED, err=True)
+                outcomes.append(None)
+                continue
+            events.flush()
+            _say(_run_line(opened, record))
+            outcomes.append(str(record.get("status")))
+    if any(outcomes):
+        _say(f"Next: `paper-orchestra research advance {root}` analyses the new results.")
+    if any(outcome != "succeeded" for outcome in outcomes):
+        raise typer.Exit(1)
+
+
+@research_app.command("write")
+def research_write(
+    project: ProjectArgument,
+    template: TemplateOption,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Model for every role. Default: the project's models."),
+    ] = None,
+    writer_model: WriterModelOption = None,
+    reflection_model: ReflectionModelOption = None,
+    plotting_model: PlottingModelOption = None,
+    fast_model: Annotated[
+        str | None,
+        typer.Option("--fast-model", help="Model for high-volume calls such as paper discovery."),
+    ] = None,
+    image_model: ImageModelOption = None,
+    effort: Annotated[
+        _Effort | None,
+        typer.Option("--effort", help="Reasoning effort. Default: the project's."),
+    ] = None,
+    research_cutoff: Annotated[
+        str | None,
+        typer.Option(
+            "--research-cutoff",
+            help="Ignore literature published after this month (YYYY-MM). Default: the "
+            "project's cutoff, or this month.",
+        ),
+    ] = None,
+    use_plotting: Annotated[
+        bool | None,
+        typer.Option(
+            "--plotting/--no-plotting",
+            help="Also generate figures from the results. Default: only the figures the "
+            "runs produced.",
+        ),
+    ] = None,
+    compute: Annotated[
+        _Compute | None,
+        typer.Option(
+            "--compute", help="Where LaTeX compiles and figure code runs. Default: the project's."
+        ),
+    ] = None,
+    lab_memory: Annotated[
+        bool | None,
+        typer.Option(
+            "--lab-memory/--no-lab-memory",
+            help="Read and extend the cross-run memory of process lessons. Default: the "
+            "project's setting.",
+        ),
+    ] = None,
+    dream: Annotated[
+        _Dream | None,
+        typer.Option("--dream", help="When a model consolidates the paper run's memory."),
+    ] = None,
+    resume: Annotated[
+        bool | None,
+        typer.Option("--resume/--no-resume", help="Continue an earlier write-up in paper/."),
+    ] = None,
+) -> None:
+    """Write a paper from the project's wiki (optional last step).
+
+    Only accepted pages reach the paper: the idea, accepted hypotheses, the experiments
+    that ran, their result records and the accepted findings.  The paper pipeline runs
+    in the project's paper/ directory.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    given = {
+        "model": model,
+        "writer_model": writer_model,
+        "reflection_model": reflection_model,
+        "plotting_model": plotting_model,
+        "fast_model": fast_model,
+        "image_model": image_model,
+        "effort": effort.value if effort else None,
+        "use_plotting": use_plotting,
+        "compute": compute.value if compute else None,
+        "lab_memory": lab_memory,
+        "dream": dream.value if dream else None,
+        "resume": resume,
+        "research_cutoff": research_cutoff,
+    }
+    # What is not given is left to the project's own settings.
+    options = {name: value for name, value in given.items() if value is not None}
+    _restore_interrupt()
+    try:
+        from paper_orchestra.research import writeup
+
+        with _EventPrinter(opened):
+            result = writeup.write_paper(opened, template=template, **options)
+    except KeyboardInterrupt:
+        _say(
+            "Stopped. The same command continues the write-up.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(INTERRUPTED) from None
+    except (ProjectError, FileNotFoundError, ValueError, ComputeError) as exc:
+        _fail(str(exc))
+    _report_paper(result, opened.paper_dir)
+
+
+@research_app.command("demo")
+def research_demo(
+    directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir",
+            help=f"Where to build it (new or empty). Default: ./research/{DEMO_NAME}.",
+        ),
+    ] = None,
+    pages: Annotated[
+        int | None,
+        typer.Option(
+            "--pages",
+            min=1,
+            help="Fill the wiki with generated pages up to this many, to see how the "
+            "views hold up with a large project (for example 150).",
+        ),
+    ] = None,
+) -> None:
+    """Build a demonstration project without calling any model.
+
+    A complete small project on learning-rate warmup: sources, topics, questions,
+    hypotheses, experiments (one of them really run on this machine), a finding and
+    things waiting for a decision.  It is for looking at the web app and for its tests.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    root = directory or _free_dir(WORKSPACE / DEMO_NAME)
+    try:
+        from paper_orchestra.research import demo
+
+        project = demo.build_demo_project(root, pages=pages)
+    except (ProjectError, ComputeError) as exc:
+        _fail(str(exc))
+    workspace = root.parent
+    flag = "" if workspace == WORKSPACE else f" --workspace {_quoted(workspace)}"
+    _say(
+        f'Built "{project.title}" in {root}: {project.counts()["pages"]} pages, '
+        f"{project.counts()['pending']['total']} waiting for a decision."
+    )
+    _say(f"Look at it with `paper-orchestra ui{flag}`.")
+
+
+# -- ui ----------------------------------------------------------------------------
+
+
+@app.command()
+def ui(
+    workspace: Annotated[
+        Path,
+        typer.Option("--workspace", help="The directory that holds the research projects."),
+    ] = WORKSPACE,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host", help="Address to listen on. Anything but loopback needs the access token."
+        ),
+    ] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=0, max=65535, help="Port.")] = 8600,
+    browser: Annotated[
+        bool, typer.Option("--browser/--no-browser", help="Open the app in the browser.")
+    ] = True,
+) -> None:
+    """Open the web app: the wiki, its graph, the review inbox, experiments and activity."""
+    try:
+        from paper_orchestra.web.app import serve
+    except ModuleNotFoundError as exc:
+        missing = exc.name or "a package"
+        if missing.split(".")[0] == "paper_orchestra":
+            raise
+        _fail(f"The web app needs {missing}, which is not installed: run `uv sync --extra ui`.")
+    serve(workspace, host=host, port=port, open_browser=browser)
 
 
 # -- memory ------------------------------------------------------------------------
@@ -1014,10 +2158,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         if exc.code == INTERRUPTED and argv is None:
             _leave_now(INTERRUPTED)
         raise
-
-
-#: Exit code of a command that was interrupted (Ctrl-C or SIGTERM).
-INTERRUPTED = 130
 
 
 def _leave_now(code: int) -> None:
