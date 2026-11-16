@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import inspect
 import io
 import itertools
@@ -36,7 +37,7 @@ from paper_orchestra.compute import (
     get_backend,
 )
 from paper_orchestra.compute.base import BackendUnusable
-from paper_orchestra.compute.local import LocalBackend
+from paper_orchestra.compute.local import DirectoryInUse, LocalBackend, lock_directory
 from paper_orchestra.compute.modal_backend import (
     TEX_PACKAGES_ENV,
     ModalBackend,
@@ -736,9 +737,9 @@ def test_check_finds_a_missing_modal_token_without_contacting_modal(fake, backen
     assert inspect.signature(ModalBackend.check) == inspect.signature(ComputeBackend.check)
     [problem] = backend.check()
     assert "Modal is not authenticated" in problem
-    assert "`modal setup`" in problem and "--compute local" in problem
-    # The same sentence is shown when one experiment is approved, where the option is another.
-    assert "`--backend local` when you approve an experiment" in problem
+    assert "sandboxes that compile the paper and run figure code" in problem
+    assert "`modal setup`" in problem and problem.endswith("or use --compute local.")
+    assert "experiment" not in problem and "--backend" not in problem
     # The paper itself is compiled in a sandbox, so this holds without figure code too.
     assert backend.check(python=False, latex=True) == [problem]
     assert backend.check(python=False, latex=False) == []
@@ -756,6 +757,50 @@ def test_check_finds_a_missing_modal_token_without_contacting_modal(fake, backen
     assert compiles_here.check(python=False, latex=True) == []
     assert compiles_here.check(python=True, latex=True) == [problem]
     assert fake.calls == []  # nothing was looked up, created or started
+
+
+def test_a_missing_modal_token_is_reported_for_an_experiment_in_its_own_words(
+    fake, backend, job, monkeypatch
+):
+    """An experiment is approved and run without any paper.  The message used to speak
+    of the sandboxes that compile the paper, and to offer ``--compute local``, which is
+    not an option of ``research approve``."""
+    [problem] = backend.check(python=True, latex=False)  # how an approval asks
+    assert problem.startswith("Modal is not authenticated (no token is configured")
+    assert "the sandbox that would run the experiment cannot be started" in problem
+    assert "`modal setup`" in problem and "approve the experiment again" in problem
+    assert "needs no GPU" in problem and "`--backend local`" in problem
+    assert "in the app, choose the local backend" in problem
+    assert "the paper" not in problem and "figure code" not in problem
+    assert "--compute" not in problem
+
+    # A token that Modal turns down shows when the job's sandbox is started, or when a
+    # job that is under way is picked up again.
+    source = job.source("print('never runs')\n")
+    fake.create_error = fake.exception.AuthError("Token expired")
+    with pytest.raises(BackendUnusable, match="Modal is not authenticated") as refused:
+        run_main(backend, job, source)
+    said = str(refused.value)
+    assert "the experiment cannot run there" in said and "`modal token new`" in said
+    assert "run the experiment again" in said and "`--backend local`" in said
+    assert "--compute" not in said
+    fake.create_error = None
+    fake.from_id_error = fake.exception.AuthError("Token expired")
+    with pytest.raises(BackendUnusable, match="Modal is not authenticated") as refused:
+        backend.attach("sb-fake-0", run_dir=job.run)
+    said = str(refused.value)
+    assert "`modal token new`" in said and "is picked up where it is" in said
+    assert "--backend local" not in said and "--compute" not in said  # it runs on Modal
+    fake.from_id_error = None
+
+    # The paper pipeline's own words are as they were.
+    fake.create_error = fake.exception.AuthError("Token expired")
+    with pytest.raises(BackendUnusable) as refused:
+        backend.run_python("pass")
+    assert str(refused.value) == (
+        "Modal is not authenticated. Run `modal token new`, or set MODAL_TOKEN_ID and "
+        "MODAL_TOKEN_SECRET."
+    )
 
 
 def test_expired_sandbox_is_replaced_and_the_job_retried(fake, backend):
@@ -1429,6 +1474,119 @@ def test_the_packed_source_does_not_lie_on_this_machine_while_the_job_runs(fake,
     assert result.ok and while_running == [[]]
     # It was made and uploaded, all the same.
     assert any(call[0] == "filesystem.copy_from_local" for call in fake.calls)
+
+
+@needs_coreutils
+def test_a_planted_job_record_cannot_have_the_directory_of_a_running_job_removed(
+    fake, backend, job
+):
+    """While a job runs, its packed source and then its outputs pass through a directory
+    in the temporary directory, where anybody can list it.  It was named like a working
+    directory of the local backend, whose clean-up after dead workers removed whatever a
+    job record of that name pointed it to: a record planted in another project had the
+    directory of a running job removed, and with it the job's outputs."""
+    source = job.source(
+        """
+        import json, time
+        print('running', flush=True)
+        time.sleep(0.5)
+        json.dump({'accuracy': 0.5}, open('metrics.json', 'w'))
+        """
+    )
+    planted: list[tuple[str, list[str], bool]] = []
+    held: list[bool] = []
+
+    def on_log(line: str) -> None:
+        if line == "running":
+            [scratch] = job.scratch.iterdir()
+            record = {"session": 0, "session_started": "", "scratch": str(scratch)}
+            planted.append((scratch.name, LocalBackend.end_job(record), scratch.is_dir()))
+            try:
+                os.close(lock_directory(str(scratch)))
+                held.append(False)
+            except DirectoryInUse:
+                held.append(True)
+
+    result, _ = run_main(backend, job, source, on_log=on_log)
+    [(name, notes, still_there)] = planted
+    assert still_there and notes == []
+    # Not a name the local backend gives its working directories, and held while in use:
+    # nothing that removes what dead workers left takes it for that.
+    assert name.startswith("paper-orchestra-modal-") and held == [True]
+    assert result.ok, result.error
+    assert json.loads((job.run / "metrics.json").read_text()) == {"accuracy": 0.5}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a directory in use is held by a kernel lock")
+def test_what_a_killed_worker_left_in_the_temporary_directory_goes_with_the_next_job(
+    fake, backend, job, monkeypatch
+):
+    """A worker that is killed while it packs or uploads the source of a job leaves the
+    archive behind: a copy of the person's repository, up to a gigabyte, of which no
+    record tells.  The next job of this backend on the machine removes what nobody
+    holds any more."""
+
+    def leftover(name: str, age: float) -> Path:
+        directory = job.scratch / f"paper-orchestra-modal-{name}"
+        directory.mkdir()
+        (directory / "source.tar").write_bytes(b"\0" * 4096)
+        os.utime(directory, (time.time() - age, time.time() - age))
+        return directory
+
+    dead = leftover("dead", 3600)
+    in_use = leftover("in-use", 3600)
+    just_made = leftover("new", 0)
+    of_the_local_backend = job.scratch / "paper-orchestra-job-abc"
+    of_the_local_backend.mkdir()
+    not_a_directory = job.scratch / "paper-orchestra-modal-file"
+    not_a_directory.write_text("x")
+    link = job.scratch / "paper-orchestra-modal-link"
+    precious = job.root / "precious"
+    precious.mkdir()
+    (precious / "thesis.tex").write_text("years of work")
+    link.symlink_to(precious, target_is_directory=True)
+    os.utime(link, (0, 0), follow_symlinks=False)
+    holder = lock_directory(str(in_use))  # as the backend of a job that runs holds it
+    assert holder is not None
+    try:
+        result, _ = run_main(backend, job, job.source("print('ok')\n"))
+        assert result.ok, result.error
+        assert not dead.exists()
+        assert (in_use / "source.tar").is_file() and (just_made / "source.tar").is_file()
+        assert of_the_local_backend.is_dir() and not_a_directory.is_file()
+        assert link.is_symlink() and (precious / "thesis.tex").read_text() == "years of work"
+    finally:
+        os.close(holder)
+        for path in (in_use, just_made, of_the_local_backend):
+            shutil.rmtree(path, ignore_errors=True)
+        not_a_directory.unlink()
+        link.unlink()
+    # Picking a job up again is the other moment a worker comes after a dead one.
+    dead = leftover("dead-too", 3600)
+    backend.attach("sb-nobody", run_dir=job.run)
+    assert not dead.exists()
+
+    # What somebody else left in the shared temporary directory is theirs to remove.
+    theirs = leftover("of-another-user", 3600)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+        assert modal_backend.sweep_scratch() == []
+    assert (theirs / "source.tar").is_file()
+
+    # Nor is one removed that could not be opened to see whether somebody holds it:
+    # that nobody does is then not known, and the job that asked goes on all the same.
+    really_open = os.open
+
+    def no_descriptor_left(path, flags, *args, **kwargs):
+        if os.fspath(path) == str(theirs):
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), str(theirs))
+        return really_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", no_descriptor_left)
+        assert modal_backend.sweep_scratch() == []
+    assert (theirs / "source.tar").is_file()
+    assert modal_backend.sweep_scratch() == [str(theirs)] and not theirs.exists()
 
 
 @needs_coreutils
@@ -2341,10 +2499,10 @@ def test_masked_strings_and_forged_notes_stay_out_of_a_log_that_is_picked_up(
     result, seen = run_main(ModalBackend(), job, source, mask=[token])
     assert result.ok and token not in job.log()
     assert job.output_lines(seen) == [
-        "origin: https://***@example.org/org/private.git",
+        "origin: https://[redacted]@example.org/org/private.git",
         f"(printed by the job) {forged}",
         "two",
-        "again ***",
+        "again [redacted]",
         f"(printed by the job) {forged}",
         "done",
     ]
@@ -2363,7 +2521,7 @@ def test_masked_strings_and_forged_notes_stay_out_of_a_log_that_is_picked_up(
     assert result.ok and token not in job.log()
     # Each line once across the two workers; the forged ones used to come twice.
     assert job.output_lines(first)[-2:] == [f"(printed by the job) {forged}", "two"]
-    assert second == ["again ***", f"(printed by the job) {forged}", "done"]
+    assert second == ["again [redacted]", f"(printed by the job) {forged}", "done"]
     # The log was rebuilt from the job's output: no line in it reads as the backend's.
     assert not any(line.startswith("[paper-orchestra]") for line in job.log().splitlines())
     assert job.log().count(f"(printed by the job) {forged}") == 2

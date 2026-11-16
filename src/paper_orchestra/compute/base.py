@@ -145,7 +145,10 @@ COST_NAME = "cost.json"
 #: for whoever has to clean up after a worker that died:
 #: ``{"session": int, "session_started": str, "scratch": str}``.  The working directory
 #: is on record from the moment it exists; the session is ``0`` (and its start ``""``)
-#: until the command has been started.
+#: until the command has been started.  The record only says where to look: it is a file
+#: of a project directory, which anybody may have written, so what is ended and removed
+#: is decided by what the machine shows (see ``LocalBackend.end_job``), and the session
+#: is there for a person who wants to look for themselves.
 JOB_NAME = "job.json"
 #: Names in a run directory that the backend or the engine writes: the records above,
 #: the engine's ``run.json``, its snapshot of the code that ran (``code``) and its copy of
@@ -158,8 +161,10 @@ NOTE_PREFIX = "[paper-orchestra] "
 #: Put before what a job printed where a line of its output begins like a line of the
 #: backend, so that no job can speak in the backend's name.
 JOB_MARK = "(printed by the job) "
-#: Stands in a log where the job printed a string that must not be written down.
-MASKED = "***"
+#: Stands where a string that must not be written down (a credential) was taken out of
+#: a text: in a job's log, and in everything else of a project that is kept or shown.
+#: One marker for all of it, so that a person and a program know it when they see it.
+MASK = "[redacted]"
 
 #: What ``describe()["jobs"]`` holds for a backend that runs no jobs.
 NO_JOB_FEATURES: Mapping[str, bool] = {
@@ -296,7 +301,7 @@ class ComputeBackend(ABC):
         came with ``source_dir`` is not in the working directory when the command
         starts, and the result's notes say that it was removed.  The strings in
         ``mask`` (credentials) never reach the log or ``on_log``: where the job
-        prints one, ``***`` stands in its place.  A line of the job that begins like
+        prints one, ``MASK`` (``[redacted]``) stands in its place.  A line of the job that begins like
         a line of the backend (``[paper-orchestra]``) is marked as the job's.
 
         Every outcome that follows from the job, or from the backend failing while it
@@ -352,6 +357,11 @@ class ComputeBackend(ABC):
         Called once before any model call is paid for; an empty list means it is
         ready.  Implementations keep this cheap: look for the tools or the
         credentials, without starting a job.
+
+        The paper pipeline asks with ``latex=True``.  A call with ``latex=False`` is
+        about running code alone, which is how it is asked before an experiment is
+        approved or run: the messages then speak of the experiment and of what a
+        person can do about it there, not of the paper.
         """
         return []
 
@@ -682,7 +692,7 @@ class _Mask:
 
     def whole(self, text: str) -> str:
         """``text`` without the secrets, for a text that is complete."""
-        return self._pattern.sub(MASKED, text) if self._pattern is not None else text
+        return self._pattern.sub(MASK, text) if self._pattern is not None else text
 
     def feed(self, text: str) -> str:
         """What may be written once ``text`` has arrived."""
@@ -700,7 +710,7 @@ class _Mask:
             if match is None or match.start() >= waits:
                 break
             pieces.append(text[position : match.start()])
-            pieces.append(MASKED)
+            pieces.append(MASK)
             position = match.end()
         pieces.append(text[position:waits])
         self._pending = text[waits:]
@@ -945,7 +955,7 @@ class JobLog:
     cannot be written (a full disk) raises :class:`ComputeError`.
 
     Two things are changed in what the job printed before it reaches the file or
-    ``on_log``.  The strings in ``mask`` (credentials) are replaced by ``MASKED``,
+    ``on_log``.  The strings in ``mask`` (credentials) are replaced by ``MASK``,
     also where one arrives in two pieces.  And a line that begins with the tag of
     ``NOTE_PREFIX`` gets ``JOB_MARK`` in front of the tag, so that a line starting
     with the prefix is always the backend's.  "Begins with" is meant as a reader

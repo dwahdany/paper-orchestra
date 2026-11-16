@@ -1143,7 +1143,9 @@ def test_the_clone_job_never_prints_the_password_of_its_url(tmp_path):
     failed = clone_job(tmp_path, url, FAKE_GIT_FAILS="bot:s3cret-token")
     assert repo.clone_failure(failed.returncode) == repo.clone_failure(repo.EXIT_CLONE_FAILED)
     assert "could not be cloned" in failed.stdout and "https://bot:***@" in failed.stdout
-    assert "Authentication failed for bot:***" in failed.stdout
+    # A secret taken out of what git said is marked as everywhere else in a log; the
+    # address keeps the form it is shown in (display_url).
+    assert "Authentication failed for bot:[redacted]" in failed.stdout
     done = clone_job(tmp_path, url)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "cloned https://bot:***@example.org/owner/project.git at 0123abc" in done.stdout
@@ -1154,7 +1156,7 @@ def test_the_clone_job_never_prints_the_password_of_its_url(tmp_path):
     encoded = clone_job(
         tmp_path, "https://bot:p%40ss-w0rd@example.org/o/p.git", FAKE_GIT_FAILS="p@ss-w0rd"
     )
-    assert "Authentication failed for ***" in encoded.stdout
+    assert "Authentication failed for [redacted]" in encoded.stdout
     assert "p@ss-w0rd" not in encoded.stdout and "p%40ss-w0rd" not in encoded.stdout
 
     # ...or written with the @ as it is.  git then names the address without what stands

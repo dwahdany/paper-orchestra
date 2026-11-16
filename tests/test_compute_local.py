@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import inspect
 import itertools
 import json
@@ -19,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import paper_orchestra.compute.base as base
+import paper_orchestra.compute.local as local
 from paper_orchestra.compute import JobResult, JobSpec
 from paper_orchestra.compute.base import BackendUnusable, CompileResult, ComputeError
 from paper_orchestra.compute.local import LocalBackend, safe_relative, scrubbed_env
@@ -1221,7 +1223,8 @@ def killed_worker(job: JobDirs, source: Path, lines: int) -> list[str]:
     try:
         deadline = time.monotonic() + 20
         log = job.run / "log.txt"
-        while not (log.exists() and len(log.read_text().splitlines()) >= lines):
+        # Whole lines: a job's output is not buffered, and one print arrives in pieces.
+        while not (log.exists() and log.read_text().count("\n") >= lines):
             assert time.monotonic() < deadline and worker.poll() is None
             time.sleep(0.05)
         return log.read_text().splitlines()
@@ -1266,11 +1269,14 @@ def test_what_a_killed_worker_left_behind_is_ended_and_removed_from_the_jobs_rec
         assert record["session"] == main and record["scratch"] == str(scratch)
         assert isinstance(record["session_started"], str) and record["session_started"]
 
+        # What would be ended can be asked first, by whoever wants to know (the web app).
+        assert LocalBackend.job_processes(record) == set(children)
+        assert all(alive(pid) for pid in children) and scratch.is_dir()
         # The engine keeps the record inside the run's own; either shape is understood.
         notes = LocalBackend.end_job({"status": "running", "job": record})
         for pid in children:
             assert_gone(pid)
-        assert not scratch.exists()
+        assert not scratch.exists() and LocalBackend.job_processes(record) == set()
         assert len(notes) == 2
         assert notes[0].startswith("Stopped 3 processes that the run had left running")
         assert notes[1] == f"Removed the working directory {scratch} that the run had left behind."
@@ -1306,9 +1312,20 @@ def test_cleaning_up_never_touches_what_is_not_the_jobs(job, tmp_path):
         assert bystander.poll() is None and (precious / "thesis.tex").exists()
 
         # Records that are not job records at all: of a Modal run, empty, or damaged.
-        damaged = ({}, {"job": None}, {"session": "7", "scratch": 3}, {"session": True}, None)
+        damaged = (
+            {},
+            {"job": None},
+            {"session": "7", "scratch": 3},
+            {"session": True},
+            None,
+            ["scratch"],
+            {"scratch": f"{job.scratch}/paper-orchestra-job-\ud800"},  # no name of a file
+            {"scratch": f"{job.scratch}/paper-orchestra-job-a\0b"},
+            {"job": {"job": {"scratch": str(precious)}}},
+        )
         for record in damaged:
             assert LocalBackend.end_job(record) == []
+            assert LocalBackend.job_processes(record) == set()
         assert LocalBackend.end_job({"session": 0, "session_started": "", "scratch": ""}) == []
         assert bystander.poll() is None
     finally:
@@ -1320,6 +1337,501 @@ def test_cleaning_up_never_touches_what_is_not_the_jobs(job, tmp_path):
     (scratch / "work").mkdir(parents=True)
     notes = LocalBackend.end_job({"session": 0, "session_started": "", "scratch": str(scratch)})
     assert not scratch.exists() and len(notes) == 1 and str(scratch) in notes[0]
+
+
+on_linux = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="looks processes up in /proc"
+)
+
+#: A process of the person's that has nothing to do with any job: it leads a session of
+#: its own and has a child in it, as a shell with a program running in it does.
+BYSTANDER = (
+    "import subprocess, sys, time\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+    "print(child.pid, flush=True)\n"
+    "time.sleep(300)\n"
+)
+
+
+def job_record(scratch: Path | str, session: int = 0, started: str = "") -> dict:
+    return {"session": session, "session_started": started, "scratch": str(scratch)}
+
+
+@on_linux
+def test_a_record_that_names_a_session_of_the_persons_ends_nothing(job):
+    """run.json and job.json are files of a project directory, and a project can come
+    from somebody else.  When a process was started can be read by anybody in /proc:
+    a record that named a session of the person's with its start used to get the whole
+    session killed as soon as the run was settled."""
+    bystander = subprocess.Popen(
+        [sys.executable, "-c", BYSTANDER], start_new_session=True, stdout=subprocess.PIPE
+    )
+    child = int(bystander.stdout.readline())
+    leftover = job.scratch / "paper-orchestra-job-left"
+    (leftover / "work").mkdir(parents=True)
+    try:
+        started = local._session_started(bystander.pid)
+        assert started, "the start of the session could not be read"
+        # By itself, and next to a working directory that really was left behind.
+        for scratch in ("", leftover):
+            record = job_record(scratch, bystander.pid, started)
+            notes = LocalBackend.end_job({"status": "running", "job": record})
+            assert bystander.poll() is None and alive(child), "a session of the person's ended"
+            assert LocalBackend.job_processes(record) == set()
+        assert not leftover.exists() and len(notes) == 1 and "Removed" in notes[0]
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(bystander.pid, signal.SIGKILL)
+        bystander.wait()
+
+
+def started_job(job: JobDirs, source: Path) -> tuple[subprocess.Popen, int, Path]:
+    """A job under a worker of its own that goes on running: the worker, the process of
+    the job's command, and the job's working directory."""
+    worker = subprocess.Popen(
+        [sys.executable, "-c", KILLED_WORKER, str(source), str(job.run), str(job.scratch)]
+    )
+    log = job.run / "log.txt"
+    deadline = time.monotonic() + 30
+    try:
+        while not (log.exists() and "\n" in log.read_text()):
+            assert time.monotonic() < deadline and worker.poll() is None
+            time.sleep(0.05)
+    except BaseException:
+        worker.kill()
+        worker.wait()
+        raise
+    [scratch] = job.scratch.iterdir()
+    return worker, int(log.read_text().split()[0]), scratch
+
+
+@on_linux
+def test_a_record_that_names_the_working_directory_of_a_running_job_ends_nothing(job):
+    """Working directories are made in the temporary directory, where anybody can list
+    them.  A record that names the one of a job that is running (a planted record, or
+    the record in a copy of a project that was made while its job ran) used to get that
+    job killed and its directory removed."""
+    source = job.source("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(300)\n")
+    worker, command, scratch = started_job(job, source)
+    try:
+        own = json.loads((job.run / "job.json").read_text())
+        assert own["scratch"] == str(scratch) and own["session"] == command
+        for record in (job_record(scratch), own, {"job": own}):
+            notes = LocalBackend.end_job(record)
+            assert worker.poll() is None and alive(command), "a running job was ended"
+            assert (scratch / "work" / "main.py").is_file(), "its working directory was removed"
+            assert len(notes) == 1 and str(scratch) in notes[0]
+            assert "is running" in notes[0] and "Nothing was stopped or removed" in notes[0]
+            assert LocalBackend.job_processes(record) == set()
+    finally:
+        worker.kill()
+        worker.wait()
+    # Once its worker is gone, the same record is what the leftovers are cleaned up by.
+    assert_gone(command)
+    assert LocalBackend.end_job(own) == [
+        f"Removed the working directory {scratch} that the run had left behind."
+    ]
+
+
+#: A job with a child, and a helper that detached from all of them: its parent ended,
+#: so it is nobody's descendant any more.  Prints the two process ids.
+DETACHING_JOB = """
+import subprocess, sys, time
+sleep = [sys.executable, "-c", "import time; time.sleep(300)"]
+child = subprocess.Popen(sleep)
+start = "import subprocess, sys; "
+start += "print(subprocess.Popen(sys.argv[1:], start_new_session=True).pid, flush=True)"
+middle = subprocess.Popen([sys.executable, "-c", start, *sleep], stdout=subprocess.PIPE)
+detached = int(middle.stdout.readline())
+middle.wait()
+print(child.pid, detached, flush=True)
+time.sleep(300)
+"""
+
+#: Stands for a worker of another project: it starts the job given as its last argument
+#: but one, with the mark of the working directory given as its last, and holds no lock.
+OTHER_WORKER = """
+import os, subprocess, sys, time
+job, scratch = sys.argv[-2:]
+command = subprocess.Popen(
+    [sys.executable, "-c", job],
+    env={**os.environ, "PAPER_ORCHESTRA_JOB": scratch},
+    start_new_session=True,
+    stdout=subprocess.PIPE,
+)
+print(command.pid, command.stdout.readline().decode().strip(), flush=True)
+time.sleep(300)
+"""
+
+
+@on_linux
+@pytest.mark.parametrize("spelling", ["module", "script"])
+def test_what_runs_under_a_living_worker_is_that_workers_job_and_is_left_alone(
+    job, tmp_path, spelling
+):
+    """Not every working directory is held by a lock (a file system without locks, a
+    job of an older version).  A job whose processes descend from a living
+    ``paper-orchestra research ...`` process is that worker's, whatever a record says:
+    nothing of it is touched, not even what has detached from the worker."""
+    scratch = job.scratch / "paper-orchestra-job-of-another-project"
+    (scratch / "work").mkdir(parents=True)
+    (scratch / "work" / "checkpoint.bin").write_text("hours of work")
+    if spelling == "module":
+        argv = [sys.executable, "-c", OTHER_WORKER, "-m", "paper_orchestra", "research", "run"]
+    else:
+        script = tmp_path / "bin" / "paper-orchestra"
+        script.parent.mkdir()
+        script.write_text(OTHER_WORKER)
+        argv = [sys.executable, str(script), "research", "advance"]
+    argv += ["another-project", DETACHING_JOB, str(scratch)]
+    worker = subprocess.Popen(argv, stdout=subprocess.PIPE)
+    # The job's command, its child and the helper that detached.
+    pids = [int(pid) for pid in worker.stdout.readline().split()]
+    record = job_record(scratch)
+    try:
+        assert all(alive(pid) for pid in pids), "the scenario needs a running job"
+        notes = LocalBackend.end_job(record)
+        assert all(alive(pid) for pid in pids), "a job of a living worker was ended"
+        assert (scratch / "work" / "checkpoint.bin").read_text() == "hours of work"
+        assert len(notes) == 1 and str(scratch) in notes[0]
+        assert f"process {worker.pid}" in notes[0] and "Nothing was stopped or removed" in notes[0]
+        assert LocalBackend.job_processes(record) == set()
+
+        # The worker dies (kill -9); its job runs on.  Now it is a leftover.
+        worker.kill()
+        worker.wait()
+        assert all(alive(pid) for pid in pids)
+        assert LocalBackend.job_processes(record) == set(pids)
+        notes = LocalBackend.end_job(record)
+        for pid in pids:
+            assert_gone(pid)
+        assert notes[0].startswith("Stopped 3 processes") and not scratch.exists()
+    finally:
+        worker.kill()
+        worker.wait()
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@on_linux
+@pytest.mark.parametrize("spelled_otherwise", ["the record", "the mark"])
+def test_a_job_is_the_same_job_however_its_working_directory_is_spelled(
+    job, tmp_path, spelled_otherwise
+):
+    """A mark names a directory, and so does a record.  A record that led to a working
+    directory by another spelling than the one in the job's mark (through a link that
+    came with the project, or by the other name of a temporary directory that is
+    reached through a link) found none of the job's processes.  So a job under a living
+    worker was not seen to be running, and what a dead worker had left was removed from
+    under its processes, which nothing found again."""
+    scratch = job.scratch / "paper-orchestra-job-spelled"
+    (scratch / "work").mkdir(parents=True)
+    (scratch / "work" / "checkpoint.bin").write_text("hours of work")
+    link = tmp_path / "project" / "tmp"
+    link.parent.mkdir()
+    link.symlink_to(job.scratch, target_is_directory=True)
+    by_link = link / scratch.name
+    named, marked = (by_link, scratch) if spelled_otherwise == "the record" else (scratch, by_link)
+    argv = [sys.executable, "-c", OTHER_WORKER, "-m", "paper_orchestra", "research", "run"]
+    worker = subprocess.Popen(
+        [*argv, "another-project", DETACHING_JOB, str(marked)], stdout=subprocess.PIPE
+    )
+    pids = [int(pid) for pid in worker.stdout.readline().split()]
+    record = job_record(named)
+    try:
+        assert all(alive(pid) for pid in pids), "the scenario needs a running job"
+        notes = LocalBackend.end_job(record)
+        assert all(alive(pid) for pid in pids), "a job of a living worker was ended"
+        assert (scratch / "work" / "checkpoint.bin").read_text() == "hours of work"
+        assert len(notes) == 1 and f"process {worker.pid}" in notes[0]
+        assert LocalBackend.job_processes(record) == set()
+
+        worker.kill()
+        worker.wait()
+        assert LocalBackend.job_processes(record) == set(pids)
+        notes = LocalBackend.end_job(record)
+        for pid in pids:
+            assert_gone(pid)
+        assert notes[0].startswith("Stopped 3 processes") and not scratch.exists()
+    finally:
+        worker.kill()
+        worker.wait()
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_a_mark_names_a_directory_only_by_a_path_that_leads_to_it(tmp_path, monkeypatch):
+    scratch = tmp_path / "paper-orchestra-job-a"
+    scratch.mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / scratch.name).mkdir()
+    (tmp_path / "link").symlink_to(tmp_path, target_is_directory=True)
+    (tmp_path / "paper-orchestra-job-b").symlink_to(scratch, target_is_directory=True)
+
+    def names(mark: str) -> bool:
+        return local._names(os.fsencode(mark), str(scratch))
+
+    assert names(str(scratch)) and names(str(tmp_path / "link" / scratch.name))
+    # Another directory of the same name, a path that leads nowhere, and no path at all.
+    assert not names(str(tmp_path / "other" / scratch.name))
+    assert not names(str(tmp_path / "gone" / scratch.name))
+    assert not names("") and not names(f"{scratch}\0") and not names(f"{scratch}/")
+    # A relative one names something else for everybody who reads it: also for one who
+    # happens to stand where it leads to the directory.
+    monkeypatch.chdir(tmp_path)
+    assert os.path.samefile(scratch.name, scratch) and not names(scratch.name)
+    # Nor a name of its own that leads there: a backend's mark ends in the name it made.
+    assert not names(str(tmp_path / "paper-orchestra-job-b"))
+
+
+#: A process of a job that asks, from a child of its own, what would be ended for the
+#: job's record; it has one more child, which only waits.
+ASKS_ABOUT_ITSELF = """
+import json, subprocess, sys
+waits = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+look = "import json, sys; from paper_orchestra.compute.local import LocalBackend; "
+look += "print(json.dumps(sorted(LocalBackend.job_processes({'scratch': sys.argv[1]}))))"
+asked = subprocess.run([sys.executable, "-c", look, sys.argv[1]], capture_output=True, text=True)
+print(json.dumps({"waits": waits.pid, "found": asked.stdout, "error": asked.stderr}), flush=True)
+waits.kill()
+"""
+
+
+@on_linux
+def test_whoever_asks_is_never_among_the_processes_to_end_nor_what_it_descends_from(job):
+    scratch = job.scratch / "paper-orchestra-job-nested"
+    scratch.mkdir()
+    env = {**os.environ, local.JOB_ENV: str(scratch), "TMPDIR": str(job.scratch)}
+    try:
+        asking = subprocess.run(
+            [sys.executable, "-c", ASKS_ABOUT_ITSELF, str(scratch)],
+            env=env,
+            start_new_session=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        said = json.loads(asking.stdout)
+        assert json.loads(said["found"]) == [said["waits"]], said["error"]
+    finally:
+        scratch.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("command", "is_one"),
+    [
+        (["python", "-P", "-m", "paper_orchestra", "research", "run", "/projects/p"], True),
+        (["/venv/bin/python3", "/venv/bin/paper-orchestra", "research", "advance", "p"], True),
+        (["paper-orchestra", "research", "demo", "p"], True),
+        (["C:\\venv\\Scripts\\paper-orchestra.exe", "research", "cancel", "p", "E1"], True),
+        (["python", "/src/paper_orchestra/__main__.py", "research", "write", "p"], True),
+        (["python", "-m", "paper_orchestra", "ui", "--workspace", "w"], False),
+        (["python", "-m", "paper_orchestra", "run", "--idea", "idea.md"], False),
+        (["python", "-m", "pytest", "tests/test_research_engine.py"], False),
+        (["vim", "src/paper_orchestra/research/experiments.py"], False),
+        (["python", "-c", "import time; time.sleep(300)", "research"], False),
+        (["research"], False),
+        ([], False),
+    ],
+)
+def test_which_command_lines_read_as_a_worker_of_this_package(command, is_one):
+    assert local._reads_as_worker(command) is is_one
+
+
+@on_linux
+def test_only_a_working_directory_that_this_backend_makes_is_cleaned_up(job, tmp_path, monkeypatch):
+    """The path in a record is a string in a file.  What is ended and removed by it is a
+    directory named as this backend names them, directly in the place where it makes
+    them, a real directory, and the person's own."""
+    elsewhere = tmp_path / "elsewhere" / "paper-orchestra-job-abc"
+    nested = job.scratch / "deeper" / "paper-orchestra-job-abc"
+    foreign = job.scratch / "paper-orchestra-job-foreign"
+    for directory in (elsewhere, nested, foreign):
+        (directory / "work").mkdir(parents=True)
+        (directory / "work" / "notes.txt").write_text("kept")
+    # A process that carries the mark of such a directory is not a job's either.
+    marked = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={**os.environ, local.JOB_ENV: str(elsewhere)},
+        start_new_session=True,
+    )
+    try:
+        for directory in (elsewhere, nested):
+            [note] = LocalBackend.end_job(job_record(directory))
+            assert (directory / "work" / "notes.txt").read_text() == "kept"
+            assert str(directory) in note and "Nothing was stopped or removed" in note
+            assert str(job.scratch) in note and "remove it yourself" in note
+            assert LocalBackend.job_processes(job_record(directory)) == set()
+        assert marked.poll() is None
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "geteuid", lambda: os.getuid() + 1)  # as if somebody else's
+            assert LocalBackend.end_job(job_record(foreign)) == []
+        assert (foreign / "work" / "notes.txt").read_text() == "kept"
+        # A spelling that leads to it by another way is not the name it was made under.
+        assert LocalBackend.end_job(job_record(f"{foreign}/")) == []
+        assert LocalBackend.end_job(job_record(f"{foreign}/../{foreign.name}")) == []
+        assert LocalBackend.end_job(job_record(os.path.relpath(foreign))) == []
+        assert (foreign / "work" / "notes.txt").read_text() == "kept"
+
+        # A backend that was told to make its working directories elsewhere knows them.
+        there = LocalBackend(scratch_dir=elsewhere.parent)
+        assert there.job_processes(job_record(elsewhere)) == {marked.pid}
+        notes = there.end_job(job_record(elsewhere))
+        assert marked.wait(timeout=10) == -signal.SIGKILL
+        assert not elsewhere.exists() and notes[0].startswith("Stopped 1 process ")
+    finally:
+        marked.kill()
+        marked.wait()
+        shutil.rmtree(job.scratch / "deeper", ignore_errors=True)
+        shutil.rmtree(foreign, ignore_errors=True)
+
+
+@on_linux
+def test_what_a_leftover_starts_while_the_others_are_ended_is_ended_too(job, monkeypatch):
+    """One look is not enough: what a process started just before it was killed is found
+    by the next look, as it is when a job that runs is ended."""
+    scratch = job.scratch / "paper-orchestra-job-forking"
+    scratch.mkdir()
+    env = {**os.environ, local.JOB_ENV: str(scratch)}
+    sleeper = [sys.executable, "-c", "import time; time.sleep(300)"]
+    first = subprocess.Popen(sleeper, env=env, start_new_session=True)
+    late: list[subprocess.Popen] = []
+    really_kill = local._kill
+
+    def kill(pid: int) -> bool:
+        if not late:  # as if the process had started this one the moment before it died
+            late.append(subprocess.Popen(sleeper, env=env, start_new_session=True))
+        return really_kill(pid)
+
+    monkeypatch.setattr(local, "_kill", kill)
+    try:
+        notes = LocalBackend.end_job(job_record(scratch))
+        assert first.wait(timeout=10) == -signal.SIGKILL
+        assert late[0].wait(timeout=10) == -signal.SIGKILL, "what it started was left running"
+        assert notes[0].startswith("Stopped 2 processes") and not scratch.exists()
+    finally:
+        for process in (first, *late):
+            process.kill()
+            process.wait()
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a working directory is held by a kernel lock")
+def test_a_directory_that_cannot_be_looked_into_is_not_taken_for_one_nobody_uses(job, monkeypatch):
+    """Whether a job is running in a working directory is told by the lock on it.  When
+    the directory could not even be opened to try that lock (this process had no file
+    descriptor left), nothing was known; that was taken for "nobody is there", and the
+    directory was removed."""
+    scratch = job.scratch / "paper-orchestra-job-unknown"
+    (scratch / "work").mkdir(parents=True)
+    record = job_record(scratch)
+    really_open = os.open
+    refused: list[int] = []
+
+    def opening(failure: int, times: int):
+        def open_(path, flags, *args, **kwargs):
+            if os.fspath(path) == str(scratch) and len(refused) < times:
+                refused.append(failure)
+                raise OSError(failure, os.strerror(failure), os.fspath(path))
+            return really_open(path, flags, *args, **kwargs)
+
+        return open_
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", opening(errno.EMFILE, times=100))
+        [note] = LocalBackend.end_job(record)
+        assert LocalBackend.job_processes(record) == set()
+    assert (scratch / "work").is_dir(), "a directory nothing was known about was removed"
+    assert str(scratch) in note and os.strerror(errno.EMFILE) in note
+    assert "Nothing was stopped or removed" in note and "remove it yourself" in note
+
+    # A job that took the access to its own directory away has still left it behind: it
+    # is the person's own directory, and is opened for them again.
+    refused.clear()
+    scratch.chmod(0o000)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", opening(errno.EACCES, times=1))
+        assert LocalBackend.end_job(record) == [
+            f"Removed the working directory {scratch} that the run had left behind."
+        ]
+    assert refused == [errno.EACCES] and not scratch.exists()
+
+    # One that is gone meanwhile is nothing to hold, and nothing to say anything about.
+    assert local.lock_directory(str(scratch)) is None
+    (job.scratch / "paper-orchestra-job-link").symlink_to(job.root, target_is_directory=True)
+    assert local.lock_directory(str(job.scratch / "paper-orchestra-job-link")) is None
+    (job.scratch / "paper-orchestra-job-link").unlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a working directory is held by a kernel lock")
+def test_a_job_runs_also_where_its_working_directory_cannot_be_held(backend, job, monkeypatch):
+    """The lock is there for whoever cleans up later.  A job does not fail for want of it."""
+    really_open = os.open
+
+    def open_(path, flags, *args, **kwargs):
+        if flags & os.O_DIRECTORY and os.path.basename(os.fspath(path)).startswith(
+            local.SCRATCH_PREFIX
+        ):
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), os.fspath(path))
+        return really_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_)
+    result, seen = run_main(backend, job, job.source("print('ran')\n"))
+    assert result.ok and seen == ["ran"], result.error
+
+
+@on_linux
+def test_a_process_that_is_already_being_killed_is_not_one_that_was_stopped(job, monkeypatch):
+    """The command of a job dies with its worker, a moment after it.  Whether it had
+    finished dying when the run was settled used to decide how many processes the run
+    was said to have left running."""
+    # A process on which the kill signal is pending reads like this one, which was
+    # killed and not collected yet; one that runs does not.
+    killed = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    running = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        killed.kill()
+        os.waitid(os.P_PID, killed.pid, os.WEXITED | os.WNOWAIT)
+        assert local._being_killed(killed.pid) and not local._being_killed(running.pid)
+        assert not local._being_killed(os.getpid())
+    finally:
+        for process in (killed, running):
+            process.kill()
+            process.wait()
+    assert not local._being_killed(killed.pid)  # nor one that is gone
+
+    scratch = job.scratch / "paper-orchestra-job-dying"
+    scratch.mkdir()
+    env = {**os.environ, local.JOB_ENV: str(scratch)}
+    sleeper = [sys.executable, "-c", "import time; time.sleep(300)"]
+    dying = subprocess.Popen(sleeper, env=env, start_new_session=True)
+    left = subprocess.Popen(sleeper, env=env, start_new_session=True)
+    signalled: list[int] = []
+
+    def kill(pid: int) -> bool:
+        signalled.append(pid)
+        os.kill(pid, signal.SIGKILL)
+        return True
+
+    really = local._being_killed
+    monkeypatch.setattr(local, "_being_killed", lambda pid: pid == dying.pid or really(pid))
+    monkeypatch.setattr(local, "_kill", kill)
+    monkeypatch.setattr(local, "_REAP_SECONDS", 0.5)
+    try:
+        assert LocalBackend.job_processes(job_record(scratch)) == {left.pid}
+        notes = LocalBackend.end_job(job_record(scratch))
+        assert signalled == [left.pid] and dying.poll() is None
+        assert notes[0].startswith("Stopped 1 process that the run had left running")
+    finally:
+        for process in (dying, left):
+            process.kill()
+            process.wait()
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 COPYING_WORKER = (
@@ -1336,6 +1848,7 @@ COPYING_WORKER = (
 )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="a working directory is held by a kernel lock")
 def test_a_worker_killed_while_the_source_is_copied_leaves_a_record_to_clean_up_by(job):
     """A repository of gigabytes takes a while to copy.  The copy that a worker leaves
     half-made when it is killed is as large as the one of a job that had started, and
@@ -1349,14 +1862,19 @@ def test_a_worker_killed_while_the_source_is_copied_leaves_a_record_to_clean_up_
         while not copying.exists():
             assert time.monotonic() < deadline and worker.poll() is None
             time.sleep(0.05)
+        [scratch] = job.scratch.iterdir()
+        record = json.loads((job.run / "job.json").read_text())
+        # No process of the job exists yet: the record names no session, and says where
+        # the directory is.
+        assert record == {"session": 0, "session_started": "", "scratch": str(scratch)}
+        # While the worker lives, the directory is the one it is copying into, whoever
+        # holds a record that names it: no process says so yet, the backend's lock does.
+        [note] = LocalBackend.end_job(record)
+        assert "A job is running in it now" in note and (scratch / "work").is_dir()
     finally:
         worker.kill()
         worker.wait()
-    [scratch] = job.scratch.iterdir()
 
-    record = json.loads((job.run / "job.json").read_text())
-    # No process of the job exists yet: the record names no session, and says where it is.
-    assert record == {"session": 0, "session_started": "", "scratch": str(scratch)}
     notes = LocalBackend.end_job(record)
     assert not scratch.exists()
     assert notes == [f"Removed the working directory {scratch} that the run had left behind."]
@@ -1499,8 +2017,8 @@ def test_a_credential_the_job_gets_hold_of_does_not_reach_the_log(job):
     assert worker.returncode == 0, worker.stderr + job.log()
     assert job.log().splitlines() == [
         "in my own environment: None",
-        "from the process that started me: ANTHROPIC_API_KEY=***",
-        "ANTHROPIC_API_KEY=***",
+        "from the process that started me: ANTHROPIC_API_KEY=[redacted]",
+        "ANTHROPIC_API_KEY=[redacted]",
         "done",
     ]
     assert worker.stdout.splitlines() == [f"seen: {line}" for line in job.log().splitlines()]

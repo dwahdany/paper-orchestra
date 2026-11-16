@@ -16,23 +16,35 @@ What a job starts is ended with it: its process group, its session and, on
 Linux, every process that still carries the job's mark in its environment
 (``JOB_ENV``), wherever it went, with whatever shares a session with one.  A
 process that left the session *and* dropped its environment cannot be found;
-that is the limit of what is tracked here.  ``job.json`` in the run directory
-records the job's working directory as soon as it exists and the session of its
-command once that is started, so that :meth:`LocalBackend.end_job` can clean up
-after a worker that was killed and could not.
+that is the limit of what is tracked here.
+
+``job.json`` in the run directory records the job's working directory as soon as
+it exists, so that :meth:`LocalBackend.end_job` can clean up after a worker that
+was killed and could not.  That record is a file of a project directory, and a
+project may have come from somebody else, so nothing is done on its word: it
+only says where to look.  A process is the job's by the mark it carries itself,
+a directory by being one that this backend makes, in the place where it makes
+them, and both only once nobody works there any more: the backend holds the
+kernel's lock on a working directory for as long as it uses it, and a job whose
+processes descend from a living ``paper-orchestra research`` process is that
+worker's.
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
+import functools
 import importlib.metadata
 import importlib.util
+import itertools
 import math
 import os
 import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -41,7 +53,12 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NamedTuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 from paper_orchestra.compute.base import (
     JOB_NAME,
@@ -82,6 +99,15 @@ SCRATCH_PREFIX = "paper-orchestra-job-"
 _SWEEPS = 3
 #: Seconds processes that were killed are waited for before their directory is removed.
 _REAP_SECONDS = 3.0
+#: Seconds the lock on a working directory is tried for when somebody holds it.  Whoever
+#: merely looks at a directory holds its lock for an instant; a backend that works in it
+#: holds it for as long as its job takes.
+_BUSY_SECONDS = 1.0
+#: The kill signal in the masks of pending signals that /proc shows.
+_KILL_PENDING = 1 << (signal.SIGKILL - 1)
+#: Why a path cannot be opened as a directory when there is no directory by that name:
+#: nothing there, something else there, or a link.
+_NO_DIRECTORY = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 #: Characters of stdout/stderr kept per stream.  Only the tail is kept, so a job
 #: that prints in a loop cannot exhaust the orchestrator's memory.
 _MAX_CAPTURE = 200_000
@@ -205,52 +231,112 @@ def _stat_fields(pid: int | str) -> list[bytes] | None:
     return fields if len(fields) > 19 else None
 
 
-def _processes() -> Iterator[tuple[int, int]]:
-    """``(pid, session)`` of the processes of this machine that are still alive."""
+class _Process(NamedTuple):
+    """What the process table says of one process."""
+
+    parent: int
+    session: int
+
+
+def _table() -> dict[int, _Process]:
+    """The processes of this machine that are still alive, by their id (read from
+    /proc: empty where there is none)."""
     try:
         entries = [entry.name for entry in os.scandir("/proc") if entry.name.isdigit()]
     except OSError:
-        return
+        return {}
+    table: dict[int, _Process] = {}
     for name in entries:
         fields = _stat_fields(name)
         # A zombie only waits to be collected: there is nothing left of it to end.
         if fields is None or fields[0] == b"Z":
             continue
         with contextlib.suppress(ValueError):
-            yield int(name), int(fields[3])
+            table[int(name)] = _Process(parent=int(fields[1]), session=int(fields[3]))
+    return table
 
 
-def _marked(mark: str) -> set[int]:
-    """The processes whose environment says they belong to the job ``mark``.
+def _marks(pids: Iterable[int]) -> Iterator[tuple[int, bytes]]:
+    """``(pid, mark)`` for those of ``pids`` that carry the mark of a job in their own
+    environment, with the mark as it stands there.
 
     A process inherits its environment whatever group or session it moves to; only
     one that replaced its environment is not found.  Environments of other users'
-    processes cannot be read and are not the job's.
+    processes cannot be read and are not a job's.
     """
-    wanted = f"{JOB_ENV}={mark}".encode()
-    found: set[int] = set()
-    for pid, _ in _processes():
+    variable = os.fsencode(f"{JOB_ENV}=")  # as the environment itself was encoded
+    for pid in pids:
         try:
             with open(f"/proc/{pid}/environ", "rb") as environ:
-                if wanted in environ.read().split(b"\0"):
-                    found.add(pid)
+                entries = environ.read().split(b"\0")
         except OSError:
             continue  # not ours to read, or gone
+        for entry in entries:
+            if entry.startswith(variable):
+                yield pid, entry[len(variable) :]
+
+
+def _marked(mark: str, pids: Iterable[int]) -> set[int]:
+    """Those of ``pids`` whose own environment says they belong to the job ``mark``,
+    letter for letter: for the backend that set the mark itself."""
+    wanted = os.fsencode(mark)
+    found = {pid for pid, value in _marks(pids) if value == wanted}
     found.discard(os.getpid())
     return found
 
 
-def _with_their_sessions(marked: set[int], processes: Iterable[tuple[int, int]]) -> set[int]:
-    """``marked`` and every process of ``processes`` (``(pid, session)``) that shares a
-    session with one of them.
+def _names(mark: bytes, scratch: str) -> bool:
+    """Whether the mark of a process names the working directory ``scratch``, which
+    exists: the same path, or another path to the same directory that ends in the same
+    name (a temporary directory has two spellings where it is reached through a link)."""
+    try:
+        path = os.fsdecode(mark)
+        if path == scratch:
+            return True
+        elsewhere = os.path.isabs(path) and os.path.basename(path) == os.path.basename(scratch)
+        return elsewhere and os.path.samefile(path, scratch)
+    except (OSError, ValueError):  # it leads nowhere, or is no name a file can have
+        return False
+
+
+def _marked_for(scratch: str, pids: Iterable[int]) -> set[int]:
+    """Those of ``pids`` whose mark names the working directory ``scratch``, however it
+    is spelled.  For whoever cleans up by a record: the record's spelling of the
+    directory is a string in a file, and need not be the one its job was given."""
+    return {pid for pid, value in _marks(pids) if _names(value, scratch)}
+
+
+def _with_their_sessions(marked: set[int], table: Mapping[int, _Process]) -> set[int]:
+    """``marked`` and every process of ``table`` that shares a session with one of them.
 
     A process cannot join a session, only start one.  So whatever is in a session with
     a process of the job was started by the job, whether or not it still carries the
     mark: the job's own session, and any session something of the job went on to start.
     """
-    processes = list(processes)
-    sessions = {session for pid, session in processes if pid in marked and session > 1}
-    return marked | {pid for pid, session in processes if session in sessions}
+    sessions = {table[pid].session for pid in marked if pid in table} - {0, 1}
+    return marked | {pid for pid, process in table.items() if process.session in sessions}
+
+
+def _being_killed(pid: int) -> bool:
+    """Whether the kill signal is already pending on the process ``pid``.
+
+    That signal cannot be held back: such a process is ending, and nothing is left of
+    it to end.  The command of a job is in this state for a moment after its worker
+    died (the kernel sends it the signal), and so is whatever was just killed here.
+    ``False`` for a process that is gone, or where /proc does not say.
+    """
+    try:
+        with open(f"/proc/{pid}/status", "rb") as status:
+            lines = status.read().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        name, _, pending = line.partition(b":")
+        if name in (b"SigPnd", b"ShdPnd"):
+            with contextlib.suppress(ValueError):
+                if int(pending, 16) & _KILL_PENDING:
+                    return True
+    return False
 
 
 def _kill(pid: int) -> bool:
@@ -292,11 +378,13 @@ def _kill_job(process: subprocess.Popen[bytes], mark: str = "") -> set[int]:
     if not _on_linux():
         return strays
     for _ in range(_SWEEPS):
-        processes = list(_processes())
-        found = _with_their_sessions(_marked(mark), processes) if mark else set()
+        table = _table()
+        found = _with_their_sessions(_marked(mark, table), table) if mark else set()
         killed = False
-        for pid, session in processes:
-            inside = session == process.pid
+        for pid, entry in table.items():
+            inside = entry.session == process.pid
+            # Also what is dying already: while something of the job is there, something
+            # may have been started that the next look finds.
             if (inside or pid in found) and pid != os.getpid() and _kill(pid):
                 killed = True
                 if not inside:
@@ -306,24 +394,294 @@ def _kill_job(process: subprocess.Popen[bytes], mark: str = "") -> set[int]:
     return strays
 
 
-def _left_behind(session: int, started: str, scratch: str) -> set[int]:
-    """The processes that still run of a job whose worker died, from its record.
+# -- cleaning up after a worker that died ------------------------------------------------
+#
+# The record of a job (job.json, or its copy in run.json) is a file in a project
+# directory.  Nothing below acts on its word: it names a path, and what is done with
+# that path is decided by what this machine shows.
 
-    Processes that carry the job's mark are the job's wherever they are, and so is
-    what shares a session with one of them.  The processes of the session on record
-    are the job's as well if it is still that session: its leader is the process that
-    was started at ``started``.  With the leader gone, the session is only known to be
-    the job's through a process in it that carries the mark (the number of a session
-    is not given out again while a process of it lives); one that cannot be told to be
-    the job's is left alone, since its number may have gone to somebody else's
-    processes since.
-    """
-    processes = list(_processes())
-    found = _with_their_sessions(_marked(scratch), processes) if scratch else set()
-    if session > 1 and started and _session_started(session) == started:
-        found |= {pid for pid, of in processes if of == session}
-    found.discard(os.getpid())
+
+def _is_command(argument: str) -> bool:
+    """Whether a command-line argument is this package's command, as a script."""
+    name = argument.replace("\\", "/")
+    if os.path.basename(name).lower() in (
+        "paper-orchestra",
+        "paper-orchestra.exe",
+        "paper-orchestra-script.py",
+    ):
+        return True
+    return name.endswith("paper_orchestra/__main__.py")
+
+
+def _reads_as_worker(command: Sequence[str]) -> bool:
+    """Whether ``command`` is the command line of a worker of this package:
+    ``... -m paper_orchestra research ...``, or the ``paper-orchestra`` command with
+    ``research``.  Those are the processes that run the experiments of a project."""
+    for index in range(1, len(command)):
+        if command[index] != "research":
+            continue
+        before = command[:index]
+        as_module = any(
+            option == "-m" and module.split(".")[0] == "paper_orchestra"
+            for option, module in itertools.pairwise(before)
+        )
+        if as_module or any(_is_command(argument) for argument in before):
+            return True
+    return False
+
+
+def _is_worker(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as cmdline:
+            parts = cmdline.read().split(b"\0")
+    except OSError:
+        return False
+    return _reads_as_worker([part.decode("utf-8", "surrogateescape") for part in parts])
+
+
+def _lineage(pid: int, table: Mapping[int, _Process]) -> list[int]:
+    """The living processes ``pid`` descends from, nearest first."""
+    found: list[int] = []
+    while pid in table and table[pid].parent not in (0, pid, *found):
+        pid = table[pid].parent
+        if pid in table:
+            found.append(pid)
     return found
+
+
+def _living_worker(pids: Iterable[int], table: Mapping[int, _Process]) -> int:
+    """The id of a living worker of this package that one of ``pids`` descends from,
+    or ``0``.  The caller is not looked at, nor what it descends from itself: a job
+    below the caller is the caller's own to end."""
+    me = os.getpid()
+    judged: dict[int, bool] = {}
+    for pid in pids:
+        for ancestor in _lineage(pid, table):
+            if ancestor == me:
+                break
+            if ancestor not in judged:
+                judged[ancestor] = _is_worker(ancestor)
+            if judged[ancestor]:
+                return ancestor
+    return 0
+
+
+class _Found(NamedTuple):
+    """What is running of a job, as its mark shows it."""
+
+    #: The processes of the job that would have to be ended.
+    processes: set[int]
+    #: Those that are being killed already and only have to be waited for.
+    dying: set[int]
+    #: A living worker that some of them descend from (``0``: none): its job, not ours.
+    worker: int
+
+
+def _find(scratch: str) -> _Found:
+    """The processes of the job whose working directory is ``scratch`` (it exists):
+    those whose mark names that directory, by whatever spelling, and what shares a
+    session with one.  Never the caller or a process it descends from.  Linux only;
+    nothing elsewhere."""
+    if not _on_linux():
+        return _Found(set(), set(), 0)
+    table = _table()
+    mine = {os.getpid(), *_lineage(os.getpid(), table)}
+    found = _with_their_sessions(_marked_for(scratch, table), table) - mine
+    dying = {pid for pid in found if _being_killed(pid)}
+    return _Found(found - dying, dying, _living_worker(found, table))
+
+
+class DirectoryInUse(Exception):
+    """Somebody holds the lock on a working directory: a backend is at work in it."""
+
+
+def is_own_directory(path: str) -> bool:
+    """Whether ``path`` is a real directory (not a link to one) that this user owns."""
+    try:
+        status = os.lstat(path)
+    except (OSError, ValueError):  # no such thing, or no name a file can have
+        return False
+    mine = not hasattr(os, "geteuid") or status.st_uid == os.geteuid()
+    return stat.S_ISDIR(status.st_mode) and mine
+
+
+def lock_directory(path: str, *, shared: bool = False, patience: float = 0.0) -> int | None:
+    """Take the kernel's lock on the directory ``path`` and return the descriptor that
+    holds it; closing the descriptor gives the lock back, and the kernel does that for
+    a process that dies, however it dies.
+
+    A backend holds this lock on the working directory of a job for as long as it uses
+    it.  That is what tells a directory nobody works in any more from one that is in
+    use: a file cannot say it, and a lock cannot be planted.  ``shared`` is for a mere
+    look, so that two who look at once do not see each other.  Raises :class:`DirectoryInUse`
+    when somebody else still holds it after ``patience`` seconds.  ``None`` where there
+    is nothing to hold or no way of holding it: no such directory (any more), or no
+    such locks on this system or file system.  A directory that is there and cannot be
+    opened raises the :class:`OSError`: whether somebody holds it is then not known,
+    which is not the same as nobody holding it.
+    """
+    if fcntl is None:  # pragma: no cover - Windows
+        return None
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in _NO_DIRECTORY:
+            return None
+        raise
+    deadline = time.monotonic() + patience
+    while True:
+        try:
+            fcntl.flock(descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(descriptor)
+                raise DirectoryInUse(path) from None
+            time.sleep(0.02)
+        except OSError:
+            os.close(descriptor)
+            return None
+
+
+@contextlib.contextmanager
+def holding(directory: str) -> Iterator[None]:
+    """Hold the lock on a job's working directory while a backend works in it (see
+    :func:`lock_directory`)."""
+    try:
+        descriptor = lock_directory(directory, patience=_BUSY_SECONDS)
+    except (DirectoryInUse, OSError):
+        # Somebody keeps looking at it, or it cannot be opened: the job runs without the
+        # lock, as it does where there are no such locks.
+        descriptor = None
+    try:
+        yield
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _shown(path: str, limit: int = 300) -> str:
+    """A path out of a record, for a note: on one line and not endless."""
+    text = "".join(char if char.isprintable() else "?" for char in path)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _made_by_backend(scratch: str) -> bool:
+    """Whether ``scratch`` is, by its name and by what is there, a working directory as
+    this backend makes them: an absolute path spelled as the backend spells it, with
+    the backend's prefix, to a real directory (not a link to one) of this user's."""
+    plain = bool(scratch) and "\0" not in scratch and os.path.isabs(scratch)
+    if not plain or os.path.normpath(scratch) != scratch:
+        return False
+    return os.path.basename(scratch).startswith(SCRATCH_PREFIX) and is_own_directory(scratch)
+
+
+def _scratch_roots(scratch_dir: Path | None) -> list[str]:
+    """Where working directories are made: the directory a backend was told to use,
+    and the system's temporary directory (as they really are, links resolved)."""
+    places = [str(scratch_dir)] if scratch_dir is not None else []
+    with contextlib.suppress(OSError):
+        places.append(tempfile.gettempdir())
+    return list(dict.fromkeys(os.path.realpath(place) for place in places))
+
+
+def _held(scratch: str, *, to_end: bool) -> int | None:
+    """The lock on the working directory ``scratch`` for whoever examines it, as
+    :func:`lock_directory` gives it: shared for a look, and tried for a moment when
+    the directory is to be cleaned up."""
+    patience = _BUSY_SECONDS if to_end else 0.0
+    try:
+        return lock_directory(scratch, shared=not to_end, patience=patience)
+    except PermissionError:
+        # Its job took the access to it away.  It is the user's own directory (the caller
+        # saw to that), and gets the access again that it was made with.
+        os.chmod(scratch, 0o700)
+        return lock_directory(scratch, shared=not to_end, patience=patience)
+
+
+class _Leftover:
+    """What a job record names, as far as this machine bears it out."""
+
+    def __init__(self) -> None:
+        #: The job's working directory, when it is this backend's and nobody's any more.
+        self.scratch = ""
+        #: What still runs of the job and would be ended, and what is ending already.
+        self.processes: set[int] = set()
+        self.dying: set[int] = set()
+        #: Why nothing is to be ended or removed although the directory exists.
+        self.reason = ""
+
+
+@contextlib.contextmanager
+def _examined(record: Any, roots: Sequence[str], *, to_end: bool) -> Iterator[_Leftover]:
+    """Look at what the job record ``record`` names.  The lock on the working directory
+    is held while the caller works with the answer (shared, unless ``to_end``)."""
+    scratch = _job_fields(record)[2]
+    left = _Leftover()
+    if not _made_by_backend(scratch):
+        yield left  # nothing of this backend's is named, or nothing is left of it
+        return
+    named = f"The run's record names the working directory {_shown(scratch)}."
+    if os.path.realpath(os.path.dirname(scratch)) not in roots:
+        left.reason = (
+            f"{named} The local backend makes its working directories directly in "
+            f"{' or '.join(roots) or 'the temporary directory'}, and cleans up only there. "
+            "Nothing was stopped or removed. If that directory is what the run left behind "
+            "(a run that was made with another TMPDIR or scratch directory), remove it yourself."
+        )
+        yield left
+        return
+    try:
+        descriptor = _held(scratch, to_end=to_end)
+    except DirectoryInUse:
+        left.reason = (
+            f"{named} A job is running in it now (its backend holds the directory), so it "
+            "is not what this run left behind. Nothing was stopped or removed."
+        )
+        yield left
+        return
+    except OSError as exc:
+        left.reason = (
+            f"{named} Whether a job is running in it could not be found out: the directory "
+            f"could not be opened ({exc.strerror or type(exc).__name__}). Nothing was stopped "
+            "or removed. If that directory is what the run left behind, remove it yourself."
+        )
+        yield left
+        return
+    try:
+        found = _find(scratch)
+        if found.worker:
+            left.reason = (
+                f"{named} The job in it is running under another worker (process "
+                f"{found.worker}), so it is not what this run left behind. Nothing was "
+                "stopped or removed."
+            )
+        else:
+            left.scratch, left.processes, left.dying = scratch, found.processes, found.dying
+        yield left
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _end_processes(left: _Leftover) -> int:
+    """Kill what still runs of the job ``left`` describes, wait for it to be gone, and
+    return how many processes were killed.  Looked up more than once: what forks while
+    the others are killed is found the next time."""
+    killed: set[int] = set()
+    waiting = set(left.dying)
+    targets = left.processes
+    for _ in range(_SWEEPS):
+        hit = {pid for pid in targets if _kill(pid)}
+        if not hit:
+            break
+        killed |= hit
+        found = _find(left.scratch)
+        waiting |= found.dying
+        targets = found.processes
+    _wait_gone(killed | waiting, _REAP_SECONDS)
+    return len(killed)
 
 
 def _job_record(scratch: str, session: int = 0) -> dict[str, Any]:
@@ -352,13 +710,12 @@ def _wait_gone(pids: Iterable[int], seconds: float) -> None:
     deadline = time.monotonic() + seconds
     waiting = set(pids)
     while waiting and time.monotonic() < deadline:
-        alive = {pid for pid, _ in _processes()}
-        waiting &= alive
+        waiting &= _table().keys()
         if waiting:
             time.sleep(0.05)
 
 
-def _remove_tree(path: Path) -> bool:
+def remove_tree(path: Path) -> bool:
     """Remove the directory ``path`` and everything in it, also what a job made
     unreadable; returns whether it is gone.  Links are removed, never followed."""
     stack = [str(path)]
@@ -563,6 +920,18 @@ def missing_packages(requirements: Iterable[str]) -> list[str]:
     return missing
 
 
+class _on_class_or_instance:
+    """Makes a method one that can be called on the class as well as on an instance:
+    the function is given the instance it was called on, or ``None``."""
+
+    def __init__(self, function: Callable[..., Any]) -> None:
+        self._function = function
+        functools.update_wrapper(self, function)
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Callable[..., Any]:
+        return functools.partial(self._function, instance)
+
+
 class LocalBackend(ComputeBackend):
     name = "local"
 
@@ -763,15 +1132,20 @@ class LocalBackend(ComputeBackend):
             try:
                 if self.scratch_dir is not None:
                     self.scratch_dir.mkdir(parents=True, exist_ok=True)
+                # Spelled out in full: the path is the job's mark and goes on record, and
+                # whoever cleans up after it compares both with what is on this machine.
+                where = os.path.abspath(self.scratch_dir) if self.scratch_dir is not None else None
                 scratch = tempfile.TemporaryDirectory(
-                    prefix=SCRATCH_PREFIX, dir=self.scratch_dir, ignore_cleanup_errors=True
+                    prefix=SCRATCH_PREFIX, dir=where, ignore_cleanup_errors=True
                 )
             except OSError as exc:
                 result.error = f"The local backend could not make a working directory: {exc}."
                 log.note(result.error)
                 return result
             try:
-                with scratch as name:
+                # Held until the directory is gone again: nobody who finds its name in a
+                # record takes it for a leftover while this backend works in it.
+                with holding(scratch.name), scratch as name:
                     work, home = Path(name, "work"), Path(name, "home")
                     home.mkdir()
                     # From here on a worker that is killed leaves this directory behind:
@@ -818,47 +1192,76 @@ class LocalBackend(ComputeBackend):
             )
         return caveats
 
-    @staticmethod
-    def end_job(record: Mapping[str, Any]) -> list[str]:
+    @_on_class_or_instance
+    def job_processes(self: LocalBackend | None, record: Any) -> set[int]:
+        """The processes that :meth:`end_job` would end for the job record ``record``.
+
+        Empty unless the record names a working directory that this backend makes
+        (see :meth:`end_job`), that no backend holds any more, and whose processes
+        descend from no living worker.  Linux only; empty elsewhere.  Callable on
+        the class, or on a backend that was told where to make its working
+        directories.
+        """
+        roots = _scratch_roots(self.scratch_dir if self is not None else None)
+        with _examined(record, roots, to_end=False) as left:
+            return set(left.processes)
+
+    @_on_class_or_instance
+    def end_job(self: LocalBackend | None, record: Any) -> list[str]:
         """Clean up after a local job whose worker died before it could, and return
         notes on what was done.
 
-        ``record`` is what the job wrote to ``job.json`` in its run directory
-        (``session``, ``session_started``, ``scratch``; the session is ``0`` in a
-        record from before the command was started), or a record that holds it under
-        ``"job"``.  The processes the job left running are killed: those that carry its
-        mark with what shares a session with them, and those of the session on record
-        if it is still that session (see :func:`_left_behind`; Linux only).  Then its
-        working directory is removed, if it is one that this backend made.  Nothing is
-        done, and nothing returned, for a record that names neither; calling this
-        twice is safe.
+        ``record`` is what the job wrote to ``job.json`` in its run directory, or a
+        record that holds it under ``"job"``.  It lies in a project directory, where
+        anybody may have put it, so only its ``scratch`` is read, as the place to
+        look, and nothing is done on its word:
+
+        * The directory must be one this backend makes: named with its prefix,
+          directly in the system's temporary directory or in the directory this
+          backend was told to use, a real directory and not a link, and the user's
+          own.  Otherwise nothing is ended or removed.
+        * Nothing is touched while the job may be running: a backend holds the lock
+          on the directory (or the directory cannot be opened to see whether one
+          does), or processes of the job descend from a living
+          ``paper-orchestra research`` process other than the caller.
+        * The processes that are ended are those whose mark, in their own
+          environment, names the directory (however the record or the mark spell
+          the way to it), with what shares a session with one of them (Linux only).
+          No session is ended because the record names it.
+
+        Then the directory is removed.  The notes say what was done, or why a
+        directory that exists was left alone.  Nothing is done, and nothing returned,
+        for a record that names no such directory; calling this twice is safe.  Call
+        it on the class, or on a backend that was told where to make its working
+        directories (``scratch_dir``), which then knows that place as well.
         """
-        session, started, scratch = _job_fields(record)
-        path = Path(scratch)
-        left = bool(scratch) and path.name.startswith(SCRATCH_PREFIX) and not path.is_symlink()
-        left = left and path.is_dir()
-        notes: list[str] = []
-        if _on_linux():
-            killed = {pid for pid in _left_behind(session, started, scratch) if _kill(pid)}
-            if killed:
-                _wait_gone(killed, _REAP_SECONDS)
+        roots = _scratch_roots(self.scratch_dir if self is not None else None)
+        with _examined(record, roots, to_end=True) as left:
+            if not left.scratch:
+                return [left.reason] if left.reason else []
+            notes: list[str] = []
+            if _on_linux():
+                killed = _end_processes(left)
+                if killed:
+                    notes.append(
+                        f"Stopped {killed} process{'es' if killed > 1 else ''} that the "
+                        "run had left running on this machine when its worker stopped."
+                    )
+            elif _job_fields(record)[0] > 1:
                 notes.append(
-                    f"Stopped {len(killed)} process{'es' if len(killed) > 1 else ''} that the "
-                    "run had left running on this machine when its worker stopped."
+                    "Whether processes of the run are still running could not be checked on "
+                    "this system (they are found through /proc, on Linux). Look for them "
+                    "yourself."
                 )
-        elif left and session > 1:
-            notes.append(
-                "Whether processes of the run are still running could not be checked on "
-                "this system (they are found through /proc, on Linux). Look for them yourself."
-            )
-        if left and _remove_tree(path):
-            notes.append(f"Removed the working directory {path} that the run had left behind.")
-        elif left:
-            notes.append(
-                f"The working directory {path} that the run left behind could not be "
-                "removed. Remove it yourself."
-            )
-        return notes
+            path = Path(left.scratch)
+            if remove_tree(path):
+                notes.append(f"Removed the working directory {path} that the run had left behind.")
+            else:
+                notes.append(
+                    f"The working directory {path} that the run left behind could not be "
+                    "removed. Remove it yourself."
+                )
+            return notes
 
     def _execute(
         self,

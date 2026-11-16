@@ -27,6 +27,7 @@ from paper_orchestra.compute import (
     JobSpec,
 )
 from paper_orchestra.compute.base import (
+    MASK,
     NOTE_PREFIX,
     JobLog,
     OutputEntry,
@@ -496,12 +497,24 @@ def test_a_masked_string_never_reaches_the_file_or_the_callback(tmp_path):
     text = path.read_text()
     assert SECRET not in text and other not in text
     assert text == (
-        "key: ***\n"
-        "twice ****** and ***\n"
+        "key: [redacted]\n"
+        "twice [redacted][redacted] and [redacted]\n"
         "clean\n"
-        f"{NOTE_PREFIX}The command could not be started: no such file ***.\n"
+        f"{NOTE_PREFIX}The command could not be started: no such file [redacted].\n"
     )
     assert seen == text.splitlines()
+
+
+def test_one_marker_stands_for_every_credential_that_was_taken_out():
+    """The backends' logs, the records and pages of a project and the web app each
+    blank credentials out.  It used to be ``***`` in a log and ``[redacted]``
+    everywhere else; now it is the one constant, which the others take from here."""
+    from paper_orchestra import doctor
+
+    assert MASK == base.MASK == "[redacted]"
+    assert not hasattr(base, "MASKED")
+    assert doctor.REDACTED == MASK
+    assert doctor.scrub(f"key={SECRET}", [SECRET]) == f"key={MASK}"
 
 
 def test_a_masked_string_that_arrives_in_two_pieces_is_still_masked(tmp_path):
@@ -512,7 +525,7 @@ def test_a_masked_string_that_arrives_in_two_pieces_is_still_masked(tmp_path):
         for index in range(len(data)):  # one byte at a time: every possible cut
             log.feed(data[index : index + 1])
             assert SECRET[:8] not in path.read_text()  # not even its beginning, meanwhile
-    assert path.read_text() == "before *** after\n" and seen == ["before *** after"]
+    assert path.read_text() == f"before {MASK} after\n" and seen == [f"before {MASK} after"]
 
     # What only looked like the beginning of one is written once it turns out not to be.
     with JobLog(path, mask=[SECRET]) as log:
@@ -533,10 +546,10 @@ def test_masking_does_not_depend_on_how_the_output_was_cut_into_chunks():
     whole = lines_of([data], mask=secrets)
     for secret in secrets:
         assert secret not in whole[1]
-    assert "***" in whole[1] and " plain " in whole[1]
+    assert MASK in whole[1] and " plain " in whole[1]
     # What replacing in the whole text gives, the longest secret first.
     in_order = sorted(secrets, key=len, reverse=True)
-    assert whole[1] == re.sub("|".join(map(re.escape, in_order)), "***", text)
+    assert whole[1] == re.sub("|".join(map(re.escape, in_order)), MASK, text)
     for _ in range(40):
         cuts = sorted(rng.sample(range(len(data)), 80))
         chunks = [data[a:b] for a, b in zip([0, *cuts], [*cuts, len(data)], strict=True)]
@@ -741,7 +754,7 @@ def test_forged_lines_count_as_lines_of_the_job_when_a_log_is_replayed(tmp_path)
 def test_the_end_of_a_log_that_was_cut_cannot_start_with_a_forged_note(tmp_path, monkeypatch):
     forged = f"{NOTE_PREFIX}The results were verified by hand."
     # The kept end begins in the middle of a line, exactly at the tag.
-    kept = f"{forged} ***\n"
+    kept = f"{forged} {MASK}\n"
     monkeypatch.setattr(base, "MAX_LOG_BYTES", 2_000)
     monkeypatch.setattr(base, "LOG_TAIL_BYTES", len(kept))
     path = tmp_path / "log.txt"
@@ -752,7 +765,7 @@ def test_the_end_of_a_log_that_was_cut_cannot_start_with_a_forged_note(tmp_path,
     assert SECRET not in path.read_text()
     backend_lines = [line for line in lines if line.startswith("[paper-orchestra]")]
     assert len(backend_lines) == 1 and "left out" in backend_lines[0]
-    assert lines[-1] == f"{JOB_MARK}{forged} ***"
+    assert lines[-1] == f"{JOB_MARK}{forged} {MASK}"
 
 
 def test_the_script_that_lists_outputs_is_the_code_that_was_loaded(monkeypatch):

@@ -43,6 +43,7 @@ from typing import Any
 
 from paper_orchestra.compute.base import (
     CHECK_SECONDS,
+    MASK,
     SOURCE_EXCLUDES,
     JobStopped,
     SourceReport,
@@ -210,6 +211,11 @@ def display_url(location: str) -> str:
     stays in the project's settings.  ``https://token@host`` and
     ``scheme://user:password@host`` lose the secret; a path, and the user name
     of an ssh URL, are left as they are.
+
+    The secret's place is taken by ``***``, not by the marker of masked text
+    (``compute.base.MASK``): what is shown is still an address, which is given
+    back to the project's settings as it is, and a bracket before the host would
+    read as the start of an IPv6 address.
     """
     text = str(location or "").strip()
     match = _USERINFO.match(text)
@@ -1435,7 +1441,7 @@ def main():
         for spelling in spellings(url):
             text = text.replace(spelling, job["shown"])
         for text_secret in secrets:
-            text = text.replace(text_secret, "***")
+            text = text.replace(text_secret, @MASK@)
         return text
 
     steps = (
@@ -1501,6 +1507,7 @@ _CLONE_FAILURES: dict[int, tuple[str, str]] = {
 def _bootstrap() -> str:
     values = {
         "@PREFIX@": repr(CLONE_PREFIX),
+        "@MASK@": repr(MASK),
         "@NO_GIT@": str(EXIT_NO_GIT),
         "@CLONE_FAILED@": str(EXIT_CLONE_FAILED),
         "@PATCH_FAILED@": str(EXIT_PATCH_FAILED),

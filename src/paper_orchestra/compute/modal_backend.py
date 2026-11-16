@@ -88,7 +88,14 @@ from paper_orchestra.compute.base import (
     walk_source,
     write_record,
 )
-from paper_orchestra.compute.local import LocalBackend
+from paper_orchestra.compute.local import (
+    DirectoryInUse,
+    LocalBackend,
+    holding,
+    is_own_directory,
+    lock_directory,
+    remove_tree,
+)
 from paper_orchestra.utils.latex import latex_commands, summarize_build
 
 if TYPE_CHECKING:
@@ -194,6 +201,27 @@ _JOB_STATUS = "status"
 #: job, the download after it, and the time a restarted orchestrator has to fetch the
 #: outputs of a job that ended while nobody was attached.
 _JOB_MARGIN = 900
+#: How the directories are named that a job's packed source and fetched outputs pass
+#: through on this machine.  Not as the local backend names the working directories of
+#: its jobs: its clean-up after a dead worker goes by a record, and must never be
+#: pointed at one of these.
+_SCRATCH_PREFIX = "paper-orchestra-modal-"
+#: Seconds such a directory is left alone after it was last written to.  A backend locks
+#: its directory within an instant of making it; one that is older than this and that
+#: nobody holds was left behind by a worker that died.
+_SCRATCH_SETTLE_SECONDS = 60.0
+#: What a sandbox that runs an experiment's job is started for (see ``_start``).
+_A_JOB = "the job"
+#: What a person can do when Modal is not usable and it is an experiment that needed it:
+#: the paper pipeline's way out (``--compute local``) is not an option of an experiment.
+_OR_LOCAL = (
+    "An experiment that needs no GPU can also run on this machine: approve it for the "
+    "local backend (`--backend local`; in the app, choose the local backend)."
+)
+_STARTED_AGAIN = f"then run the experiment again. {_OR_LOCAL}"
+_PICKED_UP_AGAIN = (
+    "then run the experiment again: its job on Modal is picked up where it is by then."
+)
 #: Bytes of source a job may bring along.  Beyond that the job is refused, not trimmed:
 #: leaving files out would change what it computes.
 _MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
@@ -424,6 +452,55 @@ def pack_source(
                     )
             tar.add(path, arcname=f"src/{relative}", recursive=False, filter=_anonymous)
     return [*report.notes(), *leftover_notes(leftovers)]
+
+
+def sweep_scratch() -> list[str]:
+    """Remove the directories that jobs of this backend left in the temporary directory
+    when their worker was killed (the packed source of a job, up to a gigabyte, of which
+    no record tells), and return the ones removed.
+
+    Only what is provably nobody's any more: a real directory of this user's, named as
+    this backend names them, not written to for a while, and whose lock can be taken.
+    The backend of a job that runs holds that lock; where it cannot be told (a file
+    system without such locks), everything is left as it is.
+    """
+    try:
+        root = tempfile.gettempdir()
+        names = [e.name for e in os.scandir(root) if e.name.startswith(_SCRATCH_PREFIX)]
+    except OSError:
+        return []
+    removed: list[str] = []
+    for name in names:
+        path = os.path.join(root, name)
+        try:
+            settled = time.time() - os.lstat(path).st_mtime >= _SCRATCH_SETTLE_SECONDS
+        except OSError:
+            continue
+        if not settled or not is_own_directory(path):
+            continue
+        try:
+            descriptor = lock_directory(path)
+        except (DirectoryInUse, OSError):  # held, or not to be opened: not known to be free
+            continue
+        if descriptor is None:
+            continue
+        try:
+            if remove_tree(Path(path)):
+                removed.append(path)
+        finally:
+            os.close(descriptor)
+    if removed:
+        log.info("Removed what earlier Modal jobs left behind here: %s", ", ".join(removed))
+    return removed
+
+
+@contextlib.contextmanager
+def _scratch() -> Iterator[Path]:
+    """A directory of this machine for what passes between it and a job's sandbox, held
+    (see :func:`sweep_scratch`) until it has been removed again."""
+    scratch = tempfile.TemporaryDirectory(prefix=_SCRATCH_PREFIX)
+    with holding(scratch.name), scratch as name:
+        yield Path(name)
 
 
 def unpack_outputs(archive: Path, chosen: Mapping[str, int], run_dir: Path) -> list[str]:
@@ -934,6 +1011,8 @@ class ModalBackend(ComputeBackend):
         log_path = open_run(run_dir, spec.outputs)
         result = JobResult(returncode=None, backend=self.name, log_path=log_path)
         result.outputs_dir = run_dir
+        # A worker that was killed while it packed or uploaded a source removed nothing.
+        sweep_scratch()
         with JobLog(log_path, on_log, mask=mask) as job_log:
             reasons = self.supports(spec)
             if not reasons and not source.is_dir():
@@ -943,10 +1022,8 @@ class ModalBackend(ComputeBackend):
                 job_log.note(result.error)
                 return result
             try:
-                with tempfile.TemporaryDirectory(prefix="paper-orchestra-job-") as scratch:
-                    self._run_job(
-                        spec, source, run_dir, Path(scratch), job_log, should_stop, result
-                    )
+                with _scratch() as scratch:
+                    self._run_job(spec, source, run_dir, scratch, job_log, should_stop, result)
             except BackendUnusable:
                 raise
             except (ComputeError, _SandboxLost, OSError, *self._transport_errors) as exc:
@@ -996,6 +1073,9 @@ class ModalBackend(ComputeBackend):
             raise ComputeError(
                 f"The run directory {run_dir} cannot be used: {exc}. Check that it can be written."
             ) from exc
+        # This is where a worker comes after one that died: what that one left in the
+        # temporary directory goes now.
+        sweep_scratch()
         # A job that this backend would not have started is not picked up as one either.
         problems = self.supports(spec) if spec is not None else []
         job = self._job_on_record(run_dir, None if problems else spec, started)
@@ -1014,7 +1094,7 @@ class ModalBackend(ComputeBackend):
         skip = delivered_lines(log_path)
         with JobLog(log_path, on_log, skip_lines=skip, mask=mask) as job_log:
             try:
-                with tempfile.TemporaryDirectory(prefix="paper-orchestra-job-") as scratch:
+                with _scratch() as scratch:
                     self._adopt(sandbox)
                     try:
                         # When the command was started is not known here; the run began
@@ -1024,7 +1104,7 @@ class ModalBackend(ComputeBackend):
                             sandbox,
                             job,
                             run_dir,
-                            Path(scratch),
+                            scratch,
                             job_log,
                             should_stop,
                             result,
@@ -1268,7 +1348,7 @@ class ModalBackend(ComputeBackend):
             image = image.uv_pip_install(*spec.packages)
         options: dict[str, Any] = {"gpu": spec.gpu} if spec.gpu else {}
         return self._start(
-            "the job",
+            _A_JOB,
             image=image,
             timeout=_seconds(job.timeout + _JOB_MARGIN),
             idle_timeout=_seconds(self.idle_timeout),
@@ -1502,7 +1582,7 @@ class ModalBackend(ComputeBackend):
         try:
             sandbox = modal.Sandbox.from_id(handle)
         except modal.exception.AuthError as exc:
-            raise self._unauthenticated() from exc
+            raise self._unauthenticated(_PICKED_UP_AGAIN) from exc
         except modal.exception.NotFoundError as exc:
             raise _JobGone(
                 f"Modal has no sandbox {handle}, so the job and its outputs cannot be "
@@ -1693,17 +1773,26 @@ class ModalBackend(ComputeBackend):
         except modal.exception.AuthError as exc:
             # check() only sees whether a token is configured; one that Modal turns down
             # shows here.  It is turned down on every attempt, so the run should stop.
-            raise self._unauthenticated() from exc
+            raise self._unauthenticated(_STARTED_AGAIN if what == _A_JOB else "") from exc
         except self._transport_errors as exc:
             raise ComputeError(
                 f"could not start a Modal sandbox for {what}: {type(exc).__name__}: {exc}"
             ) from exc
 
     @staticmethod
-    def _unauthenticated() -> BackendUnusable:
+    def _unauthenticated(experiment: str = "") -> BackendUnusable:
+        """Modal turned the token of this machine down.  ``experiment`` is what a person
+        can do next when it was an experiment's job that needed Modal; without it the
+        message is the paper pipeline's."""
+        if not experiment:
+            return BackendUnusable(
+                "Modal is not authenticated. Run `modal token new`, or set MODAL_TOKEN_ID and "
+                "MODAL_TOKEN_SECRET."
+            )
         return BackendUnusable(
-            "Modal is not authenticated. Run `modal token new`, or set MODAL_TOKEN_ID and "
-            "MODAL_TOKEN_SECRET."
+            "Modal is not authenticated: it did not accept the token that is configured on "
+            "this machine, so the experiment cannot run there. Run `modal token new` (or set "
+            f"MODAL_TOKEN_ID and MODAL_TOKEN_SECRET), {experiment}"
         )
 
     def _lookup_app(self) -> Any:
@@ -1761,12 +1850,18 @@ class ModalBackend(ComputeBackend):
         # Inside a Modal Function the container's own identity starts the sandboxes.
         if not needs_sandbox or not self._modal.is_local() or modal_token_configured():
             return []
-        # Read by whoever asked for Modal: for a paper, for figure code, for one experiment.
+        missing = "Modal is not authenticated (no token is configured on this machine)"
+        setup = "Run `modal setup` (or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET)"
+        if latex:
+            # Asked before a paper is written.
+            return [
+                f"{missing}, so the sandboxes that compile the paper and run figure code "
+                f"cannot be started. {setup}, or use --compute local."
+            ]
+        # Asked for code alone: before an experiment is approved or run (see the base class).
         return [
-            "Modal is not authenticated (no token is configured on this machine), so no "
-            "sandbox can be started there. Run `modal setup` (or set MODAL_TOKEN_ID and "
-            "MODAL_TOKEN_SECRET), or use the local backend instead: `--compute local`, or "
-            "`--backend local` when you approve an experiment."
+            f"{missing}, so the sandbox that would run the experiment cannot be started. "
+            f"{setup} and approve the experiment again. {_OR_LOCAL}"
         ]
 
     def close(self) -> None:
