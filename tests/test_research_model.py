@@ -544,6 +544,32 @@ def test_strict_loading_and_validation_refuse_with_every_problem_named():
     assert "limits.max_hypotheses" in str(caught.value) and "review.finding" in str(caught.value)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_limit_is_a_finite_number(value):
+    """NaN is below no limit and above none, so it would limit nothing; and neither it
+    nor infinity is JSON another program can read."""
+    settings = ProjectSettings()
+    settings.limits.model_usd = value
+    assert [problem.split(" is ")[0] for problem in settings.problems()] == [
+        "settings.limits.model_usd"
+    ]
+    loaded = ProjectSettings.from_dict({"limits": {"experiment_usd": value}})
+    assert loaded.limits.experiment_usd == 5.0
+    assert any("limits.experiment_usd" in problem for problem in loaded.load_problems)
+    with pytest.raises(ProjectError, match=r"limits.experiment_seconds"):
+        ProjectSettings().update({"limits": {"experiment_seconds": value}})
+
+
+def test_a_refusal_does_not_say_that_a_default_is_used():
+    with pytest.raises(ProjectError) as caught:
+        ProjectSettings.from_dict(
+            {"compute": "mainframe", "limits": {"model_usd": -1}, "review": 3}, strict=True
+        )
+    said = str(caught.value)
+    assert "limits.model_usd" in said and "compute" in said and "review" in said
+    assert "used" not in said
+
+
 def test_update_merges_a_partial_change_or_changes_nothing():
     settings = ProjectSettings()
     settings.update(

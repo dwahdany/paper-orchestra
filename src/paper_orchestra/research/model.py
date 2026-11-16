@@ -11,6 +11,7 @@ that enforces these rules on disk is :mod:`paper_orchestra.research.project`.
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
@@ -1201,6 +1202,10 @@ def as_cutoff(value: Any) -> Any:
     return typed if _CUTOFF.match(typed) else value
 
 
+#: The end of a loading problem that says what was put in the place of a bad value.
+_DEFAULT_USED = re.compile(r"; the defaults? (?:\(.*\) )?(?:is|are) used$")
+
+
 def default_review_policy() -> dict[str, str]:
     """Agents' syntheses, hypotheses, plans and findings wait for the person; verified
     sources and the agents' own process pages do not."""
@@ -1337,7 +1342,9 @@ class Limits(_Section):
         wrong: dict[str, str] = {}
         for name in ("model_usd", "experiment_seconds", "experiment_usd"):
             value = getattr(self, name)
-            if not _is_number(value) or value < 0:
+            # NaN is below no limit and above none, so it would limit nothing; neither
+            # it nor infinity is JSON that another program reads.
+            if not _is_number(value) or not math.isfinite(value) or value < 0:
                 wrong[name] = f"is {value!r}; it must be a number, zero or more"
         for name in self._COUNTS:
             value = getattr(self, name)
@@ -1551,7 +1558,9 @@ class ProjectSettings:
         elif review is not None:
             problems.append(f"settings.review is {review!r}, not an object; the defaults are used")
         if strict and problems:
-            raise ProjectError("The project settings are not valid:\n" + "\n".join(problems))
+            # A refusal uses nothing: it says what is wrong and stops there.
+            said = [_DEFAULT_USED.sub("", problem) for problem in problems]
+            raise ProjectError("The project settings are not valid:\n" + "\n".join(said))
         settings.load_problems = problems
         return settings
 

@@ -2152,10 +2152,23 @@ class Project:
     def _proposal_path(self, proposal_id: str) -> Path:
         return self.root / PROPOSALS_DIR / f"{proposal_id}.json"
 
+    def _own_json(self, file: Path) -> Any:
+        """The JSON in a file of the project, or ``None`` when it is missing, is not
+        JSON, or is a symbolic link that leads out of the project.
+
+        The folders of proposals and requests are the project's own or the project
+        is not opened; this holds each file in them to the same.  What a link out
+        leads to is not a suggestion of this project's agents nor an instruction of
+        its person, and it is neither shown as one nor written to.
+        """
+        if file.is_symlink() and not _stays_inside(self.root, file):
+            return None
+        return _read_json(file)
+
     def _proposal_or_none(self, proposal_id: Any) -> EditProposal | None:
         if not isinstance(proposal_id, str) or not re.fullmatch(r"ep-[0-9a-f]+", proposal_id):
             return None
-        data = _read_json(self._proposal_path(proposal_id))
+        data = self._own_json(self._proposal_path(proposal_id))
         return EditProposal.from_dict(data) if isinstance(data, dict) else None
 
     def proposal(self, proposal_id: str) -> EditProposal:
@@ -2170,7 +2183,7 @@ class Project:
         folder = self.root / PROPOSALS_DIR
         found = []
         for file in sorted(folder.glob("ep-*.json")) if folder.is_dir() else []:
-            data = _read_json(file)
+            data = self._own_json(file)
             if isinstance(data, dict) and data.get("id") and data.get("target"):
                 proposal = EditProposal.from_dict(data)
                 if review is None or proposal.review == review:
@@ -2662,7 +2675,7 @@ class Project:
     def _request(self, request_id: Any) -> Request:
         data = None
         if isinstance(request_id, str) and re.fullmatch(r"rq-[0-9a-f]+", request_id):
-            data = _read_json(self._request_path(request_id))
+            data = self._own_json(self._request_path(request_id))
         if not isinstance(data, dict):
             raise NotFound(f"There is no request {request_id!r}.")
         return Request.from_dict(data)
@@ -2710,7 +2723,7 @@ class Project:
         folder = self.root / REQUESTS_DIR
         found = []
         for file in sorted(folder.glob("rq-*.json")) if folder.is_dir() else []:
-            data = _read_json(file)
+            data = self._own_json(file)
             if isinstance(data, dict) and data.get("id"):
                 request = Request.from_dict(data)
                 if state is None or request.state == state:
@@ -2732,7 +2745,7 @@ class Project:
             given = [*request.handled_in, *([] if entry in request.handled_in else [entry])]
             noted = replace(request, handled_in=given, state="done" if close else request.state)
             if noted != request:
-                on_file = _read_json(self._request_path(request.id))
+                on_file = self._own_json(self._request_path(request.id))
                 extra = on_file if isinstance(on_file, dict) else {}
                 write_json(self._request_path(request.id), {**extra, **noted.to_dict()})
         return noted
@@ -3144,11 +3157,11 @@ class Project:
         for folder, prefix in ((PROPOSALS_DIR, "ep-"), (REQUESTS_DIR, "rq-")):
             directory = self.root / folder
             for file in sorted(directory.glob(f"{prefix}*.json")) if directory.is_dir() else []:
-                if not isinstance(_read_json(file), dict):
-                    found.append(
-                        {
-                            "path": file.relative_to(self.root).as_posix(),
-                            "message": "not a JSON object; the file is ignored",
-                        }
-                    )
+                if file.is_symlink() and not _stays_inside(self.root, file):
+                    message = "a symbolic link that leads out of the project; the file is ignored"
+                elif not isinstance(_read_json(file), dict):
+                    message = "not a JSON object; the file is ignored"
+                else:
+                    continue
+                found.append({"path": file.relative_to(self.root).as_posix(), "message": message})
         return found

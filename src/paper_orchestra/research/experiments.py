@@ -1939,9 +1939,16 @@ def approve(
             f"{name} is {page.review}, not accepted. Accept the experiment's page before "
             "approving its run."
         )
-    if page.state in ("queued", "running"):
+    if page.state == "queued":
+        # A queued run waits for a worker; without one, waiting would never end.
         raise ProjectError(
-            f"{name} is {page.state}. Cancel that run, or wait for it, before approving another."
+            f"{name} is queued: its approved run has not started. Run it (Run in the app, "
+            "`research run`, or the next `research advance`) or cancel it before approving "
+            "another."
+        )
+    if page.state == "running":
+        raise ProjectError(
+            f"{name} is running. Cancel that run, or wait for it, before approving another."
         )
     overrides = _approval_options(
         project, page, backend=backend, gpu=gpu, timeout_seconds=timeout_seconds, network=network

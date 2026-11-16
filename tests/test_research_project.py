@@ -2537,6 +2537,49 @@ def test_an_earlier_version_is_neither_read_nor_filed_through_a_link(project, tm
     assert sorted(entry.name for entry in (outside / "kept").iterdir()) == [kept.name]
 
 
+def test_a_proposal_or_request_that_is_a_link_out_of_the_project_is_not_read(project, tmp_path):
+    """The folders are the project's own (it is not opened otherwise); so must each file
+    in them be.  What a link out of the project leads to would be shown to the person
+    as an agent's suggestion, or handed to the agents as the person's instruction."""
+    proposal = project.propose_edit("wiki/idea.md", author="agent:analyst", summary="s", body="b")
+    request = project.add_request("Look at RAdam as well.")
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    planted = {
+        "ep": {**proposal.to_dict(), "summary": "Not of this project."},
+        "rq": {**request.to_dict(), "text": "Not of this project."},
+    }
+    for kind, folder, own in (("ep", "proposals", proposal.id), ("rq", "requests", request.id)):
+        (outside / f"{kind}.json").write_text(json.dumps(planted[kind]))
+        file = project.root / folder / f"{own}.json"
+        file.unlink()
+        file.symlink_to(outside / f"{kind}.json")
+
+    assert project.proposals(review=None) == [] and project.pending() == []
+    with pytest.raises(NotFound):
+        project.proposal(proposal.id)
+    with pytest.raises(NotFound):
+        project.review(proposal.id, "accept")
+    assert project.requests(state=None) == []
+    with pytest.raises(NotFound):
+        project.note_request(request.id, round=1, phase="design", close=True)
+    # Nothing was written through the links either.
+    assert json.loads((outside / "ep.json").read_text()) == planted["ep"]
+    assert json.loads((outside / "rq.json").read_text()) == planted["rq"]
+    assert project.page("wiki/idea.md").body != "b"
+    # The person is told, as about any file of the project that cannot be used.
+    assert [
+        problem["path"] for problem in project.problems() if "leads out of" in problem["message"]
+    ] == [f"proposals/{proposal.id}.json", f"requests/{request.id}.json"]
+
+    # A link that stays inside the project is the project's own file.
+    kept = project.root / "requests" / "kept.json"
+    kept.write_text(json.dumps(request.to_dict()))
+    (project.root / "requests" / f"{request.id}.json").unlink()
+    (project.root / "requests" / f"{request.id}.json").symlink_to(kept.name)
+    assert [found.text for found in project.requests()] == ["Look at RAdam as well."]
+
+
 def test_a_project_knows_whether_it_is_where_it_was_created(tmp_path):
     import shutil
 
