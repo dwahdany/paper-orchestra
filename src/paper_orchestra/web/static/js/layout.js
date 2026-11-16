@@ -10,12 +10,36 @@
      5. gutters between layers are routed orthogonally: edges that share an endpoint share a
         trunk, trunks get tracks by interval colouring, track order is chosen for fewest crossings
      6. column widths answer to the width available: labels shrink before anything overlaps
-   Pure function: no DOM. Written to stay quick at a few hundred nodes. */
+   A crowded map is given its reference lines apart (`opt.quiet`): they take no part in
+   the ordering, so that an experiment sits beside the hypothesis it tests. There,
+     - long lines of one look (`edge.look`) that leave the same page share one lane until
+       they part, and only lines of one look share a trunk in a gutter
+     - a stage that is a long list (`opt.packed`, or one that no drawn line ties down) is
+       set as a list: evenly, from the top; the other stages come to it and never rise above it
+     - pages that only reference lines connect are ordered by what they refer to and fill
+       the free room of their stage from the top
+     - `routeRefs` draws the reference lines of one page over the finished plan: of the page
+       that is selected or pointed at, or of every page when all lines are asked for.
+   Pure functions: no DOM. Written to stay quick at a few hundred nodes. */
 
 import { STAGES } from './vocab.js';
 
 const LANE = 7, TRACK = 6, CHAMFER = 5;
 const avg = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+/* a path through points, its corners cut */
+const dOf = (pts) => {
+  const out = [pts[0]];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i], a = pts[i - 1], b = pts[i + 1];
+    const l1 = Math.abs(p[0] - a[0]) + Math.abs(p[1] - a[1]), l2 = Math.abs(b[0] - p[0]) + Math.abs(b[1] - p[1]);
+    if (!l1 || !l2) continue;
+    const r = Math.min(CHAMFER, l1 / 2, l2 / 2);
+    out.push([p[0] + ((a[0] - p[0]) / l1) * r, p[1] + ((a[1] - p[1]) / l1) * r], [p[0] + ((b[0] - p[0]) / l2) * r, p[1] + ((b[1] - p[1]) / l2) * r]);
+  }
+  out.push(pts[pts.length - 1]);
+  return 'M' + out.map((p) => Math.round(p[0] * 10) / 10 + ' ' + Math.round(p[1] * 10) / 10).join('L');
+};
 
 /* crossings between two orderings: inversions of the lower positions, edges sorted by the upper */
 function inversions(pairs) {
@@ -40,8 +64,9 @@ export function layout(nodes, edges, opt) {
   const N = {};
   const layers = Array.from({ length: L }, () => []);
   const prev = opt.prevOrder || null;
-  nodes.forEach((n) => {
-    const r = { key: n.key, layer: n.layer == null ? STAGES.indexOf(n.kind) : n.layer, real: true, hu: n.hu, hd: n.hd, w: n.w, min: n.min, hard: n.hard == null ? n.min : n.hard, r: n.r, up: [], dn: [], y: 0 };
+  const quiet = opt.quiet || null;
+  nodes.forEach((n, idx) => {
+    const r = { key: n.key, idx, layer: n.layer == null ? STAGES.indexOf(n.kind) : n.layer, real: true, hu: n.hu, hd: n.hd, w: n.w, min: n.min, hard: n.hard == null ? n.min : n.hard, r: n.r, up: [], dn: [], y: 0 };
     N[n.key] = r;
     layers[r.layer].push(r);
   });
@@ -55,21 +80,48 @@ export function layout(nodes, edges, opt) {
   /* 1. chains: every edge becomes a path from its lower layer to its higher layer */
   const chains = [], intra = [];
   let dummy = 0;
+  /* crowded: how many long lines of one look each page has, the lanes they share, the look of each step */
+  const many = {}, shared = {}, lookOf = {};
+  if (quiet) edges.forEach((e) => {
+    const a = N[e.s], b = N[e.t];
+    if (!a || !b || !e.look || Math.abs(a.layer - b.layer) < 2) return;
+    [a, b].forEach((n) => { const k = n.key + '|' + e.look; many[k] = (many[k] || 0) + 1; });
+  });
   edges.forEach((e) => {
     let a = N[e.s], b = N[e.t];
     if (!a || !b || a === b) return;
     if (a.layer === b.layer) { intra.push({ e, a, b }); return; }
     if (a.layer > b.layer) { const t = a; a = b; b = t; }
     const path = [a];
+    const ka = a.key + '|' + e.look, kb = b.key + '|' + e.look;
+    const hub = quiet && e.look && Math.max(many[ka] || 0, many[kb] || 0) > 1 ? ((many[ka] || 0) >= (many[kb] || 0) ? ka : kb) : '';
     for (let l = a.layer + 1; l < b.layer; l++) {
-      const d = { key: '~' + dummy++, layer: l, real: false, hu: 0, hd: 0, up: [], dn: [], y: 0 };
-      layers[l].push(d);
+      let d = hub ? shared[hub + '|' + l] : null;
+      if (!d) {
+        d = { key: '~' + dummy++, layer: l, real: false, hu: 0, hd: 0, up: [], dn: [], y: 0 };
+        layers[l].push(d);
+        if (hub) shared[hub + '|' + l] = d;
+      }
       path.push(d);
     }
     path.push(b);
-    for (let i = 0; i < path.length - 1; i++) { path[i].dn.push(path[i + 1]); path[i + 1].up.push(path[i]); }
-    chains.push({ e, path });
+    for (let i = 0; i < path.length - 1; i++) {
+      const u = path[i], v = path[i + 1];
+      if (quiet) { const k = u.key + '>' + v.key; if (lookOf[k] == null) lookOf[k] = e.look || ''; else if (u.dn.indexOf(v) >= 0) continue; }
+      u.dn.push(v); v.up.push(u);
+    }
+    chains.push({ e, path, back: hub === kb });
   });
+  const tied = (n) => n.up.length + n.dn.length > 0;
+  if (quiet) {
+    quiet.forEach((e) => { const a = N[e.s], b = N[e.t]; if (a && b && a !== b) { (a.q = a.q || []).push(b); (b.q = b.q || []).push(a); } });
+    /* The pages that only reference lines connect take no part in the ordering. They are
+       put where there is room once the plan stands, and the next plan starts from this one:
+       so they stand aside here, in the order they were given, or where one plan had put
+       them would shift the pages of the next, and a map laid out again (a page was opened
+       beside it and closed) would not come back as it was. */
+    layers.forEach((arr, l) => { layers[l] = arr.filter(tied).concat(arr.filter((n) => !tied(n)).sort((a, b) => a.idx - b.idx)); });
+  }
   if (prev) {
     /* a lane starts where its ends were: between the neighbours it connects */
     layers.forEach((arr) => arr.forEach((n, i) => (n.pos = i)));
@@ -113,6 +165,20 @@ export function layout(nodes, edges, opt) {
   }
   best.forEach((arr, l) => (layers[l] = arr.filter((n) => n.up.length + n.dn.length).concat(arr.filter((n) => !(n.up.length + n.dn.length)))));
   setPos();
+  if (quiet) {
+    /* pages that only reference lines connect: beside what they refer to, among themselves */
+    const at = (x) => (x.pos + 0.5) / layers[x.layer].length;
+    for (let it = 0; it < 4; it++) {
+      for (let i = 0; i < L; i++) {
+        const l = it % 2 ? L - 1 - i : i, arr = layers[l];
+        const loose = arr.filter((n) => !tied(n));
+        if (loose.length < 2) continue;
+        loose.forEach((n) => (n.qk = n.q ? avg(n.q.map(at)) : 2));
+        layers[l] = arr.filter(tied).concat(loose.map((n, k) => [n, k]).sort((a, b) => a[0].qk - b[0].qk || a[1] - b[1]).map((x) => x[0]));
+        layers[l].forEach((n, k) => (n.pos = k));
+      }
+    }
+  }
   /* adjacent transpositions: only the edges of the two nodes can change their crossings */
   const pairCross = (xs, ys) => { let c = 0; for (const x of xs) for (const y of ys) if (x.pos > y.pos) c++; return c; };
   for (let pass = 0, improved = true; improved && pass < 8; pass++) {
@@ -142,6 +208,7 @@ export function layout(nodes, edges, opt) {
   });
   G = Math.max(opt.gapMin == null ? 3 : opt.gapMin, Math.min(opt.gapMax, G));
   const sep = (a, b) => baseSep(a, b, G);
+  const head = (n) => (n.real ? n.hu : 0);
   layers.forEach((arr) => {
     let y = 0;
     arr.forEach((n, i) => { if (i) y += sep(arr[i - 1], n); n.y = y; });
@@ -164,8 +231,10 @@ export function layout(nodes, edges, opt) {
     let i = 0;
     blocks.forEach((b) => { for (let k = 0; k < b.n; k++, i++) arr[i].y = b.sum / b.w + off[i]; });
   };
+  let list = null, top = 0;
   const relax = (l, side) => {
     const arr = layers[l];
+    if (list && list[l]) return;
     const conn = arr.filter((n) => n.up.length + n.dn.length);
     if (conn.length) {
       place(conn, conn.map((n) => {
@@ -173,6 +242,8 @@ export function layout(nodes, edges, opt) {
         if (!nb.length) nb = n.up.concat(n.dn);
         return { t: avg(nb.map((x) => x.y)), w: n.real ? 1 : 3 };
       }));
+      /* nothing rises above the top of the lists */
+      if (list) conn.forEach((n, i) => { n.y = Math.max(n.y, i ? conn[i - 1].y + sep(conn[i - 1], n) : top + head(n)); });
     }
     /* pages nothing links to yet are packed after the rest of their stage */
     arr.forEach((n, i) => { if (!(n.up.length + n.dn.length) && i > 0 && conn.length) n.y = arr[i - 1].y + sep(arr[i - 1], n); });
@@ -183,25 +254,76 @@ export function layout(nodes, edges, opt) {
     for (let l = L - 2; l >= 0; l--) relax(l, 'dn');
   }
   for (let it = 0; it < 6; it++) for (let l = 0; l < L; l++) relax(l, 'both');
+  if (quiet) {
+    /* Crowded: a stage that is a long list is set as a list, evenly and from the top. The
+       pages that lines hold are in it where their lines want them, as nearly as the pages
+       that nothing holds can be put between them; the other stages then come to the lists. */
+    const topOf = () => {
+      let t = Infinity;
+      layers.forEach((arr) => arr.forEach((n) => { if (n.real && tied(n)) t = Math.min(t, n.y - n.hu); }));
+      return t === Infinity ? 0 : t;
+    };
+    const setList = (l) => {
+      const arr = layers[l], loose = arr.filter((n) => !tied(n)), out = [];
+      let k = 0, last = null;
+      const next = (n) => (last ? last.y + sep(last, n) : top + head(n));
+      const put = (n) => { n.y = next(n); out.push(n); last = n; };
+      arr.filter(tied).forEach((f) => {
+        const want = f.y;
+        while (k < loose.length && next(f) < want) {
+          const n = loose[k], after = next(n) + sep(n, f);
+          if (Math.abs(after - want) >= Math.abs(next(f) - want)) break;
+          put(n); k++;
+        }
+        put(f);
+      });
+      while (k < loose.length) put(loose[k++]);
+      layers[l] = out;
+    };
+    top = topOf();
+    list = layers.map((arr, l) => arr.length > 0 && (!!(opt.packed && opt.packed[STAGES[l]]) || !arr.some(tied)));
+    const held = list.map((is, l) => is && layers[l].some(tied));
+    held.forEach((is, l) => { if (is) setList(l); });
+    setPos();
+    for (let it = 0; it < 6; it++) {
+      for (let l = 1; l < L; l++) relax(l, 'up');
+      for (let l = L - 2; l >= 0; l--) relax(l, 'dn');
+    }
+    for (let it = 0; it < 6; it++) for (let l = 0; l < L; l++) relax(l, 'both');
+    /* the lists that no line holds start where the rest of the plan starts */
+    if (!held.some(Boolean)) top = topOf();
+    list.forEach((is, l) => { if (is && !held[l]) setList(l); });
+    setPos();
+  }
 
   /* 4. straighten long edges where the lane is free */
   const straighten = () => chains.filter((c) => c.path.length > 2).sort((a, b) => b.path.length - a.path.length).forEach((c) => {
     const ds = c.path.slice(1, -1);
-    let lo = -Infinity, hi = Infinity;
-    ds.forEach((d) => {
+    const room = (d) => {
       const arr = layers[d.layer], i = d.pos;
-      if (i > 0) lo = Math.max(lo, arr[i - 1].y + sep(arr[i - 1], d));
-      if (i < arr.length - 1) hi = Math.min(hi, arr[i + 1].y - sep(d, arr[i + 1]));
-    });
-    if (lo > hi) return;
+      return [i > 0 ? arr[i - 1].y + sep(arr[i - 1], d) : -Infinity, i < arr.length - 1 ? arr[i + 1].y - sep(d, arr[i + 1]) : Infinity];
+    };
+    let lo = -Infinity, hi = Infinity;
+    ds.forEach((d) => { const r = room(d); lo = Math.max(lo, r[0]); hi = Math.min(hi, r[1]); });
+    if (lo > hi) {
+      /* crowded: no level is free all the way, so each step keeps as near to the one before as it can */
+      if (!quiet) return;
+      let y = c.path[c.back ? c.path.length - 1 : 0].y;
+      (c.back ? ds.slice().reverse() : ds).forEach((d) => {
+        const r = room(d);
+        if (r[0] <= r[1]) d.y = Math.max(r[0], Math.min(r[1], y));
+        y = d.y;
+      });
+      return;
+    }
     const a = c.path[0].y, b = c.path[c.path.length - 1].y;
     const y = a >= lo && a <= hi ? a : b >= lo && b <= hi ? b : Math.max(lo, Math.min(hi, avg(ds.map((d) => d.y))));
     ds.forEach((d) => (d.y = y));
   });
   straighten(); straighten();
   /* a page with one neighbour sits level with it when it can */
-  layers.forEach((arr) => arr.forEach((n, i) => {
-    if (!n.real) return;
+  layers.forEach((arr, l) => arr.forEach((n, i) => {
+    if (!n.real || (list && list[l])) return;
     const nb = n.up.concat(n.dn);
     if (nb.length !== 1) return;
     const lo = i > 0 ? arr[i - 1].y + sep(arr[i - 1], n) : -Infinity;
@@ -209,6 +331,26 @@ export function layout(nodes, edges, opt) {
     if (nb[0].y >= lo && nb[0].y <= hi) n.y = nb[0].y;
   }));
   straighten();
+  if (quiet) {
+    /* the pages no drawn line holds in place fill the free room of their stage, from the top */
+    layers.forEach((arr, l) => {
+      const fixed = arr.filter(tied), loose = arr.filter((n) => !tied(n));
+      if (!loose.length || list[l]) return;
+      const out = [];
+      let i = 0, last = null;
+      loose.forEach((n) => {
+        for (;;) {
+          const y = last ? last.y + sep(last, n) : top + n.hu, f = fixed[i];
+          if (f && y + sep(n, f) > f.y) { out.push(f); last = f; i++; continue; }
+          n.y = y; out.push(n); last = n;
+          break;
+        }
+      });
+      while (i < fixed.length) out.push(fixed[i++]);
+      layers[l] = out;
+    });
+    setPos();
+  }
 
   let minY = Infinity, maxY = -Infinity;
   layers.forEach((arr) => arr.forEach((n) => { minY = Math.min(minY, n.y - n.hu); maxY = Math.max(maxY, n.y + n.hd); }));
@@ -221,15 +363,16 @@ export function layout(nodes, edges, opt) {
   const gutters = [];
   for (let g = 0; g < L - 1; g++) {
     const segs = [], byEnds = new Map();
-    layers[g].forEach((u) => u.dn.forEach((v) => { const s = { u, v, net: null }; segs.push(s); byEnds.set(u.key + '>' + v.key, s); }));
+    /* a trunk is shared by the lines that share an end; in a crowded map, by those of one look only */
+    layers[g].forEach((u) => u.dn.forEach((v) => { const s = { u, v, net: null, look: quiet ? '|' + (lookOf[u.key + '>' + v.key] || '') : '' }; segs.push(s); byEnds.set(u.key + '>' + v.key, s); }));
     let rest = segs.filter((s) => Math.abs(s.u.y - s.v.y) >= 0.75);
     const nets = [];
     while (rest.length) {
       const cnt = {};
-      rest.forEach((s) => { cnt['v' + s.v.key] = (cnt['v' + s.v.key] || 0) + 1; cnt['u' + s.u.key] = (cnt['u' + s.u.key] || 0) + 1; });
+      rest.forEach((s) => { const kv = 'v' + s.v.key + s.look, ku = 'u' + s.u.key + s.look; cnt[kv] = (cnt[kv] || 0) + 1; cnt[ku] = (cnt[ku] || 0) + 1; });
       let bk = null;
       Object.keys(cnt).forEach((k) => { if (!bk || cnt[k] > cnt[bk] || (cnt[k] === cnt[bk] && k[0] === 'v' && bk[0] === 'u')) bk = k; });
-      const mem = rest.filter((s) => (bk[0] === 'v' ? 'v' + s.v.key : 'u' + s.u.key) === bk);
+      const mem = rest.filter((s) => (bk[0] === 'v' ? 'v' + s.v.key : 'u' + s.u.key) + s.look === bk);
       let lo = Infinity, hi = -Infinity;
       mem.forEach((s) => { lo = Math.min(lo, s.u.y, s.v.y); hi = Math.max(hi, s.u.y, s.v.y); });
       const net = { mem, lo, hi, track: 0, x: 0 };
@@ -310,18 +453,6 @@ export function layout(nodes, edges, opt) {
   const width = x + opt.padR + lead;
 
   /* 7. paths */
-  const dOf = (pts) => {
-    const out = [pts[0]];
-    for (let i = 1; i < pts.length - 1; i++) {
-      const p = pts[i], a = pts[i - 1], b = pts[i + 1];
-      const l1 = Math.abs(p[0] - a[0]) + Math.abs(p[1] - a[1]), l2 = Math.abs(b[0] - p[0]) + Math.abs(b[1] - p[1]);
-      if (!l1 || !l2) continue;
-      const r = Math.min(CHAMFER, l1 / 2, l2 / 2);
-      out.push([p[0] + ((a[0] - p[0]) / l1) * r, p[1] + ((a[1] - p[1]) / l1) * r], [p[0] + ((b[0] - p[0]) / l2) * r, p[1] + ((b[1] - p[1]) / l2) * r]);
-    }
-    out.push(pts[pts.length - 1]);
-    return 'M' + out.map((p) => Math.round(p[0] * 10) / 10 + ' ' + Math.round(p[1] * 10) / 10).join('L');
-  };
   const outEdges = chains.map((c) => {
     const a = c.path[0], b = c.path[c.path.length - 1];
     const pts = [[cols[a.layer].gx + a.r, a.y]];
@@ -347,9 +478,60 @@ export function layout(nodes, edges, opt) {
   });
 
   const outNodes = {};
-  layers.forEach((arr, l) => arr.forEach((n) => { if (n.real) outNodes[n.key] = { x: cols[l].gx, y: n.y, layer: l, pos: n.pos }; }));
+  layers.forEach((arr, l) => arr.forEach((n) => { if (n.real) outNodes[n.key] = { x: cols[l].gx, y: n.y, layer: l, pos: n.pos, r: n.r }; }));
+  /* where a line can cross each stage: the room between its rows, above the first and below the last */
+  const free = layers.map((arr) => {
+    const rows = arr.map((n) => (n.real ? [n.y - n.hu, n.y + n.hd] : [n.y - 1, n.y + 1]));
+    const gaps = [];
+    rows.forEach((r, i) => gaps.push([i ? rows[i - 1][1] : -Infinity, r[0]]));
+    if (rows.length) gaps.push([rows[rows.length - 1][1], Infinity]);
+    return gaps;
+  });
   const columnOrder = layers.map((arr) => arr.filter((n) => n.real).map((n) => n.key));
   const order = {};
   layers.forEach((arr) => arr.forEach((n, i) => { if (n.real) order[n.key] = i; }));
-  return { nodes: outNodes, cols, edges: outEdges, width, height: maxY - minY + opt.top + opt.bottom, bottomY: maxY + shiftY, crossings: bestC, columnOrder, order, G };
+  return { nodes: outNodes, cols, edges: outEdges, width, height: maxY - minY + opt.top + opt.bottom, bottomY: maxY + shiftY, crossings: bestC, columnOrder, order, G, free, gutters: gutters.map((g) => ({ x0: g.x0, x1: g.x1 })) };
+}
+
+/* The reference lines of one page, over a finished plan. They leave the page level, keep to
+   the room between the rows of the stages they pass, and turn to their other ends in the
+   gutter before them: one line that fans out where it arrives. */
+export function routeRefs(lay, focus, edges) {
+  const F = lay.nodes[focus], out = [];
+  if (!F) return out;
+  const through = (gaps, y, goal) => {
+    let best = y, cost = Infinity;
+    gaps.forEach((g) => {
+      const room = g[1] - g[0];
+      if (room <= 0) return;
+      const pad = Math.min(5, room / 2);
+      const c = Math.max(g[0] + pad, Math.min(g[1] - pad, y));
+      const k = Math.abs(c - y) + 2 * (Math.abs(c - y) + Math.abs(c - goal) - Math.abs(y - goal));
+      if (k < cost) { cost = k; best = c; }
+    });
+    return Math.round(best * 2) / 2;
+  };
+  edges.forEach((e) => {
+    const other = e.s === focus ? e.t : e.s, T = lay.nodes[other];
+    if (!T || other === focus) return;
+    let pts;
+    if (T.layer === F.layer) {
+      const col = lay.cols[F.layer], bend = col.x0 - 9;
+      pts = [[col.gx - F.r, F.y], [bend, F.y], [bend, T.y], [col.gx - T.r, T.y]];
+    } else {
+      const dir = T.layer > F.layer ? 1 : -1;
+      pts = [[lay.cols[F.layer].gx + dir * F.r, F.y]];
+      let y = F.y;
+      for (let l = F.layer; l !== T.layer; l += dir) {
+        const x = lay.gutters[dir > 0 ? l : l - 1].x0 + 5;
+        const ny = l + dir === T.layer ? T.y : through(lay.free[l + dir], y, T.y);
+        if (ny !== y) pts.push([x, y], [x, ny]);
+        y = ny;
+      }
+      pts.push([lay.cols[T.layer].gx - dir * T.r, T.y]);
+    }
+    const up = F.layer <= T.layer;
+    out.push({ s: e.s, t: e.t, type: e.type, lo: up ? focus : other, hi: up ? other : focus, d: dOf(pts), mid: null, ref: true });
+  });
+  return out;
 }

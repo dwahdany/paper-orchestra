@@ -1081,6 +1081,23 @@ a.choice { text-decoration: none; }
 .map-canvas.dense:not(.has-sel) .edge.f-reason { stroke-width: 1; }
 .map-canvas.dense:not(.has-sel) .edge.e-prop { stroke-width: .9; }
 .map-canvas.dense:not(.has-sel) .edge.f-pos.e-prop, .map-canvas.dense:not(.has-sel) .edge.f-neg.e-prop, .map-canvas.dense:not(.has-sel) .edge.f-test.e-prop { stroke-width: 1.3; }
+/* reference lines that are held back: those of the page pointed at are drawn over the plan,
+   and the legend says for which page such lines are drawn */
+.refs { pointer-events: none; }
+.edge.ref.f-read, .edge.ref.f-reason, .edge.ref.f-test { stroke: var(--accent); stroke-width: 1.3; }
+.key-note { font-style: italic; color: var(--ink-3); }
+/* a selection in a crowded map is unmistakable: what is not of its lineage steps further back */
+.map-canvas.dense .edge.dim { opacity: .1; }
+.map-canvas.dense .badge.dim { opacity: .13; }
+.map-canvas.dense .node.dim { opacity: .24; }
+/* a page whose line leaves through its words (one on one line, a source, a bundle) steps
+   back part by part: what keeps the line out of the words stays whole, or the line it steps
+   back with would strike them through */
+.map-canvas.dense .node.n-tight.dim, .map-canvas.dense .node.k-source.dim, .map-canvas.dense .node.k-bundle.dim { opacity: 1; }
+.map-canvas.dense .node.n-tight.dim > :not(.n-knock), .map-canvas.dense .node.k-source.dim > :not(.n-knock), .map-canvas.dense .node.k-bundle.dim > :not(.n-knock) { opacity: .24; }
+/* a page on one line: its line does not run through its words (nor through the marks of a proposal) */
+.node.n-tight.r-proposed .n-knock { fill: none; }
+.node.n-tight:not(.sel):hover .n-knock { fill: color-mix(in srgb, var(--ink) 6%, var(--ground)); }
 /* headings shrink with a map that is drawn smaller, so that none runs into the next */
 .heads-s .head-w, .heads-s .head-n { display: none; }
 .heads-xs .head text { display: none; }

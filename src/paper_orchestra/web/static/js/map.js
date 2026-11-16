@@ -4,12 +4,20 @@
    At scale the map stays usable by folding: the sources a topic cites are drawn as one
    bundle that opens when the topic (or one of its sources) is selected; a round filter and
    a lineage filter hide the rest; the canvas scrolls vertically under pinned headings; the
-   layout is cached by a signature of what is drawn and seeded with the previous ordering. */
+   layout is cached by a signature of what is drawn and seeded with the previous ordering.
+
+   A crowded map draws the argument only: which experiment tests which hypothesis, which run
+   belongs to which experiment, what a finding rests on and what it supports or refutes. The
+   reference lines (cites, about, answers, mentions, and every line that ends at a source)
+   are drawn for the page that is selected or, while none is, pointed at. Asked for all of
+   them, the map keeps its plan and draws them over it, thin, along the gutters and between
+   the rows: no page changes its place. A stage with more pages than the sheet has rows for
+   shows each as one line: mark, id, title. */
 
 import { app, link, select } from './core.js';
 import { $, $$, esc, html, plural, raw, setHTML, tf } from './util.js';
 import { KIND, STAGES, TONE, glyph, glyphInner, icon, kindName, relOf } from './vocab.js';
-import { layout } from './layout.js';
+import { layout, routeRefs } from './layout.js';
 import { afterRender, label, panelHTML, shortTitle, statusLine, trailHTML } from './page.js';
 import { continueLabel, engineView, strip } from './shell.js';
 
@@ -19,6 +27,10 @@ const CAP = { idea: 86, source: 150, topic: 150, question: 156, hypothesis: 176,
 const MIN = { idea: 30, source: 84, topic: 72, question: 46, hypothesis: 92, experiment: 92, result: 48, finding: 60 };
 const HERO = { question: 1, hypothesis: 1, experiment: 1, finding: 1 };
 const TOP = 44, BTN = 58, ROOM = 80, NEAR_STEPS = 2;
+/* a map with more marks or more reference lines than this is crowded */
+const CROWD_NODES = 50, CROWD_REFS = 40;
+/** A line that says where something was read or what it is about, not what was argued. */
+const isRef = (type) => type === 'answers' || relOf(type).fam === 'read';
 
 let ctx, fam;
 const tw = (text, font) => { ctx = ctx || document.createElement('canvas').getContext('2d'); ctx.font = font; return ctx.measureText(text).width; };
@@ -87,24 +99,52 @@ function mount(root, store) {
     if (n.dataset.bundle) openBundle(n.dataset.key);
     else select(n.dataset.key === V.route.sel ? '' : n.dataset.key);
   });
-  svg.addEventListener('mouseover', (ev) => {
+  /* A page is pointed at when the pointer comes onto it, or when the person moves the map
+     under the pointer. A page that a new plan put under a pointer at rest was not: selecting
+     a page opens it beside the map, the map is laid out again, and what then lies under the
+     pointer shows neither its tip nor its lines until the pointer moves. */
+  let at = null, waits = false;
+  const moved = (ev) => { const was = at; at = [ev.clientX, ev.clientY]; return !was || was[0] !== at[0] || was[1] !== at[1]; };
+  const point = (ev) => {
     const n = ev.target.closest('.node'), e = ev.target.closest('.edge-hit');
     if (n) tip(n.dataset.key); else if (e) edgeTip(e, ev); else hideTip();
+    if ((n ? n.dataset.key : '') !== V.pointed) pointAt(n ? n.dataset.key : '');
+  };
+  svg.addEventListener('mousemove', (ev) => {
+    if (!moved(ev)) return;
+    V.shifted = false;
+    if (waits) { waits = false; point(ev); }
   });
-  svg.addEventListener('mouseleave', hideTip);
+  svg.addEventListener('mouseover', (ev) => {
+    const real = moved(ev);
+    if (!real && V.shifted) { waits = true; return; }
+    if (real) V.shifted = false;
+    waits = false;
+    point(ev);
+  });
+  svg.addEventListener('mouseleave', () => { hideTip(); pointAt(''); });
   svg.addEventListener('focusin', (ev) => {
     const n = ev.target.closest('.node');
     if (!n) return;
     /* Tab can reach a node that lies outside the sheet: the map moves so that it shows */
     if (ev.target.matches(':focus-visible')) reveal(n.dataset.key);
     if (!ev.target.closest('.n-btn')) tip(n.dataset.key);
+    pointAt(n.dataset.key);
   });
-  svg.addEventListener('focusout', hideTip);
+  svg.addEventListener('focusout', () => { hideTip(); pointAt(''); });
   svg.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
     const b = ev.target.closest('.n-btn'), n = ev.target.closest('.node');
     if (b) { ev.preventDefault(); ev.stopPropagation(); b.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
     else if (n) { ev.preventDefault(); if (n.dataset.bundle) openBundle(n.dataset.key); else select(n.dataset.key); }
+  });
+  /* reference lines: for the selected page only, or all of them */
+  $('.map-foot', root).addEventListener('click', (ev) => {
+    if (!ev.target.closest('[data-act="map-refs"]') || ev.detail > 1) return;
+    app.ui.map.refs = V.st.refsAlways ? 'sel' : 'always';
+    /* a crowded map keeps its plan, and with it where the person had moved it */
+    if (!V.st.crowded) { V.st.user = false; V.st.fitted = false; }
+    app.render('ui');
   });
   if (window.ResizeObserver) new ResizeObserver(() => { cancelAnimationFrame(V._raf); V._raf = requestAnimationFrame(() => { if (V.root && V.root.contains(canvas)) draw(); }); }).observe(canvas);
 }
@@ -169,7 +209,7 @@ function applyT() {
 
 /* lineage of the selection: upstream and downstream, with the direct links marked.
    Only the nearest steps unless the whole lineage is asked for. */
-function trace(lay, sel, steps) {
+function trace(lay, edges, sel, steps) {
   const near = new Set(), kin = new Set(), strong = new Set(), mid = new Set();
   let more = false;
   if (!sel || !lay.nodes[sel]) return { near, kin, strong, mid, more };
@@ -179,7 +219,7 @@ function trace(lay, sel, steps) {
     while (frontier.size) {
       depth++;
       const next = new Set();
-      lay.edges.forEach((e, i) => {
+      edges.forEach((e, i) => {
         const from = dir > 0 ? e.lo : e.hi, to = dir > 0 ? e.hi : e.lo;
         if (!frontier.has(from)) return;
         if (depth > steps) { if (!seen.has(to)) more = true; return; }
@@ -268,7 +308,17 @@ function scene(store, sel) {
       seen.add(k); return true;
     });
   }
-  return { nodes, edges, bundles, rounds, fold, sources: sources.length, hidden: store.pages.filter((pg) => STAGES.indexOf(pg.kind) >= 0).length - pages.length };
+  /* a crowded map keeps its reference lines back until a page is selected or pointed at */
+  const read = (key) => !!bundles[key] || (store.byPath.get(key) || {}).kind === 'source';
+  const held = (e) => isRef(e.type) || read(e.s) || read(e.t);
+  const refs = edges.filter(held), strong = edges.filter((e) => !held(e));
+  const crowded = strong.length > 0 && (nodes.length > CROWD_NODES || refs.length > CROWD_REFS);
+  if (crowded) m.refTool = true;
+  const always = m.refs ? m.refs === 'always' : !crowded;
+  /* Every line, asked for on a crowded map: the plan stays as it is and the reference lines
+     are drawn over it, so that the pages do not change places under the person who asked. */
+  const over = always && crowded, apart = !always || over;
+  return { nodes, edges: apart ? strong : edges, refs: apart ? refs : [], refsAlways: always, refsOver: over, crowded, refTool: !!(refs.length && (m.refTool || m.refs)), bundles, rounds, fold, sources: sources.length, hidden: store.pages.filter((pg) => STAGES.indexOf(pg.kind) >= 0).length - pages.length };
 }
 
 function draw() {
@@ -302,6 +352,7 @@ function draw() {
   setHTML($('.map-tools', root), html`
     ${rejected ? html`<button class="tool${showRej ? ' on' : ''}" data-act="toggle-rejected" aria-pressed="${tf(showRej)}" data-tip="Show or hide rejected pages">Rejected ${showRej ? 'shown' : 'hidden'}</button>` : ''}
     ${sc.sources > 6 ? html`<button class="tool${sc.fold ? ' on' : ''}" data-act="toggle-fold" aria-pressed="${tf(sc.fold)}" data-tip="Draw the sources a topic cites as one bundle; it opens when the topic is selected">Sources ${sc.fold ? 'folded' : 'unfolded'}</button>` : ''}
+    ${sc.refTool ? html`<button class="tool${sc.refsAlways ? ' on' : ''}" data-act="map-refs" aria-pressed="${tf(sc.refsAlways)}" data-tip="${sc.refsAlways ? 'Every line is drawn. Press to draw the lines to sources and those that cite, mention, answer or are about a page for the selected page only.' : 'Lines to sources and lines that cite, mention, answer or are about a page are drawn for the page you select; while nothing is selected, for the page you point at. Press to draw all of them.'}">Reference lines: ${sc.refsAlways ? 'always' : 'on selection'}</button>` : ''}
     ${sc.rounds.length > 1 ? html`<label class="tool tool-sel"><span class="sr">Round shown</span><select data-input="map-round" id="map-round" aria-label="Round shown"><option value="">All rounds</option>${sc.rounds.map((r) => html`<option value="${r}"${m.round === r ? raw(' selected') : ''}>Round ${r}</option>`)}</select></label>` : ''}
     <label class="tool tool-sel"><span class="sr">Lineage of the selection</span><select data-input="map-lineage" id="map-lineage" aria-label="Lineage of the selection">
       <option value="near"${!m.deep && !m.lineageOnly ? raw(' selected') : ''}>Lineage: nearest steps</option><option value="all"${m.deep && !m.lineageOnly ? raw(' selected') : ''}>Lineage: all of it</option><option value="only"${m.lineageOnly ? raw(' selected') : ''}>Lineage only, hide the rest</option></select></label>
@@ -309,13 +360,17 @@ function draw() {
     <span class="tool-group"><button class="tool tool-i" data-act="zoom-out" data-tip="Zoom out (−)" aria-label="Zoom out">${icon('minus')}</button>
       <button class="tool tool-i" data-act="zoom-fit" data-tip="Fit the whole map (0)" aria-label="Fit the whole map">${icon('fit')}</button>
       <button class="tool tool-i" data-act="zoom-in" data-tip="Zoom in (+)" aria-label="Zoom in">${icon('plus')}</button></span>`);
-  const keyEl = $('.map-key', root);
-  if (!keyEl.firstChild) setHTML(keyEl, keyHTML());
+  const keyEl = $('.map-key', root), keyOf = sc.refsAlways ? 'all' : 'sel';
+  if (keyEl.dataset.refs !== keyOf) { setHTML(keyEl, keyHTML(!sc.refsAlways)); keyEl.dataset.refs = keyOf; }
   canvas.classList.toggle('narrow', canvas.clientWidth < 780);
   const W = canvas.clientWidth, H = canvas.clientHeight;
   if (!W || !H) return;
   const bottom = $('.map-foot', root).offsetHeight + 12;
   const F = fonts();
+  /* a stage with more pages than the sheet has rows for: one line each, mark, id and title */
+  const dense = sc.nodes.length > 60, rows = Math.max(6, Math.floor((H - TOP - 96) / 38)), perKind = {};
+  sc.nodes.forEach((n) => { if (n.page) perKind[n.kind] = (perKind[n.kind] || 0) + 1; });
+  const tight = (kind) => dense && kind !== 'source' && kind !== 'idea' && perKind[kind] > rows;
   const info = {}, idCol = {};
   sc.nodes.forEach((n) => { if (n.page && HERO[n.kind]) idCol[n.kind] = Math.max(idCol[n.kind] || 0, tw(n.page.id || '', F.id)); });
   const nodes = sc.nodes.map((n) => {
@@ -334,6 +389,13 @@ function draw() {
     const btn = st.ref ? BTN : 0;
     const stFull = st.full ? tw(st.full, F.s) + btn : 0;
     let w, min, hard;
+    if (tight(pg.kind)) {
+      /* the marks of a proposal stand at the end of its line (a topic is decided on its page) */
+      const held = pg.kind === 'topic' ? 0 : btn, one = idText && title ? idW + 5 + tW : Math.max(idW, tW);
+      w = Math.min(CAP[pg.kind], one) + held; min = Math.max(MIN[pg.kind], idW + held);
+      info[pg.path] = { pg, st, idText, title, idW, lines: 1, tight: true, held };
+      return { key: pg.path, kind: pg.kind, r: R[pg.kind], hu: held ? 14 : 12, hd: held ? 14 : 12, w: Math.ceil(w), min: Math.ceil(Math.min(min, w)) };
+    }
     if (pg.kind === 'source') { w = Math.min(CAP.source, tW); min = w; hard = MIN.source; }
     else if (pg.kind === 'idea') { w = Math.max(idW, stFull); min = w; }
     else if (pg.kind === 'result') { w = Math.max(idW, stFull); min = w; hard = Math.max(MIN.result, Math.ceil(stFull)); }   // "succeeded" is never cut
@@ -346,8 +408,15 @@ function draw() {
     info[pg.path] = { pg, st, idText, title, idW, lines: 1 };
     return { key: pg.path, kind: pg.kind, r: R[pg.kind], hu: 19, hd: 17, w: Math.ceil(w), min: Math.ceil(Math.min(min, w)), hard: hard == null ? undefined : Math.min(hard, Math.ceil(w)) };
   });
-  const edges = sc.edges.filter((e) => info[e.s] && info[e.t]);
-  const sig = [W, H, bottom, nodes.map((n) => n.key + (info[n.key].pg ? info[n.key].pg.review : '') + n.w).join(), edges.map((e) => e.s + e.t + e.type).join()].join('|');
+  const reviewOf = (key) => (info[key] && info[key].pg ? info[key].pg.review : 'accepted');
+  const refs = sc.refs.filter((e) => info[e.s] && info[e.t]);
+  /* the look of a line: lines of one look may run together where the map is crowded */
+  const edges = sc.edges.filter((e) => info[e.s] && info[e.t]).map((e) => {
+    const a = reviewOf(e.s), b = reviewOf(e.t);
+    return { s: e.s, t: e.t, type: e.type, look: relOf(e.type).fam + (a === 'rejected' || b === 'rejected' ? '-dead' : a === 'proposed' || b === 'proposed' ? '-prop' : '') };
+  });
+  const sig = [W, H, bottom, nodes.map((n) => n.key + (info[n.key].pg ? info[n.key].pg.review : '') + n.w + (info[n.key].tight ? 't' : '')).join(), edges.map((e) => e.s + e.t + e.type).join(), sc.refsAlways && !sc.refsOver ? '' : 'refs:' + refs.map((e) => e.s + e.t).join()].join('|');
+  const drawnSig = s.sig;
   if (sig !== s.sig) {
     /* a column is never narrower than its own heading */
     const colMin = {};
@@ -359,13 +428,12 @@ function draw() {
       const name = KIND[k].many.toUpperCase();
       colMin[k] = Math.ceil(tw(name, fh) + name.length * 0.8 + 8 + tw(String(count), fh) + (wait ? 20 : 0) + 4 - 5 - 4 - (k === 'finding' ? 0 : 22) + 8);
     });
-    const dense = nodes.length > 60;
-    const opt = { W, H, top: TOP, bottom, padL: 14, padR: 10, min: MIN, colMin, slot: SLOT, gutterGrow: 56, gapMax: 12, gapMin: dense ? 2 : 3, prevOrder: s.order };
+    const opt = { W, H, top: TOP, bottom, padL: 14, padR: 10, min: MIN, colMin, slot: SLOT, gutterGrow: 56, gapMax: 12, gapMin: dense ? 2 : 3, prevOrder: s.order, quiet: sc.refsAlways && !sc.refsOver ? null : refs, packed: Object.fromEntries(STAGES.map((k) => [k, tight(k)])) };
     /* first pass finds the width each column gets; then titles are wrapped and heights are known */
     const first = layout(nodes, edges, opt);
     nodes.forEach((n) => {
       const it = info[n.key], lw = first.cols[n.layer == null ? STAGES.indexOf(n.kind) : n.layer].lw;
-      if (it.bundle) return;
+      if (it.bundle || it.tight) return;
       if (n.kind === 'source') { n.hu = 10; n.hd = 10; return; }
       if (n.kind === 'idea') { n.hu = 18; n.hd = 18; return; }
       if (n.kind === 'topic') { it.lines = dense ? 1 : wrap2(it.title, F.t, lw).length; n.hu = it.lines > 1 ? 32 : 19; n.hd = 10; return; }
@@ -381,7 +449,10 @@ function draw() {
     s.sig = sig;
     if (!s.user) { s.k = 1; s.tx = 0; s.ty = 0; }
   }
-  s.W = W; s.H = H; s.bottom = bottom; s.bundles = sc.bundles; s.folded = sc.fold;
+  /* the plan or the selection changed under the pointer: what it pointed at may lie elsewhere now */
+  if (sig !== drawnSig || sel !== V.sel) { V.pointed = ''; V.shifted = true; hideTip(); }
+  V.sel = sel;
+  s.W = W; s.H = H; s.bottom = bottom; s.bundles = sc.bundles; s.folded = sc.fold; s.refsAlways = sc.refsAlways; s.crowded = sc.crowded;
   const lay = s.lay;
   Object.keys(info).forEach((k) => (info[k].lines = s.lines[k] || 1));
   /* if the plan is larger than the sheet, keep the selection in sight */
@@ -396,7 +467,17 @@ function draw() {
     const tall = (lay.bottomY + 12) * s.k - (H - bottom);
     if (tall > 0 && at) s.ty = -Math.max(0, Math.min(tall, at.y * s.k - (H - bottom) * 0.5));
   }
-  const tr = trace(lay, sel, m.deep || m.lineageOnly ? Infinity : NEAR_STEPS);
+  /* the lines of the plan, and after them the reference lines of the selected page */
+  s.refs = sc.refsOver ? [] : refs;
+  let lines = lay.edges;
+  if (sc.refsOver) {
+    /* all of them: those that end at one page leave it as one line and part where they arrive */
+    const ends = {};
+    refs.forEach((e) => (ends[e.t] = ends[e.t] || []).push(e));
+    lines = lines.concat(...Object.keys(ends).map((key) => routeRefs(lay, key, ends[key])));
+  } else if (sel && refs.length) lines = lines.concat(routeRefs(lay, sel, refs.filter((e) => e.s === sel || e.t === sel)));
+  s.drawn = lines;
+  const tr = trace(lay, lines, sel, m.deep || m.lineageOnly ? Infinity : NEAR_STEPS);
   const flash = app.ui.flash && Date.now() - app.ui.flash.at < 1600 ? app.ui.flash : null;
   const prev = V.prevKeys[store.pid];
   const empty = store.pages.filter((pg) => STAGES.indexOf(pg.kind) >= 0).length <= 1;
@@ -422,11 +503,11 @@ function draw() {
 
   /* edges, quietest first */
   const famOrder = { read: 0, reason: 1, test: 2, pos: 3, neg: 4 };
-  const reviewOf = (key) => (info[key] && info[key].pg ? info[key].pg.review : 'accepted');
-  const order = lay.edges.map((e, i) => i).sort((a, b) => famOrder[relOf(lay.edges[a].type).fam] - famOrder[relOf(lay.edges[b].type).fam] || (tr.strong.has(a) ? 1 : 0) - (tr.strong.has(b) ? 1 : 0));
-  let ed = '', hits = '', badges = '';
+  const order = lines.map((e, i) => i).sort((a, b) => famOrder[relOf(lines[a].type).fam] - famOrder[relOf(lines[b].type).fam] || (tr.strong.has(a) ? 1 : 0) - (tr.strong.has(b) ? 1 : 0));
+  let ed = '', hits = '';
+  const marks = {};
   order.forEach((i) => {
-    const e = lay.edges[i], rel = relOf(e.type);
+    const e = lines[i], rel = relOf(e.type);
     const provisional = reviewOf(e.s) === 'proposed' || reviewOf(e.t) === 'proposed';
     const dead = reviewOf(e.s) === 'rejected' || reviewOf(e.t) === 'rejected';
     const type = String(e.type).replace(/[^a-z_]/g, '');
@@ -434,9 +515,12 @@ function draw() {
     ed += '<path class="' + cls + '" d="' + e.d + '"/>';
     hits += '<path class="edge-hit" d="' + e.d + '" data-s="' + esc(e.s) + '" data-t="' + esc(e.t) + '" data-type="' + type + '"/>';
     if ((rel.fam === 'pos' || rel.fam === 'neg') && e.mid) {
-      badges += '<g class="badge b-' + rel.fam + (sel && !tr.strong.has(i) && !tr.mid.has(i) ? ' dim' : '') + '" transform="translate(' + e.mid[0] + ' ' + e.mid[1] + ')"><circle r="6.5"/><path d="' + (rel.fam === 'pos' ? 'M-3 0h6M0-3v6' : 'M-2.4-2.4l4.8 4.8M2.4-2.4l-4.8 4.8') + '"/></g>';
+      /* lines that run together carry one mark between them; it is lit while one of them is */
+      const at = rel.fam + ' ' + e.mid[0] + ' ' + e.mid[1], dim = !!sel && !tr.strong.has(i) && !tr.mid.has(i);
+      if (!marks[at] || !dim) marks[at] = '<g class="badge b-' + rel.fam + (dim ? ' dim' : '') + '" transform="translate(' + e.mid[0] + ' ' + e.mid[1] + ')"><circle r="6.5"/><path d="' + (rel.fam === 'pos' ? 'M-3 0h6M0-3v6' : 'M-2.4-2.4l4.8 4.8M2.4-2.4l-4.8 4.8') + '"/></g>';
     }
   });
+  const badges = Object.values(marks).join('');
 
   /* nodes. The map is one stop for Tab: the selected page (or the idea) takes the keyboard,
      the arrow keys move from there, and Tab goes on to the tools and the page. A map of 150
@@ -462,7 +546,33 @@ function draw() {
     }
     const pg = it.pg;
     let l1 = '', l2 = '', btn = '';
-    if (pg.kind === 'source') { const t = fit(it.title, F.src, lw); l1 = '<rect class="n-knock" x="' + (lx - 2) + '" y="-7" width="' + (tw(t, F.src) + 5) + '" height="14"/><text class="n-l1 n-src" x="' + lx + '" y="4">' + esc(t) + '</text>'; }
+    const decide = (bx, by, name) => '<g class="n-btn n-yes" data-act="accept" data-ref="' + esc(it.st.ref) + '" transform="translate(' + bx + ' ' + by + ')" tabindex="' + tab + '" role="button" aria-label="Accept ' + name + '"><title>Accept (A)</title><rect class="n-hit" x="-4.5" y="-6.5" width="28" height="28"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M5.4 7.9l2.7 2.7 5.4-6.2"/></g>' +
+      '<g class="n-btn n-no" data-act="reject-ask" data-ref="' + esc(it.st.ref) + '" data-key="' + esc(pg.path) + '" transform="translate(' + (bx + 28) + ' ' + by + ')" tabindex="' + tab + '" role="button" aria-label="Reject ' + name + '"><title>Reject, with a reason (R)</title><rect class="n-hit" x="-4.5" y="-6.5" width="28" height="28"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M6.1 4.1l6.8 6.8M12.9 4.1l-6.8 6.8"/></g>';
+    if (it.tight) {
+      /* one line: the mark says the state, the words are in the tip and on the page */
+      const held = it.held;
+      const idShown = pg.kind === 'result' && it.idW > lw - held + 2 ? it.idText.replace(/^.*· /, '') : it.idText;
+      let room = lw - held - (idShown ? it.idW + 5 : 0);
+      /* The marks of a page that is itself proposed need no word: its hatching says what they
+         decide. On an accepted page they decide a change to it, and the line says which
+         before it says the title: "testing → supported", or "→ supported" (the mark shows the
+         state it has). The longer of the two that leaves the title room to be read; where
+         neither does, the longer that fits, and no stump of a title beside it; then "change".
+         A stage drawn at its narrowest has room for the id and the marks only (one word in one
+         row is not worth a wider column in every row): there the dashed ring around the mark
+         says that a change waits, and the tip and the page say which. */
+      const fits = (text) => !!text && tw(text, F.s) + 8 <= room;
+      const forms = held && pg.review === 'accepted' ? [it.st.full, it.st.short].filter(fits) : [];
+      const says = forms.find((text) => room - tw(text, F.s) - 8 >= 60) || forms[0] || (held && pg.review === 'accepted' && fits('change') ? 'change' : '');
+      if (says) room -= tw(says, F.s) + 8;
+      const t = it.title && room >= (says ? 60 : 34) ? fit(it.title, F.t, room) : '';
+      const end = t ? (idShown ? it.idW + 5 : 0) + tw(t, F.t) : tw(idShown, F.id);
+      l1 = '<rect class="n-knock" x="' + (lx - 2) + '" y="-8" width="' + (held ? lw + 4 : end + 6) + '" height="16"/>' +
+        (idShown ? '<text class="n-l1" x="' + lx + '" y="4"><tspan class="n-id">' + esc(idShown) + '</tspan></text>' : '') +
+        (t ? '<text class="n-l1" x="' + (lx + (idShown ? it.idW + 5 : 0)) + '" y="4">' + esc(t) + '</text>' : '') +
+        (says ? '<text class="n-l2" x="' + (lx + lw - 47 - 8 - tw(says, F.s)) + '" y="3.5">' + esc(says) + '</text>' : '');
+      if (held) btn = decide(lx + lw - 47, -7.5, esc(label(pg)));
+    } else if (pg.kind === 'source') { const t = fit(it.title, F.src, lw); l1 = '<rect class="n-knock" x="' + (lx - 2) + '" y="-7" width="' + (tw(t, F.src) + 5) + '" height="14"/><text class="n-l1 n-src" x="' + lx + '" y="4">' + esc(t) + '</text>'; }
     else if (pg.kind === 'topic') {
       const lines = wrap2(pg.title, F.t, lw).slice(0, it.lines);
       if (lines.length < 2 && it.lines < 2) lines[0] = fit(pg.title, F.t, lw);
@@ -476,7 +586,7 @@ function draw() {
       l1 = '<text class="n-l1" x="' + lx + '" y="' + y0 + '"><tspan class="n-id">' + esc(idShown) + '</tspan></text>' +
         lines.map((t, i) => '<text class="n-l1" x="' + (lx + it.idW + 5) + '" y="' + (y0 + i * 13) + '">' + esc(t) + '</text>').join('');
     }
-    if (pg.kind !== 'topic' && pg.kind !== 'source' && it.st.full) {
+    if (!it.tight && pg.kind !== 'topic' && pg.kind !== 'source' && it.st.full) {
       const room = lw - (it.st.ref ? BTN : 0);
       const fits = (text) => tw(text, F.s) <= room;
       /* A state is said in whole words or not at all: "prop…" tells nobody anything. Where a
@@ -489,13 +599,11 @@ function draw() {
       if (it.st.ref) {
         /* the marks are small; what is pressed is a square around each: 28 units, which is
            24 px where the map is drawn at its smallest automatic scale */
-        const bx = lx + (words ? tw(words, F.s) + 8 : 1), name = esc(label(pg));
-        btn = '<g class="n-btn n-yes" data-act="accept" data-ref="' + esc(it.st.ref) + '" transform="translate(' + bx + ' 1)" tabindex="' + tab + '" role="button" aria-label="Accept ' + name + '"><title>Accept (A)</title><rect class="n-hit" x="-4.5" y="-6.5" width="28" height="28"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M5.4 7.9l2.7 2.7 5.4-6.2"/></g>' +
-          '<g class="n-btn n-no" data-act="reject-ask" data-ref="' + esc(it.st.ref) + '" data-key="' + esc(pg.path) + '" transform="translate(' + (bx + 28) + ' 1)" tabindex="' + tab + '" role="button" aria-label="Reject ' + name + '"><title>Reject, with a reason (R)</title><rect class="n-hit" x="-4.5" y="-6.5" width="28" height="28"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M6.1 4.1l6.8 6.8M12.9 4.1l-6.8 6.8"/></g>';
+        btn = decide(lx + (words ? tw(words, F.s) + 8 : 1), 1, esc(label(pg)));
       }
     }
     const change = store.pendingFor(pg.path).length > 0;
-    const cls = 'node k-' + pg.kind + ' r-' + (pg.review === 'proposed' || pg.review === 'rejected' ? pg.review : 'accepted') + ' t-' + (TONE[pg.state] || 'none') + (change ? ' has-change' : '') + dimCls +
+    const cls = 'node k-' + pg.kind + ' r-' + (pg.review === 'proposed' || pg.review === 'rejected' ? pg.review : 'accepted') + ' t-' + (TONE[pg.state] || 'none') + (change ? ' has-change' : '') + (it.tight ? ' n-tight' : '') + dimCls +
       (flash && flash.key === pg.path ? ' flash-' + flash.decision : '') + (prev && !prev.has(pg.path) ? ' pop' : '');
     const aria = kindName(pg.kind) + ' ' + (pg.id && pg.kind !== 'source' ? pg.id : '') + ', ' + pg.title + ', ' + pg.review + (pg.state ? ', ' + pg.state : '') + (change ? ', change proposed' : '');
     nd += '<g class="' + cls + '" data-key="' + esc(pg.path) + '" transform="translate(' + n.x + ' ' + n.y + ')" tabindex="' + tab + '" role="button" aria-label="' + esc(aria) + '"' + (pg.path === sel ? ' aria-pressed="true"' : '') + '>' +
@@ -521,7 +629,7 @@ function draw() {
   /* built from numbers, class names and escaped text only */
   svg.innerHTML =
     '<defs><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect class="hatch-bg" width="5" height="5"/><path class="hatch-ln" d="M0 0v5"/></pattern></defs>' +
-    '<g class="vp"><g class="ghosts">' + ghost + '</g><g class="edges">' + ed + '</g><g class="hits">' + hits + '</g><g class="badges">' + badges + '</g><g class="nodes">' + nd + '</g></g>' +
+    '<g class="vp"><g class="ghosts">' + ghost + '</g><g class="edges">' + ed + '</g><g class="refs"></g><g class="hits">' + hits + '</g><g class="badges">' + badges + '</g><g class="nodes">' + nd + '</g></g>' +
     '<rect class="head-bg" width="' + W + '" height="34"/><path class="head-rule" d="M0 34.5H' + W + '"/><g class="heads">' + heads + '</g>';
   /* The drawing was written again, and with it the node that had the keyboard: the keyboard
      is put back where it was. When the arrow keys moved the selection from a node, it goes
@@ -534,7 +642,8 @@ function draw() {
     if (el) V.focusNext = null;
   }
   canvas.classList.toggle('has-sel', !!sel);
-  canvas.classList.toggle('dense', sc.nodes.length > 60);
+  canvas.classList.toggle('dense', dense);
+  pointAt(V.pointed);
   canvas.classList.toggle('wider', lay.width * s.k > W + 2 || (lay.bottomY + 12) * s.k > H - bottom + 2);
   canvas.classList.toggle('trace-more', !!(sel && tr.more));
 
@@ -544,13 +653,13 @@ function draw() {
   applyT();
 }
 
-function keyHTML() {
-  const sw = (cls, lab) => html`<span class="key-i"><svg width="30" height="12" viewBox="0 0 30 12" aria-hidden="true"><path class="edge ${cls}" d="M1 6H29"/>${
-    cls.indexOf('f-pos') >= 0 ? raw('<g class="badge b-pos" transform="translate(15 6) scale(.8)"><circle r="6.5"/><path d="M-3 0h6M0-3v6"/></g>') : cls.indexOf('f-neg') >= 0 ? raw('<g class="badge b-neg" transform="translate(15 6) scale(.8)"><circle r="6.5"/><path d="M-2.4-2.4l4.8 4.8M2.4-2.4l-4.8 4.8"/></g>') : ''}</svg>${lab}</span>`;
+function keyHTML(refsOnSelection) {
+  const sw = (cls, lab, note) => html`<span class="key-i"><svg width="30" height="12" viewBox="0 0 30 12" aria-hidden="true"><path class="edge ${cls}" d="M1 6H29"/>${
+    cls.indexOf('f-pos') >= 0 ? raw('<g class="badge b-pos" transform="translate(15 6) scale(.8)"><circle r="6.5"/><path d="M-3 0h6M0-3v6"/></g>') : cls.indexOf('f-neg') >= 0 ? raw('<g class="badge b-neg" transform="translate(15 6) scale(.8)"><circle r="6.5"/><path d="M-2.4-2.4l4.8 4.8M2.4-2.4l-4.8 4.8"/></g>') : ''}</svg>${lab}${note ? html` <i class="key-note">${note}</i>` : ''}</span>`;
   const g = (review, state, lab) => html`<span class="key-i">${glyph('hypothesis', review, state, 16)}${lab}</span>`;
   return html`<div class="key-row"><span class="key-h">Review</span>${g('accepted', 'open', 'accepted')}${g('proposed', 'open', 'proposed')}${g('rejected', 'open', 'rejected')}</div>
     <div class="key-row key-state"><span class="key-h">State</span>${g('accepted', 'open', 'open')}${g('accepted', 'testing', 'testing, running')}${g('accepted', 'supported', 'supported, succeeded')}${g('accepted', 'refuted', 'refuted, failed')}</div>
-    <div class="key-row"><span class="key-h">Lines</span>${sw('f-read', 'cites, about')}${sw('f-reason', 'motivated by, follows')}${sw('f-test', 'tests, run of, based on')}${sw('f-pos', 'supports')}${sw('f-neg', 'refutes')}</div>`;
+    <div class="key-row"><span class="key-h">Lines</span>${sw('f-read', refsOnSelection ? 'cites, about, lines to sources' : 'cites, about', refsOnSelection ? 'on selection' : '')}${sw('f-reason', 'motivated by, follows')}${sw('f-test', 'tests, run of, based on')}${sw('f-pos', 'supports')}${sw('f-neg', 'refutes')}</div>`;
 }
 
 function emptyHTML(store) {
@@ -563,6 +672,24 @@ function emptyHTML(store) {
     <p>${e.fresh ? 'Research has not started.' : 'Nothing has been written yet.'} Intake reads ${files ? 'your ' + plural(files, 'file') : 'the idea'}, then the scout looks for prior work, verifies every paper and writes down what is known and what is open. It pauses at the first checkpoint and nothing is accepted without you.</p>
     <p class="empty-meta">The limit for models in this project is $${limits.model_usd != null ? Number(limits.model_usd).toFixed(2) : '…'}.</p>
     <div class="row"><button class="btn btn-primary" data-act="continue">${e.fresh ? 'Start research' : continueLabel(e.next, store)} ${icon('right')}</button>${idea ? html`<a class="btn" href="${link({ view: 'wiki', sel: idea.path, sub: 'edit' })}">Edit the idea first</a>` : ''}</div></div>`;
+}
+
+/** The reference lines of the page the pointer or the keyboard is on, while they are held
+    back and nothing is selected. A selection has its own drawn; beside them, the lines of a
+    second page could not be told from its lineage, and would end at pages that are dimmed. */
+function pointAt(key) {
+  const s = V.st, g = V.root && $('.map-svg .refs', V.root);
+  V.pointed = key || '';
+  if (!g) return;
+  const own = key && !V.sel && s.lay && s.refs && s.refs.length ? routeRefs(s.lay, key, s.refs.filter((e) => e.s === key || e.t === key)) : [];
+  const review = (k) => (V.store.byPath.get(k) || {}).review;
+  const state = (e) => (review(e.s) === 'rejected' || review(e.t) === 'rejected' ? ' e-dead' : review(e.s) === 'proposed' || review(e.t) === 'proposed' ? ' e-prop' : '');
+  g.replaceChildren(...own.map((e) => {
+    const path = document.createElementNS(g.namespaceURI, 'path');
+    path.setAttribute('class', 'edge f-' + relOf(e.type).fam + ' t-' + String(e.type).replace(/[^a-z_]/g, '') + state(e) + ' ref');
+    path.setAttribute('d', e.d);
+    return path;
+  }));
 }
 
 function tip(key) {
@@ -628,7 +755,7 @@ export const mapView = {
       to = colKeys[i + (ev.key === 'ArrowDown' ? 1 : -1)];
     } else {
       const right = ev.key === 'ArrowRight';
-      const cand = lay.edges.filter((e) => (right ? e.lo : e.hi) === sel).map((e) => (right ? e.hi : e.lo)).filter(isPage);
+      const cand = (V.st.drawn || lay.edges).filter((e) => (right ? e.lo : e.hi) === sel).map((e) => (right ? e.hi : e.lo)).filter(isPage);
       /* the nearest stage first, then the nearest line */
       cand.sort((a, b) => Math.abs(lay.nodes[a].layer - me.layer) - Math.abs(lay.nodes[b].layer - me.layer) || Math.abs(lay.nodes[a].y - me.y) - Math.abs(lay.nodes[b].y - me.y));
       to = cand[0];

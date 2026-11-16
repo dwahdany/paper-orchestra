@@ -2,7 +2,9 @@
 
    node tests/e2e/web_shots.js --base http://127.0.0.1:8600 --out DIR [--only REGEX] [--themes light,dark] [--dsf 2]
 
-   Needs the demo project in the server's workspace (see README.md). Nothing is changed in
+   Needs the demo project in the server's workspace (see README.md); with the project of 150
+   pages beside it, its map is photographed too: with nothing selected, with a hypothesis, an
+   experiment and a finding selected, and with every reference line drawn. Nothing is changed in
    the project: the shots that need a typed word or an open form type it and leave. The
    moving states (a running phase, a live log, a failure) are photographed by
    web_check.js --shots while it drives them. */
@@ -26,6 +28,8 @@ fs.writeFileSync(notes, '# Notes\n\nThe spike is near step 40 at batch size 16.\
 fs.writeFileSync(runs, 'step,loss\n' + Array.from({ length: 2000 }, (_, i) => i + ',' + (1 / (i + 1)).toFixed(5)).join('\n'));
 
 const type = (selector, text) => async (page) => { await page.fill(selector, text); await page.waitForTimeout(400); };
+/* a crowded map draws its reference lines for the selected page only; this asks for all of them */
+const allLines = async (page) => { await page.click('.map-tools [data-act="map-refs"]'); await page.waitForSelector('.map-svg .edges .edge.t-cites'); await page.mouse.move(4, 4); await page.waitForTimeout(400); };
 const SHOTS = [
   ['01-start-empty', '#/start'],
   ['02-start-filled', '#/start', async (page) => {
@@ -67,7 +71,10 @@ const SHOTS = [
   ['26-keyboard-sheet', '#/p/PID/wiki/H2', async (page) => { await page.keyboard.press('?'); await page.waitForTimeout(200); }],
   ['27-new-page-dialog', '#/p/PID/wiki/H2', async (page) => { await page.click('[data-act="new-page"]'); await page.fill('#np-title', 'Why I doubt the variance account'); await page.waitForTimeout(200); }],
   ['28-large-map', '#/p/LARGE/map'],
-  ['29-large-map-selected', '#/p/LARGE/map/H3'],
+  ['29-large-map-selected', '#/p/LARGE/map/H1'],
+  ['29b-large-map-finding', '#/p/LARGE/map/F1'],
+  ['29c-large-map-all-lines', '#/p/LARGE/map', allLines],
+  ['29d-large-map-experiment', '#/p/LARGE/map/E1'],
   ['30-missing-project', '#/p/p-000000000000/map'],
 ];
 const SIZES = [
@@ -76,6 +83,8 @@ const SIZES = [
   ['15-inbox', '#/p/PID/inbox', 1900, 1000],
   ['15-inbox', '#/p/PID/inbox', 820, 1000], ['17-experiments-table', '#/p/PID/experiments', 820, 1000], ['21-experiment-failed-e2', '#/p/PID/experiments/E2', 820, 1000],
   ['05-map-home', '#/p/PID/map', 1100, 800], ['10-wiki-page-h2', '#/p/PID/wiki/H2', 1100, 800],
+  ['28-large-map', '#/p/LARGE/map', 1900, 1000], ['29-large-map-selected', '#/p/LARGE/map/H1', 1900, 1000], ['29b-large-map-finding', '#/p/LARGE/map/F1', 1900, 1000], ['29c-large-map-all-lines', '#/p/LARGE/map', 1900, 1000, allLines],
+  ['28-large-map', '#/p/LARGE/map', 820, 1000], ['29-large-map-selected', '#/p/LARGE/map/H1', 820, 1000],
 ];
 
 (async () => {
@@ -107,7 +116,7 @@ const SIZES = [
     await ctx.close();
   };
   for (const theme of THEMES) for (const s of SHOTS) { if (ONLY && !ONLY.test(s[0])) continue; await shoot(s[0], s[1], 1440, 900, theme, s[2], s[3]); }
-  for (const s of SIZES) { if (ONLY && !ONLY.test(s[0] + '-' + s[2])) continue; for (const theme of THEMES) await shoot(s[0], s[1], s[2], s[3], theme); }
+  for (const s of SIZES) { if (ONLY && !ONLY.test(s[0] + '-' + s[2])) continue; for (const theme of THEMES) await shoot(s[0], s[1], s[2], s[3], theme, s[4]); }
   await browser.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(errors.length ? 'ERRORS\n' + errors.join('\n') : 'no console errors');

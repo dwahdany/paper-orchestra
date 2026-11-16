@@ -134,6 +134,9 @@ CHECKS.map = async ({ page, pid }) => {
   await open(page, '#/p/' + pid + '/map', '.map-svg .node');
   const nodes = await count(page, '.map-svg .node');
   ok(nodes >= 39, 'the map shows the demo project: ' + nodes + ' nodes');
+  /* a small map draws every line; only a crowded one holds its reference lines back */
+  ok((await count(page, '.map-svg .edges .edge.t-cites')) >= 10 && (await count(page, '.map-svg .edges .edge.t-about')) >= 3, 'a small project draws its reference lines with nothing selected: ' + (await count(page, '.map-svg .edges .edge.t-cites')) + ' cites, ' + (await count(page, '.map-svg .edges .edge.t-about')) + ' about');
+  ok(!/on selection/.test(await text(page, '.map-key')), 'and its legend does not say that any line waits for a selection');
   ok((await text(page, '.strip-text')).includes('waiting for you'), 'the strip says what is waiting: ' + (await text(page, '.strip-text')));
   const n0 = await inboxCount(page);
   ok(n0 === 6, 'six proposals wait at the start, got ' + n0);
@@ -935,6 +938,125 @@ CHECKS.large = async ({ page, pid, large }) => {
   const over = await page.evaluate(OVERFLOW);
   ok(!over.length, 'large map overflow: ' + over.join('; '));
   await shot(page, 'large-map');
+  /* A crowded map draws the argument and holds the reference lines back: nothing that cites,
+     mentions, answers, is about a page or ends at a source is drawn until a page is selected
+     or pointed at, and then that page's own lines only. A control and the legend say so. */
+  const refLines = () => page.evaluate(() => {
+    const read = (key) => /^bundle:/.test(key) || /(^|\/)sources\//.test(key);
+    const hits = (group) => Array.from(document.querySelectorAll('.map-svg ' + group + ' .edge-hit')).filter((e) => /^(cites|about|mentions|answers)$/.test(e.dataset.type) || read(e.dataset.s) || read(e.dataset.t));
+    return { drawn: hits('.hits').map((e) => [e.dataset.s, e.dataset.t]), marked: document.querySelectorAll('.map-svg .edges .edge.t-cites, .map-svg .edges .edge.t-about, .map-svg .edges .edge.t-mentions, .map-svg .edges .edge.t-answers').length, pointed: document.querySelectorAll('.map-svg .refs .edge').length, argued: document.querySelectorAll('.map-svg .edges .edge.f-test, .map-svg .edges .edge.f-pos, .map-svg .edges .edge.f-neg').length };
+  });
+  await page.mouse.move(4, 4);
+  await page.waitForTimeout(150);
+  let lines = await refLines();
+  ok(lines.drawn.length === 0 && lines.marked === 0 && lines.pointed === 0, 'in a large project no reference line is drawn while nothing is selected: ' + lines.drawn.length + ' drawn, ' + lines.pointed + ' for a page pointed at');
+  const argued = lines.argued;
+  ok(argued >= 20, 'the lines of the argument (tests, runs, what findings rest on and support) are drawn: ' + argued);
+  ok(/on selection/.test(await text(page, '.map-tools [data-act="map-refs"]')) && (await page.getAttribute('.map-tools [data-act="map-refs"]', 'aria-pressed')) === 'false', 'a control says that reference lines wait for a selection: ' + (await text(page, '.map-tools [data-act="map-refs"]')));
+  ok(/on selection/.test(await text(page, '.map-key')), 'and so does the legend: ' + (await text(page, '.map-key .key-row >> nth=-1')).replace(/\s+/g, ' ').trim());
+  /* pointing at a page shows its lines for as long as the pointer is on it */
+  const onSheet = await page.evaluate(() => {
+    const sheet = document.querySelector('.map-canvas').getBoundingClientRect(), foot = document.querySelector('.map-foot').getBoundingClientRect();
+    return Array.from(document.querySelectorAll('.map-svg .node:not(.k-bundle) .gl')).map((g) => g.getBoundingClientRect()).filter((b) => b.top > sheet.top + 40 && b.bottom < foot.top - 6 && b.left > sheet.left && b.right < sheet.right).map((b) => [b.left + b.width / 2, b.top + b.height / 2]);
+  });
+  let pointed = 0;
+  for (const at of onSheet.slice(0, 30)) {
+    await page.mouse.move(at[0], at[1]);
+    await page.waitForTimeout(80);
+    pointed = await count(page, '.map-svg .refs .edge');
+    if (pointed) break;
+  }
+  ok(pointed > 0, 'pointing at a page draws its reference lines (tried ' + Math.min(30, onSheet.length) + ' pages on the sheet)');
+  ok((await count(page, '.map-svg .edges .edge.t-cites, .map-svg .edges .edge.t-about')) === 0, 'without drawing them into the plan');
+  await page.mouse.move(4, 4);
+  await until(page, () => document.querySelectorAll('.map-svg .refs .edge').length === 0, null, 3000, 'and they go when the pointer leaves it');
+  /* The marks on a page that is itself proposed decide the page, and its hatching says so. On
+     an accepted page they decide a change to it; where such a page is drawn on one line, the
+     line says which change before it says the title. */
+  const says = await page.evaluate(() => Array.from(document.querySelectorAll('.map-svg .node.n-tight.r-accepted')).filter((n) => n.querySelector('.n-btn')).map((n) => n.getAttribute('aria-label').split(',')[0] + ': "' + ((n.querySelector('.n-l2') || {}).textContent || '') + '"'));
+  ok(says.length >= 1 && says.every((line) => /→ \w|change"/.test(line)), 'an accepted page on one line says what its two marks decide: ' + (says.join('; ') || 'no such page is drawn'));
+  /* A page is pointed at when the pointer moves onto it. Selecting a page opens it beside the
+     map and the map is laid out again; the page that then lies under the pointer, which has
+     not moved, was not pointed at: neither its tip nor its lines are shown. */
+  const asked = await page.evaluate(() => Array.from(document.querySelectorAll('.map-svg .node.k-question.r-accepted')).map((n) => n.dataset.key));
+  let landed = 0, stray = 0, clicked = 0;
+  for (const key of asked.slice(0, 8)) {
+    const at = await page.evaluate((key) => {
+      const sheet = document.querySelector('.map-canvas').getBoundingClientRect(), foot = document.querySelector('.map-foot').getBoundingClientRect();
+      const b = document.querySelector('.map-svg .node[data-key="' + CSS.escape(key) + '"] .n-bg').getBoundingClientRect();
+      return b.top > sheet.top + 40 && b.bottom < foot.top - 6 ? [b.left + 40, b.top + b.height / 2] : null;
+    }, key);
+    if (!at) continue;
+    await page.mouse.click(at[0], at[1]);
+    await until(page, (key) => { const n = document.querySelector('.map-svg .node.sel'); return !!n && n.dataset.key === key; }, key, 4000, 'a click on a question selects it');
+    await page.waitForTimeout(250);
+    const under = await page.evaluate((at) => {
+      const el = document.elementFromPoint(at[0], at[1]), node = el && el.closest && el.closest('.map-svg .node');
+      return { other: !!node && !node.classList.contains('sel'), lines: document.querySelectorAll('.map-svg .refs .edge').length, tip: !!document.querySelector('.map-tip.on') };
+    }, at);
+    clicked++;
+    if (under.other) landed++;
+    if (under.lines || under.tip) stray++;
+    await page.keyboard.press('Escape');
+    await until(page, () => /\/map$/.test(location.hash) && !document.querySelector('.map-svg .node.sel'), null, 4000, 'Escape clears the selection');
+    await page.mouse.move(4, 4);
+    await page.waitForTimeout(120);
+  }
+  if (!landed) notes.push('large: none of ' + clicked + ' selections moved another page under the pointer, so what a pointer at rest shows was not checked');
+  ok(!stray, 'a page that the map moved under a pointer at rest shows neither its tip nor its lines: ' + stray + ' of ' + clicked + ' selections left some (' + landed + ' put another page under the pointer)');
+  /* selecting a page draws its own reference lines, and no other page's */
+  const graph = (await api('GET', '/api/projects/' + large + '/graph')).data.edges;
+  const listed = (await api('GET', '/api/projects/' + large + '/pages')).data.pages;
+  const citing = listed.find((pg) => pg.kind === 'hypothesis' && pg.review !== 'rejected' && graph.some((e) => e.source === pg.path && e.type === 'cites'));
+  const placesOf = () => page.evaluate(() => Array.from(document.querySelectorAll('.map-svg .node:not(.k-source):not(.k-bundle)')).map((n) => n.dataset.key + ' ' + n.getAttribute('transform')).sort());
+  const elsewhere = (was, now) => was.filter((place) => now.indexOf(place) < 0).length;
+  const unselected = await placesOf();
+  if (ok(!!citing, 'the large project has a hypothesis that cites a source')) {
+    await open(page, '#/p/' + large + '/map/' + citing.id, '.map-svg .node.sel');
+    await page.mouse.move(4, 4);
+    await page.waitForTimeout(200);
+    lines = await refLines();
+    ok(lines.drawn.length >= 1 && lines.marked >= 1, 'selecting ' + citing.id + ' draws its reference lines: ' + lines.drawn.length);
+    ok(lines.drawn.every((ends) => ends[0] === citing.path || ends[1] === citing.path), 'and only its own: ' + lines.drawn.filter((ends) => ends[0] !== citing.path && ends[1] !== citing.path).length + ' of ' + lines.drawn.length + ' belong to another page');
+    ok((await count(page, '.map-svg .edges .edge.t-cites.hl')) >= 1, 'they are drawn at full strength, as part of its lineage');
+    /* while a page is selected the reference lines on the map are its own: pointing at
+       another page shows what that page is, and draws no second set of lines beside them */
+    const others = await page.evaluate(() => {
+      const sheet = document.querySelector('.map-canvas').getBoundingClientRect(), foot = document.querySelector('.map-foot').getBoundingClientRect(), panel = document.querySelector('.panel').getBoundingClientRect();
+      return Array.from(document.querySelectorAll('.map-svg .node:not(.sel):not(.k-bundle) .gl')).map((g) => g.getBoundingClientRect()).filter((b) => b.top > sheet.top + 40 && b.bottom < foot.top - 6 && b.left > sheet.left && b.right < Math.min(sheet.right, panel.left)).map((b) => [b.left + b.width / 2, b.top + b.height / 2]);
+    });
+    let tips = 0, second = 0;
+    for (const at of others.slice(0, 16)) {
+      await page.mouse.move(at[0], at[1]);
+      await page.waitForTimeout(60);
+      if (await count(page, '.map-tip.on')) tips++;
+      second += await count(page, '.map-svg .refs .edge');
+    }
+    ok(tips > 0 && !second, 'with ' + citing.id + ' selected, pointing at ' + Math.min(16, others.length) + ' other pages showed ' + tips + ' tips and drew ' + second + ' lines of theirs');
+    await page.mouse.move(4, 4);
+    await page.waitForTimeout(150);
+    await shot(page, 'large-map-selected');
+    await page.keyboard.press('Escape');
+    await until(page, () => /\/map$/.test(location.hash) && !document.querySelector('.map-svg .edges .edge.t-cites'), null, 4000, 'the reference lines go with the selection');
+    /* the page opened beside the map and closed again: the map was laid out twice, and is as it was */
+    await page.waitForTimeout(200);
+    ok(!elsewhere(unselected, await placesOf()), 'the map comes back as it was when the selection is cleared: ' + elsewhere(unselected, await placesOf()) + ' of ' + unselected.length + ' pages are elsewhere');
+  }
+  /* the control draws all of them, and takes them back; the keyboard stays on it. They are
+     drawn over the plan: no page changes its place under the person who asked for them */
+  const plan = await placesOf();
+  await page.focus('.map-tools [data-act="map-refs"]');
+  await page.keyboard.press('Enter');
+  await until(page, () => /always/.test((document.querySelector('.map-tools [data-act="map-refs"]') || {}).textContent || '') && document.querySelectorAll('.map-svg .edges .edge.t-cites').length > 20, null, 5000, 'the control draws every reference line');
+  ok(!elsewhere(plan, await placesOf()), 'every reference line is drawn over the plan as it stood: ' + elsewhere(plan, await placesOf()) + ' of ' + plan.length + ' pages changed their place');
+  ok((await count(page, '.map-svg .edges .edge.f-test, .map-svg .edges .edge.f-pos, .map-svg .edges .edge.f-neg')) === argued, 'and the lines of the argument are the same ' + argued);
+  ok((await page.getAttribute('.map-tools [data-act="map-refs"]', 'aria-pressed')) === 'true' && !/on selection/.test(await text(page, '.map-key')), 'the control and the legend say that all lines are drawn');
+  ok(await page.evaluate(() => document.activeElement && document.activeElement.dataset.act === 'map-refs'), 'the keyboard stays on the control: ' + (await focusOf(page)));
+  ok(!(await page.evaluate(OVERFLOW)).length, 'large map with every line: overflow ' + (await page.evaluate(OVERFLOW)).join('; '));
+  await shot(page, 'large-map-all-lines');
+  await page.keyboard.press('Enter');
+  await until(page, () => /on selection/.test((document.querySelector('.map-tools [data-act="map-refs"]') || {}).textContent || '') && !document.querySelector('.map-svg .edges .edge.t-cites'), null, 5000, 'and takes them back');
+  await page.evaluate(() => document.activeElement.blur());
   /* a bundle opens when its topic is selected (by the keyboard: the bundle may lie below the sheet) */
   await page.focus('.map-svg .node.k-bundle[aria-label*="cited by"] >> nth=0');
   await page.keyboard.press('Enter');
