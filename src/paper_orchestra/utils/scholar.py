@@ -47,9 +47,11 @@ MATCH_THRESHOLD = 70.0
 YEAR_BONUS = 10.0
 
 # Keyless requests share one public quota with every other anonymous client, so they are
-# spaced a little wider than the one request per second a personal key is granted.
+# spaced a little wider than the one request per second a personal key is granted.  Keyed
+# requests keep a margin under that second too: sent exactly one second apart, two of them
+# can reach the service within the same second, and it answers the second with HTTP 429.
 KEYLESS_INTERVAL_S = 1.2
-KEYED_INTERVAL_S = 1.0
+KEYED_INTERVAL_S = 1.1
 
 _CUTOFF = re.compile(r"^\s*(\d{4})-(\d{1,2})(?:-\d{1,2})?\s*$")
 _DATE = re.compile(r"^\s*(\d{4})(?:-(\d{1,2}))?")
