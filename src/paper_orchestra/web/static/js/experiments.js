@@ -6,7 +6,7 @@ import { app, link } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf } from './util.js';
 import { TONE, agentName, glyph, icon, pageGlyph } from './vocab.js';
-import { afterRender, approvalChoice, backendName, label, pageName, pageTip, reviewBar, reviewTag, stateTag, who } from './page.js';
+import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, reviewBar, reviewTag, stateTag, who } from './page.js';
 
 const GROUPS = [
   ['Needs your approval', (x) => x.review !== 'rejected' && (x.review === 'proposed' || x.state === 'planned' || !x.state)],
@@ -140,7 +140,9 @@ function approveHTML(store, page, data) {
   const capMin = Math.max(1, Math.floor((limits.experiment_seconds || 900) / 60));
   const planMin = Math.max(1, Math.round((plan.timeout_seconds || 900) / 60));
   const limitMin = chosen.minutes != null && chosen.minutes !== '' ? chosen.minutes : Math.min(planMin, capMin);
-  const network = chosen.network != null ? chosen.network : !!plan.network;
+  /* network access is never taken from the plan: off until the person turns it on, and a
+     plan that asks for it is answered explicitly (`networkAsk`) */
+  const network = chosen.network === true;
   const gpu = chosen.gpu != null ? chosen.gpu : plan.gpu || '';
   const pick = options.find((o) => o.backend === chosen.backend);
   const proposed = page.review === 'proposed';
@@ -154,7 +156,7 @@ function approveHTML(store, page, data) {
   };
   const sum = pick ? backendName(pick.backend, pick.backend === 'modal' ? gpu : '') + ', for at most ' + minutes(+limitMin || planMin) + (pick.max_usd ? ' and ' + money(pick.max_usd * ((+limitMin || planMin) * 60) / Math.max(1, pick.timeout_seconds || planMin * 60)) : '') : '';
   return html`<section class="approve" id="approve" data-eid="${eid}"><h2>Where should it run?</h2>
-    ${proposed ? html`<p class="approve-say"><b>Proposed</b> by the ${agentName(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(page.updated)}. It is not part of the wiki until you accept it, and it will not run until you approve it.</p>` : ''}
+    ${proposed ? html`<p class="approve-say"><b>Proposed</b> by ${who(page.author)}${page.round ? ' in round ' + page.round : ''}, ${ago(page.updated)}. It is not part of the wiki until you accept it, and it will not run until you approve it.</p>` : ''}
     ${!proposed && page.state === 'planned' && (page.meta || {}).state_reason ? html`<p class="note note-warn approve-back" role="status">${icon('warn')}<span><b>It is planned again and waits for your approval.</b> ${plain(page.meta.state_reason)}</span></p>` : ''}
     ${data.plan_error ? html`<p class="note note-warn">${icon('warn')}<span>The plan cannot be read as it is: ${data.plan_error}</span></p>` : ''}
     <div class="backends" role="radiogroup" aria-label="Backend">${options.map(row)}</div>
@@ -162,8 +164,9 @@ function approveHTML(store, page, data) {
     <div class="approve-fields">
       <label><span>Time limit</span><input type="number" id="ap-min-${eid}" min="1" max="${capMin}" step="1" value="${limitMin}" data-input="ap-minutes" data-eid="${eid}" inputmode="numeric"><span class="quiet">minutes, then it is stopped (at most ${capMin} in this project)</span></label>
       ${chosen.backend === 'modal' || plan.mode === 'gpu' ? html`<label><span>GPU</span><input id="ap-gpu-${eid}" value="${gpu}" placeholder="none (CPU)" data-input="ap-gpu" data-eid="${eid}" size="8" autocomplete="off"><span class="quiet">for example T4, L4, A10G</span></label>` : ''}
-      <label class="tick"><input type="checkbox" id="ap-net-${eid}" data-input="ap-network" data-eid="${eid}"${network ? raw(' checked') : ''}> Allow network access<span class="quiet">${chosen.backend === 'local' ? 'the local backend cannot block it either way' : 'off unless you tick this'}</span></label>
+      ${plan.network ? '' : html`<label class="tick"><input type="checkbox" id="ap-net-${eid}" data-input="ap-network" data-eid="${eid}"${network ? raw(' checked') : ''}> Allow network access<span class="quiet">${chosen.backend === 'local' ? 'off unless you tick this; this machine cannot block it either way' : 'off unless you tick this'}</span></label>`}
     </div>
+    ${networkAsk(eid, plan)}
     <div class="approve-opts"><span><b>Mode</b> ${plan.mode || 'script'}</span>${(plan.packages || []).length ? html`<span><b>Packages</b> ${plan.packages.join(', ')}</span>` : ''}${plan.repo ? html`<span><b>Repository</b> ${plan.repo}</span>` : ''}
       <span><b>Left for experiments</b> ${money(Math.max(0, (limits.experiment_usd || 0) - (((store.project.state || {}).spent || {}).experiment_usd || 0)))}</span></div>
     ${app.ui.rejecting === page.path ? html`<form class="reject-form" data-form="reject" data-ref="${page.path}"><label class="sr" for="why-x-${eid}">Reason</label><input id="why-x-${eid}" name="reason" data-input="reason" data-ref="${page.path}" value="${app.ui.reasons[page.path] || ''}" placeholder="Why? The agents read this reason." autocomplete="off"><button class="btn btn-neg" type="submit">Reject</button><button class="btn btn-quiet" type="button" data-act="reject-cancel">Cancel</button></form>`
@@ -328,11 +331,13 @@ function liveHTML(store, page, data, run) {
 }
 
 /** Who wrote the file that is shown, and when. Code that arrived after the plan was accepted says so. */
-function codeBy(page, file) {
-  if (!file.author) return html`<p class="code-by"><code>${file.name}</code> has no recorded author: it was put into the project by hand.</p>`;
-  const decided = parseStamp((page.meta || {}).decided_at);
-  const late = page.review === 'accepted' && file.author !== 'human' && decided != null && (parseStamp(file.written) || 0) > decided;
-  return html`<p class="code-by"><code>${file.name}</code> was written by ${who(file.author)} ${ago(file.written)}${late ? html`<span class="code-late">${icon('warn')}after you accepted the plan: read it before you approve a run</span>` : ''}</p>`;
+function codeBy(page, file, approval) {
+  if (!file.author) return html`<p class="code-by"><span><code>${file.name}</code> has no recorded author: it was put into the project by hand.</span></p>`;
+  const decided = parseStamp((page.meta || {}).decided_at), written = parseStamp(file.written) || 0;
+  const late = page.review === 'accepted' && file.author !== 'human' && decided != null && written > decided;
+  /* an approval made since the file was written covers it: the person has been asked to read it */
+  const covered = !!(approval && approval.matches && approval.at && (parseStamp(approval.at) || 0) >= written);
+  return html`<p class="code-by"><span><code>${file.name}</code> was written by ${who(file.author)} ${ago(file.written)}${late ? ', after you accepted the plan' : ''}.</span>${late && !covered ? html`<span class="code-late">${icon('warn')}Read it before you approve a run</span>` : ''}</p>`;
 }
 function codeSection(store, page, data) {
   const eid = page.id, files = (data.code && data.code.files) || [], plan = data.plan || {};
@@ -349,7 +354,7 @@ function codeSection(store, page, data) {
           <label class="sr" for="code-text">${name}</label><textarea id="code-text" name="text" data-input="code" data-key="${editKey}" spellcheck="false" wrap="off">${editing.text}</textarea>
           ${editing.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span><b>Not saved.</b> ${editing.error} Your text is still here.</span></p>` : ''}
           <div class="code-bar"><span class="quiet">${editing.restored ? html`<b>Your unsaved edit of ${name} was restored.</b> ` : ''}The earlier version is kept. A changed file is parsed, not run; an approved run must be approved again.</span><button class="btn btn-quiet" type="button" data-act="code-cancel" data-key="${editKey}">Discard</button><button class="btn btn-primary" type="submit"${editing.saving ? raw(' disabled') : ''}>Save ${name}</button></div></form>`
-        : file ? html`${codeBy(page, file)}${codeHTML(file.text)}` : ''}`
+        : file ? html`${codeBy(page, file, data.approval)}${codeHTML(file.text)}` : ''}`
       : html`<p class="quiet">${plan.mode === 'repo' ? 'No patch: the command runs on a clean copy of the repository.' : 'No code has been written for this experiment yet.'}</p>`}
   </section>`;
 }
@@ -361,7 +366,7 @@ function detailHTML(store, page, route) {
   const head = html`<header class="page-head"><div class="page-kicker"><span class="kicker-kind">${pageGlyph(page, 18)}<span>Experiment <b>${eid}</b></span></span>
       <span class="page-tools"><a class="ibtn" href="${link({ view: 'map', sel: page.path, sub: '' })}" data-tip="Show on the map (1)" aria-label="Show on the map">${icon('map')}</a><a class="ibtn" href="${link({ view: 'wiki', sel: page.path, sub: '' })}" data-tip="Open in the wiki (2)" aria-label="Open in the wiki">${icon('open')}</a></span></div>
     <h1 class="page-title">${page.title}</h1>${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
-    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by"><span>designed by the ${agentName(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span></div>
+    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span></div>
     ${tests.length ? html`<div class="ex-testsline"><span class="quiet">Tests</span>${tests.map((h) => html`<a class="chip" href="${link({ view: 'wiki', sel: h.path, sub: '' })}" data-sel="${h.path}" data-tip="${pageTip(h)}">${pageGlyph(h, 12)}<b>${h.id}</b> ${h.title}</a>`)}</div>` : ''}</header>`;
   if (!data) {
     return html`${head}${entry && entry.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The experiment could not be loaded: ${entry.error.message} <button class="linkish" data-act="reload-experiment" data-eid="${eid}">Try again</button></span></div>`
@@ -373,7 +378,16 @@ function detailHTML(store, page, route) {
   let top = '';
   if (page.review === 'rejected') top = reviewBar(store, page, { part: 'page' });
   else if (page.review === 'proposed' || page.state === 'planned' || !page.state || app.ui.reapprove === eid) top = approveHTML(store, page, data);
-  else if (page.state === 'approved' || page.state === 'queued') {
+  else if ((page.state === 'approved' || page.state === 'queued') && data.approval && data.approval.digest && data.approval.matches === false) {
+    /* approved, and then the plan or the code changed: a run would be refused, so the page
+       says so before the person presses anything, with what changed and by whom */
+    const changes = (data.approval.changed || []).map((c) => plain(String(c)).replace(/\bagent:(\w+)/g, 'the $1').replace(/\bwritten by human\b/g, 'written by you'));
+    top = html`<section class="callout callout-changed"><h2>${icon('warn')}Changed since you approved it</h2>
+      <p>You approved this experiment${data.approval.at ? ' ' + ago(data.approval.at) : ''}. It is no longer what you approved, so it will not run as it is. Look at what changed, then approve it again.</p>
+      ${changes.length ? html`<ul class="changed-list">${changes.map((c) => html`<li>${c}</li>`)}</ul>` : ''}
+      <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Look and approve again…</button>
+        <button class="btn btn-quiet" data-act="cancel-run" data-eid="${eid}" data-tip="Take the approval back: it is recorded as cancelled and can be approved again">Do not run it</button></div></section>`;
+  } else if (page.state === 'approved' || page.state === 'queued') {
     top = html`<section class="callout"><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
       <p>${busy ? 'The agents are at work; it runs when they reach it, or when they have stopped.' : 'It runs with the next run phase, or now.'}</p>
       <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy ? raw(' disabled') : ''}>${icon('play')}Run now</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>

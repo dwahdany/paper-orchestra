@@ -957,21 +957,39 @@ CHECKS.large = async ({ page, pid, large }) => {
     await page.selectOption('#map-round', '');
   }
   await page.keyboard.press('Escape');
-  /* Tab reaches every node, also those below the sheet: the map moves to show the one that has the keyboard */
+  /* The map is one stop for Tab: the selected page, or the idea, takes the keyboard, and the
+     arrow keys move from there. A node that has the keyboard is on the sheet, also when it
+     lies below what was showing: the map moves to it. Tab then leaves the map for its
+     tools, however many pages there are. */
   const vp0 = await page.evaluate(() => document.querySelector('.map-svg .vp').getAttribute('transform'));
   await page.focus('.map-canvas');
-  let outside = 0;
-  for (let i = 0; i < 70; i++) {
-    await page.keyboard.press('Tab');
-    outside += await page.evaluate(() => {
+  await page.keyboard.press('Tab');
+  ok(await page.evaluate(() => !!(document.activeElement.closest && document.activeElement.closest('.map-svg .node'))), 'Tab goes from the map to a page on it');
+  ok((await count(page, '.map-svg .node[tabindex="0"]:not(.k-bundle)')) === 1, 'one page of the map is in the Tab order');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('ArrowRight');
+  let outside = 0, strayed = 0;
+  for (let i = 0; i < 40; i++) {
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(60);
+    const where = await page.evaluate(() => {
       const node = document.activeElement.closest && document.activeElement.closest('.map-svg .node');
-      if (!node) return 0;
+      if (!node) return 'lost';
       const sheet = document.querySelector('.map-canvas').getBoundingClientRect(), foot = document.querySelector('.map-foot').getBoundingClientRect(), mark = node.querySelector('.gl').getBoundingClientRect();
-      return mark.top < sheet.top + 34 || mark.bottom > foot.top || mark.left < sheet.left || mark.right > sheet.right ? 1 : 0;
+      return mark.top < sheet.top + 34 || mark.bottom > foot.top || mark.left < sheet.left || mark.right > sheet.right ? 'outside' : node.classList.contains('sel') ? 'ok' : 'unselected';
     });
+    if (where === 'outside') outside++; else if (where !== 'ok') strayed++;
   }
-  ok(!outside, 'a node that has the keyboard is on the sheet: ' + outside + ' of 70 were not');
+  ok(!strayed, 'the keyboard goes along with the selection when the arrow keys move it: ' + strayed + ' of 40 times it did not');
+  ok(!outside, 'a node that has the keyboard is on the sheet: ' + outside + ' of 40 were not');
   ok((await page.evaluate(() => document.querySelector('.map-svg .vp').getAttribute('transform'))) !== vp0, 'the map moved to follow the keyboard');
+  /* after the page that has the keyboard come its two marks and the folded bundles, then the tools */
+  const stops = (await count(page, '.map-svg .node.k-bundle')) + 4;
+  let left = false;
+  for (let i = 0; i < stops && !left; i++) { await page.keyboard.press('Tab'); left = await page.evaluate(() => !(document.activeElement.closest && document.activeElement.closest('.map-svg'))); }
+  ok(left, 'Tab leaves a map of 150 pages within ' + stops + ' presses');
+  await page.keyboard.press('Escape');
   await open(page, '#/p/' + large + '/wiki', '.wiki-index .idx');
   ok((await count(page, '.wiki-index .idx')) >= 140, 'the wiki index lists all pages');
   await page.fill('#idx-filter', 'hypothesis 1');
@@ -1028,6 +1046,42 @@ CHECKS.large = async ({ page, pid, large }) => {
   await open(page, '#/p/' + pid + '/overview', '#rq-text');
   ok((await page.inputValue('#rq-text')) === 'Typed for the first project only.', 'the instruction is still in the box of its own project');
   await page.fill('#rq-text', '');
+
+  /* Network access is never taken from the plan. A plan that asks for it is answered by
+     the person, yes or no, with no default: an approval pressed before the answer sends
+     nothing, and the answer goes out with the approval. (In the second project, so that
+     the experiment made for this does not get in the way of the other checks.) */
+  const made = await api('POST', '/api/projects/' + large + '/pages', { kind: 'experiment', title: 'Repeat E1 on a public data set', body: '## Objective\n\nRepeat E1 on a data set that is downloaded when the run starts.\n', fields: { mode: 'script', network: true, timeout_seconds: 120, summary: 'E1 again, on data fetched from the network.' } });
+  if (ok(made.status < 300 && made.data && made.data.page && made.data.page.id, 'an experiment whose plan asks for the network can be written: ' + made.status)) {
+    const eid = made.data.page.id;
+    await api('PUT', '/api/projects/' + large + '/experiments/' + eid + '/code/main.py', { text: 'import json\n\njson.dump({"spike": 0.1}, open("metrics.json", "w"))\nprint("done")\n' });
+    const approvals = [];
+    const listen = (request) => { if (request.method() === 'POST' && /\/approve$/.test(request.url())) approvals.push(request.postData() || ''); };
+    page.on('request', listen);
+    await open(page, '#/p/' + large + '/experiments/' + eid, '.approve .net-ask');
+    ok(/asks for network access/.test(await text(page, '.net-ask')), 'the approval form says that the plan asks for the network');
+    ok((await count(page, '.net-ask input[type="radio"]')) === 2 && (await count(page, '.net-ask input:checked')) === 0, 'the question has two answers and neither is chosen for the person');
+    ok(/written by you/.test(await text(page, '.page-by')), 'an experiment the person wrote is not "designed by the you": ' + (await text(page, '.page-by')));
+    await page.click('.approve [data-act="approve"]:not([data-start])');
+    await until(page, () => !!document.querySelector('.net-ask.nudge') && /network access/.test((document.querySelector('#toast') || {}).textContent || ''), null, 4000, 'an approval without the answer shows the question instead');
+    await sleep(400);
+    ok(approvals.length === 0, 'and nothing is sent: ' + approvals.length + ' approval requests');
+    await shot(page, 'experiment-network-question');
+    await page.click('.net-ask input[value="no"]');
+    await until(page, () => !document.querySelector('.net-ask.nudge') && document.querySelectorAll('.net-ask input:checked').length === 1, null, 3000, 'the answer is taken');
+    await page.click('.approve [data-act="approve"]:not([data-start])');
+    await until(page, () => /approved/.test((document.querySelector('.page-status') || {}).textContent || ''), null, 8000, 'the experiment is approved once the question is answered');
+    ok(approvals.length === 1 && JSON.parse(approvals[0] || '{}').network === false, 'the approval says "network: false" itself: ' + approvals.join(' '));
+    const view = (await api('GET', '/api/projects/' + large + '/experiments/' + eid)).data;
+    ok(view.page.state === 'approved' && view.page.meta.network === false, 'and the server recorded a run without network access: ' + view.page.state + ', network ' + view.page.meta.network);
+    page.off('request', listen);
+  }
+  /* a plan that does not ask: the box starts unticked and the approval still says so */
+  const plain = ((await api('GET', '/api/projects/' + large + '/experiments')).data.experiments || []).find((x) => x.review === 'accepted' && x.state === 'planned' && !(x.meta || {}).network);
+  if (plain) {
+    await open(page, '#/p/' + large + '/experiments/' + plain.id, '.approve');
+    ok((await count(page, '.approve .net-ask')) === 0 && (await count(page, '#ap-net-' + plain.id + ':checked')) === 0, 'a plan that does not ask for the network has "Allow network access" unticked');
+  }
 };
 
 /* hostile text: titles and bodies with markup, scripts, odd Unicode and words longer than any

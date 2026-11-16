@@ -115,15 +115,16 @@ export function topbar(route) {
   }
   const p = store.project, e = engineView(store), n = store.pending().length;
   const round = html`<span class="ts-long">Round ${e.round || 1} · </span>`;
-  const status = e.mode === 'running' ? html`<span class="live-dot" aria-hidden="true"></span>${round}${phaseName(e.phase) || 'starting'}`
-    : e.mode === 'experiment' ? html`<span class="live-dot" aria-hidden="true"></span><span class="ts-long">Experiment </span>running`
+  /* the words are one piece: the bar's gap belongs between the mark and the words, not inside them */
+  const status = e.mode === 'running' ? html`<span class="live-dot" aria-hidden="true"></span><span>${round}${phaseName(e.phase) || 'starting'}</span>`
+    : e.mode === 'experiment' ? html`<span class="live-dot" aria-hidden="true"></span><span><span class="ts-long">Experiment </span>running</span>`
     : e.mode === 'writing' ? html`<span class="live-dot" aria-hidden="true"></span>Writing the paper`
     : e.mode === 'failed' ? html`${icon('warn')}${cap1(phaseName(e.next || e.phase))} failed`
     : e.died || e.crashed ? html`${icon('warn')}The agents stopped`
     : e.mode === 'stopped' ? html`${PAUSE}Stopped by you`
     : e.fresh ? html`${RING}Not started`
     : e.budget ? html`${icon('warn')}Budget reached`
-    : html`${PAUSE}${round}checkpoint`;
+    : html`${PAUSE}<span>${round}checkpoint</span>`;
   const cls = e.mode === 'running' || e.mode === 'experiment' || e.mode === 'writing' ? 'running' : e.mode === 'failed' || e.died || e.crashed ? 'failed' : e.budget ? 'budget' : e.mode;
   const limits = (p.settings || {}).limits || {};
   const spent = (p.state || {}).spent || {};
@@ -182,7 +183,21 @@ export function foldRuns(events) {
     }
     out.push(ev);
   });
-  return out;
+  /* The person's approval of a run is two records, written in the same moment: how the
+     experiment may run, then "is now approved". They are one thing the person did, and
+     one line: "You approved experiment E4 … to run on this machine, for up to 300 s, …". */
+  const lines = [];
+  out.forEach((ev) => {
+    const prev = lines[lines.length - 1], d = ev.data || {}, pd = (prev && prev.data) || {};
+    if (prev && !prev.run && !ev.run && ev.type === 'experiment.state' && d.by === 'human' && d.state === 'approved'
+        && prev.type === 'page.updated' && pd.by === 'human' && pd.approval && pd.id === d.id) {
+      const said = /^You set how (.+) may run: (.+)$/.exec(prev.summary || '');
+      lines[lines.length - 1] = Object.assign({}, ev, { summary: said ? 'You approved ' + said[1] + ' to run ' + said[2].replace(/\bon local\b/, 'on this machine') : prev.summary });
+      return;
+    }
+    lines.push(ev);
+  });
+  return lines;
 }
 /** What a folded run says. */
 export function runSentence(line) {

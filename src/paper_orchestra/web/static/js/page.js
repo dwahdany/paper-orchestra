@@ -113,6 +113,21 @@ export function approvalChoice(eid, data) {
   }
   return chosen;
 }
+/** A plan that asks for network access is never given it by default, and never refused it
+    by default either: the person answers, one way or the other, before a run is approved.
+    The answer is kept in `app.ui.approve[eid].network` (true or false; undefined = not yet). */
+export function networkAsk(eid, plan) {
+  if (!plan || !plan.network) return '';
+  const answer = (app.ui.approve[eid] || {}).network;
+  const answered = answer === true || answer === false;
+  const nudge = !answered && app.ui.netNudge === eid;
+  return html`<fieldset class="net-ask${answered ? '' : ' unanswered'}${nudge ? ' nudge' : ''}" data-net="${eid}">
+    <legend><b>This plan asks for network access.</b> The run gets it only if you allow it here.</legend>
+    <div class="net-opts">
+      <label><input type="radio" name="net-${eid}" value="yes" data-input="ap-net-choice" data-eid="${eid}"${answer === true ? raw(' checked') : ''}> Allow network access</label>
+      <label><input type="radio" name="net-${eid}" value="no" data-input="ap-net-choice" data-eid="${eid}"${answer === false ? raw(' checked') : ''}> Run it without network access</label></div>
+    ${answered ? '' : html`<span class="net-need"${nudge ? raw(' role="alert"') : ''}>Choose one of the two before you approve the run.</span>`}</fieldset>`;
+}
 function runOn(store, page, entry) {
   const data = entry && entry.data;
   if (!data) return html`<p class="quiet runon-wait">${entry && entry.error ? 'What can run this could not be read: ' + entry.error.message : 'Checking where this can run…'}</p>`;
@@ -124,7 +139,7 @@ function runOn(store, page, entry) {
   }
   const chosen = approvalChoice(page.id, data);
   return html`<label class="runon"><span>Run on</span><select data-input="runon" data-eid="${page.id}" id="runon-${page.id}">
-    ${runnable.map((o) => html`<option value="${o.backend}"${o.backend === chosen.backend ? raw(' selected') : ''}>${optionLabel(o, data.plan)}</option>`)}</select></label>`;
+    ${runnable.map((o) => html`<option value="${o.backend}"${o.backend === chosen.backend ? raw(' selected') : ''}>${optionLabel(o, data.plan)}</option>`)}</select></label>${networkAsk(page.id, data.plan)}`;
 }
 
 /* ---------- review bar: accept / edit, then accept / reject ---------- */
@@ -166,7 +181,7 @@ function changeNote(store, page, proposal, opt) {
   const added = Object.entries(proposal.relations_add || {}).filter(([, list]) => list && list.length).map(([name, list]) => html`<span class="chg"><span class="chg-f">adds ${name.replace(/_/g, ' ')}</span><b>${list.join(', ')}</b></span>`);
   const text = proposal.body != null;
   const asDiff = !!app.ui.asDiff[proposal.id];
-  const key = (k) => (opt.compact ? '' : html` <kbd>${k}</kbd>`);
+  const key = (k) => (opt.compact || opt.margin ? '' : html` <kbd>${k}</kbd>`);   // the margin is narrow: its three answers keep to one line
   return html`<div class="review review-change${opt.compact ? ' review-compact' : ''}${opt.margin ? ' review-margin' : ''}" data-ref="${proposal.id}">
     <p class="review-say"><b>${cap(who(proposal.author))} suggests</b>${opt.compact ? ': ' : html` <span class="quiet">· ${ago(proposal.created)}${proposal.round ? ', round ' + proposal.round : ''}</span><br>`}<span class="review-sum">${proposal.summary}</span></p>
     ${changes.length || added.length ? html`<div class="chg-row">${changes}${added}</div>` : ''}
@@ -424,9 +439,11 @@ export function panelHTML(store, page, opt) {
     <button class="ibtn${sub === 'history' ? ' on' : ''}" data-act="history" data-ref="${page.path}" data-tip="History (H)" aria-label="History" aria-pressed="${tf(sub === 'history')}">${icon('clock')}</button>
     ${page.kind === 'idea' || page.kind === 'result' ? '' : html`<button class="ibtn" data-act="delete-ask" data-ref="${page.path}" data-tip="Delete this page" aria-label="Delete this page">${icon('trash')}</button>`}
     ${mode === 'panel' ? html`<button class="ibtn" data-act="close-panel" data-tip="Close (Esc)" aria-label="Close">${icon('x')}</button>` : ''}`;
+  /* one first-level heading per screen: the wiki's is the page; the map and the inbox have their own */
+  const titleTag = mode === 'wiki' ? 'h1' : 'h2';
   const head = html`<header class="page-head">
     <div class="page-kicker"><span class="kicker-kind">${pageGlyph(page, 18)}<span>${kindName(page.kind)}${hasId(page) ? html` <b>${page.id}</b>` : ''}</span></span><span class="page-tools">${tools}</span></div>
-    <h1 class="page-title">${page.title}</h1>
+    <${raw(titleTag)} class="page-title">${page.title}</${raw(titleTag)}>
     ${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
     <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by">${byline(page)}</span></div>
     ${page.kind === 'experiment' && page.meta && page.meta.state_reason && (page.state === 'failed' || page.state === 'planned') ? html`<p class="page-reason${page.state === 'planned' ? ' page-reason-back' : ''}">${icon('warn')}${plain(page.meta.state_reason)}</p>` : ''}
@@ -502,5 +519,12 @@ export function afterRender(root) {
     if (el.dataset.numbers) { const view = (store.views.get(el.dataset.prose) || {}).data; if (view && view.number_check) markNumbers(el, view.number_check, store); }
   });
   $$('.prose-s[data-plan], .hist-body, .ed-prev', root).forEach((el) => decorate(store, el));
+  /* The two lines that head a diff of versions name them by a raw stamp. The row above
+     already says which version is compared, in the person's own time: they are left out. */
+  $$('.hist-body pre.diff .diff-file', root).forEach((el) => {
+    const next = el.nextSibling;
+    if (next && next.nodeType === 3 && next.nodeValue.charAt(0) === '\n') next.nodeValue = next.nodeValue.slice(1);
+    el.remove();
+  });
   if ($('[data-preview]', root)) $$('[data-preview]', root).forEach((el) => renderPreview(store, el));
 }

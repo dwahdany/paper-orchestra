@@ -18,7 +18,7 @@ const SLOT = { idea: 26, source: 16, topic: 24, question: 22, hypothesis: 22, ex
 const CAP = { idea: 86, source: 150, topic: 150, question: 156, hypothesis: 176, experiment: 168, result: 96, finding: 176 };
 const MIN = { idea: 30, source: 84, topic: 72, question: 46, hypothesis: 92, experiment: 92, result: 48, finding: 60 };
 const HERO = { question: 1, hypothesis: 1, experiment: 1, finding: 1 };
-const TOP = 44, BTN = 54, ROOM = 80, NEAR_STEPS = 2;
+const TOP = 44, BTN = 58, ROOM = 80, NEAR_STEPS = 2;
 
 let ctx, fam;
 const tw = (text, font) => { ctx = ctx || document.createElement('canvas').getContext('2d'); ctx.font = font; return ctx.measureText(text).width; };
@@ -41,10 +41,11 @@ const V = { st: { k: 1, tx: 0, ty: 0, sig: '', lay: null }, prevKeys: {}, root: 
 
 function mount(root, store) {
   setHTML(root, html`<div class="map-view" data-pid="${store.pid}">
+    <h1 class="sr">Map of ${store.project.title}</h1>
     <div class="strip-slot"></div>
     <div class="map-body">
-      <div class="map-canvas" tabindex="0" aria-label="Research map. Arrow keys move between pages.">
-        <svg class="map-svg" role="group" aria-label="Research map"></svg>
+      <div class="map-canvas" tabindex="0" role="group" aria-label="Research map. Tab goes to the selected page; the arrow keys move between pages; Enter opens one.">
+        <svg class="map-svg" role="group" aria-label="Research map" tabindex="-1" focusable="false"></svg>
         <div class="map-empty"></div><div class="map-tip" role="tooltip"></div>
         <div class="map-foot"><div class="map-key"></div><div class="map-tools"></div></div>
       </div>
@@ -156,7 +157,14 @@ function applyT() {
     s.ty = Math.max(Math.min(0, viewH - h) - viewH * 0.35, Math.min(viewH * 0.35, s.ty));
   }
   vp.setAttribute('transform', 'translate(' + s.tx + ' ' + s.ty + ') scale(' + s.k + ')');
-  $$('.head', root).forEach((h) => h.setAttribute('transform', 'translate(' + (s.tx + s.k * +h.dataset.x) + ' 0)'));
+  /* The headings stand over their columns. A map drawn smaller has its headings drawn
+     smaller with it (down to a size that can still be read); smaller still, they lose
+     their counts and then their names, so that none ever runs into the next. */
+  const hk = Math.max(0.8, Math.min(1, s.k));
+  $$('.head', root).forEach((h) => h.setAttribute('transform', 'translate(' + (s.tx + s.k * +h.dataset.x) + ' ' + (1 - hk) * 17 + ') scale(' + hk + ')'));
+  const canvas = $('.map-canvas', root);
+  canvas.classList.toggle('heads-s', s.k < 0.8);
+  canvas.classList.toggle('heads-xs', s.k < 0.68);
 }
 
 /* lineage of the selection: upstream and downstream, with the direct links marked.
@@ -270,6 +278,8 @@ function draw() {
   const sel = route.sel && store.byPath.has(route.sel) ? route.sel : '';
   const view = $('.map-view', root);
   view.classList.toggle('has-panel', !!sel);
+  const heading = $('.map-view > h1', root);
+  if (heading) heading.textContent = 'Map of ' + store.project.title;      // the intake may have named the project since
   /* the strip's log follows what arrives, unless the person scrolled up in it */
   const oldLog = $('.strip-log', root);
   const logTop = oldLog ? oldLog.scrollTop : 0, logStuck = !oldLog || oldLog.scrollTop + oldLog.clientHeight >= oldLog.scrollHeight - 24;
@@ -326,7 +336,7 @@ function draw() {
     let w, min, hard;
     if (pg.kind === 'source') { w = Math.min(CAP.source, tW); min = w; hard = MIN.source; }
     else if (pg.kind === 'idea') { w = Math.max(idW, stFull); min = w; }
-    else if (pg.kind === 'result') { w = Math.max(idW, stFull); min = w; hard = MIN.result; }
+    else if (pg.kind === 'result') { w = Math.max(idW, stFull); min = w; hard = Math.max(MIN.result, Math.ceil(stFull)); }   // "succeeded" is never cut
     else if (pg.kind === 'topic') { w = tW <= 120 ? tW : Math.max(MIN.topic, Math.min(CAP.topic, tW / 2 + 16)); min = Math.min(w, MIN.topic); }
     else {
       const one = idW + 5 + tW;
@@ -428,11 +438,16 @@ function draw() {
     }
   });
 
-  /* nodes */
+  /* nodes. The map is one stop for Tab: the selected page (or the idea) takes the keyboard,
+     the arrow keys move from there, and Tab goes on to the tools and the page. A map of 150
+     pages is not 150 presses of Tab away from its own page panel. */
+  const ideaKey = (store.pages.find((pg) => pg.kind === 'idea') || {}).path;
+  const rove = sel && lay.nodes[sel] ? sel : ideaKey && lay.nodes[ideaKey] ? ideaKey : (sc.nodes.find((x) => x.page && lay.nodes[x.key]) || {}).key;
   let nd = '';
   sc.nodes.forEach((sn) => {
     const key = sn.key, n = lay.nodes[key], it = info[key];
     if (!n) return;
+    const tab = key === rove ? 0 : -1;
     const col = lay.cols[n.layer], ext = s.ext[key];
     const lw = col.lw, lx = col.slot / 2 + 5;
     const dimCls = sel ? (key === sel ? ' sel' : tr.near.has(key) ? ' near' : tr.kin.has(key) ? ' kin' : ' dim') : '';
@@ -463,20 +478,27 @@ function draw() {
     }
     if (pg.kind !== 'topic' && pg.kind !== 'source' && it.st.full) {
       const room = lw - (it.st.ref ? BTN : 0);
-      const words = tw(it.st.full, F.s) <= room ? it.st.full : tw(it.st.short, F.s) <= room ? it.st.short : it.st.ref && pg.review === 'accepted' ? 'change' : fit(it.st.short, F.s, Math.max(room, 30));
-      l2 = '<text class="n-l2" x="' + lx + '" y="11.5">' + esc(words) + '</text>';
+      const fits = (text) => tw(text, F.s) <= room;
+      /* A state is said in whole words or not at all: "prop…" tells nobody anything. Where a
+         column is too narrow for the word and the two marks, the marks stay: the hatching
+         and the dashed outline already say that the page waits for a decision. */
+      const words = fits(it.st.full) ? it.st.full : fits(it.st.short) ? it.st.short
+        : it.st.ref ? (pg.review === 'accepted' && fits('change') ? 'change' : '')
+        : tw(it.st.short, F.s) <= lw + 8 ? it.st.short : fit(it.st.short, F.s, Math.max(room, 30));
+      l2 = words ? '<text class="n-l2" x="' + lx + '" y="11.5">' + esc(words) + '</text>' : '';
       if (it.st.ref) {
-        /* the marks are small; what is pressed is a 24 px square around each */
-        const bx = lx + tw(words, F.s) + 8, name = esc(label(pg));
-        btn = '<g class="n-btn n-yes" data-act="accept" data-ref="' + esc(it.st.ref) + '" transform="translate(' + bx + ' 1)" tabindex="0" role="button" aria-label="Accept ' + name + '"><title>Accept (A)</title><rect class="n-hit" x="-2.5" y="-4.5" width="24" height="24"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M5.4 7.9l2.7 2.7 5.4-6.2"/></g>' +
-          '<g class="n-btn n-no" data-act="reject-ask" data-ref="' + esc(it.st.ref) + '" data-key="' + esc(pg.path) + '" transform="translate(' + (bx + 25) + ' 1)" tabindex="0" role="button" aria-label="Reject ' + name + '"><title>Reject, with a reason (R)</title><rect class="n-hit" x="-2.5" y="-4.5" width="24" height="24"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M6.1 4.1l6.8 6.8M12.9 4.1l-6.8 6.8"/></g>';
+        /* the marks are small; what is pressed is a square around each: 28 units, which is
+           24 px where the map is drawn at its smallest automatic scale */
+        const bx = lx + (words ? tw(words, F.s) + 8 : 1), name = esc(label(pg));
+        btn = '<g class="n-btn n-yes" data-act="accept" data-ref="' + esc(it.st.ref) + '" transform="translate(' + bx + ' 1)" tabindex="' + tab + '" role="button" aria-label="Accept ' + name + '"><title>Accept (A)</title><rect class="n-hit" x="-4.5" y="-6.5" width="28" height="28"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M5.4 7.9l2.7 2.7 5.4-6.2"/></g>' +
+          '<g class="n-btn n-no" data-act="reject-ask" data-ref="' + esc(it.st.ref) + '" data-key="' + esc(pg.path) + '" transform="translate(' + (bx + 28) + ' 1)" tabindex="' + tab + '" role="button" aria-label="Reject ' + name + '"><title>Reject, with a reason (R)</title><rect class="n-hit" x="-4.5" y="-6.5" width="28" height="28"/><rect class="n-face" width="19" height="15" rx="3"/><path d="M6.1 4.1l6.8 6.8M12.9 4.1l-6.8 6.8"/></g>';
       }
     }
     const change = store.pendingFor(pg.path).length > 0;
     const cls = 'node k-' + pg.kind + ' r-' + (pg.review === 'proposed' || pg.review === 'rejected' ? pg.review : 'accepted') + ' t-' + (TONE[pg.state] || 'none') + (change ? ' has-change' : '') + dimCls +
       (flash && flash.key === pg.path ? ' flash-' + flash.decision : '') + (prev && !prev.has(pg.path) ? ' pop' : '');
     const aria = kindName(pg.kind) + ' ' + (pg.id && pg.kind !== 'source' ? pg.id : '') + ', ' + pg.title + ', ' + pg.review + (pg.state ? ', ' + pg.state : '') + (change ? ', change proposed' : '');
-    nd += '<g class="' + cls + '" data-key="' + esc(pg.path) + '" transform="translate(' + n.x + ' ' + n.y + ')" tabindex="0" role="button" aria-label="' + esc(aria) + '"' + (pg.path === sel ? ' aria-pressed="true"' : '') + '>' +
+    nd += '<g class="' + cls + '" data-key="' + esc(pg.path) + '" transform="translate(' + n.x + ' ' + n.y + ')" tabindex="' + tab + '" role="button" aria-label="' + esc(aria) + '"' + (pg.path === sel ? ' aria-pressed="true"' : '') + '>' +
       bg + glyphInner(pg.kind, pg.review, pg.state, { change }) + l1 + l2 + btn + '</g>';
   });
   V.prevKeys[store.pid] = new Set(sc.nodes.filter((n) => n.page).map((n) => n.key));
@@ -493,13 +515,26 @@ function draw() {
     });
   }
 
+  const focused = document.activeElement && svg.contains(document.activeElement) ? document.activeElement : null;
+  const held = focused && focused.closest('.node') ? { key: focused.closest('.node').dataset.key, act: focused.classList.contains('n-btn') ? focused.dataset.act : '' } : null;
   svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
   /* built from numbers, class names and escaped text only */
   svg.innerHTML =
     '<defs><pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect class="hatch-bg" width="5" height="5"/><path class="hatch-ln" d="M0 0v5"/></pattern></defs>' +
     '<g class="vp"><g class="ghosts">' + ghost + '</g><g class="edges">' + ed + '</g><g class="hits">' + hits + '</g><g class="badges">' + badges + '</g><g class="nodes">' + nd + '</g></g>' +
     '<rect class="head-bg" width="' + W + '" height="34"/><path class="head-rule" d="M0 34.5H' + W + '"/><g class="heads">' + heads + '</g>';
+  /* The drawing was written again, and with it the node that had the keyboard: the keyboard
+     is put back where it was. When the arrow keys moved the selection from a node, it goes
+     along to the new one. */
+  const wanted = V.focusNext || (held && held.key);
+  if (wanted) {
+    let el = svg.querySelector('.node[data-key="' + CSS.escape(wanted) + '"]');
+    if (el && !V.focusNext && held.act) el = el.querySelector('.n-btn[data-act="' + held.act + '"]') || el;
+    if (el && document.activeElement !== el && (V.focusNext || !document.activeElement || document.activeElement === document.body)) el.focus({ preventScroll: true });
+    if (el) V.focusNext = null;
+  }
   canvas.classList.toggle('has-sel', !!sel);
+  canvas.classList.toggle('dense', sc.nodes.length > 60);
   canvas.classList.toggle('wider', lay.width * s.k > W + 2 || (lay.bottomY + 12) * s.k > H - bottom + 2);
   canvas.classList.toggle('trace-more', !!(sel && tr.more));
 
@@ -578,7 +613,13 @@ export const mapView = {
     if (ev.key === '-') { zoom(-1); return true; }
     if (ev.key === '0') { zoom(0); return true; }
     if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].indexOf(ev.key) < 0) return false;
-    if (!sel || !lay.nodes[sel]) { const idea = store.pages.find((pg) => pg.kind === 'idea'); if (idea) select(idea.path); return true; }
+    if (!sel || !lay.nodes[sel]) {
+      const idea = store.pages.find((pg) => pg.kind === 'idea');
+      const active = document.activeElement;
+      if (idea && active && active.closest && active.closest('.map-svg, .map-canvas') && !active.closest('.map-foot')) { V.focusNext = idea.path; active.blur(); }
+      if (idea) select(idea.path);
+      return true;
+    }
     const me = lay.nodes[sel];
     let to = null;
     const isPage = (k) => store.byPath.has(k);
@@ -593,7 +634,11 @@ export const mapView = {
       to = cand[0];
       if (!to) { const next = (lay.columnOrder[me.layer + (right ? 1 : -1)] || []).filter(isPage); to = next.slice().sort((a, b) => Math.abs(lay.nodes[a].y - me.y) - Math.abs(lay.nodes[b].y - me.y))[0]; }
     }
-    if (to) select(to);
+    if (to) {
+      const active = document.activeElement;
+      if (active && active.closest && active.closest('.map-svg, .map-canvas') && !active.closest('.map-foot')) { V.focusNext = to; active.blur(); }
+      select(to);
+    }
     return true;
   },
   /** Forget pan and zoom (a new filter, a new project). */

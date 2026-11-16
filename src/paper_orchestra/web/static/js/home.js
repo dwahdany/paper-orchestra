@@ -2,7 +2,7 @@
 
 import { app } from './core.js';
 import { api } from './api.js';
-import { ago, bytes, html, money, plural, raw, setHTML, storage } from './util.js';
+import { ago, bytes, checkpointDid, html, money, plural, raw, setHTML, storage } from './util.js';
 import { STAGES, icon, phaseName } from './vocab.js';
 import { stripMapSmall } from './overview.js';
 
@@ -77,13 +77,13 @@ export const startView = {
         <div class="drop-veil" aria-hidden="true">Drop to attach</div></form>
       <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint. It stops when ' + limit + ' has been spent on models.' : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
       <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, limits, what needs your review</span></summary><div class="adv-grid">
-        <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea if left empty" autocomplete="off"></label>
+        <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea" autocomplete="off"></label>
         <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', 'As the project default'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['xhigh', 'extra high'], ['max', 'max']].map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
         <label><span>Only literature before</span><input id="opt-cutoff" data-input="opt" data-name="cutoff" value="${s.cutoff}" placeholder="No cutoff (or 2024-06)" autocomplete="off"></label>
         <label><span>Experiments run on</span><select id="opt-compute" data-input="opt" data-name="compute">${[['', 'As the project default'], ['local', 'This machine (local CPU)'], ['modal', 'Modal sandboxes']].map(([v, t]) => html`<option value="${v}"${s.compute === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
-        <label><span>Spend limit for models</span><input id="opt-model-usd" data-input="opt" data-name="model_usd" value="${s.model_usd}" placeholder="25.00 dollars" inputmode="decimal" autocomplete="off"></label>
-        <label><span>Limit per experiment run</span><input id="opt-exp-min" data-input="opt" data-name="exp_minutes" value="${s.exp_minutes}" placeholder="15 minutes" inputmode="decimal" autocomplete="off"></label>
-        <label><span>Spend limit for experiments</span><input id="opt-exp-usd" data-input="opt" data-name="exp_usd" value="${s.exp_usd}" placeholder="5.00 dollars" inputmode="decimal" autocomplete="off"></label>
+        <label><span>Model spend limit</span><input id="opt-model-usd" data-input="opt" data-name="model_usd" value="${s.model_usd}" placeholder="25.00 dollars" inputmode="decimal" autocomplete="off"></label>
+        <label><span>Time limit per run</span><input id="opt-exp-min" data-input="opt" data-name="exp_minutes" value="${s.exp_minutes}" placeholder="15 minutes" inputmode="decimal" autocomplete="off"></label>
+        <label><span>Experiment spend limit</span><input id="opt-exp-usd" data-input="opt" data-name="exp_usd" value="${s.exp_usd}" placeholder="5.00 dollars" inputmode="decimal" autocomplete="off"></label>
         <fieldset class="adv-review"><legend>Needs your review before it counts</legend>${REVIEW_KINDS.map(([kind, name]) => html`<label class="tick"><input type="checkbox" data-input="opt-review" data-kind="${kind}"${s.auto[kind] ? '' : raw(' checked')}> ${name}</label>`)}
           <label class="tick"><input type="checkbox" disabled> Sources <span class="quiet">verified by code, accepted on creation</span></label></fieldset></div></details>
       <div class="start-route" aria-label="What happens next"><div class="smap smap-route">
@@ -139,8 +139,12 @@ export const libraryView = {
       body = html`<div class="lib-list">${lib.projects.map((row) => {
         const d = details.get(row.id), counts = d && d.counts, st = rowState(row, counts ? (counts.pending || {}).total : null);
         const by = counts ? counts.by_kind || {} : null;
-        const say = row.status === 'failed' || (row.status === 'stopped' && row.error) ? row.error : row.checkpoint && row.checkpoint.summary ? row.checkpoint.summary : row.status === 'idle' ? 'The idea is in place; research has not started.' : '';
-        return html`<a class="lib-row" href="#/p/${encodeURIComponent(row.id)}/map"><div class="lib-main"><h2>${row.title || row.dir}</h2><p>${say}</p></div>
+        /* what the last phase did; how much waits now is said live in the next column */
+        const did = row.checkpoint && row.checkpoint.summary ? checkpointDid(row.checkpoint.summary) : '';
+        const say = row.status === 'failed' || (row.status === 'stopped' && row.error) ? row.error : did ? 'After ' + phaseName(row.checkpoint.phase) + ': ' + did : row.checkpoint && row.checkpoint.summary ? row.checkpoint.summary : row.status === 'idle' ? 'The idea is in place; research has not started.' : '';
+        /* two projects of one title are told apart by their folders */
+        const twin = row.title && lib.projects.filter((x) => x.title === row.title).length > 1;
+        return html`<a class="lib-row" href="#/p/${encodeURIComponent(row.id)}/map"><div class="lib-main"><h2>${row.title || row.dir}</h2>${twin && row.dir ? html`<code class="lib-dir">${row.dir}/</code>` : ''}<p>${say}</p></div>
           <div class="lib-map">${stripMapSmall(by, counts ? (counts.pending || {}).by_kind : null)}<span class="lib-counts">${by ? (STAGES.slice(1).some((k) => by[k]) ? (by.source || 0) + ' sources · ' + (by.hypothesis || 0) + ' hypotheses · ' + (by.experiment || 0) + ' experiments · ' + (by.finding || 0) + ' findings' : 'idea only') : ' '}</span></div>
           <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2">${st[2]}</span></div>
           <div class="lib-num"><span>${money((row.spent || {}).model_usd || 0)}</span><span class="quiet">${ago(row.updated)}</span></div></a>`;

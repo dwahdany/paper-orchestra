@@ -47,6 +47,7 @@ const SHOTS = [
   ['12-wiki-editor', '#/p/PID/wiki/H2/edit', async (page) => { await page.waitForSelector('.ed-prev h2'); }],
   ['13-wiki-history', '#/p/PID/wiki/topics%2Fwhy-warmup-helps/history', async (page) => { await page.click('.hist-i [data-act="version"] >> nth=-1'); await page.waitForSelector('.hist-body pre.diff'); }],
   ['14-wiki-finding-f1', '#/p/PID/wiki/F1'],
+  ['14f-wiki-finding-f2-flagged', '#/p/PID/wiki/F2', async (page) => { await page.waitForSelector('.numcheck'); await page.waitForTimeout(300); }],
   ['14b-wiki-suggested-edit', '#/p/PID/wiki/topics%2Fwhy-warmup-helps', async (page) => { await page.waitForSelector('.prose-marked ins'); await page.evaluate(() => { const el = document.querySelector('.prose-marked .diff-changed'); if (el) el.scrollIntoView({ block: 'center' }); }); await page.waitForTimeout(200); }],
   ['14c-wiki-result-record', '#/p/PID/wiki/results%2FE1-run1'],
   ['14d-wiki-idea', '#/p/PID/wiki/idea'],
@@ -72,6 +73,7 @@ const SHOTS = [
 const SIZES = [
   ['05-map-home', '#/p/PID/map', 1900, 1000], ['06-map-lineage-h2', '#/p/PID/map/H2', 1900, 1000], ['09-overview', '#/p/PID/overview', 1900, 1000], ['10-wiki-page-h2', '#/p/PID/wiki/H2', 1900, 1000],
   ['05-map-home', '#/p/PID/map', 820, 1000], ['06-map-lineage-h2', '#/p/PID/map/H2', 820, 1000], ['09-overview', '#/p/PID/overview', 820, 1000], ['10-wiki-page-h2', '#/p/PID/wiki/H2', 820, 1000],
+  ['15-inbox', '#/p/PID/inbox', 1900, 1000],
   ['15-inbox', '#/p/PID/inbox', 820, 1000], ['17-experiments-table', '#/p/PID/experiments', 820, 1000], ['21-experiment-failed-e2', '#/p/PID/experiments/E2', 820, 1000],
   ['05-map-home', '#/p/PID/map', 1100, 800], ['10-wiki-page-h2', '#/p/PID/wiki/H2', 1100, 800],
 ];

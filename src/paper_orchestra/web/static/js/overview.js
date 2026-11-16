@@ -2,7 +2,7 @@
    map, the rounds, what waits, the argument so far, activity, instructions, spend. */
 
 import { app, link } from './core.js';
-import { ago, clock, dayOf, duration, hm, html, money, parseStamp, plural, raw, setHTML } from './util.js';
+import { ago, checkpointDid, clock, dayOf, duration, hm, html, money, parseStamp, plural, raw, setHTML } from './util.js';
 import { CHECKPOINT_AFTER, KIND, PHASES, STAGES, TONE, agentName, glyph, icon, pageGlyph, phaseName } from './vocab.js';
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
 import { continueLabel, crashText, engineView, foldRuns, runSentence, waitingSentence, whoOf } from './shell.js';
@@ -85,9 +85,11 @@ function feedHTML(store) {
         <span class="ev-run-l">${path ? html`<a href="${link({ view: 'experiments', sel: path, sub: '' })}">${runSentence(ev)}</a>` : runSentence(ev)}
           <details class="ev-steps" data-keep="run:${ev.key}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${p.summary}</span></li>`)}</ol></details></span></li>`;
     }
-    const you = whoOf(ev) === 'you';
-    const ref = (ev.refs || []).find((r) => store.byPath.has(r));
-    return html`${head}<li class="ev ev-${String(ev.type).replace(/[^a-z]/g, '-')}${you ? ' ev-you' : whoOf(ev) === 'engine' ? ' ev-engine' : ''}"><time>${hm(ev.ts)}</time><span class="ev-who">${whoOf(ev)}</span>
+    /* a checkpoint is the engine pausing, whichever agent worked last; it is the line to find again */
+    const pause = ev.type === 'checkpoint';
+    const who = pause ? 'engine' : whoOf(ev), you = who === 'you';
+    const ref = pause ? null : (ev.refs || []).find((r) => store.byPath.has(r));
+    return html`${head}<li class="ev ev-${String(ev.type).replace(/[^a-z]/g, '-')}${you ? ' ev-you' : who === 'engine' && !pause ? ' ev-engine' : ''}"><time>${hm(ev.ts)}</time><span class="ev-who">${who}</span>
       ${ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${ev.summary}</a>` : html`<span>${ev.summary}</span>`}</li>`;
   });
   const more = store.activity.length > app.ui.feedLimit || store.moreActivity;
@@ -165,7 +167,7 @@ export const overviewView = {
     const problems = (p.problems || []);
     setHTML(root, html`<div class="overview"><div class="ov-wrap">
       <header class="ov-head"><div class="ov-state">${idle ? '' : html`<span class="live-dot"></span>`}${p.title} · ${e.round ? 'round ' + e.round : 'new'}</div><h1>${headline}</h1><p class="ov-sub">${sub}</p>
-        ${e.mode === 'checkpoint' && p.checkpoint && p.checkpoint.summary ? html`<p class="ov-note">When it paused, ${ago(p.checkpoint.at)}: ${p.checkpoint.summary}</p>` : ''}
+        ${e.mode === 'checkpoint' && !e.budget && p.checkpoint && checkpointDid(p.checkpoint.summary) ? html`<p class="ov-note">${cap1(phaseName(p.checkpoint.phase)) || 'The last phase'} finished ${ago(p.checkpoint.at)}: ${checkpointDid(p.checkpoint.summary)}</p>` : ''}
         <div class="row">${actions}</div></header>
       <section class="ov-map" aria-label="Where things stand"><a class="ov-maplink" href="${link({ view: 'map', sel: '', sub: '' })}">Open the map <kbd>1</kbd></a>${stripMap(store)}${roundsHTML(store, e)}</section>
       <div class="ov-cols"><div class="ov-col">

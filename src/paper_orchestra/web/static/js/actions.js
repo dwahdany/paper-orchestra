@@ -13,6 +13,8 @@ import { clearToast, closeOverlay, openHelp, openNewPage, openPalette, overlayOp
 import { theme } from './shell.js';
 
 const GRACE_MS = 5000;
+/** How the page moves to something: at once for a person who asked for less motion. */
+const glide = () => (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth');
 /** The reasons being typed are kept on this device until the rejection they belong to is made. */
 function keepReasons() {
   if (!app.store) return;
@@ -244,25 +246,48 @@ async function stopAgents() {
 }
 
 /* ---------- experiments ---------- */
+/** The plan of an experiment as the server last read it, or null when it has not been fetched. */
+const planOf = (eid) => { const entry = store().exps.get(eid); return (entry && entry.data && entry.data.plan) || null; };
+/** What an approval says. Network access is never taken from the plan: the request says
+    yes or no itself. For a plan that asks for the network the answer is the person's own
+    (`chosen.network`); until they have given it the field is left out, and nothing is sent. */
 function approvalBody(eid, start) {
   const s = store(), row = s.expById.get(eid), entry = s.exps.get(eid), chosen = app.ui.approve[eid] || {};
+  const plan = planOf(eid);
   const body = { start: !!start };
   if (chosen.backend) body.backend = chosen.backend;
   if (chosen.gpu != null) body.gpu = String(chosen.gpu).trim() || null;
   if (chosen.minutes != null && chosen.minutes !== '' && !Number.isNaN(+chosen.minutes)) body.timeout_seconds = Math.round(+chosen.minutes * 60);
-  if (chosen.network != null) body.network = !!chosen.network;
+  if (chosen.network === true || chosen.network === false) body.network = chosen.network;
+  else if (plan && !plan.network) body.network = false;
   if (row) body.base_updated = row.updated;
   const digest = entry && entry.data && entry.data.code && entry.data.code.digest;
   if (digest) body.code_digest = digest;
   return body;
+}
+/** The plan asks for the network and the person has not said yes or no: the question is
+    shown (the approval form is opened if it is not), and nothing is sent. Never a guess. */
+function networkUnanswered(eid, body) {
+  const plan = planOf(eid);
+  if (!plan || !plan.network || body.network === true || body.network === false) return false;
+  const row = store().expById.get(eid);
+  app.ui.netNudge = eid;
+  if (app.route.view === 'experiments' && row && row.review === 'accepted' && row.state && row.state !== 'planned') app.ui.reapprove = eid;
+  sayError('The plan of ' + eid + ' asks for network access. Say whether the run may have it, then approve.');
+  app.render('ui');
+  setTimeout(() => { const q = $('.net-ask'); if (!q) return; q.scrollIntoView({ block: 'center', behavior: glide() }); const first = $('input', q); if (first) first.focus({ preventScroll: true }); }, 0);
+  return true;
 }
 async function approve(eid, start, overrides) {
   const s = store();
   await flushAll();
   try {
     const body = Object.assign(approvalBody(eid, start), overrides || {});
+    if (networkUnanswered(eid, body)) return;
     const answer = await api.approve(s.pid, eid, body);
     app.ui.reapprove = null;
+    app.ui.netNudge = null;
+    if (app.ui.approve[eid]) delete app.ui.approve[eid].network;      // an answer about the network is given per approval, not once for good
     delete app.ui.runOpen[eid];
     if (answer.worker) s.project.worker = answer.worker;
     s.invalidateExperiment(eid);
@@ -280,10 +305,11 @@ function acceptAndRun(path) {
   const s = store(), page = s.byPath.get(path);
   if (!page) return;
   const body = approvalBody(page.id, true);
+  if (networkUnanswered(page.id, body)) return;
   const run = { start: true };
   ['backend', 'gpu', 'timeout_seconds', 'network', 'code_digest'].forEach((k) => { if (body[k] != null) run[k] = body[k]; });
   const done = decide(path, 'accept', { approve_run: run, immediate: true });
-  if (done && done.then) done.then((out) => { if (out && !out.failed.length) { s.invalidateExperiment(page.id); say(label(page) + ' is accepted; its run is starting.'); if (app.route.view !== 'experiments') go({ view: 'experiments', sel: path, sub: '' }); } });
+  if (done && done.then) done.then((out) => { if (out && !out.failed.length) { if (app.ui.approve[page.id]) delete app.ui.approve[page.id].network; s.invalidateExperiment(page.id); say(label(page) + ' is accepted; its run is starting.'); if (app.route.view !== 'experiments') go({ view: 'experiments', sel: path, sub: '' }); } });
 }
 
 /* ---------- the composer ---------- */
@@ -419,7 +445,7 @@ const ACT = {
   'reload-page': (el) => { store().invalidate(el.dataset.ref); app.render('reload'); },
   'reload-experiment': (el) => { store().invalidateExperiment(el.dataset.eid); app.render('reload'); },
   'toggle-diff': (el) => { app.ui.asDiff[el.dataset.ref] = !app.ui.asDiff[el.dataset.ref]; app.render('diff'); },
-  'jump-change': () => { const el = $('.prose-marked .diff-changed, .prose-marked ins, .prose-marked del'); if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1600); } },
+  'jump-change': () => { const el = $('.prose-marked .diff-changed, .prose-marked ins, .prose-marked del'); if (el) { el.scrollIntoView({ block: 'center', behavior: glide() }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1600); } },
   'close-panel': () => select(''),
   continue: () => advance(),
   stop: () => stopAgents(),
@@ -452,8 +478,10 @@ const ACT = {
   'bulk-accept': () => bulk('accept'),
   'bulk-reject': () => { app.ui.rejecting = app.ui.rejecting === 'bulk' ? null : 'bulk'; app.render('ui'); },
   approve: (el) => approve(el.dataset.eid, !!el.dataset.start),
-  reapprove: (el) => { app.ui.reapprove = el.dataset.eid || null; app.render('ui'); if (app.ui.reapprove) setTimeout(() => { const f = $('#approve'); if (f) f.scrollIntoView({ block: 'start', behavior: 'smooth' }); }, 0); },
-  rerun: (el) => { const eid = el.dataset.eid; const over = {}; if (el.dataset.backend) over.backend = el.dataset.backend; if (el.dataset.minutes) over.timeout_seconds = Math.round(+el.dataset.minutes * 60); const row = store().expById.get(eid); app.ui.approve[eid] = {}; approve(eid, true, Object.assign({ base_updated: row ? row.updated : undefined }, over)); },
+  reapprove: (el) => { app.ui.reapprove = el.dataset.eid || null; app.render('ui'); if (app.ui.reapprove) setTimeout(() => { const f = $('#approve'); if (f) f.scrollIntoView({ block: 'start', behavior: glide() }); }, 0); },
+  /* what the button offers becomes the choice of the approval form, so that a question still
+     to be answered (network access) is asked with that choice in place */
+  rerun: (el) => { const eid = el.dataset.eid; const chosen = {}; if (el.dataset.backend) chosen.backend = el.dataset.backend; if (el.dataset.minutes) chosen.minutes = String(+el.dataset.minutes); const row = store().expById.get(eid); app.ui.approve[eid] = chosen; approve(eid, true, { base_updated: row ? row.updated : undefined }); },
   'run-now': async (el) => {
     const s = store(), eid = el.dataset.eid;
     await flushAll();
@@ -621,6 +649,7 @@ export function installActions() {
       app.render('check');
     } else if (what === 'runon' || what === 'backend') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).backend = t.value; app.render('backend'); }
     else if (what === 'ap-network') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).network = t.checked; app.render('backend'); }
+    else if (what === 'ap-net-choice') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).network = t.value === 'yes'; if (app.ui.netNudge === t.dataset.eid) app.ui.netNudge = null; app.render('backend'); }
     else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.tagName === 'SELECT') app.render('start'); }
     else if (what === 'opt-review') { const s = composer(); s.auto[t.dataset.kind] = !t.checked; keepComposer(); }
     else if (what === 'request-about') { app.ui.request.about = t.checked; }

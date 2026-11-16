@@ -73,6 +73,14 @@ export function plain(text) {
     .replace(/\bat the person's request\b/g, 'at your request')
     .replace(/\bRaise settings\.limits\.\w+ in the project's settings\b/g, 'Raise the limit');
 }
+/** What a phase did, from the sentence the engine wrote when it paused ("Round 2, design:
+    2 experiments are planned. 1 question and 2 suggested edits are waiting for you.").
+    The count of what waits was true at that moment only; the page shows the live count
+    beside it, so the stale one is left out, and so is the heading the page already has. */
+export const checkpointDid = (summary) => String(summary || '')
+  .replace(/^Round \d+, [^:.]{1,40}:\s*/, '')
+  .replace(/(^|[.!?]\s+)[^.!?]*\b(?:is|are) waiting for you\.\s*$/, '$1')
+  .trim();
 /** "38 min ago", "2 h ago", "3 days ago", then the date. */
 export const ago = (stamp, now = Date.now()) => {
   const t = parseStamp(stamp);

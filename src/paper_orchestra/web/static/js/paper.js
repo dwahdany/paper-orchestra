@@ -28,12 +28,18 @@ export const paperView = {
     clearInterval(pollTimer);
     if (running) pollTimer = setInterval(() => { if (app.store === store && app.route.view === 'paper') store.loadPaper(); else clearInterval(pollTimer); }, 3000);
     const busy = (store.project.worker || {}).state && store.project.worker.state !== 'idle';
-    const accepted = store.pages.filter((p) => p.review === 'accepted').length, findings = store.pages.filter((p) => p.kind === 'finding' && p.review === 'accepted').length;
+    const findings = store.pages.filter((p) => p.kind === 'finding' && p.review === 'accepted').length;
+    const ran = store.experiments.filter((x) => x.review === 'accepted' && x.state === 'succeeded').length;
+    const attached = (store.project.attachments || []).length;
     const stages = state && state.stages ? Object.keys(state.stages) : [];
     const mark = (status) => (status === 'completed' ? icon('check') : status === 'failed' ? icon('x') : status === 'running' ? raw('<span class="live-dot" aria-hidden="true"></span>') : status === 'interrupted' ? icon('pause') : icon('ring'));
     setHTML(root, html`<div class="paper"><div class="paper-wrap">
       <header class="view-head"><h1>Write it up <span class="quiet">optional</span></h1>
-        <p>The paper pipeline writes a draft from what the project holds: the runs that succeeded, the accepted findings that say what they mean (${findings} of ${accepted} accepted pages), and what you attached. Attached text files and tables go into the materials as they are; attached images become figures marked “Provided by the researcher”. A project with attached results and an accepted finding can be written up without any run. Proposals you have not accepted are left out. Nothing in the wiki is changed.</p></header>
+        <p>A draft paper is written from what the project holds, with one of the bundled templates. Proposals you have not accepted are left out, and nothing in the wiki is changed.</p></header>
+      <ul class="paper-from" aria-label="What the paper is written from">
+        <li><b>${findings}</b><span class="pf-what">accepted ${findings === 1 ? 'finding' : 'findings'}</span><span class="pf-how">What the results mean. A paper needs at least one.</span></li>
+        <li><b>${ran}</b><span class="pf-what">${ran === 1 ? 'experiment' : 'experiments'} with a run that succeeded</span><span class="pf-how">Their metrics and figures go in as the runs wrote them.</span></li>
+        <li><b>${attached}</b><span class="pf-what">${attached === 1 ? 'file' : 'files'} you attached</span><span class="pf-how">Text and tables go in as they are; images become figures marked “Provided by the researcher”. With these and a finding, a paper can be written without any run.</span></li></ul>
       ${paper.missing === 'results' ? html`<div class="note note-warn paper-gap">${icon('warn')}<span><b>Not ready: there are no results to report.</b> No accepted experiment has a run that succeeded, and no text file, table or image is attached to the project. <a href="${link({ view: 'experiments', sel: '', sub: '' })}">Approve an experiment and run it</a>; then a finding about its results must be accepted.</span></div>`
         : paper.missing === 'finding' ? html`<div class="note note-warn paper-gap">${icon('warn')}<span><b>Not ready: no finding is accepted.</b> The results are there, but a paper reports what they mean. <a href="${link({ view: 'inbox', sel: '', sub: '' })}">Accept a finding in the inbox</a>, or write one yourself as a new page.</span></div>` : ''}
       ${paper.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The state of the paper could not be read: ${paper.error.message}</span></div>` : ''}

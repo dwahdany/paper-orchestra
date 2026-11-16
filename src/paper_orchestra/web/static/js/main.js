@@ -60,6 +60,19 @@ function refocus(key) {
   if (key.caret && el.setSelectionRange) { try { el.setSelectionRange(key.caret[0], key.caret[1]); } catch (e) { /* not a text field */ } el.scrollTop = key.caret[2]; }
 }
 
+/** The row that is selected stays in sight in its list. A page reached by a link, a key or
+    the map must not be left below the edge of the index (the list's own scroll position is
+    kept across a render, so nothing else would bring it up). */
+function showCurrent(main) {
+  $$('.idx-scroll .idx.cur, .exp-rail .idx.cur, .in-scroll .in-row.cur', main).forEach((el) => {
+    const box = el.closest('.idx-scroll, .exp-rail, .in-scroll');
+    if (!box) return;
+    const a = el.getBoundingClientRect(), b = box.getBoundingClientRect(), pad = Math.min(40, b.height / 4);
+    if (a.top < b.top + pad) box.scrollTop -= b.top + pad - a.top;
+    else if (a.bottom > b.bottom - pad) box.scrollTop += a.bottom - (b.bottom - pad);
+  });
+}
+
 function onStoreChange(reason, background, event) {
   if (reason === 'run.log') { if (app.hooks.runLog) app.hooks.runLog(event); return; }
   /* An experiment the person approved was put back to planned instead of being run (its
@@ -146,6 +159,7 @@ function render(reason, background) {
   document.body.classList.toggle('in-project', route.name === 'project' && !!store && store.loaded);
 
   Object.keys(saved).forEach((sel) => { const el = $(sel, main); if (el) el.scrollTop = saved[sel]; });
+  if (!same) showCurrent(main);
   logs.forEach((log) => { const el = $('.log-body[data-log="' + CSS.escape(log.key || '') + '"]', main); if (el && !log.stuck) el.scrollTop = log.top; });
   opened.forEach((keep) => { const el = $('details[data-keep="' + CSS.escape(keep) + '"]', main); if (el) el.open = true; });
   renderToast();

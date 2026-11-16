@@ -45,6 +45,11 @@ The flows change the project, so every run needs a fresh workspace. Options:
   as the checks pass them.
 - `--scheme dark`: the flows in the dark theme (for the photographs).
 - `--slow 2`: doubles every wait, for a slow machine.
+- `large` also checks the keyboard on the map (Tab reaches the selected page, the arrow
+  keys move from there with the map following, Tab leaves a map of 150 pages within a few
+  presses) and the question about network access: for a plan that asks for the network
+  the approval form offers two answers with neither chosen, an approval pressed before
+  the answer sends nothing, and the answer goes out with the approval.
 - `large` looks at the project of 150 pages when the workspace holds it (the two demo
   projects have the same title; they are told apart by the number of their pages);
   otherwise it says that it was skipped. It also checks that what is being typed in one

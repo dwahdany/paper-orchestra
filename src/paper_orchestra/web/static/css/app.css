@@ -30,7 +30,7 @@
   --neg: #a6372c;
   --neg-wash: #f8e6e3;
 
-  --e-read: #8f9399;
+  --e-read: #888c93;
   --e-reason: #6c7179;
   --e-test: #33373d;
   --field: #858991;
@@ -89,7 +89,7 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 code, kbd, pre { font-family: var(--mono); }
 code { font-size: .88em; }
 :focus { outline: none; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 ::selection { background: var(--accent-wash); }
 [hidden] { display: none !important; }
 .sr, .skip:not(:focus) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -1021,7 +1021,7 @@ a.choice { text-decoration: none; }
 }
 @media (max-width: 960px) {
   .trail { padding: 8px 26px 0; }
-  .statusbar .sb-conn, .statusbar .sb-i:nth-last-child(2) { display: none; }
+  .statusbar .sb-of { display: none; }
   .ex-table th:nth-child(3), .ex-table td:nth-child(3), .ex-table th:nth-child(6), .ex-table td:nth-child(6) { display: table-cell; }
   .ex-table th:nth-child(3), .ex-table td:nth-child(3), .ex-table th:nth-child(7), .ex-table td:nth-child(7) { display: none; }
   .paper-wrap { padding: 28px 22px 60px; } .ps { grid-template-columns: 24px minmax(0, 1fr) auto; } .ps-s { grid-column: 2; }
@@ -1059,3 +1059,114 @@ a.choice { text-decoration: none; }
 .page-reason-back { color: var(--prop); }
 .approve .approve-back { margin: 8px 0 12px; }
 .ex-sub .t-prop { color: var(--prop); }
+
+/* ====================================================================================
+   The last pass: every screen looked at beside the mockup, in both themes and at the
+   four widths. What was cramped, cut off, misaligned or unclear is put right here.
+   ==================================================================================== */
+
+/* ---------- names: an id is one word, never broken ("H5", not "H" over "5") ---------- */
+.pn-id, .kicker-kind b, .lin-name b, .arg-id b, .ex-id b { white-space: nowrap; }
+.in-name .pn-id, .ov-main .pn-id { flex: none; }
+
+/* ---------- top bar: the project's title takes the room there is ---------- */
+.brand, .views, .top-r { flex: none; }
+.top-proj { flex: 0 1 auto; min-width: 0; max-width: 46ch; }
+@media (max-width: 1100px) { .top-proj { max-width: 46ch; } }
+
+/* ---------- the map ---------- */
+/* a large map: the lines that only say "read" step back, so the argument can be followed */
+/* (thinner, not fainter: a line keeps its 3:1 against the sheet) */
+.map-canvas.dense:not(.has-sel) .edge.f-read { stroke-width: .7; }
+.map-canvas.dense:not(.has-sel) .edge.f-reason { stroke-width: 1; }
+.map-canvas.dense:not(.has-sel) .edge.e-prop { stroke-width: .9; }
+.map-canvas.dense:not(.has-sel) .edge.f-pos.e-prop, .map-canvas.dense:not(.has-sel) .edge.f-neg.e-prop, .map-canvas.dense:not(.has-sel) .edge.f-test.e-prop { stroke-width: 1.3; }
+/* headings shrink with a map that is drawn smaller, so that none runs into the next */
+.heads-s .head-w, .heads-s .head-n { display: none; }
+.heads-xs .head text { display: none; }
+.map-foot { align-items: center; }
+
+/* ---------- the page ---------- */
+.trail-i { height: 24px; }
+.wiki-rail .lin { grid-template-columns: 88px 16px minmax(0, 1fr); }
+.lin { grid-template-columns: 90px 16px minmax(0, 1fr); }
+.result .lin, .run-b .lin { grid-template-columns: 16px minmax(0, 1fr); }
+/* a suggested edit in the margin: the three answers on one line */
+.review-margin .review-actions { gap: 6px; }
+.review-margin .review-actions .btn { padding: 0 8px; }
+.review-margin .review-count { gap: 2px 12px; }
+/* a diff of prose is read, not scrolled sideways */
+.hist-body .diff-line, .diff-wrap .diff-line { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* the editor: the title has the whole line */
+.ed-wiki .ed-fields { grid-template-columns: 1fr; }
+.ed-wiki .ed-pane textarea, .ed-wiki .ed-prev { height: calc(100vh - 414px); }
+
+/* ---------- inbox ---------- */
+.in-keys { gap: 4px 14px; white-space: nowrap; }
+@media (max-width: 960px) { .in-keys { display: none; } .inbox { grid-template-rows: minmax(240px, 50%) minmax(0, 1fr); } }
+
+/* ---------- overview ---------- */
+.ev-checkpoint > :last-child { font-weight: 600; color: var(--ink); }
+/* every mark of the strip map can be hit: 24 px each, the glyph stays 16 */
+.smap-marks { gap: 0; margin: 3px 0 0 -4px; min-height: 24px; }
+.smap-marks a { width: 24px; height: 24px; place-items: center; }
+.smap-marks a.smap-more { width: auto; padding: 0 6px; }
+.smap-wait { margin-top: 2px; }
+
+/* ---------- experiments ---------- */
+.run-b > .failure:first-child, .run-b > .repair-ok:first-child { margin-top: 12px; }
+.code-by { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.code-late { margin-left: 0; }
+/* the plan asks for the network: a question with two answers and no default */
+.net-ask { margin: 12px 0 0; padding: 10px 12px; border: 1px dashed var(--prop-line); border-radius: 6px; background: var(--prop-wash); font-size: 12.5px; min-width: 0; }
+.net-ask legend { float: left; width: 100%; padding: 0; margin: 0 0 6px; font-size: 13px; line-height: 1.45; } .net-ask legend + * { clear: both; }
+.net-ask legend b { font-weight: 650; }
+.net-ask .net-opts { display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.net-ask label { display: inline-flex; align-items: center; gap: 7px; color: var(--ink); min-height: 24px; cursor: pointer; }
+.net-ask.unanswered.nudge { border-style: solid; border-color: var(--neg); }
+.net-ask .net-need { display: block; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
+.review .net-ask { background: var(--surface); }
+.approve-fields .tick .quiet { margin-left: 2px; }
+/* approved, and then the code or the plan changed */
+.callout-changed { border-style: dashed; border-color: var(--prop-line); background: var(--prop-wash); }
+.callout-changed h2 .ic { color: var(--prop); flex: none; }
+.changed-list { margin: 8px 0 0; padding-left: 1.1em; list-style: disc; font-size: 12.5px; color: var(--ink-2); max-width: 78ch; } .changed-list li + li { margin-top: 2px; }
+
+/* ---------- library, setup, paper ---------- */
+.lib-counts { white-space: normal; line-height: 1.45; }
+.lib-row { grid-template-columns: minmax(0, 1fr) 336px 180px 88px; gap: 32px; }
+@media (max-width: 1280px) { .lib-row { grid-template-columns: minmax(0, 1fr) 300px 170px; } }
+@media (max-width: 960px) { .lib-row { grid-template-columns: minmax(0, 1fr) 170px; gap: 20px; } }
+.doc-i { grid-template-columns: 26px minmax(0, 1fr) minmax(110px, max-content); }
+.doc-s { white-space: nowrap; }
+.paper-from { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 28px; margin: 4px 0 18px; padding: 0; border-top: 1px solid var(--rule-2); }
+.paper-from li { padding: 11px 0 0; }
+.paper-from b { display: block; font: 600 22px/1.15 var(--serif); font-variant-numeric: tabular-nums lining-nums; }
+.paper-from .pf-what { display: block; margin-top: 2px; font-size: 12.5px; font-weight: 600; }
+.paper-from .pf-how { display: block; margin-top: 2px; font-size: 12px; line-height: 1.45; color: var(--ink-3); }
+.paper .view-head p + p { margin-top: 6px; }
+@media (max-width: 960px) { .paper-from { grid-template-columns: 1fr; } .paper-from li { display: grid; grid-template-columns: 44px minmax(0, 1fr); column-gap: 10px; } .paper-from b { grid-row: 1 / 3; } }
+.lib-dir { display: inline-block; margin-top: 3px; font-size: 11px; color: var(--ink-3); }
+.paper .view-head { margin-bottom: 14px; }
+
+/* ---------- contrast: what is quieter is still read (AA for text in both themes) ---------- */
+.node.r-rejected:not(.dim), .node.kin:not(.dim) { opacity: 1; }
+.idx.cur.r-rejected .idx-name, .idx.cur.r-rejected .pn-t { color: var(--ink-2); }
+.btn-primary kbd { opacity: .74; }
+
+/* ---------- what can be pressed is at least 24 px, or stands clear of its neighbours ---------- */
+.brand, .top-proj { align-self: stretch; display: flex; align-items: center; }
+.top-proj { display: block; line-height: 43px; }
+@media (max-width: 960px) { .top-proj { display: none; } }   /* a narrow bar keeps to the views; the title is on the overview */
+.statusbar { height: 26px; }
+.tool { height: 26px; } .tool-sel select { height: 24px; } .tool-i { width: 28px; }
+.chip { height: 24px; border-radius: 12px; }
+.adv summary, .repair-i summary, .spend-more summary, .conflict summary { padding: 3px 0; min-height: 24px; }
+.tick, .in-all, .rq-bar .tick, .approve-fields label { min-height: 24px; }
+.ov-maplink { display: inline-flex; align-items: center; min-height: 24px; }
+.back { padding: 4px 0; margin-top: 0; }
+.ex-name a { min-height: 24px; }
+.page-foot .linkish, .review-count .linkish, .details .linkish, .idx-more, .ev-steps > summary { display: inline-flex; align-items: center; min-height: 24px; min-width: 24px; }
+.details .linkish { justify-content: flex-start; }
+.details dt, .details dd { line-height: 24px; } .details dd code { line-height: 1.5; display: inline-block; vertical-align: middle; }
+.review-count { align-items: center; }

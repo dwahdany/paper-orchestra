@@ -40,6 +40,7 @@ export const app = {
     drafts: {},             // editor drafts in memory (they are also kept in localStorage)
     editProposal: {},       // page path -> the edit proposal being edited before it is accepted
     reapprove: null,        // the experiment whose approval form is open again
+    netNudge: null,         // the experiment whose question about network access was left unanswered
     showLessons: false,
     toast: null,
     flash: null,
@@ -70,7 +71,7 @@ export function openProjectUi(pid) {
   ui.activityOpen = false; ui.logOpen = false; ui.feedLimit = 40; ui.map = freshMap();
   ui.approve = {}; ui.codeTab = {}; ui.codeEdit = {}; ui.runOpen = {}; ui.asDiff = {}; ui.histVersion = {};
   ui.newPage = null; ui.limitEdit = null; ui.limits = null; ui.limitsOpen = false;
-  ui.editProposal = {}; ui.reapprove = null; ui.showLessons = false; ui.focusEditor = '';
+  ui.editProposal = {}; ui.reapprove = null; ui.netNudge = null; ui.showLessons = false; ui.focusEditor = '';
   ui.paper = { templates: ui.paper.templates, template: ui.paper.template };
   ui.request = { text: String(storage.get(requestKey(pid), '') || ''), about: true };
   const prefix = codeKey(pid, '');

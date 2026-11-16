@@ -2,7 +2,7 @@
    number check, lineage, where the page sits on the map, details). */
 
 import { app, link } from './core.js';
-import { $, dateTime, html, plural, raw, setHTML } from './util.js';
+import { dateTime, html, plural, raw, setHTML } from './util.js';
 import { EXTRA_KINDS, KIND, STAGES, agentName, icon, pageGlyph } from './vocab.js';
 import { afterRender, lineageHTML, notesHTML, pageName, pageTip, panelHTML, trailHTML } from './page.js';
 
@@ -72,7 +72,5 @@ export const wikiView = {
           <dt>Versions</dt><dd>${view ? html`<button class="linkish" data-act="history" data-ref="${page.path}">${(view.history || []).length + 1}</button>` : '…'}</dd></dl></aside>` : ''}
     </div>`);
     afterRender(root);
-    const cur = $('.idx.cur', root);
-    if (cur && cur.scrollIntoView && app.lastRenderKey !== app.renderKey) cur.scrollIntoView({ block: 'nearest' });
   },
 };
