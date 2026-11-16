@@ -274,7 +274,8 @@ def test_requests_are_faster_with_a_key_and_the_pace_can_be_set(monkeypatch):
     for query in ("a", "b", "c"):
         client.search(query)
     assert fake_time.sleeps == pytest.approx([KEYED_INTERVAL_S, KEYED_INTERVAL_S])
-    assert KEYED_INTERVAL_S < KEYLESS_INTERVAL_S
+    # A margin under the one request per second a key is granted, and still the faster pace.
+    assert 1.0 < KEYED_INTERVAL_S < KEYLESS_INTERVAL_S
 
     fast, fast_time = make_client(FakeSession(), min_interval=0.1)
     fast.search("a")
