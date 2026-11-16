@@ -3,8 +3,9 @@
 `web_check.js` drives the real frontend in a real browser against a real server: every
 screen at four widths in both themes (no console error, nothing blocked by the
 Content-Security-Policy, no horizontal overflow), the inbox on a phone that is touched
-(three widths: nothing wider than the screen, the list and then one proposal, every answer
-on the screen and a finger wide), and the flows a person goes through:
+(three widths, and once held on its side: nothing wider than the screen, the list and then
+one proposal, every answer on the screen and a finger wide, the toast on no row, no field
+under 16 px), and the flows a person goes through:
 deciding proposals from the map, the inbox and the page (with the short undo, a reason for a
 rejection, a stale decision, a double click that must decide once), editing a page into a
 conflict and out of it both ways, adding and deleting a page, approving an experiment and

@@ -1,6 +1,6 @@
 /* The inbox: everything that waits for a decision, with the proposal beside it. */
 
-import { app, link } from './core.js';
+import { app, link, listAlone } from './core.js';
 import { ago, html, plural, raw, setHTML, tf } from './util.js';
 import { KIND, STAGES, agentName, glyph, icon, kindName, shownState } from './vocab.js';
 import { afterRender, pageName, panelHTML, proposalWhat } from './page.js';
@@ -59,7 +59,7 @@ export function currentItem(store, route) {
 
 export const inboxView = {
   render(root, route) {
-    const store = app.store, items = store.pending(), cur = currentItem(store, route);
+    const store = app.store, items = store.pending(), cur = currentItem(store, route), alone = listAlone(route);
     const checked = app.ui.checked;
     Object.keys(checked).forEach((ref) => { if (!items.find((it) => it.ref === ref)) delete checked[ref]; });
     const nChecked = Object.keys(checked).length;
@@ -68,7 +68,7 @@ export const inboxView = {
       const group = items.filter((it) => it.kind === k);
       if (!group.length) return '';
       return html`<div class="in-group"><h3>${(KIND[k] || { many: k }).many}<span>${group.length}</span></h3>${group.map((it) => {
-        const on = cur && it.ref === cur.ref;
+        const on = !alone && cur && it.ref === cur.ref;      // (the list alone, on a phone, has no proposal in front)
         const sum = summaryOf(it);
         return html`<div class="in-row${on ? ' cur' : ''}" data-ref="${it.ref}">
           <label class="in-check"><input type="checkbox" data-check="${it.ref}"${checked[it.ref] ? raw(' checked') : ''} aria-label="Select ${it.page.id || it.page.title}"></label>

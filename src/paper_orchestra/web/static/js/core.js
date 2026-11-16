@@ -151,7 +151,10 @@ export function go(patch, replace) {
   window.dispatchEvent(new HashChangeEvent('hashchange'));
 }
 export const select = (path, sub) => go({ sel: path || '', sub: sub || '' });
-/** On a sheet as narrow as a phone the inbox shows its list or one proposal, never both
-    (the last block of the stylesheet), and an address that names no page is the list: no
-    proposal is in front then, though a wide sheet shows the first one beside the list. */
-export const listAlone = (route) => route.view === 'inbox' && !route.sel && !!(window.matchMedia && window.matchMedia('(max-width: 700px)').matches);
+/** A sheet as narrow as a phone, or a phone held on its side: the question the last block
+    of the stylesheet asks, in the same words. */
+export const phone = () => !!(window.matchMedia && window.matchMedia('(max-width: 700px), (max-height: 480px) and (pointer: coarse)').matches);
+/** On a phone the inbox shows its list or one proposal, never both, and an address that
+    names no page is the list: no proposal is in front then, though a wide sheet shows the
+    first one beside the list. */
+export const listAlone = (route) => route.view === 'inbox' && !route.sel && phone();

@@ -4,7 +4,7 @@
    the open route into the page, keeping scroll positions and the caret. A render caused by
    the event stream waits while the person is in the middle of typing. */
 
-import { app, askHealth, listAlone, openProjectUi, parseHash } from './core.js';
+import { app, askHealth, link, listAlone, openProjectUi, parseHash, phone } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $, $$, clock, html, parseStamp, plain, setHTML } from './util.js';
 import { Store } from './store.js';
@@ -162,8 +162,8 @@ function render(reason, background) {
 
   const navAt = ($('#top .views') || {}).scrollLeft || 0;
   setHTML($('#top'), topbar(route));
-  showView(navAt);
   const viewKey = route.name === 'project' ? route.pid + '/' + route.view + (store.loaded ? '' : '/loading') : route.name;
+  showView(navAt, main.dataset.view !== viewKey);
   if (main.dataset.view !== viewKey) { setHTML(main, html``); main.dataset.view = viewKey; main.className = 'view view-' + (route.view || route.name); }
   const bar = $('#status');
   if (route.name === 'project') {
@@ -190,6 +190,7 @@ function render(reason, background) {
   setHTML(ban, banner());
   /* the keyboard is where it was: on the same control, though its markup is new */
   refocus(focused);
+  if (!same) stepFocus(main, route, app.lastRoute);
   /* an editor that has just opened takes the keyboard: E, then type */
   if (app.ui.focusEditor === key) {
     const body = $('#ed-body', main);
@@ -199,20 +200,31 @@ function render(reason, background) {
   const page = store && store.loaded && route.sel ? store.byPath.get(route.sel) : null;
   document.title = (store && store.loaded ? (page ? label(page) + ' · ' : '') + store.project.title : { start: 'New project', setup: 'Setup', library: 'Projects', project: 'Project' }[route.name]) + ' · PaperOrchestra';
   app.lastRenderKey = key;
+  app.lastRoute = route;
   lastKey = key;
 }
 app.render = render;
 
 /** The views of the top bar scroll sideways where the bar is too narrow for them (a phone).
-    The bar is written again by every render: the row stays where it was, and the view that
-    is open is in sight. */
-function showView(at) {
-  const nav = $('#top .views'), cur = nav && $('a[aria-current]', nav);
-  if (!nav || nav.scrollWidth <= nav.clientWidth) return;
-  nav.scrollLeft = at;
-  if (!cur) return;
+    The bar is written again by every render: the row stays where the person left it, and
+    only a view that has just been opened (`moved`) is brought into sight. */
+function showView(at, moved) {
+  const nav = (at || moved) && $('#top .views'), cur = nav && $('a[aria-current]', nav);
+  if (!nav) return;
+  if (at) nav.scrollLeft = at;
+  if (!moved || !cur || nav.scrollWidth <= nav.clientWidth) return;
   const a = cur.getBoundingClientRect(), b = nav.getBoundingClientRect();
   if (a.left < b.left || a.right > b.right) nav.scrollLeft += a.left - b.left - (b.width - a.width) / 2;
+}
+
+/** On a phone a touched row of the inbox gives way to its proposal, and the way back to
+    the list: the keyboard (and a screen reader) goes along, to the way back at the head
+    of the proposal, then to the row that was left; without this it stays on a row that is
+    no longer shown, and lands in the top bar. */
+function stepFocus(main, route, was) {
+  if (!phone() || route.view !== 'inbox' || !was || was.view !== 'inbox' || was.pid !== route.pid || !route.sel === !was.sel) return;
+  const to = route.sel ? $('.in-back', main) : $('.in-row a.in-main[href="' + CSS.escape(link({ view: 'inbox', sel: was.sel, sub: '' })) + '"]', main) || $('.in-row a.in-main', main);
+  if (to) to.focus({ preventScroll: true });
 }
 
 /* ---------- the clock: stopwatches and meters move without a render ---------- */
