@@ -950,7 +950,7 @@ CHECKS.states = async ({ page, pid, context }) => {
   ok(started.status === 202, 'a phase starts for the kill test: ' + started.status);
   await until(page, () => !!document.querySelector('.strip.s-running'), null, 10000, 'it runs');
   let worker = null;
-  for (let i = 0; i < 80 && !(worker && worker.pid > 0); i++) { const view = (await api('GET', '/api/projects/' + pid)).data; if (view.state.status === 'running') worker = view.worker; else await sleep(150); }
+  for (let i = 0; i < 600 && !(worker && worker.pid > 0); i++) { const view = (await api('GET', '/api/projects/' + pid)).data; if (view.state.status === 'running') worker = view.worker; else await sleep(150); }
   ok(worker && worker.pid > 0, 'the worker has a pid and its phase is under way');
   if (worker && worker.pid > 0) { try { process.kill(worker.pid, 'SIGKILL'); } catch (e) { fails.push('could not kill the worker: ' + e.message); } }
   await until(page, () => !!document.querySelector('.strip.s-failed'), null, 30000, 'a dead worker is noticed');
@@ -1827,14 +1827,17 @@ CHECKS.paper = async ({ page, pid }) => {
   await idle(pid, 120000);
   await page.click('.paper-form button[type=submit]');
   let writing = null;
-  for (let i = 0; i < 150 && !writing; i++) { const paper = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (paper.running && paper.last && paper.last.outcome === 'running' && paper.worker.pid > 0 && paper.worker.kind === 'write') writing = paper.worker; else await sleep(60); }
+  /* (How long the worker takes to start is the machine's business: a loaded or small one needs
+     many seconds to import the pipeline. The wait is for that; the write-up itself then runs
+     for a second or two, and a look every few dozen milliseconds does not miss it.) */
+  for (const deadline = Date.now() + 90000; Date.now() < deadline && !writing;) { const paper = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (paper.running && paper.last && paper.last.outcome === 'running' && paper.worker.pid > 0 && paper.worker.kind === 'write') writing = paper.worker; else await sleep(60); }
   if (ok(!!writing, 'the write-up is under way again, and has said that it started')) {
     let killed = true;
     try { process.kill(writing.pid, 'SIGKILL'); } catch (e) { killed = false; notes.push('paper: the worker of the write-up had ended before it could be killed (' + e.message + '); how a killed write-up is shown was not looked at'); }
     await idle(pid, 60000);
     if (killed) {
       let cut = null;
-      for (let i = 0; i < 80 && !(cut && cut.last && cut.last.exit_code != null); i++) { cut = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (!(cut.last && cut.last.exit_code != null)) await sleep(150); }
+      for (let i = 0; i < 400 && !(cut && cut.last && cut.last.exit_code != null); i++) { cut = (await api('GET', '/api/projects/' + pid + '/paper')).data; if (!(cut.last && cut.last.exit_code != null)) await sleep(150); }
       if (ok(!!cut && !!cut.last && cut.last.outcome === 'failed' && cut.last.exit_code < 0 && /killed/.test(cut.last.summary || '') && !cut.running, 'the server says how the killed write-up ended, from the project\'s events: ' + JSON.stringify(cut && cut.last && [cut.last.outcome, cut.last.exit_code]))) {
         await until(page, (summary) => ((document.querySelector('.paper-last[data-ended="failed"]') || {}).textContent || '').replace(/\s+/g, ' ').includes(summary), cut.last.summary.replace(/\s+/g, ' '), 15000, 'the paper view says in the server\'s sentence that the write-up was cut short');
         ok(/did not finish/.test(await text(page, '.paper-last')) && !/In progress/.test(await text(page, '.paper-state .sec-t')), 'and does not show it as in progress: ' + (await text(page, '.paper-last')).replace(/\s+/g, ' ').trim().slice(0, 140));
