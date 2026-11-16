@@ -1577,7 +1577,9 @@ def _what_was_approved(project: Project, page: ResearchPage) -> list[str]:
 
 def _what_runs(plan: Any) -> str:
     """The command a run of ``plan`` executes and, in repo mode, where: the repository
-    as it may be written down (never the token of its URL)."""
+    as it may be written down (never the token of its URL).  The packages the plan asks
+    for are named with it: the approval pins them, and where they are installed for the
+    run their code runs too."""
     from paper_orchestra.research import experiments
     from paper_orchestra.research import repo as repositories
 
@@ -1586,6 +1588,8 @@ def _what_runs(plan: Any) -> str:
         how = "a clone of" if repositories.is_url(plan.repo) else "a copy of your repository"
         told += f" in {how} {repositories.display_url(plan.repo)}"
         told += f" at {plan.repo_ref}" if plan.repo_ref else ""
+    if plan.packages:
+        told += f", with the packages {', '.join(plan.packages)}"
     return told + "."
 
 

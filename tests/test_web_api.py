@@ -2573,6 +2573,20 @@ def test_an_approval_without_a_backend_goes_to_the_projects_not_the_pages(real, 
     assert chosen.status_code == 200 and chosen.json()["page"]["meta"]["backend"] == "local"
 
 
+def test_the_approval_form_is_offered_the_projects_backend_first(real, project):
+    """A form offers the first backend that can run as its choice.  That must be what the
+    person set for the project, not their own machine in place of a sandbox."""
+
+    def offered() -> list[str]:
+        view = real.get(url(project, "/experiments/E1")).json()
+        return [option["backend"] for option in view["options"]]
+
+    assert offered() == ["local", "modal"]
+    project.settings.update({"compute": "modal"})
+    project.save_settings()
+    assert offered() == ["modal", "local"]
+
+
 def test_the_experiment_view_says_what_was_approved_and_whether_it_still_is(real, project):
     never = real.get(url(project, "/experiments/E1")).json()
     assert never["approval"] == {

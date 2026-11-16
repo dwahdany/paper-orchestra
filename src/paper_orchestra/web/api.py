@@ -309,10 +309,16 @@ class Services:
         return list(self._experiments().runs(project, experiment_id))
 
     def backend_names(self, project: Project) -> list[str]:
-        """The compute backends the approval form asks about."""
+        """The compute backends the approval form asks about, the project's own first.
+
+        A form offers the first one that can run as its choice.  That is then what the
+        person set for the project, never their own machine in place of a sandbox
+        because of the order of a list.
+        """
         from paper_orchestra.compute import BACKEND_NAMES
 
-        return list(BACKEND_NAMES)
+        own = str(project.settings.compute)
+        return sorted(BACKEND_NAMES, key=lambda name: name != own)
 
     def options(self, project: Project, ref: str) -> list[dict[str, Any]]:
         # By name: the experiments module builds each backend itself, and one that cannot

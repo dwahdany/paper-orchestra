@@ -200,6 +200,9 @@ MAX_EVIDENCE_WALK = 256
 #: The shortest password or token of a repository URL that is blanked out of logs: a
 #: shorter one would blank ordinary words.
 MIN_URL_SECRET_CHARS = 4
+#: Bytes from the start of a log that are read for what the clone step of a job said
+#: before it started the command.
+CLONE_HEAD_BYTES = 16_384
 
 _RUNNER = agent_author("runner")
 _DESIGNER = agent_author("designer")
@@ -217,6 +220,14 @@ _NO_GPU = frozenset({"", "false", "no", "none", "null", "cpu", "0"})
 _WORKER_STOPPED = "The worker stopped while this run was in progress."
 _URL_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)([^/@\s]+)@")
 _HOW_TO_APPROVE = "`paper-orchestra research approve`, or Approve in the app"
+#: Said on the record of a run that clones with a credential where nothing fences the job in.
+_SECRET_WITHIN_REACH = (
+    "The address of the repository carries a password or token. It is kept out of the "
+    "job's working directory, its log and this record, but the local backend is not a "
+    "sandbox: the command runs as you and can read the project's settings (project.json), "
+    "where the address is. Run it on the Modal backend, or give git the credential another "
+    "way (a credential helper, an ssh key), where that matters."
+)
 
 #: Modules whose import means the code talks to the network.
 _NETWORK_MODULES = frozenset(
@@ -834,6 +845,22 @@ def _digest(files: Iterable[tuple[str, Path]]) -> str:
 # -- what an approval pins ----------------------------------------------------------------
 
 
+def _pinned_repository(plan: ExperimentPlan) -> str | None:
+    """The repository of a plan as an approval pins it: a URL as it is written, a
+    directory by the place where it really is.
+
+    The same project is opened by its absolute path in the app and often by a relative
+    one on the command line, and its repository may be given relative to it.  However
+    the path was put together, the same directory is the same repository; another
+    directory behind the same name (a link pointed elsewhere since) is another.
+    """
+    if not plan.repo or repositories.is_url(plan.repo):
+        return plan.repo
+    with contextlib.suppress(OSError, RuntimeError):
+        return str(Path(plan.repo).resolve())
+    return os.path.abspath(plan.repo)  # a loop of links: at least not the caller's spelling
+
+
 def _run_fields(plan: ExperimentPlan) -> dict[str, Any]:
     """The fields of a plan that decide what a run executes, where and for how long
     (``model.RUN_FIELDS``), in a form that can be hashed and compared."""
@@ -842,7 +869,7 @@ def _run_fields(plan: ExperimentPlan) -> dict[str, Any]:
         "entrypoint": plan.entrypoint,
         "command": job_command(plan),
         "packages": list(plan.packages),
-        "repo": plan.repo,
+        "repo": _pinned_repository(plan),
         "repo_ref": plan.repo_ref,
         "gpu": plan.gpu,
         "network": plan.network,
@@ -863,7 +890,10 @@ def plan_digest(project: Project, ref: str) -> str:
     """SHA-256 over what a run of the experiment would execute as things are now: its
     code files (as :func:`code_digest`) and the run-defining fields of its plan (mode,
     entrypoint, command, packages, repo, repo_ref, gpu, network, backend,
-    timeout_seconds), as they are read from the page and the project's settings.
+    timeout_seconds), as they are read from the page and the project's settings.  A
+    repository that is a directory counts as the place where it really is, so the
+    digest does not depend on how the path of the project was written when it was
+    opened.
 
     An approval records it on the page as ``approved_digest``; a run starts only while
     the two are equal (:func:`approval` says whether they are).
@@ -2505,7 +2535,8 @@ def _finish(
     if cost is None and (result is None or result.error or result.cancelled):
         cost = _cost_without_result(attempt)  # the job's own account never came back
     error = _shorten(_masked(outcome.error, secrets) if outcome.error else outcome.error)
-    notes = [*attempt.notes, *(result.notes if result else []), *dropped]
+    cloned = _clone_notes(record, attempt.directory)
+    notes = [*attempt.notes, *cloned, *(result.notes if result else []), *dropped]
     record.update(
         status=outcome.status,
         finished=_now(),
@@ -2522,7 +2553,8 @@ def _finish(
         error_kind=outcome.kind,
         requeued=outcome.requeued,
         notes=list(dict.fromkeys(_masked(str(note), secrets) for note in notes)),
-        job=record.get("job") or _read_job(attempt.directory),
+        # The backend's file says the latest; the record's copy is from when it appeared.
+        job=_read_job(attempt.directory) or record.get("job"),
     )
     # A record found on disk may be older than these fields, or written by hand.
     record.setdefault("repairs", [])
@@ -2762,6 +2794,38 @@ def _clear_results(copy: Path) -> list[str]:
             path.unlink(missing_ok=True)
             removed.append(name)
     return removed
+
+
+def _clone_notes(record: Mapping[str, Any], directory: Path) -> list[str]:
+    """What the clone step of a job removed before it started the command (a
+    ``metrics.json`` or ``artifacts`` that came with the repository), as a note for the
+    record of the run.
+
+    The repository is cloned inside the job, so this side learns it from the log, where
+    the clone step says it on a line of its own before the command prints anything.
+    Only the names a run writes its results to are taken from that line: the command
+    writes to the same log, and a line of its making must not become a statement of the
+    record.
+    """
+    repo = record.get("repo")
+    if not isinstance(repo, dict) or repo.get("method") != "clone":
+        return []
+    try:
+        with open(directory / LOG_NAME, "rb") as stream:
+            head = stream.read(CLONE_HEAD_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    said = f"{repositories.CLONE_PREFIX}Removed "
+    line = next((line for line in head.splitlines() if line.startswith(said)), "")
+    listed = line[len(said) :].split(" that was there", 1)[0].split(",")
+    names = [name.strip() for name in listed if name.strip() in repositories.RESULT_PATHS]
+    if not names:
+        return []
+    return [
+        f"The job that cloned the repository removed {', '.join(names)} before the command "
+        "started (it came with the repository): only what the command itself writes is the "
+        "result of the run."
+    ]
 
 
 def _unified_diff(before: Mapping[str, str], after: Mapping[str, str]) -> str:
@@ -3057,6 +3121,9 @@ class _Session:
                     files=files,
                     command=spec.command,
                 )
+                if self.backend_name == "local" and repositories.userinfo(str(plan.repo)):
+                    # Nothing here can keep it from the command; the record says so.
+                    attempt.notes.append(_SECRET_WITHIN_REACH)
                 return copy, replaced(spec, command=command)
             made = repositories.copy_local(
                 str(plan.repo),
@@ -3271,7 +3338,9 @@ class _Session:
         # work is not the experiment's failure: it goes back to the queue.  Anything else
         # is a failure someone has to look at.
         requeue = stops_the_run(exc) or not isinstance(exc, Exception)
-        said = f"{type(exc).__name__}: {exc}"
+        # It goes onto the record and into the page's state, which every agent reads: an
+        # error may quote what it was given (the address of the repository, a key).
+        said = _masked(f"{type(exc).__name__}: {exc}", self._mask)
         attempt = self._current
         if attempt is not None and attempt.record.get("status") == "running":
             outcome = self._abandoned(exc, requeue, said)
@@ -3511,7 +3580,8 @@ def _clean_up(attempt: _Attempt, backend_for: Callable[[Mapping[str, Any]], Any]
     recorded them in ``job.json``), and the run's copy of the repository.  Returns notes
     for the run's record."""
     notes: list[str] = []
-    job = attempt.record.get("job") or _read_job(attempt.directory)
+    # The file first: a backend may add to it after the record took its copy.
+    job = _read_job(attempt.directory) or attempt.record.get("job")
     if isinstance(job, dict) and job:
         attempt.record["job"] = job
         try:

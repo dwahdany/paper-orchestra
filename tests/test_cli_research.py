@@ -1059,6 +1059,24 @@ def test_approve_shows_what_will_run_and_what_the_code_check_warns_of(project):
     assert f"approved digest {project.page('E1').meta['approved_digest'][:12]}" in out
     assert "Warning: main.py, line 1: it imports requests, which uses the network" in out
     assert "Warning: no file of the code mentions metrics.json" in out
+    assert "packages" not in out.lower()  # the plan asks for none
+
+
+def test_approve_names_the_packages_the_run_asks_for(project):
+    """Packages are part of what an approval pins, and a plan (or an accepted edit to it)
+    names them: the approval says which, since a backend that installs them runs their
+    code too."""
+    from paper_orchestra.research import experiments
+
+    code = "import json\n\njson.dump({'loss': 0.5}, open('metrics.json', 'w'))\n"
+    experiments.write_code(project, "E1", {"main.py": code}, author="agent:designer")
+    project.update_page("E1", author="agent:designer", fields={"packages": ["numpy", "typer"]})
+    project.review("E1", "accept")
+
+    result = invoke("approve", str(project.root), "E1")
+
+    assert result.exit_code == 0, result.output
+    assert "It runs `python main.py`, with the packages numpy, typer." in flat(result.stdout)
 
 
 def test_approve_names_the_repository_and_the_command_of_a_repo_experiment(project):

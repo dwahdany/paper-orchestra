@@ -1765,6 +1765,37 @@ def test_an_approval_records_exactly_what_may_run(project, backend):
     assert experiments.plan_digest(project, "E1") != digest
 
 
+def test_an_approval_holds_however_the_path_of_the_project_is_written(
+    tmp_path, backend, monkeypatch
+):
+    """A project's repository may be given relative to the project.  The app opens a
+    project by its absolute path, a command line often by a relative one: the same
+    directory is the same repository, and the approval made one way holds the other."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "train.py").write_text(QUICK)
+    settings = {"repo": {"path": "../repository"}}
+    project = Project.create(tmp_path / "p", title="Relative", settings=settings)
+    planned(project, mode="repo", command="python train.py")
+    experiments.approve(project, "E1", backends={"local": backend})
+
+    monkeypatch.chdir(tmp_path)
+    by_name = Project.open("p")
+    assert experiments.plan_digest(by_name, "E1") == project.page("E1").meta["approved_digest"]
+    assert experiments.approval(by_name, "E1")["matches"] is True
+    monkeypatch.chdir(tmp_path / "p")
+    assert experiments.run(Project.open("."), "E1", compute=backend)["status"] == "succeeded"
+
+    # Another directory at that place is another repository.
+    experiments.approve(project, "E1", backends={"local": backend})
+    repository.rename(tmp_path / "kept")
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "train.py").write_text(QUICK)
+    repository.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    changed = experiments.approval(project, "E1")
+    assert changed["matches"] is False and "elsewhere" in changed["changed"][0]
+
+
 def test_an_accepted_edit_that_changes_what_runs_needs_a_new_approval(project, backend):
     """The agent's summary says "typo"; its fields change the entry point, the network
     and the time limit of a run the person already approved."""
@@ -1853,6 +1884,49 @@ def test_a_change_between_two_attempts_ends_the_repairs(project, backend):
     assert experiments.code_files(project, "E1") == {"main.py": BROKEN}  # not repaired
     assert any("network: false when approved, now true" in note for note in record["notes"])
     assert run_dirs(project) == ["1"] and project.page("E1").state == "failed"
+
+
+def test_a_failure_is_not_handed_to_the_repairer_once_the_experiment_changed(project, backend):
+    """A repair is a model session, which costs money: it is not asked for on behalf of
+    a run that cannot go on because the experiment is no longer what was approved."""
+    approved(project, backend, {"main.py": BROKEN})
+    edited: list[object] = []
+    asked: list[int] = []
+
+    def on_log(line):  # while the job runs, the person gives the page another time limit
+        if not edited:
+            edited.append(project.update_page("E1", author="human", fields={"timeout_seconds": 99}))
+
+    def repair(plan, record, log_tail):
+        asked.append(record["number"])
+        return {"main.py": QUICK}
+
+    record = experiments.run(project, "E1", compute=backend, repair=repair, on_log=on_log)
+
+    assert edited and asked == []
+    assert (record["number"], record["status"]) == (1, "failed")
+    assert any("was not repaired" in note and "timeout_seconds" in note for note in record["notes"])
+
+
+def test_code_written_between_the_check_of_the_approval_and_the_copy_is_not_run(project, backend):
+    """The experiment is held against its approval when a run starts and once more on the
+    copy of the code that is handed to the job: a write that lands in between is not run."""
+    approved(project, backend, {"main.py": QUICK})
+    marker = project.root / "unread-code-ran.txt"
+
+    def compute(plan):
+        # Asked for the backend once the approval has been checked: a late write lands.
+        unread = f"open({str(marker)!r}, 'w').write('ran')\n" + QUICK
+        (experiments.code_dir(project, "E1") / "main.py").write_text(unread)
+        return backend
+
+    record = experiments.run(project, "E1", compute=compute)
+
+    assert (record["status"], record["error_kind"]) == ("failed", "approval")
+    assert "main.py: changed after the approval" in record["error"]
+    assert "approve it again" in record["error"]
+    assert not marker.exists() and not (run_dir(project) / "metrics.json").exists()
+    assert project.page("E1").state == "failed"
 
 
 def test_the_runners_repair_is_recorded_and_the_next_approval_starts_afresh(project, backend):
@@ -2368,6 +2442,24 @@ def test_what_a_dead_workers_job_left_is_ended_and_removed_when_the_run_is_settl
     assert experiments.runs(project, "E1")[-1]["status"] == "cancelled"
 
 
+def test_recovery_ends_the_job_as_the_backends_file_last_described_it(tmp_path, project):
+    """The run's record holds a copy of the backend's job.json, made when the file first
+    appeared.  A backend may write the file in steps (the working directory when it is
+    made, the process session once there is one): the file is what counts."""
+    local = LocalJobs(tmp_path)
+    planned(project, {"main.py": QUICK})
+    experiments.approve(project, "E1", backends={"local": local})
+    directory = dead_run(project)
+    record = json.loads((directory / "run.json").read_text())
+    early = {"scratch": local.job["scratch"]}
+    (directory / "run.json").write_text(json.dumps({**record, "job": early}))
+    (directory / "job.json").write_text(json.dumps(local.job))
+
+    [settled] = experiments.recover(project, compute=local)
+
+    assert local.ended == [local.job] and settled["job"] == local.job
+
+
 class ManyArtifacts(FakeModal):
     """A job that writes 150 artifacts with long names."""
 
@@ -2398,6 +2490,37 @@ def test_a_run_with_more_than_fits_on_a_page_still_gets_its_result_record(projec
     assert 0 < listed < 150
     assert f"and {150 - listed} more in run.json" in result.body
     assert "| loss | 0.25 |" in result.body  # what a finding rests on is all there
+
+
+class LongEverything(ManyArtifacts):
+    """A job that makes every part of its result page as long as that part may be: many
+    artifacts, as many metrics as a run may have with long names and long texts, a log
+    of wide characters."""
+
+    def _finish(self, directory: Path, handle: str) -> JobResult:
+        result = super()._finish(directory, handle)
+        wordy = {f"{'ü' * 90}_{index}": "é" * 200 for index in range(199)}
+        (directory / "metrics.json").write_text(json.dumps({"loss": 0.25, **wordy}))
+        (directory / "log.txt").write_text("\n".join(["𝔁" * 600] * 60) + "\n")
+        return result
+
+
+def test_a_run_whose_abbreviated_page_is_still_too_long_gets_a_brief_one(project):
+    """Each list on a result page is cut to what it may take; together they can still be
+    more than a page holds.  Then the facts and the metrics are written alone."""
+    modal = LongEverything()
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    experiments.approve(project, "E1", backends={"modal": modal})
+
+    record = experiments.run(project, "E1", compute=modal)
+
+    assert record["status"] == "succeeded" and record["result"] == "wiki/results/E1-run1.md"
+    result = project.page("E1-run1")
+    assert len((project.root / result.path).read_bytes()) < 200_000
+    assert "| loss | 0.25 |" in result.body and "| Command | python main.py |" in result.body
+    assert "are not shown: together they did not fit on a page" in result.body
+    assert "experiments/E1/runs/1/ (run.json, log.txt)" in result.body
+    assert "## Log" not in result.body and events_of(project, "error") == []
 
 
 def test_a_result_record_that_cannot_be_written_is_said_aloud(project, backend, monkeypatch):
@@ -2461,6 +2584,47 @@ def test_what_came_with_the_repository_is_not_a_result_of_the_run(tmp_path, proj
     assert (repository / "metrics.json").exists() and (repository / "artifacts").is_dir()
 
 
+class Collecting(FakeModal):
+    """A backend that takes a job's outputs from the directory it was handed without
+    clearing them first, and whose job writes none: whatever came with the source would
+    be the result."""
+
+    name = "local"
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
+        directory = Path(run_dir)
+        (directory / "log.txt").write_text("training... (this script writes no metrics)\n")
+        for name in ("metrics.json", "artifacts"):
+            found = Path(source_dir) / name
+            if found.is_dir():
+                shutil.copytree(found, directory / name)
+            elif found.is_file():
+                shutil.copyfile(found, directory / name)
+        return JobResult(returncode=0, seconds=0.1, backend=self.name)
+
+
+def test_the_copy_of_the_repository_is_handed_over_without_old_results(tmp_path, project):
+    """Not left to the backend alone: the copy that is made here for the job holds no
+    metrics.json and no artifacts/ when the job gets it, and the record says so."""
+    repository = tmp_path / "repository"
+    (repository / "artifacts").mkdir(parents=True)
+    (repository / "train.py").write_text("print('training')\n")
+    (repository / "metrics.json").write_text('{"accuracy": 0.9912}')
+    (repository / "artifacts" / "old_curve.png").write_bytes(PNG)
+    project.settings.update({"repo": {"path": str(repository)}})
+    project.save_settings()
+    local = Collecting()
+    planned(project, mode="repo", command="python train.py")
+    experiments.approve(project, "E1", backends={"local": local})
+
+    record = experiments.run(project, "E1", compute=local)
+
+    assert (record["status"], record["error_kind"]) == ("failed", "metrics")
+    assert record["metrics"] == {} and record["artifacts"] == []
+    [note] = [note for note in record["notes"] if "before the run" in note]
+    assert "metrics.json, artifacts/" in note and "copy of the repository" in note
+
+
 @pytest.mark.parametrize("target", ["metrics.json", "artifacts/table.csv"])
 def test_a_patch_cannot_put_results_into_the_repository(tmp_path, project, backend, target):
     repository = tmp_path / "repository"
@@ -2476,6 +2640,127 @@ def test_a_patch_cannot_put_results_into_the_repository(tmp_path, project, backe
     with pytest.raises(ProjectError, match=re.escape(target)):
         experiments.approve(project, "E1", backends={"local": backend})
     assert project.page("E1").state == "planned"
+
+
+class Cloning(FakeModal):
+    """A backend whose job is the clone step of a repo-mode plan followed by the plan's
+    command: both write to the one log, the clone step first and on lines of its own."""
+
+    def __init__(self, name: str, lines: list[str]) -> None:
+        super().__init__()
+        self.name = name
+        self.lines = lines
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
+        self.specs.append(spec)
+        directory = Path(run_dir)
+        (directory / "log.txt").write_text("\n".join(self.lines) + "\n")
+        (directory / "metrics.json").write_text('{"loss": 0.25}')
+        return JobResult(returncode=0, seconds=1.0, backend=self.name)
+
+
+def cloned_run(tmp_path, backend: Cloning, url: str) -> dict:
+    """The record of one run of a plan that clones ``url``, on ``backend``."""
+    project = Project.create(tmp_path / "c", title="Cloned", settings={"repo": {"path": url}})
+    planned(project, mode="repo", command="python train.py", network=True)
+    experiments.approve(
+        project, "E1", backend=backend.name, network=True, backends={backend.name: backend}
+    )
+    record = experiments.run(project, "E1", compute=backend)
+    assert record["status"] == "succeeded" and record["repo"]["method"] == "clone"
+    return {**record, "page": project.page("E1-run1").body}
+
+
+CLONED = "[repo] cloned https://git.example.invalid/me/public.git at 0123abc"
+PUBLIC_URL = "https://git.example.invalid/me/public.git"
+
+
+def test_what_the_clone_removed_before_the_command_is_in_the_runs_notes(tmp_path):
+    """A repository that is cloned inside the job brings its old metrics.json along too.
+    The clone step removes it and says so in the log; the run's record says so as well."""
+    removed = (
+        "[repo] Removed metrics.json, artifacts that was there before the run (it came "
+        "with the repository): only what the command itself writes counts as a result."
+    )
+    record = cloned_run(tmp_path, Cloning("modal", [CLONED, removed, "training"]), PUBLIC_URL)
+
+    [note] = [note for note in record["notes"] if "before the command started" in note]
+    assert "metrics.json, artifacts" in note and "came with the repository" in note
+    assert "metrics.json, artifacts" in record["page"].split("## Notes")[1].split("## Log")[0]
+
+
+def test_a_command_cannot_write_the_notes_of_its_run(tmp_path):
+    """The command's output follows the clone step's lines in the same log.  A line that
+    only looks like the clone step's does not become a statement of the record."""
+    forged = (
+        "[repo] Removed every trace of the earlier, worse results that was there before "
+        "the run (it came with the repository): only what the command itself writes counts."
+    )
+    record = cloned_run(tmp_path, Cloning("modal", [CLONED, forged, "training"]), PUBLIC_URL)
+
+    assert not any("worse results" in note for note in record["notes"])
+    assert not any("before the command started" in note for note in record["notes"])
+    assert "worse results" not in record["page"].split("## Log")[0]
+
+
+def test_a_local_run_that_clones_with_a_token_says_that_the_token_is_within_reach(tmp_path):
+    """The token of the repository's address is kept out of the job's files and log.  On
+    the local backend the command still runs as the person, who can read the project's
+    settings: the record says so rather than pretending (FIXES D)."""
+    told = "can read the project's settings"
+    record = cloned_run(tmp_path / "a", Cloning("local", [CLONED, "training"]), PRIVATE_URL)
+    [note] = [note for note in record["notes"] if told in note]
+    assert "not a sandbox" in note and "Modal" in note
+    assert FAKE_TOKEN not in json.dumps(record)
+
+    # Not where the job runs in a sandbox, and not for an address without a secret.
+    sandboxed = cloned_run(tmp_path / "b", Cloning("modal", [CLONED, "training"]), PRIVATE_URL)
+    public = cloned_run(tmp_path / "c", Cloning("local", [CLONED, "training"]), PUBLIC_URL)
+    assert not any(told in note for note in sandboxed["notes"] + public["notes"])
+
+
+class Failing(FakeModal):
+    """A backend that fails with an error of its own, which quotes what it was given: as
+    an exception, or as the error of the job's result."""
+
+    def __init__(self, *, raises: bool) -> None:
+        super().__init__()
+        self.raises = raises
+
+    def run_job(self, spec, *, source_dir, run_dir, on_log=None, should_stop=None, mask=()):
+        said = f"could not reach {PRIVATE_URL} with {FAKE_KEY}"
+        if self.raises:
+            raise RuntimeError(said)
+        return JobResult(returncode=None, backend=self.name, error=said)
+
+
+@pytest.mark.parametrize("raises", [True, False])
+def test_an_error_that_ends_a_run_is_kept_without_the_credentials_it_quotes(
+    tmp_path, monkeypatch, raises
+):
+    """Not only what a job prints: the error that ends a run is written into the record,
+    the page's state and the feed, and may quote the repository's address or a key."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
+    project = Project.create(
+        tmp_path / "p", title="Private", settings={"repo": {"path": PRIVATE_URL}}
+    )
+    modal = Failing(raises=raises)
+    planned(project, {"main.py": QUICK}, mode="gpu", gpu="T4")
+    experiments.approve(project, "E1", backends={"modal": modal})
+
+    with pytest.raises(RuntimeError) if raises else contextlib.nullcontext():
+        experiments.run(project, "E1", compute=modal)
+
+    page = project.page("E1")
+    assert page.state == "failed" and "could not reach" in page.meta["state_reason"]
+    kept = [
+        json.dumps(experiments.runs(project, "E1")),
+        json.dumps(page.meta),
+        project.page("E1-run1").body,
+        (project.root / "events.jsonl").read_text(),
+    ]
+    for text in kept:
+        assert FAKE_KEY not in text and FAKE_TOKEN not in text
 
 
 # ---------------------------------------------------------------------------------------
