@@ -21,7 +21,7 @@
    Exit status 0 when every check passed. */
 
 'use strict';
-const { chromium } = require('playwright');
+const { chromium, devices } = require('playwright');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -180,6 +180,75 @@ CHECKS.screens = async ({ browser, pid }) => {
     }
     await ctx.close();
   }));
+};
+
+/* a phone, held upright and touched: no screen is wider than the phone at three widths; the
+   inbox is its list, then one proposal and the way back; what decides is on the screen and
+   a finger wide; a proposal accepted in the list leaves the list in front, with its undo */
+CHECKS.phone = async ({ browser, pid }) => {
+  const routes = ['#/library', '#/start', '#/setup', '#/p/PID/inbox', '#/p/PID/inbox/H5', '#/p/PID/inbox/E3', '#/p/PID/inbox/H5/edit', '#/p/PID/map', '#/p/PID/wiki', '#/p/PID/experiments', '#/p/PID/overview', '#/p/PID/paper'];
+  const NARROW = () => { const de = document.documentElement, out = de.scrollWidth > de.clientWidth ? ['document ' + de.scrollWidth + '>' + de.clientWidth] : [];
+    ['#top', '#status', '.in-list', '.in-detail'].forEach((s) => { const el = document.querySelector(s); if (el && !el.hidden && el.scrollWidth > el.clientWidth + 1) out.push(s + ' ' + el.scrollWidth + '>' + el.clientWidth); });
+    return out; };
+  /* where each of these stands, the ones that are shown: [what, left, right, top, bottom, width, height] */
+  const BOXES = (selectors) => { const out = [];
+    selectors.forEach((s) => document.querySelectorAll(s).forEach((el) => { const r = el.getBoundingClientRect(); if (r.width && getComputedStyle(el).visibility !== 'hidden') out.push([s, r.left, r.right, r.top, r.bottom, r.width, r.height]); }));
+    return out; };
+  const reach = async (page, width, where, selectors, least) => {
+    const boxes = await page.evaluate(BOXES, selectors), high = await page.evaluate(() => window.innerHeight);
+    selectors.forEach((s) => ok(boxes.some((b) => b[0] === s), width + ' ' + where + ': nothing shown for ' + s));
+    boxes.forEach((b) => { ok(b[1] >= -1 && b[2] <= width + 1, width + ' ' + where + ': ' + b[0] + ' is off the screen, at ' + Math.round(b[1]) + '..' + Math.round(b[2]));
+      if (least) ok(b[5] >= least && b[6] >= least, width + ' ' + where + ': ' + b[0] + ' is ' + Math.round(b[5]) + ' by ' + Math.round(b[6]) + ' px under a finger'); });
+    return boxes.filter((b) => b[3] >= 0 && b[4] <= high + 1);
+  };
+  for (const width of [360, 390, 430]) {
+    const ctx = await entered(await browser.newContext({ ...devices['iPhone 14'], viewport: { width, height: 664 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' }));
+    const page = await ctx.newPage();
+    let hash = '';
+    watch(page, () => 'phone ' + width + ' ' + hash);
+    for (const r of routes) {
+      hash = r.replace('PID', pid);
+      await open(page, hash);
+      await page.waitForTimeout(350);
+      const over = await page.evaluate(NARROW);
+      ok(!over.length, width + ' ' + hash + ' horizontal overflow: ' + over.join('; '));
+      if (hash.includes(pid)) ok(await page.evaluate(() => { const nav = document.querySelector('.views'), a = nav.querySelector('a[aria-current]').getBoundingClientRect(), b = nav.getBoundingClientRect(); return a.left >= b.left - 1 && a.right <= b.right + 1; }), width + ' ' + hash + ': the open view is not in sight in the top bar');
+    }
+    /* the list alone, each answer a finger wide; nothing typed in makes the phone zoom */
+    await open(page, hash = '#/p/' + pid + '/inbox');
+    await until(page, () => document.querySelectorAll('.in-row:not(.in-old)').length >= 6, null, 8000, 'the phone lists what waits');
+    ok(await page.evaluate(() => getComputedStyle(document.querySelector('.in-detail')).visibility === 'hidden' && getComputedStyle(document.querySelector('.in-list')).visibility === 'visible'), width + ': the bare inbox is not the list alone');
+    await reach(page, width, 'the list', ['.in-row:not(.in-old) [data-act="accept"]', '.in-row [data-act="reject-ask"]', '.in-check', '.in-all', '.in-old', '#status a.sb-i'], 0);
+    await reach(page, width, 'the list', ['.in-row:not(.in-old) [data-act="accept"]', '.in-row [data-act="reject-ask"]', '.in-check'], 40);
+    /* a row accepted in the list: the list stays in front, and the undo is there to be touched */
+    await page.tap('.in-row:not(.in-old) [data-act="accept"]');
+    await until(page, () => !!document.querySelector('.toast [data-act="undo"]') && document.querySelectorAll('.in-row:not(.in-old)').length === 5, null, 8000, 'a touch accepts a row of the list');
+    ok(await page.evaluate(() => !document.querySelector('.inbox.in-open')) && page.url().endsWith('/inbox'), width + ': accepting a row of the list left the list, for ' + page.url().split('#')[1]);
+    await reach(page, width, 'the toast', ['.toast [data-act="undo"]'], 40);
+    await page.tap('.toast [data-act="undo"]');
+    await until(page, () => document.querySelectorAll('.in-row:not(.in-old)').length === 6, null, 8000, 'the undo of the phone takes the decision back');
+    /* two ticked: both answers for them come up, on the screen */
+    await page.tap('.in-check >> nth=1'); await page.tap('.in-check >> nth=2');
+    const both = await reach(page, width, 'two ticked', ['[data-act="bulk-accept"]', '[data-act="bulk-reject"]'], 40);
+    ok(both.length === 2, width + ': the answers for the ticked rows are not on the screen');
+    await page.tap('.in-check >> nth=1'); await page.tap('.in-check >> nth=2');
+    /* a row touched: its proposal alone, the answers held on the screen, and the way back */
+    await page.tap('.in-row[data-ref] .in-main >> nth=3');
+    await until(page, () => !!document.querySelector('.inbox.in-open .in-detail .review-actions'), null, 8000, 'a touched row opens its proposal');
+    ok(await page.evaluate(() => getComputedStyle(document.querySelector('.in-list')).visibility === 'hidden'), width + ': the list shows beside the proposal');
+    await page.evaluate(() => { const d = document.querySelector('.in-detail'); d.scrollTop = d.scrollHeight; });
+    const held = await reach(page, width, 'the proposal', ['.in-detail .review-actions [data-act="accept"]', '.in-detail .review-actions [data-act="reject-ask"]', '.in-back'], 40);
+    ok(held.length === 3, width + ': at the end of a proposal its answers and the way back are not on the screen: ' + held.map((b) => b[0]).join(', '));
+    await page.tap('.in-detail .review-actions [data-act="reject-ask"]');
+    await until(page, () => document.activeElement && document.activeElement.matches('.reject-form input'), null, 8000, 'the reason of a rejection takes the keyboard');
+    ok(await page.evaluate(() => Array.from(document.querySelectorAll('.inbox input:not([type=checkbox]), .inbox select, .inbox textarea')).every((el) => parseFloat(getComputedStyle(el).fontSize) >= 16)), width + ': a field of the inbox is under 16 px: the phone zooms in on it');
+    await reach(page, width, 'the reason', ['.reject-form input', '.reject-form button[type=submit]', '.reject-form [data-act="reject-cancel"]'], 40);
+    await page.tap('.reject-form [data-act="reject-cancel"]');
+    await page.tap('.in-back');
+    await until(page, () => !document.querySelector('.inbox.in-open') && getComputedStyle(document.querySelector('.in-list')).visibility === 'visible', null, 8000, 'the way back shows the list');
+    await shot(page, 'phone-' + width);
+    await ctx.close();
+  }
 };
 
 /** The words on the control that continues the project: a button that starts the agents, or
@@ -2478,7 +2547,7 @@ CHECKS.hostile = async ({ page, pid }) => {
   const page = await context.newPage();
   watch(page, () => current);
   /* (`nomodel` switches the scripted model off for the whole server while it looks: it comes before any check that starts agents) */
-  const order = ['screens', 'nomodel', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
+  const order = ['screens', 'phone', 'nomodel', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
   const unknown = (ONLY || []).concat(SKIP).filter((name) => order.indexOf(name) < 0);
   if (unknown.length) { console.error('not a check: ' + unknown.join(', ') + ' (the checks are: ' + order.join(', ') + '; separate several with commas)'); await browser.close(); process.exit(2); }
   for (const name of order) {

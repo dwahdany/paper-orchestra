@@ -2,7 +2,9 @@
 
 `web_check.js` drives the real frontend in a real browser against a real server: every
 screen at four widths in both themes (no console error, nothing blocked by the
-Content-Security-Policy, no horizontal overflow), and the flows a person goes through:
+Content-Security-Policy, no horizontal overflow), the inbox on a phone that is touched
+(three widths: nothing wider than the screen, the list and then one proposal, every answer
+on the screen and a finger wide), and the flows a person goes through:
 deciding proposals from the map, the inbox and the page (with the short undo, a reason for a
 rejection, a stale decision, a double click that must decide once), editing a page into a
 conflict and out of it both ways, adding and deleting a page, approving an experiment and
@@ -174,7 +176,7 @@ To look at the app yourself meanwhile, open the link the server printed.
 
 The flows change the project, so every run needs a fresh workspace. Options:
 
-- `--only map,inbox` / `--skip composer`: the checks are `screens`, `nomodel`, `map`,
+- `--only map,inbox` / `--skip composer`: the checks are `screens`, `phone`, `nomodel`, `map`,
   `inbox`, `wiki`, `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`,
   `composer`, `hostile`. They are written to run in that order on one fresh demo project; a
   single one also runs alone.
