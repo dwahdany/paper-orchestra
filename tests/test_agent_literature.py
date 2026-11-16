@@ -18,7 +18,7 @@ from paper_orchestra.agents.literature import (
     LiteratureAgent,
     LiteratureResult,
     PaperData,
-    _ScholarCache,
+    ScholarCache,
     bibtex_entry,
     check_document,
     collect_search_tasks,
@@ -1125,7 +1125,7 @@ def test_without_a_lab_wiki_every_run_asks_semantic_scholar(tmp_path):
 def test_cache_entries_are_separate_files_and_a_damaged_one_is_ignored(tmp_path, caplog):
     client = FakeLLM(Script())
     harness = make_ctx(tmp_path, client).harness
-    cache = _ScholarCache(harness, "2024-10")
+    cache = ScholarCache(harness, "2024-10")
     titles = [f"Paper {i}" for i in range(40)]
     for title in titles:
         cache.put(title, {"title": title, "abstract": "```" + "a" * 1500, "year": 2020})

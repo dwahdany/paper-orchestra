@@ -60,7 +60,7 @@ from paper_orchestra.errors import stops_the_run
 # The scan that keeps a paper's results out of the shared memory already knows how
 # numbers are written and which of them are specific enough to be someone's result;
 # a finding is checked with the same notion, not with a second one.
-from paper_orchestra.memory.leakscan import _NUMBER, _identifying, _readings, numbers_in
+from paper_orchestra.memory.leakscan import NUMBER, is_identifying, number_readings, numbers_in
 from paper_orchestra.memory.lock import WikiLock
 from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import (
@@ -2917,10 +2917,10 @@ def number_check(project: Project, page: ResearchPage | str) -> list[dict[str, A
     evidence = _evidence(project)
     checks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for raw in _NUMBER.findall(page.body):
-        readings = _readings(raw)
+    for raw in NUMBER.findall(page.body):
+        readings = number_readings(raw)
         number, parts = readings[0], readings[1:]
-        if number in seen or not _identifying(number):
+        if number in seen or not is_identifying(number):
             continue
         seen.add(number)
         found = [

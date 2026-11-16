@@ -20,15 +20,15 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-# The private helpers are shared on purpose: a record must be cleaned, and the cross-run
-# cache read and written, exactly as the literature stage does it.
+# Shared on purpose: a record must be cleaned, and the cross-run cache read and written,
+# exactly as the paper pipeline's literature stage does it.
 from paper_orchestra.agents.literature import (
     ABSTRACT_LIMIT,
-    _clean,
-    _public_record,
-    _record_year,
-    _ScholarCache,
+    ScholarCache,
+    clean_text,
     make_citation_key,
+    public_record,
+    record_year,
     unique_citation_key,
 )
 from paper_orchestra.llm.base import ToolError, ToolSpec
@@ -87,15 +87,15 @@ def _link(match: Mapping[str, Any]) -> str:
     """Where the paper can be read, from a search result: its DOI, arXiv id or record page."""
     ids = match.get("externalIds")
     ids = ids if isinstance(ids, Mapping) else {}
-    doi, arxiv = _clean(ids.get("DOI")), _clean(ids.get("ArXiv"))
+    doi, arxiv = clean_text(ids.get("DOI")), clean_text(ids.get("ArXiv"))
     if doi:
         return "https://doi.org/" + quote(doi, safe="/:;().-_")
     if arxiv:
         return "https://arxiv.org/abs/" + quote(arxiv, safe="/.-_")
-    paper_id = _clean(match.get("paperId"))
+    paper_id = clean_text(match.get("paperId"))
     if paper_id:
         return "https://www.semanticscholar.org/paper/" + quote(paper_id, safe="")
-    url = _clean(match.get("url")) or ""
+    url = clean_text(match.get("url")) or ""
     return url if url.startswith("https://") and " " not in url else ""
 
 
@@ -115,7 +115,7 @@ def _credit(authors: list[str], year: int | None) -> str:
 
 def _summary(record: Mapping[str, Any]) -> str:
     """One line for indexes: who and when, then the first sentence of the abstract."""
-    credit = _credit(_authors(record), _record_year(record))
+    credit = _credit(_authors(record), record_year(record))
     abstract = " ".join(str(record.get("abstract") or "").split())
     if not abstract:
         return f"{credit}: no abstract available"
@@ -134,7 +134,7 @@ def source_body(record: Mapping[str, Any], link: str, *, verified_on: str) -> st
     authors = _authors(record)
     lines = [
         f"- **Authors:** {_inert(', '.join(authors)) or 'not recorded'}",
-        f"- **Year:** {_record_year(record) or 'not recorded'}",
+        f"- **Year:** {record_year(record) or 'not recorded'}",
         f"- **Venue:** {_inert(record.get('venue') or '') or 'not recorded'}",
     ]
     if record.get("publicationDate"):
@@ -254,7 +254,7 @@ class SourceVerifier:
         self.cutoff = normalize_cutoff(project.settings.research_cutoff)
         self.round = round
         self._scholar = scholar or SemanticScholar()
-        self._cache = _ScholarCache(harness or SimpleNamespace(cache=None), self.cutoff)  # type: ignore[arg-type]
+        self._cache = ScholarCache(harness or SimpleNamespace(cache=None), self.cutoff)  # type: ignore[arg-type]
         self._failures = 0
         self.down = False
         self.candidates = 0
@@ -295,7 +295,7 @@ class SourceVerifier:
         if cached is None or not cached.get("link"):
             return None
         # The same rule as for a live result, so the cutoff is applied again on every hit.
-        match = select_match([_public_record(cached)], title, year_hint=year, cutoff=self.cutoff)
+        match = select_match([public_record(cached)], title, year_hint=year, cutoff=self.cutoff)
         return (match, str(cached.get("link") or "")) if match is not None else None
 
     def _ask(self, title: str) -> list[dict[str, Any]]:
@@ -340,14 +340,14 @@ class SourceVerifier:
                 "Check the exact official title (and the year) and try again, or leave the "
                 "paper out.",
             )
-        record, link = _public_record(match), _link(match)
+        record, link = public_record(match), _link(match)
         self._cache.put(title, {**record, "link": link})
         return record, link
 
     # -- recording ---------------------------------------------------------------
 
     def _write(self, record: Mapping[str, Any], link: str) -> ResearchPage:
-        authors, year = _authors(record), _record_year(record)
+        authors, year = _authors(record), record_year(record)
         taken = {str(page.id).casefold() for page in self.project.pages(kind="source")}
         key = unique_citation_key(make_citation_key(authors, year, record["title"]), taken)
         verified_on = format_stamp(datetime.now(UTC))

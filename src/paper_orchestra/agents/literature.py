@@ -671,7 +671,7 @@ def _strip_controls(text: str) -> str:
     return "".join(c for c in text if c.isspace() or unicodedata.category(c)[0] != "C")
 
 
-def _clean(value: Any) -> str | None:
+def clean_text(value: Any) -> str | None:
     """``value`` as one line of text, or ``None`` when nothing is left of it."""
     text = " ".join(_strip_controls(str(value)).split()) if value is not None else ""
     return text or None
@@ -684,7 +684,7 @@ def _clip_abstract(abstract: str) -> str:
     return abstract[:ABSTRACT_LIMIT] + _ABSTRACT_MARK
 
 
-def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
+def public_record(record: Mapping[str, Any]) -> dict[str, Any]:
     """The bibliographic fields of a Semantic Scholar result that the pipeline uses.
 
     Total on purpose: the input is a service's answer or a cache page, and a field of an
@@ -694,13 +694,13 @@ def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
     authors = record.get("authors") if isinstance(record.get("authors"), list) else []
     year, abstract, citations = (record.get(k) for k in ("year", "abstract", "citationCount"))
     return {
-        "title": _clean(record.get("title")) or "",
+        "title": clean_text(record.get("title")) or "",
         "authors": [
             {"name": name}
             for author in authors
-            if isinstance(author, Mapping) and (name := _clean(author.get("name")))
+            if isinstance(author, Mapping) and (name := clean_text(author.get("name")))
         ],
-        "venue": _clean(record.get("venue")),
+        "venue": clean_text(record.get("venue")),
         "year": year if isinstance(year, int) and not isinstance(year, bool) else None,
         "abstract": (
             _clip_abstract(_strip_controls(abstract).strip()) if isinstance(abstract, str) else ""
@@ -709,22 +709,23 @@ def _public_record(record: Mapping[str, Any]) -> dict[str, Any]:
             citations if isinstance(citations, int) and not isinstance(citations, bool) else 0
         ),
         "journal": {
-            "name": _clean(journal.get("name")),
-            "volume": _clean(journal.get("volume")),
-            "pages": _clean(journal.get("pages")),
+            "name": clean_text(journal.get("name")),
+            "volume": clean_text(journal.get("volume")),
+            "pages": clean_text(journal.get("pages")),
         },
-        "publicationDate": _clean(record.get("publicationDate")),
+        "publicationDate": clean_text(record.get("publicationDate")),
     }
 
 
-def _record_year(record: Mapping[str, Any]) -> int | None:
+def record_year(record: Mapping[str, Any]) -> int | None:
+    """The year a record was published, from its year or its publication date."""
     if record.get("year"):
         return int(record["year"])
     match = re.match(r"\d{4}", record.get("publicationDate") or "")
     return int(match.group()) if match else None
 
 
-class _ScholarCache:
+class ScholarCache:
     """Semantic Scholar matches kept across runs, beside the lab memory.
 
     Only public bibliographic metadata is stored, and only for papers that
@@ -842,7 +843,7 @@ class LiteratureAgent:
         self.ctx = ctx
         self._scholar = scholar or SemanticScholar()
         self._cutoff = ctx.cfg.research_cutoff.strip() or None
-        self._cache = _ScholarCache(ctx.harness, self._cutoff)
+        self._cache = ScholarCache(ctx.harness, self._cutoff)
 
     def run(self, outline: dict[str, Any]) -> LiteratureResult:
         """Collect verified literature for ``outline`` and write Introduction + Related Work."""
@@ -1151,7 +1152,7 @@ class LiteratureAgent:
             return None
         # The same rule as for live results, so the cutoff is applied again on every hit.
         return select_match(
-            [_public_record(cached)], title, year_hint=year_hint, cutoff=self._cutoff
+            [public_record(cached)], title, year_hint=year_hint, cutoff=self._cutoff
         )
 
     def _from_scholar(self, title: str, year_hint: int | None) -> dict[str, Any] | None:
@@ -1159,7 +1160,7 @@ class LiteratureAgent:
         match = self._scholar.find_paper(title, year_hint=year_hint, cutoff=self._cutoff)
         if match is None:
             return None
-        record = _public_record(match)
+        record = public_record(match)
         if is_before_cutoff(record["publicationDate"], record["year"], self._cutoff):
             self._cache.put(title, record)
         return record
@@ -1231,7 +1232,7 @@ class LiteratureAgent:
             self._add_section(found.papers[canonical], task.section)
         else:
             authors = [author["name"] for author in record["authors"]]
-            year = _record_year(record)
+            year = record_year(record)
             journal = record["journal"]
             found.papers[canonical] = PaperData(
                 citation_key=unique_citation_key(

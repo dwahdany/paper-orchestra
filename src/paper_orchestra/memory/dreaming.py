@@ -31,14 +31,14 @@ from typing import TYPE_CHECKING, Any, Literal
 from paper_orchestra.llm.base import LLMError
 from paper_orchestra.memory import prompts
 from paper_orchestra.memory.leakscan import (  # noqa: F401 - re-exported
-    _NUMBER,
     CONTENT_SECTIONS,
+    NUMBER,
     LeakScanner,
     Materials,
-    _readings,
     _significant,
     content_sources,
     leak_reason,
+    number_readings,
     numbers_in,
     paper_materials,
     protected_files,
@@ -164,8 +164,8 @@ def unverified_numbers(
     findings: list[tuple[str, str]] = []
     for path, body in written:
         seen: set[str] = set()
-        for raw in _NUMBER.findall(body):
-            readings = _readings(raw)
+        for raw in NUMBER.findall(body):
+            readings = number_readings(raw)
             number = readings[0]
             if number in seen or not _significant(number):
                 continue

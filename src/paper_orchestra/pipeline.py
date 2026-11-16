@@ -507,7 +507,7 @@ def _usage_of(row: dict[str, Any]) -> Usage:
     return Usage(**{name: int(row.get(name) or 0) for name in _USAGE_FIELDS})
 
 
-def _carried_usage(path: Path) -> list[dict[str, Any]]:
+def read_carried_usage(path: Path) -> list[dict[str, Any]]:
     """Usage rows recorded by the earlier invocations of a resumed run."""
     if not path.is_file():
         return []
@@ -522,7 +522,7 @@ def _carried_usage(path: Path) -> list[dict[str, Any]]:
         return []
 
 
-def _usage_report(
+def usage_report(
     tracker: UsageTracker,
     carried: Sequence[dict[str, Any]],
     baseline: Sequence[dict[str, Any]] = (),
@@ -734,7 +734,7 @@ class _Runner:
         stages = {name: _blank_record() for name in names}
         self.start_time = self.invocation_start
         if previous is not None:
-            self.carried_usage = _carried_usage(paths.usage)
+            self.carried_usage = read_carried_usage(paths.usage)
             for name in self.reuse:
                 stages[name] = {**_blank_record(), **previous["stages"][name], "reused": True}
             # Stages that ran side by side overlapped, so their group took as long as its
@@ -1245,7 +1245,7 @@ class _Runner:
         # Stage threads and the periodic flush write this file too; one at a time, so the
         # report written last is never older than the one it replaces.
         with self._usage_lock:
-            report = _usage_report(self.ctx.harness.usage, self.carried_usage, self.usage_baseline)
+            report = usage_report(self.ctx.harness.usage, self.carried_usage, self.usage_baseline)
             write_json(self.ctx.paths.usage, report)
         return report
 

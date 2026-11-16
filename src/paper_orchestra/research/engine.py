@@ -37,7 +37,7 @@ from paper_orchestra.memory.lock import WikiLock
 
 # The usage ledger is the paper pipeline's, so that usage.json has one shape and one
 # way of pricing wherever it is written.
-from paper_orchestra.pipeline import _carried_usage, _usage_report
+from paper_orchestra.pipeline import read_carried_usage, usage_report
 from paper_orchestra.research import agents, experiments
 from paper_orchestra.research.agents import AgentContext, AgentReport
 from paper_orchestra.research.model import (
@@ -474,7 +474,7 @@ class Engine:
                     "started": started,
                     "heartbeat": started,
                 }
-                self._carried = _carried_usage(self.project.root / USAGE_FILE)
+                self._carried = read_carried_usage(self.project.root / USAGE_FILE)
                 self._baseline = self.harness.usage.to_dict()["by_label"]
                 self._save()
             beat = _Heartbeat(self._beat, self.HEARTBEAT_SECONDS)
@@ -574,7 +574,7 @@ class Engine:
     def _write_usage(self) -> float:
         """Bring usage.json and ``spent.model_usd`` up to date; return the model spend."""
         with self._lock:
-            report = _usage_report(self.harness.usage, self._carried, self._baseline)
+            report = usage_report(self.harness.usage, self._carried, self._baseline)
             write_json(self.project.root / USAGE_FILE, report)
             self._unpriced = [str(model) for model in report.get("unpriced_models") or []]
             spent = _number(report.get("estimated_cost_usd"))
