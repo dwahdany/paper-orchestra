@@ -72,6 +72,12 @@ jobs:
           node-version: "22"
       - name: Install
         run: uv sync --extra ui
+      # The check starts a write-up and ends its worker in the middle. Without pdflatex and
+      # bibtex a write-up stops at its first look at the machine, before there is a middle.
+      - name: Install TeX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends texlive-latex-base
       # The tests give every process a home directory of its own, so the browser is kept
       # where a variable says and not under ~/.cache, where the test would not find it.
       - name: Install Playwright and Chromium
