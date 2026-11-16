@@ -23,8 +23,15 @@ Shapes, for whoever writes a client:
   credentials and the token in the URL of the project's repository replaced by
   ``[redacted]``, whatever file of the project it was read from;
 * text that cannot be stored (half of a surrogate pair) is refused with 422
-  wherever a request carries it, and where a project's file holds it the answer
-  shows U+FFFD in its place.
+  wherever a request carries it, and so is a number that is none (``NaN``, an
+  infinity); where a project's file holds such text the answer shows U+FFFD in
+  its place;
+* nothing of a project is read or written through a symbolic link that leads
+  out of its directory: a project whose ``project.json``, wiki, proposals,
+  requests or inputs are such a link is listed as one that cannot be opened (the
+  store refuses it, also when the link appears while the server runs), and an
+  experiment's code, a log and an earlier version of a page are refused or left
+  out one by one.
 
 The engine, experiment execution and the paper write-up live in other modules
 of the package and run in worker processes; what the API needs from them is
@@ -48,6 +55,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -96,10 +104,13 @@ from paper_orchestra.research.project import (
     EVENTS_FILE,
     INPUTS_DIR,
     MANIFEST_FILE,
+    NOTES_DIR,
     PAPER_DIR,
     PROJECT_FILE,
     PROPOSALS_DIR,
+    REQUESTS_DIR,
     STATE_FILE,
+    TRANSCRIPTS_DIR,
     WIKI_DIR,
     Project,
 )
@@ -193,14 +204,33 @@ class ApiError(Exception):
         self.extra = extra
 
 
-def _error(status: int, code: str, message: str, **extra: Any) -> JSONResponse:
-    """A refusal as the API promises it.  What a message quotes may come from a file of
-    a project as much as an answer does: it is made presentable the same way, with the
-    server's own credentials blanked (which project it is about is not known here)."""
+def _error(
+    status: int, code: str, message: str, hidden: Sequence[str] | None = None, **extra: Any
+) -> JSONResponse:
+    """A refusal as the API promises it.  What a message quotes, and what a refusal
+    carries next to it (the page as it is now, for a stale edit), comes from the files
+    of a project as much as an answer does: it is made presentable the same way.
+    ``hidden`` is what it may not carry (see :func:`_hidden_from`); without it, the
+    server's own credentials."""
     from paper_orchestra import doctor
 
     body = {"error": {"code": code, "message": message}, **extra}
-    return JSONResponse(_presentable(body, doctor.secret_values(os.environ)), status_code=status)
+    if hidden is None:
+        hidden = doctor.secret_values(os.environ)
+    return JSONResponse(_presentable(body, hidden), status_code=status)
+
+
+def _hidden_from(request: Request) -> Sequence[str] | None:
+    """The credentials the answer to ``request`` may not carry: the server's and, when
+    the request is about a project, the token of that project's repository (the
+    project is noted on the request where it is looked up).  ``None`` when that cannot
+    be told; a refusal then blanks the server's own."""
+    context = getattr(request.app.state, "context", None)
+    project = getattr(request.state, "project", None)
+    try:
+        return context.services.secrets(project if isinstance(project, Project) else None)
+    except Exception:  # a refusal is sent whatever else is wrong
+        return None
 
 
 def _classify(exc: Exception) -> tuple[int, str]:
@@ -229,7 +259,7 @@ def install_error_handlers(app: FastAPI) -> None:
     """Make every error of the app the JSON object the API promises."""
 
     async def api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return _error(exc.status, exc.code, exc.message, **exc.extra)
+        return _error(exc.status, exc.code, exc.message, _hidden_from(request), **exc.extra)
 
     async def project_error(request: Request, exc: ProjectError) -> JSONResponse:
         status, code = _classify(exc)
@@ -241,12 +271,12 @@ def install_error_handlers(app: FastAPI) -> None:
             if exc.proposal is not None:
                 extra["proposal"] = exc.proposal.to_dict()
             extra["applied"] = exc.applied
-        return _error(status, code, str(exc), **extra)
+        return _error(status, code, str(exc), _hidden_from(request), **extra)
 
     async def worker_error(request: Request, exc: WorkerError) -> JSONResponse:
         status, code = _classify(exc)
         extra = {"worker": exc.status, "phase": exc.phase} if isinstance(exc, WorkerBusy) else {}
-        return _error(status, code, str(exc), **extra)
+        return _error(status, code, str(exc), _hidden_from(request), **extra)
 
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
         problems = []
@@ -254,11 +284,11 @@ def install_error_handlers(app: FastAPI) -> None:
             where = ".".join(str(part) for part in problem.get("loc", ())[1:])
             problems.append(f"{where}: {problem.get('msg')}" if where else str(problem.get("msg")))
         message = "The request is not what this endpoint takes: " + "; ".join(problems)
-        return _error(422, "invalid_request", message)
+        return _error(422, "invalid_request", message, _hidden_from(request))
 
     async def http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         code = _STATUS_CODES.get(exc.status_code, "error")
-        return _error(exc.status_code, code, str(exc.detail))
+        return _error(exc.status_code, code, str(exc.detail), _hidden_from(request))
 
     async def unexpected(request: Request, exc: Exception) -> JSONResponse:
         # The type only: the text of an unexpected error may quote anything.
@@ -315,10 +345,20 @@ def _presentable(value: Any, secrets: Sequence[str] = ()) -> Any:
 
 
 def _unstorable(value: Any, where: str = "") -> str | None:
-    """Where in ``value`` (JSON data) a string holds half of a surrogate pair, as a
-    dotted path, or ``None`` when all of it can be written to a file."""
+    """Why ``value`` (JSON data) cannot be written to a file and read back as it is, as
+    a sentence that names the place by its dotted path, or ``None`` when all of it can.
+
+    Two things pass the reading of a request body and are none a file can hold: a
+    string with half of a surrogate pair, and a number that is none (``NaN``, an
+    infinity, a literal too large to be anything else), which would be written as a
+    word no JSON reader but this one accepts, and as a limit would limit nothing.
+    """
     if isinstance(value, str):
-        return None if value.isascii() or not _UNSENDABLE.search(value) else where or "the text"
+        if value.isascii() or not _UNSENDABLE.search(value):
+            return None
+        return _cannot_be_stored(where or "The text")
+    if isinstance(value, float):
+        return None if math.isfinite(value) else _is_no_number(where or "A value", value)
     if isinstance(value, Mapping):
         for key, item in value.items():
             name = str(key) if isinstance(key, str) and key.isascii() else "a name"
@@ -341,6 +381,37 @@ def _cannot_be_stored(where: str) -> str:
         "in a file. That is usually what is left of an emoji that was cut in two: remove "
         "it and send the request again. Nothing was changed."
     )
+
+
+def _is_no_number(where: str, value: float) -> str:
+    return (
+        f"{where} is {value} (not a finite number), which cannot be stored in a file. Send "
+        "a number, or leave the field out to keep what is there. Nothing was changed."
+    )
+
+
+def _written_forms(secrets: Sequence[str]) -> list[bytes]:
+    """Each of ``secrets`` as it stands in a file, as bytes, the longest first: as it
+    is, and escaped the way JSON writes it (with and without its escapes for letters
+    beyond ASCII).  A record of a run is a JSON file and a job may print JSON into
+    its log: a password with a quote, a backslash or an umlaut stands there escaped."""
+    forms: set[bytes] = set()
+    for secret in secrets:
+        if not secret:
+            continue
+        for text in (
+            secret,
+            json.dumps(secret)[1:-1],
+            json.dumps(secret, ensure_ascii=False)[1:-1],
+        ):
+            try:
+                # As the environment gave it: bytes that are no UTF-8 come back as they were.
+                forms.add(text.encode("utf-8", "surrogateescape"))
+            except UnicodeEncodeError:
+                # Half a surrogate pair from a file written by hand: no file holds it as
+                # UTF-8, and it must not cost the answer.
+                forms.add(text.encode("utf-8", "surrogatepass"))
+    return sorted(forms, key=lambda form: (-len(form), form))
 
 
 def _url_secrets(url: Any) -> set[str]:
@@ -429,21 +500,33 @@ class Services:
         return self._experiments().approve(project, ref, **options)
 
     def secrets(
-        self, project: Project | None = None, *, server: Sequence[str] | None = None
+        self,
+        project: Project | None = None,
+        *,
+        server: Sequence[str] | None = None,
+        pages: bool = True,
     ) -> list[str]:
         """The strings no answer may carry, longest first: the values of the server's
         credentials (the rule of ``paper-orchestra doctor``; workers inherit them, and
         a library may quote one in an error) and the token or password in the URL of
-        the project's repository, which a job that clones it is handed.
+        the project's repository, which a job that clones it is handed.  An
+        experiment may name a repository of its own on its page: the token of that
+        address counts as well.
 
         ``server`` is what a call without a project returned, for an answer about
         many projects: the environment is then gone through once, not once for each.
+        Without ``pages`` no page is read (the library reads none), and only the
+        repository of the project's settings is looked at.
         """
         from paper_orchestra import doctor
 
         found = set(doctor.secret_values(os.environ) if server is None else server)
         repo = project.settings.repo if project is not None else None
         found |= _url_secrets(repo.get("path") if isinstance(repo, Mapping) else repo)
+        if project is not None and pages:
+            with contextlib.suppress(ProjectError, OSError):
+                for page in project.pages(kind="experiment"):
+                    found |= _url_secrets(page.meta.get("repo"))
         return sorted(found, key=len, reverse=True)
 
     def masked(self, project: Project, text: str) -> str:
@@ -534,6 +617,18 @@ class Services:
             return None  # Starting the write-up says what is wrong with the installation.
         return writeup.missing(project)
 
+    def paper_left_out(self, project: Project) -> list[dict[str, Any]]:
+        """The accepted findings a paper would not report, each with why: ``[{"id",
+        "path", "title", "reason"}]`` as ``writeup.left_out`` gives them (every record
+        such a finding is based on belongs to an experiment that was rejected or is
+        gone).  Empty where the write-up cannot be asked."""
+        try:
+            writeup = importlib.import_module("paper_orchestra.research.writeup")
+        except ImportError:
+            return []
+        left_out = getattr(writeup, "left_out", None)
+        return [dict(item) for item in left_out(project)] if callable(left_out) else []
+
 
 # ---------------------------------------------------------------------------
 # The workspace: a directory of project directories
@@ -549,6 +644,33 @@ def _signature(path: Path) -> tuple[int, int, int] | None:
     return stat.st_ino, stat.st_mtime_ns, stat.st_size
 
 
+#: What a project keeps at the top of its directory as its own.  ``Project.open``
+#: refuses a project in which one of these is a symbolic link that leads out of the
+#: project directory (what is there would be shown, and written to, as the
+#: project's); the same names here say when to ask it again (:func:`_linked_out`).
+_OWN_PLACES = (
+    PROJECT_FILE,
+    WIKI_DIR,
+    PROPOSALS_DIR,
+    REQUESTS_DIR,
+    INPUTS_DIR,
+    NOTES_DIR,
+    TRANSCRIPTS_DIR,
+)
+
+
+def _linked_out(root: str | Path) -> bool:
+    """Whether one of the project's own places in ``root`` is a symbolic link that leads
+    out of the project directory.  A handful of ``lstat`` calls where none is a link."""
+    base = os.path.realpath(root)
+    inside = base if base.endswith(os.sep) else base + os.sep
+    for name in _OWN_PLACES:
+        place = os.path.join(base, name)
+        if os.path.islink(place) and not os.path.realpath(place).startswith(inside):
+            return True
+    return False
+
+
 class Workspace:
     """Finds projects by the id in their ``project.json``.  Thread-safe.
 
@@ -562,7 +684,10 @@ class Workspace:
     (``<id>-<directory>``), whatever the two are called: a tab that is open on a
     project, a bookmark or a request in flight never lands in its copy.  A server
     that sees both for the first time gives the id to the directory the project
-    was created as (see :meth:`_seniority`).  A renamed directory keeps its id.
+    was created as (see :meth:`_seniority`).  A renamed directory keeps its id,
+    also when a copy of it was put under its old name meanwhile: the directory is
+    known by what the file system knows it by (:meth:`_identity`), not by what it
+    is called.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -573,6 +698,9 @@ class Workspace:
         #: project directory of the last scan, also one that cannot be opened now.
         self._keys: dict[Path, str] = {}
         self._by_id: dict[str, Path] = {}
+        #: Which directory each id was given to (:meth:`_identity`): another directory
+        #: under the same name is not it.
+        self._held: dict[str, tuple[int, int] | None] = {}
         #: Why a directory with a ``project.json`` could not be opened.
         self._unreadable: dict[Path, str] = {}
 
@@ -585,6 +713,11 @@ class Workspace:
             self._unreadable.pop(directory, None)
             return None
         cached = self._opened.get(directory)
+        if cached is not None and _linked_out(directory):
+            # Looked at each time: a link can be put there without project.json changing.
+            # The project is then opened anew, which the store refuses, saying why: it
+            # is not read or written through such a link, here as on the command line.
+            cached = None
         if cached is not None and cached[0] == signature:
             return cached[1]
         try:
@@ -602,6 +735,17 @@ class Workspace:
         self._unreadable.pop(directory, None)
         self._opened[directory] = (signature, project)
         return project
+
+    @staticmethod
+    def _identity(directory: Path) -> tuple[int, int] | None:
+        """What tells a directory from another one put under its name: its device and
+        inode, which a rename keeps and a copy does not get.  ``None`` where that
+        cannot be read."""
+        try:
+            found = os.lstat(directory)
+        except OSError:
+            return None
+        return found.st_dev, found.st_ino
 
     @staticmethod
     def _seniority(project: Project) -> tuple[int, int, str]:
@@ -640,13 +784,15 @@ class Workspace:
 
     def scan(self) -> dict[str, Project]:
         """Every project in the workspace that can be opened, by the id it is addressed
-        by.  Costs one ``stat`` per project that has not changed: no page is read."""
+        by.  Costs a handful of ``stat`` calls per project that has not changed: no
+        page is read."""
         with self._guard:
             try:
                 entries = sorted(os.scandir(self.root), key=lambda entry: entry.name)
             except OSError:
                 entries = []
             present: list[tuple[Path, Project | None]] = []
+            identity: dict[Path, tuple[int, int] | None] = {}
             for entry in entries:
                 if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
                     continue
@@ -654,21 +800,39 @@ class Workspace:
                 project = self._open(directory)
                 if project is not None or directory in self._unreadable:
                     present.append((directory, project))
+                    identity[directory] = self._identity(directory)
+
+            def keeps(held: str | None, project: Project | None) -> bool:
+                # A project.json that was given another id by hand makes it a newcomer.
+                return held is not None and (project is None or self._fits(held, project))
+
             keys: dict[Path, str] = {}
+            given = {where: key for key, where in self._held.items() if where is not None}
+            for directory, project in present:
+                # The very directory an id was given to keeps it, whatever it is called now.
+                held = given.get(identity[directory])
+                if keeps(held, project):
+                    keys[directory] = str(held)
+            taken = set(keys.values())
             newcomers: list[Project] = []
             for directory, project in present:
+                if directory in keys:
+                    continue
+                # Else by its name (a file system that does not keep inodes), unless the
+                # directory that held the id is still there under another name: what
+                # stands under the old name is then a copy of it, and a newcomer.
                 held = self._keys.get(directory)
-                # A project.json that was given another id by hand makes it a newcomer.
-                if held is not None and (project is None or self._fits(held, project)):
-                    keys[directory] = held
+                if keeps(held, project) and held not in taken:
+                    keys[directory] = str(held)
+                    taken.add(str(held))
                 elif project is not None:
                     newcomers.append(project)
-            taken = set(keys.values())
             for project in sorted(newcomers, key=self._seniority):
                 keys[project.root] = self._free_key(project, taken)
                 taken.add(keys[project.root])
             self._keys = keys
             self._by_id = {key: directory for directory, key in keys.items()}
+            self._held = {key: identity[directory] for directory, key in keys.items()}
             listed = {directory for directory, _ in present}
             for directory in set(self._opened) - listed:
                 del self._opened[directory]
@@ -693,6 +857,8 @@ class Workspace:
         be opened."""
         with self._guard:
             directory = self._by_id.get(pid)
+            if directory is not None and self._identity(directory) != self._held.get(pid):
+                directory = None  # another directory stands under that name: look again
             project = self._open(directory) if directory is not None else None
             if project is None or self._keys.get(project.root) != pid:
                 project = self.scan().get(pid)
@@ -837,8 +1003,11 @@ def _context(request: Request) -> Context:
 Ctx = Annotated[Context, Depends(_context)]
 
 
-def _project(pid: str, context: Ctx) -> Project:
-    return context.workspace.project(pid)
+def _project(pid: str, request: Request, context: Ctx) -> Project:
+    project = context.workspace.project(pid)
+    # A refusal is blanked of this project's credentials like an answer (_hidden_from).
+    request.state.project = project
+    return project
 
 
 Proj = Annotated[Project, Depends(_project)]
@@ -893,19 +1062,17 @@ router = _Router(prefix="/api")
 
 
 class _Body(BaseModel):
-    """A JSON request body.  Unknown fields are ignored; text that cannot be stored is
-    refused before any endpoint sees it."""
+    """A JSON request body.  Unknown fields are ignored; what cannot be stored (see
+    :func:`_unstorable`) is refused before any endpoint sees it."""
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     @model_validator(mode="before")
     @classmethod
     def _storable(cls, data: Any) -> Any:
-        where = _unstorable(data)
-        if where is not None:
-            raise PydanticCustomError(
-                "unstorable_text", "{problem}", {"problem": _cannot_be_stored(where)}
-            )
+        problem = _unstorable(data)
+        if problem is not None:
+            raise PydanticCustomError("unstorable", "{problem}", {"problem": problem})
         return data
 
 
@@ -1198,7 +1365,7 @@ def list_projects(context: Ctx) -> dict[str, Any]:
         try:
             counted = _counted(context, project, row, deadline)
             # Each row with the credentials of its own project blanked.
-            hidden = context.services.secrets(project, server=server)
+            hidden = context.services.secrets(project, server=server, pages=False)
             listed.append(_presentable(counted, hidden))
         except Exception as exc:
             failed.append(_not_listed(key, project, exc))
@@ -1237,11 +1404,14 @@ def _megabytes(count: int) -> str:
     return f"{size:.0f} MB" if size >= 10 else f"{size:.1f} MB"
 
 
-def _free_path(name: str, files: set[str], folders: set[str]) -> str:
+def _free_path(name: str, files: set[str], folders: dict[str, str]) -> str:
     """``name`` (a relative path), changed where needed so that it collides with nothing
     stored so far: not with a file of the same name, and not with a file where it needs
     a folder or a folder where it is a file.  Compared without case: the workspace may
-    be on a file system that ignores it."""
+    be on a file system that ignores it, and the project keeps no two inputs that
+    differ by case alone.  So a folder that came before under another spelling
+    (``Data``, then ``data``) is the same folder, under the spelling it came with
+    first (``folders``: that spelling, by the path in lower case)."""
     *parents, leaf = name.split("/")
     prefix = ""
     for part in parents:
@@ -1249,11 +1419,10 @@ def _free_path(name: str, files: set[str], folders: set[str]) -> str:
         while f"{prefix}{candidate}".lower() in files:
             copy += 1
             candidate = f"{part}-{copy}"
-        prefix = f"{prefix}{candidate}/"
-        folders.add(prefix.rstrip("/").lower())
+        prefix = folders.setdefault(f"{prefix}{candidate}".lower(), f"{prefix}{candidate}") + "/"
     stem, suffix = os.path.splitext(leaf)
     candidate, copy = leaf, 1
-    while f"{prefix}{candidate}".lower() in files | folders:
+    while f"{prefix}{candidate}".lower() in files or f"{prefix}{candidate}".lower() in folders:
         copy += 1
         candidate = f"{stem}-{copy}{suffix}"
     files.add(f"{prefix}{candidate}".lower())
@@ -1271,7 +1440,7 @@ def _stage_uploads(
     # and for its own list of the files; an attachment called the same would be
     # renamed there, and the answer would name another file than the one attached.
     files: set[str] = {BRIEF_FILE.lower(), MANIFEST_FILE.lower()}
-    folders: set[str] = set()
+    folders: dict[str, str] = {}
     total = 0
     for number, upload in enumerate(uploads, start=1):
         sent = upload.filename or ""
@@ -1378,9 +1547,9 @@ async def create_project(request: Request, context: Ctx) -> dict[str, Any]:
                 raise ApiError(422, "invalid", f"settings is not valid JSON ({exc}).") from exc
             if not isinstance(settings, dict):
                 raise ApiError(422, "invalid", "settings must be a JSON object.")
-            where = _unstorable(settings, "settings")
-            if where is not None:
-                raise ApiError(422, "invalid", _cannot_be_stored(where))
+            unstorable = _unstorable(settings, "settings")
+            if unstorable is not None:
+                raise ApiError(422, "invalid", unstorable)
         if not brief.strip() and not uploads and not title.strip():
             raise ApiError(
                 422,
@@ -1588,15 +1757,7 @@ class _LineMask:
 
     def __init__(self, secrets: Sequence[str]) -> None:
         self.secrets = list(secrets)
-        forms: set[bytes] = set()
-        for secret in self.secrets:
-            for text in (
-                secret,
-                json.dumps(secret)[1:-1],
-                json.dumps(secret, ensure_ascii=False)[1:-1],
-            ):
-                forms.add(text.encode("utf-8", "surrogateescape"))
-        self._forms = sorted(forms)
+        self._forms = _written_forms(self.secrets)
 
     def line(self, raw: bytes) -> bytes:
         if not any(form in raw for form in self._forms):
@@ -1779,6 +1940,16 @@ def _as_proposed(page: ResearchPage, proposal: EditProposal) -> ResearchPage:
     for name, targets in proposal.relations_add.items():
         meta[name] = [*page.relations.get(name, []), *targets]
     return page_from_parts(page.path, meta, page.body if proposal.body is None else proposal.body)
+
+
+def _as_stored(page: ResearchPage, fields: dict[str, Any], hidden: Sequence[str]) -> dict:
+    """``fields`` of an edit to ``page``, with the address of a repository that came back
+    as it was shown (its token blanked) replaced by the stored one: showing a page
+    must not cost the token when what was shown is sent back with an edit."""
+    stored, sent = page.meta.get("repo"), fields.get("repo")
+    if not (isinstance(stored, str) and isinstance(sent, str)) or sent == stored:
+        return fields
+    return {**fields, "repo": stored} if sent.strip() == _presentable(stored, hidden) else fields
 
 
 def _blank(text: str, hidden: Sequence[str]) -> str:
@@ -2010,7 +2181,7 @@ def put_page(path: str, body: PageEdit, project: Proj, context: Ctx) -> dict[str
             f"This page is {page.kind} and stays one: the kind follows from where a page "
             "is kept. Create a new page of the other kind instead.",
         )
-    fields = dict(body.fields or {})
+    fields = _as_stored(page, dict(body.fields or {}), context.services.secrets(project))
     if body.title is not None:
         fields["title"] = body.title
     updated = project.update_page(
@@ -2081,6 +2252,15 @@ def _failure(exc: Exception) -> dict[str, Any]:
     return failure
 
 
+def _edited_page(project: Project, ref: str) -> ResearchPage:
+    """The page the edits of a decision apply to: the page ``ref`` names, or the one the
+    edit proposal of that id would change."""
+    try:
+        return project.page(ref)
+    except NotFound:
+        return project.page(project.proposal(ref).target)
+
+
 def _decide(context: Context, project: Project, item: ReviewItem) -> dict[str, Any]:
     """Apply one decision and say how it went."""
     outcome: dict[str, Any] = {"ref": item.ref, "decision": item.decision, "ok": False}
@@ -2108,11 +2288,17 @@ def _decide(context: Context, project: Project, item: ReviewItem) -> dict[str, A
                     "Look at the code as it is now, and decide again.",
                     page=target,
                 )
+        edits = item.edits
+        if edits and isinstance(edits.get("fields"), dict):
+            with contextlib.suppress(ProjectError):  # the review says what is wrong with it
+                edited = _edited_page(project, item.ref)
+                hidden = context.services.secrets(project)
+                edits = {**edits, "fields": _as_stored(edited, edits["fields"], hidden)}
         decided = project.review(
             item.ref,
             item.decision,
             reason=item.reason,
-            edits=item.edits,
+            edits=edits,
             base_updated=item.base_updated,
         )
     except Exception as exc:
@@ -2608,14 +2794,16 @@ def _read_log(
     being written, or its writer was killed): ``next`` then stays before that
     character, and a client that reads on while ``eof`` is false does not spin.
 
-    Each of ``secrets`` is replaced by ``[redacted]`` in ``text``, also where the
-    piece begins or ends inside one (the file is read a little beyond both ends
-    to see that): then the part inside the piece is what is replaced.  Where the
-    file itself ends in what may be the first part of a secret that is still being
-    written, the piece ends before it, like before half a character.  ``offset``,
-    ``next`` and ``size`` are always those of the file.
+    Each of ``secrets`` is replaced by ``[redacted]`` in ``text`` (as it is, and as
+    JSON writes it: see :func:`_written_forms`), also where the piece begins or
+    ends inside one (the file is read a little beyond both ends to see that):
+    then the part inside the piece is what is replaced.  Where the file itself
+    ends in what may be the first part of a secret that is still being written,
+    the piece ends before it, like before half a character, and ``eof`` is true:
+    the rest of it has to be waited for.  ``offset``, ``next`` and ``size`` are
+    always those of the file.
     """
-    needles = [secret.encode("utf-8", "surrogateescape") for secret in secrets if secret]
+    needles = _written_forms(secrets)
     margin = max((len(needle) for needle in needles), default=1) - 1
     size = os.fstat(handle.fileno()).st_size
     from_end = offset < 0
@@ -2634,10 +2822,15 @@ def _read_log(
     if whole_lines and not at_end:
         end = window.rfind(b"\n", begin, end) + 1 or end
     spans = _spans(window, needles)
-    if at_end:
-        # What follows the last secret that is all there may be the start of the next.
-        whole = max((last for _, last in spans if last <= end), default=0)
-        end = max(begin, end - _begun(window[whole:end], needles))
+    waits = at_end
+    if start - lead + len(window) >= size:
+        # What was read holds the end of the file.  What follows the last secret that
+        # is all there may be the start of the next: the piece ends before it, also
+        # where its size would have cut it inside that start.
+        whole = max((last for _, last in spans), default=0)
+        begun = len(window) - _begun(window[whole:], needles)
+        if begun < end:
+            end, waits = max(begin, begun), True
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     decoder.decode(window[begin:end], final=False)
     end -= len(decoder.getstate()[0])  # half a character at the end waits for its rest
@@ -2653,7 +2846,7 @@ def _read_log(
         "next": start - lead + end,
         "size": size,
         "text": b"".join(shown).decode("utf-8", errors="replace"),
-        "eof": at_end,
+        "eof": waits,
         "reset": reset,
     }
 
@@ -2801,9 +2994,11 @@ def get_file(path: str, project: Proj, context: Ctx, download: str | None = None
     download (as is anything with ``?download=1``).
 
     A text file that holds a credential of the server or the token of the
-    project's repository (the whole log of a run, something a job wrote into an
-    artifact) is served with it replaced by ``[redacted]``, like every other
-    answer; such an answer has no length and cannot be resumed.  What is not
+    project's repository (the whole log of a run, its record, something a job
+    wrote into an artifact) is served with it replaced by ``[redacted]``, like
+    every other answer, also where it stands escaped as JSON writes it; such an
+    answer has no length and cannot be resumed.  An SVG drawing is text in this
+    sense.  What is not
     text (an archive, a model file) is the job's own data and is handed over as
     it is.
     """
@@ -2827,9 +3022,8 @@ def get_file(path: str, project: Proj, context: Ctx, download: str | None = None
     if suffix == ".pdf":
         headers["Content-Security-Policy"] = PDF_CONTENT_SECURITY_POLICY
         headers["X-Frame-Options"] = "SAMEORIGIN"
-    if media_type.startswith("text/plain"):
-        hidden = context.services.secrets(project)
-        needles = [secret.encode("utf-8", "surrogateescape") for secret in hidden]
+    if media_type.startswith("text/plain") or suffix == ".svg":  # a drawing is text too
+        needles = _written_forms(context.services.secrets(project))
         if needles and _holds_any(real, needles):
             headers["Content-Disposition"] = _disposition(real.name, attach)
             return StreamingResponse(
@@ -2859,13 +3053,18 @@ def _paper_view(context: Context, project: Project) -> dict[str, Any]:
     state = _read_json(project.root, f"{PAPER_DIR}/{STATE_FILE}")
     worker = context.workers.status(project.root)
     final = paper / "final_paper.pdf"
+    missing = context.services.paper_missing(project)
     return {
         "exists": paper.is_dir(),
         "state": state if isinstance(state, dict) else None,
         "running": worker["state"] != "idle" and worker["kind"] == "write",
         "final_pdf": f"{PAPER_DIR}/final_paper.pdf" if final.is_file() else None,
         # What a write-up would refuse for ("results", "finding"), or None: it can start.
-        "missing": context.services.paper_missing(project),
+        "missing": missing,
+        # Which accepted findings were not counted for that, and why, in a sentence.
+        "missing_detail": str(getattr(missing, "detail", "") or ""),
+        # The accepted findings a paper would not report, whether or not it can start.
+        "left_out": context.services.paper_left_out(project),
         "worker": worker,
     }
 
@@ -2892,5 +3091,11 @@ def get_paper(project: Proj, context: Ctx) -> dict[str, Any]:
     """The paper run: ``state`` is ``paper/state.json`` (``null`` before the first run),
     ``final_pdf`` the project-relative path of the finished paper for the files
     endpoint, ``missing`` what the project lacks for a paper (``"results"``,
-    ``"finding"``) or ``null`` when it can be written."""
+    ``"finding"``) or ``null`` when it can be written.
+
+    ``left_out`` lists the accepted findings a paper would not report, each as
+    ``{"id", "path", "title", "reason"}``: every record such a finding is based on
+    belongs to an experiment that was rejected or is gone.  ``missing_detail`` says
+    the same in a sentence where that is why the paper cannot be written yet (empty
+    otherwise)."""
     return _paper_view(context, project)

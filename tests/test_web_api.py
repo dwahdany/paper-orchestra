@@ -1844,6 +1844,8 @@ def test_the_paper_step_starts_a_worker_and_reports_its_state(client, project, l
         "running": False,
         "final_pdf": None,
         "missing": None,
+        "missing_detail": "",
+        "left_out": [],
         "worker": client.get(url(project)).json()["worker"],
     }
     unknown = client.post(url(project, "/paper"), json={"template": "../../etc"})
@@ -3792,3 +3794,550 @@ def test_a_credential_is_blanked_before_text_is_rendered(client, project, monkey
     assert page["proposals"][-1]["marked_html"].count("[redacted]") == 2
     assert "[redacted]" in page["proposals"][-1]["diff_html"]
     assert "Use [redacted]." in answers[2].json()["html"]
+
+
+# ---------------------------------------------------------------------------
+# What the review of these repairs found
+# ---------------------------------------------------------------------------
+
+
+def test_a_piece_cut_by_its_size_shows_nothing_of_a_credential_still_being_written(tmp_path):
+    """The file ends in the first part of a key (its writer is in the middle of the line),
+    and the size of a piece cuts the read inside that part: the piece ends before it, as
+    one that reaches the end of the file does."""
+    key = "sk-audit-FAKE-0123456789abcdefFAKE"
+    path = tmp_path / "log.txt"
+    for written in (8, 20, len(key) - 1):
+        for inside in (1, 5, written - 1):
+            before = b"x" * 40 + b"\n" + b"y" * (59 - inside)
+            path.write_bytes(before + key[:written].encode())
+            with path.open("rb") as handle:
+                first = api_module._read_log(handle, 0, 100, secrets=[key])
+                assert first["text"] == before.decode(), (written, inside)
+                assert first["next"] == len(before)
+                # Nothing more can be read for now: a client that follows the log waits.
+                assert first["eof"] is True
+                again = api_module._read_log(handle, first["next"], 100, secrets=[key])
+                assert again["text"] == "" and again["next"] == first["next"] and again["eof"]
+            with path.open("ab") as handle:  # the writer finishes the line
+                handle.write(key[written:].encode() + b" was refused\n")
+            with path.open("rb") as handle:
+                rest = api_module._read_log(handle, first["next"], 100, secrets=[key])
+            assert rest["text"] == "[redacted] was refused\n", (written, inside)
+
+
+def test_a_credential_is_blanked_as_json_writes_it_in_a_file_and_in_a_log(
+    client, project, monkeypatch
+):
+    """A record is a JSON file: a password with a quote, a backslash or a letter beyond
+    ASCII stands in it escaped.  The run's view blanks it; so does the same file
+    served as a file, and a log a job printed JSON into."""
+    secret = 'p"ss\\wörd-0123456789'
+    monkeypatch.setenv("AUDIT_FAKE_PASSWORD", secret)
+    run_dir = add_run(project, status="failed")
+    record = json.loads((run_dir / "run.json").read_text())
+    record["error"] = f"login failed for {secret}"
+    for name, ascii_only in (("run.json", True), ("artifacts/as-utf8.json", False)):
+        (run_dir / name).write_text(json.dumps(record, ensure_ascii=ascii_only), encoding="utf-8")
+    (run_dir / "log.txt").write_text(
+        f"plain: {secret}\n{json.dumps({'error': secret})}\n"
+        f"{json.dumps({'error': secret}, ensure_ascii=False)}\nlast line\n",
+        encoding="utf-8",
+    )
+    (project.root / "worker.log").write_text(json.dumps({"error": secret}) + "\n")
+
+    shown = client.get(url(project, "/experiments/E1/runs/1")).json()
+    assert shown["run"]["error"] == "login failed for [redacted]"
+    assert shown["log"]["text"].count("[redacted]") == 3
+    answers = [
+        client.get(url(project, "/files/experiments/E1/runs/1/run.json")),
+        client.get(url(project, "/files/experiments/E1/runs/1/artifacts/as-utf8.json")),
+        client.get(url(project, "/files/experiments/E1/runs/1/log.txt")),
+        client.get(url(project, "/experiments/E1/runs/1/log")),
+        client.get(url(project, "/experiments/E1/runs/1/log?offset=-30")),
+        client.get(url(project, "/worker/log")),
+    ]
+    for response in answers:
+        assert response.status_code == 200
+        for piece in ("0123456789", "ss\\\\w", "w\\u00f6rd", "wörd"):
+            assert piece not in response.text, (response.url, piece)
+        assert "[redacted]" in response.text or "last line" in response.text
+    served = json.loads(answers[0].text)  # still the record, with the value blanked
+    assert served["error"] == "login failed for [redacted]"
+    assert answers[2].text.count("[redacted]") == 3
+    # Every offset of the log: no piece shows part of the value, in either form.
+    size = (run_dir / "log.txt").stat().st_size
+    for offset in range(size):
+        text = client.get(url(project, f"/experiments/E1/runs/1/log?offset={offset}")).json()
+        assert "012345" not in text["text"] and "456789" not in text["text"], offset
+
+
+def test_a_number_that_is_no_number_is_refused_wherever_it_is_sent(client, project):
+    """``NaN`` and ``Infinity`` pass for numbers where the body is read and are none a
+    file can hold: a limit of NaN would be no limit at all, and say nothing."""
+    before = (project.root / "project.json").read_text()
+    for method, path, raw in (
+        ("PATCH", url(project), '{"settings": {"limits": {"model_usd": NaN}}}'),
+        ("PATCH", url(project), '{"settings": {"limits": {"experiment_usd": Infinity}}}'),
+        ("PATCH", url(project), '{"settings": {"limits": {"experiment_seconds": 1e999}}}'),
+        ("PATCH", url(project), '{"settings": {"limits": {"model_usd": -Infinity}}}'),
+        ("POST", url(project, "/experiments/E1/approve"), '{"timeout_seconds": NaN}'),
+        ("POST", url(project, "/experiments/E1/approve"), '{"timeout_seconds": 1e999}'),
+        ("POST", url(project, "/pages"),
+         '{"kind": "topic", "title": "x", "fields": {"weights": [1.5, NaN]}}'),
+        ("PUT", url(project, "/pages/H1"), '{"fields": {"confidence": Infinity}}'),
+        ("POST", url(project, "/review"),
+         '{"items": [{"ref": "E1", "decision": "accept", "approve_run": {"timeout_seconds": NaN}}]}'),
+    ):  # fmt: skip
+        response = client.request(
+            method, path, content=raw.encode(), headers={"content-type": "application/json"}
+        )
+        assert response.status_code == 422, (path, raw, response.text)
+        error = error_of(response)
+        assert error["code"] == "invalid_request", raw
+        assert "cannot be stored" in error["message"] and "number" in error["message"], raw
+    form = client.post(
+        "/api/projects", data={"brief": "x", "settings": '{"limits": {"model_usd": NaN}}'}
+    )
+    assert form.status_code == 422 and "cannot be stored" in error_of(form)["message"]
+    assert (project.root / "project.json").read_text() == before
+    assert client.get(url(project, "/pages/E1")).json()["page"]["review"] == "proposed"
+    assert len(client.get("/api/projects").json()["projects"]) == 1
+    # An ordinary number is one, whatever its size.
+    fine = client.patch(url(project), json={"settings": {"limits": {"model_usd": 1e6}}})
+    assert fine.status_code == 200 and fine.json()["settings"]["limits"]["model_usd"] == 1e6
+
+
+def outside_code(tmp_path: Path) -> Path:
+    """A directory elsewhere that reads like the code of an experiment."""
+    outside = tmp_path / "elsewhere"
+    (outside / "code").mkdir(parents=True)
+    (outside / "code" / "main.py").write_text("# OUTSIDE-SECRET (a file of the person)\n")
+    return outside
+
+
+@pytest.mark.parametrize("linked", ["code", "experiment", "experiments"])
+def test_the_code_of_an_experiment_is_not_read_through_a_link_that_leads_out_of_the_project(
+    real, project, tmp_path, linked
+):
+    """A sibling of the linked logs: the experiment's view shows its code, and a project
+    directory that came from somebody else may have that directory linked to one of the
+    person's.  Nothing of the experiment is shown, changed, approved or run then (the
+    experiments module refuses; this holds the endpoints to it)."""
+    import shutil
+
+    project.review("E1", "accept")
+    outside = outside_code(tmp_path)
+    home = project.experiment_dir("E1")
+    if linked == "code":
+        shutil.rmtree(home / "code")
+        (home / "code").symlink_to(outside / "code", target_is_directory=True)
+    elif linked == "experiment":
+        shutil.rmtree(home)
+        home.symlink_to(outside, target_is_directory=True)
+    else:
+        (tmp_path / "all").mkdir()
+        outside.rename(tmp_path / "all" / "E1")
+        shutil.rmtree(project.root / "experiments")
+        (project.root / "experiments").symlink_to(tmp_path / "all", target_is_directory=True)
+
+    view = real.get(url(project, "/experiments/E1"))
+    assert view.status_code == 422 and "OUTSIDE-SECRET" not in view.text
+    message = error_of(view)["message"]
+    assert "link" in message and "experiments/E1" in message and "Remove the link" in message
+    attempts = [
+        real.post(url(project, "/experiments/E1/approve"), json={"backend": "local"}),
+        real.put(url(project, "/experiments/E1/code/main.py"), json={"text": "print(1)\n"}),
+    ]
+    for response in attempts:
+        assert response.status_code == 422 and "OUTSIDE-SECRET" not in response.text
+    for path in ("/experiments/E1/runs/1", "/experiments/E1/runs/1/log"):
+        assert "OUTSIDE-SECRET" not in real.get(url(project, path)).text
+    assert real.post(url(project, "/experiments/E1/run")).status_code == 422  # not approved
+    decided = real.post(
+        url(project, "/review"),
+        json={"items": [{"ref": "E1", "decision": "accept", "approve_run": True}]},
+    ).json()
+    assert decided["ok"] is False and decided["results"][0]["status"] == 422
+    assert "OUTSIDE-SECRET" not in json.dumps(decided)
+    assert project.page("E1").state == "planned"
+    code = (tmp_path / "all" / "E1" if linked == "experiments" else outside) / "code"
+    assert (code / "main.py").read_text() == "# OUTSIDE-SECRET (a file of the person)\n"
+    # The rest of the project is read as before, and the listing says nothing of the code.
+    assert real.get(url(project)).status_code == 200
+    listed = real.get(url(project, "/experiments"))
+    assert listed.status_code == 200 and "OUTSIDE-SECRET" not in listed.text
+
+
+@pytest.mark.parametrize("linked", ["version", "page", "history"])
+def test_an_earlier_version_is_not_read_through_a_link_that_leads_out_of_the_project(
+    client, project, tmp_path, linked
+):
+    import shutil
+
+    project.update_page("topics/adaptive-optimisers", author="human", body="A second text.\n")
+    version = project.history("topics/adaptive-optimisers")[0]
+    kept = project.root / version.path
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    if linked == "version":
+        (outside / "private.md").write_text("OUTSIDE-SECRET (a file of the person)\n")
+        kept.unlink()
+        kept.symlink_to(outside / "private.md")
+    else:
+        # The same names as in the project, in a directory of somebody else's making.
+        place = kept.parent if linked == "page" else project.root / "history"
+        (outside / kept.relative_to(place)).parent.mkdir(parents=True, exist_ok=True)
+        (outside / kept.relative_to(place)).write_text("OUTSIDE-SECRET (a file of the person)\n")
+        shutil.rmtree(place)
+        place.symlink_to(outside, target_is_directory=True)
+
+    for stamp in {version.stamp, *(v.stamp for v in project.history("topics/adaptive-optimisers"))}:
+        response = client.get(url(project, f"/pages/topics/adaptive-optimisers/versions/{stamp}"))
+        assert response.status_code in (404, 422), response.text
+        assert "OUTSIDE-SECRET" not in response.text
+    page = client.get(url(project, "/pages/topics/adaptive-optimisers"))
+    assert page.status_code == 200 and "OUTSIDE-SECRET" not in page.text
+    assert page.json()["page"]["body"] == "A second text.\n"
+
+
+def test_a_version_kept_in_the_project_is_still_read(client, project):
+    """The guard of the test above lets the project's own history through."""
+    project.update_page("topics/adaptive-optimisers", author="human", body="A second text.\n")
+    version = project.history("topics/adaptive-optimisers")[0]
+    shown = client.get(url(project, f"/pages/topics/adaptive-optimisers/versions/{version.stamp}"))
+    assert shown.status_code == 200
+    assert shown.json()["body"].startswith("Adam divides by a running average.")
+    current = project.page("topics/adaptive-optimisers").updated
+    now = client.get(url(project, f"/pages/topics/adaptive-optimisers/versions/{current}"))
+    assert now.status_code == 200 and now.json()["body"] == "A second text.\n"
+
+
+def test_the_server_asks_again_about_the_places_the_store_refuses_as_links():
+    """The store decides which of a project's own places may not be a link out of it;
+    the server only has to know when to ask it again.  The two lists are one list."""
+    from paper_orchestra.research import project as store
+
+    assert set(api_module._OWN_PLACES) == set(store._OWN_ENTRIES)
+
+
+@pytest.mark.parametrize("name", ["wiki", "proposals", "requests", "project.json"])
+def test_a_project_whose_own_files_are_a_link_out_of_it_is_not_opened(
+    client, workspace, project, tmp_path, name
+):
+    """A project directory with its wiki (or its proposals, its requests, its
+    project.json) linked to a directory of the person's: the app would show what is
+    there as the project's, and write there.  The store does not open such a project;
+    neither does a server that had it open before the link was put there.  It is listed
+    as a project that cannot be opened, with the reason."""
+    import shutil
+
+    Project.create(workspace / "second", title="Second", brief="x")
+    assert set(library(client)) == {"warmup", "second"}
+    outside = tmp_path / "elsewhere"
+    shutil.copytree(project.root, outside)
+    for page in (outside / "wiki").rglob("*.md"):
+        page.write_text(page.read_text() + "\nOUTSIDE-SECRET (a file of the person)\n")
+    for kept in [*(outside / "proposals").glob("*.json"), *(outside / "requests").glob("*.json")]:
+        kept.write_text(kept.read_text().replace("RAdam", "OUTSIDE-SECRET").replace(
+            "Say which average", "OUTSIDE-SECRET"))  # fmt: skip
+    title = json.loads((outside / "project.json").read_text())
+    (outside / "project.json").write_text(json.dumps({**title, "title": "OUTSIDE-SECRET"}))
+    target = project.root / name
+    shutil.rmtree(target) if target.is_dir() else target.unlink()
+    target.symlink_to(outside / name, target_is_directory=(outside / name).is_dir())
+
+    listing = client.get("/api/projects")
+    assert listing.status_code == 200 and "OUTSIDE-SECRET" not in listing.text
+    assert [row["dir"] for row in listing.json()["projects"]] == ["second"]
+    (unreadable,) = listing.json()["unreadable"]
+    assert unreadable["dir"] == "warmup" and unreadable["id"] == project.id
+    assert name in unreadable["message"] and "link" in unreadable["message"]
+    for path in ("", "/pages", "/pages/wiki/idea.md", "/proposals", "/requests", "/graph"):
+        refused = client.get(url(project, path))
+        assert refused.status_code == 422 and "OUTSIDE-SECRET" not in refused.text, path
+        assert error_of(refused)["code"] == "project_unreadable"
+    written = client.post(url(project, "/pages"), json={"kind": "topic", "title": "Through it"})
+    asked = client.post(url(project, "/requests"), json={"text": "Through it"})
+    assert written.status_code == 422 and asked.status_code == 422
+    assert not list(outside.rglob("through-it*"))
+    assert "Through it" not in "".join(p.read_text() for p in (outside / "requests").glob("*"))
+
+    # With the directory itself back in place the project is read again, under its id.
+    target.unlink()
+    if (outside / name).is_dir():
+        shutil.copytree(outside / name, target)
+    else:
+        shutil.copy(outside / name, target)
+    assert client.get(url(project)).status_code == 200
+    assert client.get("/api/projects").json()["unreadable"] == []
+
+
+def test_a_link_that_stays_inside_the_project_is_no_reason_to_refuse_it(client, project):
+    """Only a link that leads out is one: a directory kept under another name inside the
+    project directory is the project's own."""
+    (project.root / "requests").rename(project.root / "requests-kept")
+    (project.root / "requests").symlink_to("requests-kept", target_is_directory=True)
+    assert client.get("/api/projects").json()["unreadable"] == []
+    assert len(client.get(url(project, "/requests")).json()["requests"]) == 1
+
+
+def test_the_original_takes_its_id_back_from_a_copy_put_under_its_name(client, workspace, project):
+    """The directory is renamed and a copy of it put under the old name between two looks
+    of the server.  The id goes on naming the directory it named, which is the renamed
+    one, not whatever stands under its old name now: a tab that was open on the project
+    writes into the project, also when its request is the first thing the server hears
+    of the change."""
+    import shutil
+
+    assert library(client) == {"warmup": project.id}
+    project.root.rename(workspace / "warmup-2026")
+    shutil.copytree(workspace / "warmup-2026", workspace / "warmup")
+    # The open tab asks first: nobody looked at the library in between.
+    posted = client.post(url(project, "/requests"), json={"text": "typed in the open tab"})
+    assert posted.status_code == 201
+    assert len(list((workspace / "warmup-2026" / "requests").glob("*"))) == 2
+    assert len(list((workspace / "warmup" / "requests").glob("*"))) == 1
+    assert client.get(url(project)).json()["dir"] == "warmup-2026"
+    ids = library(client)
+    assert ids["warmup-2026"] == project.id
+    assert ids["warmup"] not in (project.id, None)
+    # And it stays so: the next looks change nothing, and the copy has its own address.
+    assert library(client) == ids
+    assert client.get(f"/api/projects/{ids['warmup']}").json()["dir"] == "warmup"
+
+
+def test_a_copy_that_was_addressed_by_the_id_keeps_it_when_the_original_comes_back(
+    client, workspace, project, tmp_path
+):
+    """The other way round: the server knew only the copy under the id (the original was
+    kept elsewhere) and the original is moved in.  The tab that is open shows the copy
+    and goes on writing into the copy; the newcomer gets the derived id."""
+    import shutil
+
+    project.root.rename(tmp_path / "kept-elsewhere")
+    shutil.copytree(tmp_path / "kept-elsewhere", workspace / "working-copy")
+    assert library(client) == {"working-copy": project.id}
+    (tmp_path / "kept-elsewhere").rename(workspace / "a-original")
+    posted = client.post(url(project, "/requests"), json={"text": "typed in the open tab"})
+    assert posted.status_code == 201
+    assert len(list((workspace / "working-copy" / "requests").glob("*"))) == 2
+    ids = library(client)
+    assert ids["working-copy"] == project.id and ids["a-original"] not in (project.id, None)
+
+
+def test_an_unreadable_project_keeps_its_address_when_its_directory_is_renamed(
+    client, workspace, project
+):
+    assert library(client) == {"warmup": project.id}
+    file = project.root / "project.json"
+    whole = file.read_text()
+    file.write_text("{ cut short")
+    project.root.rename(workspace / "warmup-2026")
+    (unreadable,) = client.get("/api/projects").json()["unreadable"]
+    assert unreadable["dir"] == "warmup-2026" and unreadable["id"] == project.id
+    assert client.get(url(project)).status_code == 422
+    (workspace / "warmup-2026" / "project.json").write_text(whole)
+    assert client.get(url(project)).json()["dir"] == "warmup-2026"
+
+
+def test_a_refusal_blanks_the_token_of_the_projects_repository_too(client, project):
+    """A stale edit is answered with the page as it is now; a refused review with the
+    page it was about.  Those hold the project's text like any view of the page."""
+    project.settings.update({"repo": {"path": PRIVATE_URL}})
+    project.save_settings()
+    said = f"fatal: could not read from {PRIVATE_URL}\n"
+    project.update_page("topics/adaptive-optimisers", author="human", body=said)
+    assert TOKEN not in client.get(url(project, "/pages/topics/adaptive-optimisers")).text
+    stale = client.put(
+        url(project, "/pages/topics/adaptive-optimisers"),
+        json={"body": "mine", "base_updated": "2020-01-01T00:00:00Z"},
+    )
+    assert stale.status_code == 409 and TOKEN not in stale.text
+    assert "[redacted]" in stale.json()["page"]["body"]
+    missing = client.get(url(project, f"/pages/{TOKEN}-is-no-page"))
+    assert missing.status_code == 404 and TOKEN not in missing.text
+
+
+def test_folders_that_differ_by_case_alone_are_one_folder_under_the_name_reported(
+    client, workspace
+):
+    """Two folders picked from different places, ``Data`` and ``data``: the project keeps
+    no two top-level names that differ by case alone and would rename one, so the
+    answer would name files that are not there.  They are one folder, under the
+    spelling it was first sent with, and every file is where the answer says."""
+    sent = [
+        ("Data/a.txt", b"the first folder"),
+        ("data/b.txt", b"the second folder, another spelling"),
+        ("DATA/a.txt", b"a third, with a file called like one of the first"),
+        ("data", b"a file called like the folder"),
+        ("Data/Deep/x.txt", b"deeper"),
+        ("data/deep/y.txt", b"deeper, another spelling"),
+    ]
+    response = client.post(
+        "/api/projects",
+        data={"title": "Cases", "brief": "What is in the folders?"},
+        files=[("files", (name, content, "text/plain")) for name, content in sent],
+    )
+    assert response.status_code == 201, response.text
+    inputs = workspace / "cases" / "inputs"
+    uploads = response.json()["uploads"]
+    assert [entry["sent"] for entry in uploads] == [name for name, _ in sent]
+    for entry, (_, content) in zip(uploads, sent, strict=True):
+        assert (inputs / entry["stored"]).read_bytes() == content, entry
+    stored = [entry["stored"] for entry in uploads]
+    assert stored[:3] == ["Data/a.txt", "Data/b.txt", "Data/a-2.txt"]
+    assert stored[3] == "data-2" and stored[4:] == ["Data/Deep/x.txt", "Data/Deep/y.txt"]
+    assert sorted(stored) == sorted(a["name"] for a in response.json()["attachments"])
+    assert response.json()["skipped"] == []
+
+
+def test_the_paper_view_names_the_findings_a_paper_would_leave_out(real, project):
+    """The store asked for it: before the write-up is started, the app can say which
+    accepted findings would not be reported (every record they rest on belongs to an
+    experiment that was rejected or is gone), in the words the write-up's refusal uses."""
+    project.review("E1", "accept")
+    finding = a_finding(project)
+    before = real.get(url(project, "/paper")).json()
+    assert before["left_out"] == [] and before["missing_detail"] == ""
+    project.review("E1", "reject", reason="The setup was wrong.")
+
+    paper = real.get(url(project, "/paper")).json()
+    assert paper["missing"] in ("results", "finding")
+    (left,) = paper["left_out"]
+    assert left["id"] == finding.id and left["path"] == finding.path
+    assert "rejected" in left["reason"]
+    assert finding.id in paper["missing_detail"] and "rejected" in paper["missing_detail"]
+
+
+def test_a_drawing_is_text_too_and_is_served_without_the_credentials_in_it(
+    client, project, monkeypatch
+):
+    """An SVG figure is shown as an image and is text all the same: a label a job wrote
+    into it is read by whoever looks at the figure."""
+    monkeypatch.setenv("AUDIT_FAKE_API_KEY", FAKE_KEY)
+    run_dir = add_run(project)
+    drawing = f'<svg xmlns="http://www.w3.org/2000/svg"><text>key {FAKE_KEY}</text></svg>'
+    (run_dir / "artifacts" / "figure.svg").write_text(drawing)
+    (run_dir / "artifacts" / "clean.svg").write_text(drawing.replace(FAKE_KEY, "none"))
+    shown = client.get(url(project, "/files/experiments/E1/runs/1/artifacts/figure.svg"))
+    assert shown.status_code == 200 and shown.headers["content-type"] == "image/svg+xml"
+    assert shown.text == drawing.replace(FAKE_KEY, "[redacted]")
+    assert shown.headers["content-security-policy"].endswith("sandbox")
+    assert shown.headers["content-disposition"] == 'inline; filename="figure.svg"'
+    clean = client.get(url(project, "/files/experiments/E1/runs/1/artifacts/clean.svg"))
+    assert clean.text == drawing.replace(FAKE_KEY, "none") and "content-length" in clean.headers
+
+
+def test_a_repository_address_no_file_can_hold_does_not_cost_the_logs_or_the_stream(
+    client, stream, project
+):
+    """``project.json`` written by hand, with half a surrogate pair in the token of the
+    repository's address: what is blanked is looked for as bytes, and looking for it
+    must not fail the answer (the log, a served file, every event)."""
+    file = project.root / "project.json"
+    data = json.loads(file.read_text())
+    data["settings"]["repo"] = {"path": "https://tok\ud83den-0123456789@git.example.invalid/x.git"}
+    file.write_text(json.dumps(data))  # written as an escape, as any JSON writer does
+    run_dir = add_run(project)
+    (project.root / "worker.log").write_text("it said tok\\ud83den-0123456789 and went on\n")
+    append_event(project, type="note", summary="it said tok\ud83den-0123456789")
+
+    for path in (
+        "/worker/log",
+        "/experiments/E1/runs/1/log",
+        "/experiments/E1/runs/1",
+        "/files/experiments/E1/runs/1/log.txt",
+        "/activity",
+        "",
+    ):
+        assert client.get(url(project, path)).status_code == 200, path
+    assert (run_dir / "log.txt").read_text() in client.get(
+        url(project, "/files/experiments/E1/runs/1/log.txt")
+    ).text
+    # Where the file holds it as JSON writes it, it is blanked like any other.
+    assert (
+        client.get(url(project, "/worker/log")).json()["text"] == "it said [redacted] and went on\n"
+    )
+    live = stream(url(project, "/events"))
+    wait_for(lambda: len(live.events()) == len(project.events()), message="every event")
+    assert live.events()[-1]["summary"] == "it said [redacted]"
+
+
+def test_the_server_itself_puts_back_what_could_not_be_saved(client, project, monkeypatch):
+    """The store reads the file back when a save of its own fails; the server does not
+    lean on that.  Whatever stopped the change (here a save that fails and leaves the
+    object as it was set), the project it keeps says what is on disk again."""
+
+    def fails(self):
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Project, "save_settings", fails)
+        with pytest.raises(OSError):
+            client.patch(
+                url(project),
+                json={"title": "Never saved", "settings": {"limits": {"model_usd": 99.0}}},
+            )
+    seen = client.get(url(project)).json()
+    assert seen["title"] == "Warmup" and seen["settings"]["limits"]["model_usd"] != 99.0
+    assert client.get("/api/projects").json()["projects"][0]["title"] == "Warmup"
+
+
+def test_the_token_of_a_repository_an_experiment_names_itself_is_blanked_too(
+    client, stream, project
+):
+    """An experiment may name a repository of its own on its page, token and all (only the
+    person can).  That address is shown like the project's: without the token, in the
+    page as in every answer that quotes it."""
+    project.review("E1", "accept")
+    project.update_page("E1", author="human", fields={"mode": "repo", "repo": PRIVATE_URL})
+    said = f"fatal: could not read from {PRIVATE_URL}"
+    append_event(project, type="error", summary=said, data={"error": said})
+    (project.root / "worker.log").write_text(said + "\n")
+    shown = "https://[redacted]@git.example.invalid/me/private.git"
+
+    answers = {
+        "the page": client.get(url(project, "/pages/E1")),
+        "the pages": client.get(url(project, "/pages?kind=experiment")),
+        "the experiments": client.get(url(project, "/experiments")),
+        "the experiment": client.get(url(project, "/experiments/E1")),
+        "the activity": client.get(url(project, "/activity")),
+        "the worker's log": client.get(url(project, "/worker/log")),
+        "a stale edit": client.put(
+            url(project, "/pages/E1"), json={"body": "x", "base_updated": "2020-01-01T00:00:00Z"}
+        ),
+    }
+    for name, response in answers.items():
+        assert TOKEN not in response.text, name
+    assert answers["the page"].json()["page"]["meta"]["repo"] == shown
+    assert answers["a stale edit"].status_code == 409
+    live = stream(url(project, "/events"))
+    wait_for(lambda: len(live.events()) == len(project.events()), message="every event")
+    assert TOKEN not in live._data.decode()
+
+    # The address as it was shown, sent back with an edit, is the address that is kept.
+    saved = client.put(
+        url(project, "/pages/E1"), json={"fields": {"repo": shown, "timeout_seconds": 60}}
+    )
+    assert saved.status_code == 200, saved.text
+    assert project.page("E1").meta["repo"] == PRIVATE_URL
+    assert project.page("E1").meta["timeout_seconds"] == 60
+    project.propose_edit("E1", author="agent:designer", summary="A note", body="x\n", round=1)
+    for ref in ("E1", project.proposals(review="proposed")[-1].id):
+        decided = client.post(
+            url(project, "/review"),
+            json={
+                "items": [{"ref": ref, "decision": "accept", "edits": {"fields": {"repo": shown}}}]
+            },
+        ).json()
+        assert TOKEN not in json.dumps(decided), ref
+    assert project.page("E1").meta["repo"] == PRIVATE_URL
+    # Another address is another address: the person names a repository as before.
+    other = "https://git.example.invalid/me/public.git"
+    assert (
+        client.put(url(project, "/pages/E1"), json={"fields": {"repo": other}}).status_code == 200
+    )
+    assert project.page("E1").meta["repo"] == other
+    # The library still reads no page for it.
+    assert client.get("/api/projects").status_code == 200
