@@ -85,6 +85,9 @@ async function flush(entries) {
     const out = await s.send(entries);
     if (out.failed.length) sayError(out.failed.map(failureText).join(' '));
     out.results.forEach((result, i) => { if (result.ok && result.worker_error) sayError(cap(entries[i].label) + ' is accepted and approved, but the run could not start now: ' + plain(result.worker_error.message) + ' It runs when you continue.'); });
+    /* a worker is at work: the run was not refused, it waits in line, and the server says behind what */
+    const lined = out.results.filter((result) => result.ok && result.in_line && !result.worker_error).map((result) => acceptedInLine(result.in_line));
+    if (lined.length && !out.failed.length) say(lined.join(' '), { ms: 9000 });
     out.failed.forEach((failure) => { const page = failure.entry.item && failure.entry.item.page; if (page && page.kind === 'experiment' && page.id) s.invalidateExperiment(page.id); });   // its code may be what changed: read it again
     /* an experiment was rejected: the server says what rests on it (the findings based on its
        runs, the verdicts they carry). Said here; its page lists it with links, from the server. */
@@ -409,6 +412,7 @@ async function approve(eid, start, overrides) {
     s.invalidateExperiment(eid);
     await s.refreshNow();
     if (answer.worker_error) sayError(eid + ' is approved, but the run could not start now: ' + plain(answer.worker_error.message) + ' It runs when you continue.');
+    else if (answer.in_line) say(plain(answer.in_line.message), { ms: 9000 });   // "E7 is approved; it runs after E6."
     else say(start ? eid + ' is approved; its run is starting.' : eid + ' is approved. It runs first when you continue, or now.');
   } catch (error) {
     sayError(eid + ' was not approved: ' + message(error));
@@ -417,6 +421,9 @@ async function approve(eid, start, overrides) {
   }
   app.render('approve');
 }
+/** The server's sentence about an experiment that waits in line, for one that was accepted
+    with the same press ("E7 is accepted and approved; it runs after E6."). */
+const acceptedInLine = (inLine) => plain(inLine.message).replace(' is approved', ' is accepted and approved');
 function acceptAndRun(path) {
   const s = store(), page = s.byPath.get(path);
   if (!page) return;
@@ -425,7 +432,7 @@ function acceptAndRun(path) {
   const run = { start: true };
   ['backend', 'gpu', 'timeout_seconds', 'network', 'code_digest'].forEach((k) => { if (body[k] != null) run[k] = body[k]; });
   const done = decide(path, 'accept', { approve_run: run, immediate: true });
-  if (done && done.then) done.then((out) => { if (out && !out.failed.length) { if (app.ui.approve[page.id]) delete app.ui.approve[page.id].network; s.invalidateExperiment(page.id); say(label(page) + ' is accepted; its run is starting.'); if (app.route.view !== 'experiments') go({ view: 'experiments', sel: path, sub: '' }); } });
+  if (done && done.then) done.then((out) => { if (out && !out.failed.length) { if (app.ui.approve[page.id]) delete app.ui.approve[page.id].network; s.invalidateExperiment(page.id); const first = (out.results || [])[0] || {}; if (!first.in_line && !first.worker_error) say(label(page) + ' is accepted; its run is starting.'); if (app.route.view !== 'experiments') go({ view: 'experiments', sel: path, sub: '' }); } });
 }
 
 /* ---------- the composer ---------- */
@@ -658,7 +665,7 @@ const ACT = {
     app.ui.starting[eid] = true;
     app.render('run');
     await flushAll();
-    try { const answer = await api.run(s.pid, eid); if (answer.worker) s.project.worker = answer.worker; delete app.ui.runOpen[eid]; s.invalidateExperiment(eid); await s.refreshNow(); say(again ? eid + ' is run again. What was left of the interrupted run is settled first.' : 'The run of ' + eid + ' is starting.'); }
+    try { const answer = await api.run(s.pid, eid); if (answer.worker) s.project.worker = answer.worker; delete app.ui.runOpen[eid]; s.invalidateExperiment(eid); await s.refreshNow(); say(answer.in_line ? plain(answer.in_line.message) : again ? eid + ' is run again. What was left of the interrupted run is settled first.' : 'The run of ' + eid + ' is starting.', answer.in_line ? { ms: 9000 } : undefined); }
     catch (error) { sayError(eid + ' was not started: ' + message(error)); s.invalidateExperiment(eid); s.refresh(); }
     delete app.ui.starting[eid];
     app.render('run');

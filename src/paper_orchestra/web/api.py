@@ -588,6 +588,21 @@ class Services:
             return None
         return str(reason) if reason else None
 
+    def line(self, project: Project) -> dict[str, Any]:
+        """Which experiments read as running and which wait for their run, in the order
+        they are run in (``experiments.line``): ``{"running", "waiting", "after"}``.
+        Empty where it cannot be told."""
+        try:
+            found = self._later("line")(project)
+        except (ApiError, ProjectError, OSError, ValueError):
+            found = None
+        found = found if isinstance(found, Mapping) else {}
+        return {
+            "running": [str(name) for name in found.get("running") or ()],
+            "waiting": [str(name) for name in found.get("waiting") or ()],
+            "after": dict(found.get("after") or {}),
+        }
+
     def last_success(self, project: Project, experiment_id: str) -> dict[str, Any] | None:
         """The latest run of the experiment that succeeded, ``{"number", "result_page"}``
         (``experiments.last_success``); ``None`` when none did or it cannot be told."""
@@ -3025,7 +3040,89 @@ def _approval_options(given: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _start_run(context: Context, project: Project, experiment_id: str) -> dict[str, Any]:
-    return context.workers.start(project.root, "run", experiments=[experiment_id])
+    """Have an approved experiment run with no further request; what the answer says of
+    it: ``{"worker"}``, and ``"in_line"`` when the project's worker is at other work.
+
+    With no worker one is started for the experiment (``research run E --queue``),
+    which afterwards goes on with whatever else is approved, in the order of the
+    approvals, until nothing waits.  With a worker at work nothing is refused: the
+    experiment waits in line, and ``in_line`` says behind what (see :func:`_in_line`).
+    ``WorkerBusy`` only for a worker that is being stopped or cannot be verified.
+    """
+    status = dict(context.workers.run_in_line(project.root, experiment_id))
+    waits = status.pop("waits", None)
+    answer: dict[str, Any] = {"worker": status}
+    if waits:
+        line = context.services.line(project)
+        answer["in_line"] = _in_line(experiment_id, status, line) or _in_line(
+            experiment_id, status, {**line, "waiting": [*line["waiting"], experiment_id]}
+        )
+    return answer
+
+
+def _waits_for(worker: Mapping[str, Any], experiment_id: str) -> str | None:
+    """How an approved experiment gets its run from the project's worker with no
+    further request: ``"line"`` (the worker runs experiments one after the other and
+    goes on with every approved one: a ``run`` worker with ``queue``, or the run phase
+    of an ``advance``), ``"worker"`` (a run of it was asked for, and a worker is
+    started for it when this one has ended), or ``None``: nothing runs it until the
+    person continues or runs it (no worker, one that is being stopped, one that this
+    server cannot verify)."""
+    if worker.get("state") != "running" or worker.get("verified") is not True:
+        return None
+    if worker.get("queue") or (worker.get("kind") == "advance" and worker.get("phase") == "run"):
+        return "line"
+    return "worker" if experiment_id in (worker.get("then_runs") or ()) else None
+
+
+def _in_line(
+    experiment_id: str, worker: Mapping[str, Any], line: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Where an approved experiment stands in the line of those that wait for their
+    run, when the project's worker gets to it by itself; ``None`` otherwise.
+
+    ``{"waits", "position", "after", "message"}``: ``waits`` as :func:`_waits_for`
+    says; ``position`` counts from 1 among those that wait; ``after`` is the
+    experiment it runs after (the one before it in the line, or the one being run),
+    ``None`` when none is ahead; ``message`` is the sentence for the person.
+    """
+    waiting = [str(name) for name in line.get("waiting") or ()]
+    waits = _waits_for(worker, experiment_id)
+    if waits is None or experiment_id not in waiting:
+        return None
+    position = waiting.index(experiment_id) + 1
+    after = (line.get("after") or {}).get(experiment_id)
+    if after is None and position > 1:
+        after = waiting[position - 2]
+    if after is None and line.get("running"):
+        after = str(list(line["running"])[-1])
+    if waits == "line":
+        message = (
+            f"{experiment_id} is approved; it runs after {after}."
+            if after
+            else f"{experiment_id} is approved; it runs next."
+        )
+    else:
+        kind = worker.get("kind")
+        if kind == "advance":
+            busy = f"The agents are at work ({_phase_words(worker.get('phase'))})"
+            then = (
+                "it runs in their run phase if that is still to come, and otherwise "
+                "starts by itself when they reach their checkpoint"
+            )
+        elif kind == "write":
+            busy, then = "The paper is being written", "it starts by itself when that has ended"
+        else:
+            busy = "A worker is running other experiments"
+            then = "it starts by itself when that worker has ended"
+        behind = f", after {after}" if after and position > 1 else ""
+        message = f"{experiment_id} is approved. {busy}: {then}{behind}."
+    return {"waits": waits, "position": position, "after": after, "message": message}
+
+
+def _phase_words(phase: Any) -> str:
+    """``the design phase`` for ``design``; ``a phase`` when none is named."""
+    return f"the {phase} phase" if isinstance(phase, str) and phase else "a phase"
 
 
 def _failure(exc: Exception) -> dict[str, Any]:
@@ -3120,7 +3217,7 @@ def _decide(context: Context, project: Project, item: ReviewItem) -> dict[str, A
     outcome.update(page=page.to_dict(body=False), approved=True, ok=True)
     if run_options.get("start"):
         try:
-            outcome["worker"] = _start_run(context, project, page.id or decided.path)
+            outcome.update(_start_run(context, project, str(page.id or decided.path)))
         except WorkerError as exc:
             # Approved stays approved: the run phase picks it up.
             outcome["worker_error"] = _failure(exc)["error"]
@@ -3443,9 +3540,17 @@ def list_experiments(project: Proj, context: Ctx) -> dict[str, Any]:
     ``will_not_run`` is ``null``, or why an experiment that reads approved would not
     run as it stands (it changed since the approval: it needs approval again).
     ``last_success`` is ``null``, or, for an experiment that reads ``cancelled`` or
-    ``failed``, its latest run that succeeded: ``{"number", "result_page"}``."""
+    ``failed``, its latest run that succeeded: ``{"number", "result_page"}``.
+
+    ``in_line`` is ``null``, or, for an approved experiment that the project's worker
+    gets to with no further request, where it stands: ``{"waits", "position",
+    "after", "message"}`` (see the approval).  ``line`` names the experiments being
+    run and those that wait that way, in the order they run in: ``{"running",
+    "waiting"}``."""
     pages = project.pages(kind="experiment")
     interrupted = _interrupted(context, project, pages)
+    worker = context.workers.status(project.root)
+    line = context.services.line(project)
     rows = []
     for page in pages:
         runs = context.services.runs(project, page.id) if page.id else []
@@ -3457,10 +3562,19 @@ def list_experiments(project: Proj, context: Ctx) -> dict[str, Any]:
                 "last_run": _run_view(context, project, page.id, latest) if latest else None,
                 "interrupted": page.id in interrupted,
                 "cancel_does": _cancel_does(context, project, page),
+                "in_line": _in_line(str(page.id), worker, line) if page.id else None,
                 **_run_standing(context, project, page),
             }
         )
-    return {"experiments": rows}
+    running = [name for name in line["running"] if name not in interrupted]
+    in_line = {row["id"] for row in rows if row["in_line"]}
+    return {
+        "experiments": rows,
+        "line": {
+            "running": running,
+            "waiting": [name for name in line["waiting"] if name in in_line],
+        },
+    }
 
 
 _INTERRUPTED = (
@@ -3499,6 +3613,10 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
         "interrupted_note": _INTERRUPTED.format(id=experiment_id) if interrupted else None,
         # What the cancel endpoint would do now: "withdraw", "cancel" or nothing.
         "cancel_does": _cancel_does(context, project, page),
+        # Where it stands in line when the project's worker gets to it by itself.
+        "in_line": _in_line(
+            experiment_id, context.workers.status(project.root), context.services.line(project)
+        ),
         # Why it would not run although it reads approved; an earlier run that succeeded.
         **_run_standing(context, project, page),
         # For a rejected experiment: the findings and verdicts that rest on its runs.
@@ -3641,8 +3759,15 @@ def approve(
     (Modal for a GPU), and without ``network`` it runs without network access; a plan
     that asks for the network (``network: true``) is refused (422) until the request
     says ``"network": true`` or ``false``.  With ``start`` the run begins at once
-    (``worker``), unless the project already has a worker (``worker_error``): an
-    approved experiment is then run by the next run phase.
+    (``worker``).  When the project already has a worker the approval still succeeds
+    and the experiment waits in line with no further request: ``in_line`` is
+    ``{"waits", "position", "after", "message"}`` (``E7 is approved; it runs after
+    E6.``).  A worker that runs experiments goes on with every one that is approved
+    while it runs, in the order of the approvals; after a worker of another kind (a
+    phase, a write-up) a worker is started for it when that one has ended.  Only
+    with a worker that is being stopped, or one this server cannot verify, is nothing
+    arranged (``worker_error``): the experiment stays approved and runs when the
+    person continues, or runs it.
     """
     body = body or ApproveBody()
     page = _experiment(project, eid)
@@ -3653,7 +3778,7 @@ def approve(
     answer: dict[str, Any] = {"page": approved.to_dict(body=False)}
     if body.start:
         try:
-            answer["worker"] = _start_run(context, project, str(page.id))
+            answer.update(_start_run(context, project, str(page.id)))
         except WorkerError as exc:
             answer["worker_error"] = _failure(exc)["error"]
     return answer
@@ -3662,7 +3787,10 @@ def approve(
 @router.post("/projects/{pid}/experiments/{eid}/run", status_code=202)
 def run_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     """Run an approved experiment now, in a worker of its own (no model is called
-    unless its code has to be repaired).  409 when the project already has a worker.
+    unless its code has to be repaired).  The worker then goes on with whatever else
+    is approved until nothing waits.  When the project already has a worker the
+    experiment waits in line instead (``in_line``, as the approval answers it); 409
+    only for a worker that is being stopped or cannot be verified.
 
     An experiment whose run was interrupted (its page says ``running``, the
     project has no worker and nothing holds the experiment's run lock) is run
@@ -3687,13 +3815,18 @@ def run_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
                 "the experiment's run lock). Wait for that run, or cancel it.",
             )
         # With a worker at work the start below is refused, as any second worker is.
-    elif page.state not in ("approved", "queued"):
+        return {
+            "worker": context.workers.start(
+                project.root, "run", experiments=[str(page.id)], queue=True
+            )
+        }
+    if page.state not in ("approved", "queued"):
         raise ApiError(
             422,
             "invalid",
             f"{page.id} is {page.state}; only an approved experiment can be run. Approve it first.",
         )
-    return {"worker": _start_run(context, project, str(page.id))}
+    return _start_run(context, project, str(page.id))
 
 
 class CancelBody(_Body):

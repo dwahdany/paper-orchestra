@@ -1231,6 +1231,27 @@ def test_a_stop_request_ends_the_agent_and_the_run_goes_back_to_the_queue(projec
     assert second.resume is None and Path(second.cwd).parent.name == "2"
 
 
+def test_a_stop_request_during_a_run_of_its_own_is_known_to_whoever_runs_the_line(
+    project, team, backend
+):
+    """`research run` runs one experiment after the other: the run a stop request ended
+    returns its record (the run went back to the queue), and the engine still says that
+    a stop was asked, so that the next of the line is not started."""
+    to_approved(project, team, backend)
+    engine = make_engine(project, team, backend)
+
+    def stop(agent: FakeAgent) -> None:
+        engine.stop()
+        agent.tick()
+        agent.bash("python main.py")
+
+    team.during["experimenter"] = stop
+    record = engine.run_experiment("E1")
+
+    assert (record["status"], record["requeued"]) == ("cancelled", True)
+    assert engine.stop_requested is True and project.page("E1").state == "queued"
+
+
 def test_every_run_of_a_run_phase_gets_an_agent_of_its_own(project, team, backend):
     to_approved(project, team, backend)
     other = project.create_page(

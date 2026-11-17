@@ -152,6 +152,20 @@ class FakeServices(Services):
     def request_cancel(self, project, ref):
         (project.experiment_dir(project.page(ref).id) / "cancel").write_text("requested")
 
+    def line(self, project):
+        """The line as ``experiments.line`` gives it, in the order of these approvals."""
+        accepted = project.pages(kind="experiment", review="accepted")
+        order = [name for name, _ in self.approvals]
+        waiting = sorted(
+            (str(page.id) for page in accepted if page.state in ("approved", "queued")),
+            key=lambda name: order.index(name) if name in order else len(order),
+        )
+        running = [str(page.id) for page in accepted if page.state == "running"]
+        after, ahead = {}, (running[-1] if running else None)
+        for name in waiting:
+            after[name], ahead = ahead, name
+        return {"running": running, "waiting": waiting, "after": after}
+
     def runs(self, project, experiment_id):
         folder = project.experiment_dir(experiment_id) / "runs"
         found = [json.loads(f.read_text()) for f in folder.glob("*/run.json")]
@@ -1192,7 +1206,7 @@ def test_accept_and_run_with_defaults_and_with_start(client, project, services, 
     (result,) = response.json()["results"]
     assert result["ok"] is True and services.approvals == [("E1", {})]
     assert result["worker"]["state"] == "running" and result["worker"]["kind"] == "run"
-    assert launched.calls == [("run", {"experiments": ["E1"]})]
+    assert launched.calls == [("run", {"experiments": ["E1"], "queue": True})]
     wait_for(lambda: (project.root / "ready").exists())
 
     project.create_page(
@@ -1203,9 +1217,17 @@ def test_accept_and_run_with_defaults_and_with_start(client, project, services, 
         json={"items": [{"ref": "E2", "decision": "accept", "approve_run": {"start": True}}]},
     )
     (second,) = busy.json()["results"]
-    # Approved all the same; it waits for the worker that is running.
+    # Approved, and not refused: it waits in line behind E1, and the worker that is
+    # running goes on with it.  No second worker is started and no error is said.
     assert second["ok"] is True and second["approved"] is True
-    assert second["worker_error"]["code"] == "worker_running"
+    assert "worker_error" not in second and len(launched.calls) == 1
+    assert second["worker"]["state"] == "running" and second["worker"]["queue"] is True
+    assert second["in_line"] == {
+        "waits": "line",
+        "position": 2,
+        "after": "E1",
+        "message": "E2 is approved; it runs after E1.",
+    }
 
 
 def test_accept_and_run_says_when_only_the_accept_went_through(client, project, services):
@@ -1556,16 +1578,123 @@ def test_an_approved_experiment_can_be_run_now(client, project, services, launch
     started = client.post(url(project, "/experiments/E1/approve"), json={"start": True})
     assert started.json()["page"]["state"] == "approved"
     assert started.json()["worker"]["kind"] == "run"
-    assert launched.calls == [("run", {"experiments": ["E1"]})]
+    assert launched.calls == [("run", {"experiments": ["E1"], "queue": True})]
     wait_for(lambda: (project.root / "ready").exists())
 
+    # A second press while the worker is at work is not an error: the experiment is in
+    # the line of the worker that runs.  Nothing more is started.
     second = client.post(url(project, "/experiments/E1/run"))
-    assert second.status_code == 409
-    assert second.json()["error"]["code"] == "worker_running" and second.json()["phase"] == "run"
+    assert second.status_code == 202 and second.json()["in_line"]["waits"] == "line"
+    assert len(launched.calls) == 1
     assert client.post(url(project, "/stop")).json()["worker"]["state"] == "stopping"
+    # A stop ends the line: behind a worker that is being stopped nothing is put.
+    stopping = client.post(url(project, "/experiments/E1/run"))
+    if stopping.status_code != 202:  # (the stand-in may already be gone)
+        assert stopping.status_code == 409
+        assert stopping.json()["error"]["code"] == "worker_running"
     wait_for(lambda: client.get(url(project)).json()["worker"]["state"] == "idle")
     again = client.post(url(project, "/experiments/E1/run"))
     assert again.status_code == 202 and again.json()["worker"]["state"] == "running"
+
+
+def more_experiments(project: Project, count: int) -> None:
+    for number in range(count):
+        page = project.create_page(
+            "experiment",
+            f"Another {number}",
+            "x",
+            author="agent:designer",
+            fields={"mode": "script"},
+        )
+        project.review(page.path, "accept")
+
+
+def test_experiments_approved_while_one_runs_wait_in_line_in_the_order_approved(
+    client, project, services, launched
+):
+    """The person approves three experiments in a row, two of them while the first
+    runs: one worker is started, nothing is refused, and each answer and the list say
+    behind what the experiment waits."""
+    project.review("E1", "accept")
+    more_experiments(project, 2)
+    first = client.post(url(project, "/experiments/E1/approve"), json={"start": True}).json()
+    assert first["worker"]["kind"] == "run" and "in_line" not in first
+    wait_for(lambda: (project.root / "ready").exists())
+    project.set_state("E1", "queued", by="system")
+    project.set_state("E1", "running", by="system")  # as the worker has it by now
+
+    third = client.post(url(project, "/experiments/E3/approve"), json={"start": True}).json()
+    second = client.post(url(project, "/experiments/E2/approve"), json={"start": True}).json()
+
+    assert launched.calls == [("run", {"experiments": ["E1"], "queue": True})]
+    assert "worker_error" not in third and "worker_error" not in second
+    assert third["in_line"]["message"] == "E3 is approved; it runs after E1."
+    assert second["in_line"] == {
+        "waits": "line",
+        "position": 2,
+        "after": "E3",
+        "message": "E2 is approved; it runs after E3.",
+    }
+    listed = client.get(url(project, "/experiments")).json()
+    assert listed["line"] == {"running": ["E1"], "waiting": ["E3", "E2"]}
+    rows = {row["id"]: row for row in listed["experiments"]}
+    assert rows["E1"]["in_line"] is None
+    assert (rows["E3"]["in_line"]["position"], rows["E3"]["in_line"]["after"]) == (1, "E1")
+    assert (rows["E2"]["in_line"]["position"], rows["E2"]["in_line"]["after"]) == (2, "E3")
+    assert client.get(url(project, "/experiments/E2")).json()["in_line"]["after"] == "E3"
+
+    # One that waits can still be taken back; the line closes up behind it.
+    taken = client.post(url(project, "/experiments/E3/cancel"))
+    assert taken.status_code == 200 and taken.json()["outcome"] == "withdrawn"
+    listed = client.get(url(project, "/experiments")).json()
+    assert listed["line"]["waiting"] == ["E2"]
+    row = next(row for row in listed["experiments"] if row["id"] == "E2")
+    assert row["in_line"]["message"] == "E2 is approved; it runs after E1."
+
+
+def test_one_approved_without_a_start_is_in_the_line_of_a_worker_that_runs_the_queue(
+    client, project, services, launched
+):
+    project.review("E1", "accept")
+    more_experiments(project, 1)
+    client.post(url(project, "/experiments/E1/approve"), json={"start": True})
+    wait_for(lambda: (project.root / "ready").exists())
+
+    approved = client.post(url(project, "/experiments/E2/approve"), json={}).json()
+
+    # No start was asked, so the answer promises nothing; the list says what is true:
+    # the worker that runs experiments goes on with every approved one.
+    assert "in_line" not in approved and "worker" not in approved
+    row = next(
+        row
+        for row in client.get(url(project, "/experiments")).json()["experiments"]
+        if row["id"] == "E2"
+    )
+    assert row["in_line"]["waits"] == "line" and row["in_line"]["after"] == "E1"
+
+
+def test_a_run_approved_during_a_phase_starts_by_itself_when_the_phase_has_ended(
+    client, project, services, launched
+):
+    project.review("E1", "accept")
+    assert client.get(url(project, "/experiments")).json()["line"] == {"running": [], "waiting": []}
+    assert client.post(url(project, "/advance"), json={"phase": "research"}).status_code < 300
+    wait_for(lambda: (project.root / "ready").exists())
+
+    answer = client.post(url(project, "/experiments/E1/approve"), json={"start": True}).json()
+
+    # Not an error, and no second press: the run starts when the phase has ended.
+    assert "worker_error" not in answer and answer["worker"]["kind"] == "advance"
+    assert answer["worker"]["then_runs"] == ["E1"]
+    assert answer["in_line"]["waits"] == "worker" and answer["in_line"]["position"] == 1
+    assert answer["in_line"]["message"] == (
+        "E1 is approved. The agents are at work (the research phase): it runs in their "
+        "run phase if that is still to come, and otherwise starts by itself when they "
+        "reach their checkpoint."
+    )
+    row = client.get(url(project, "/experiments")).json()["experiments"][0]
+    assert row["in_line"]["waits"] == "worker"
+    assert [kind for kind, _ in launched.calls] == ["advance"]
 
 
 def test_cancel_asks_the_running_job_to_stop(client, project, services):
@@ -3715,7 +3844,7 @@ def test_an_interrupted_run_is_shown_as_that_and_run_starts_it_again(
     started = client.post(url(project, "/experiments/E1/run"))
     assert started.status_code == 202, started.text
     assert started.json()["worker"]["kind"] == "run"
-    assert launched.calls == [("run", {"experiments": ["E1"]})]
+    assert launched.calls == [("run", {"experiments": ["E1"], "queue": True})]
     wait_for(lambda: (project.root / "ready").exists())
     # With the worker at it, the run is not "interrupted", and a second start is refused.
     view = client.get(url(project, "/experiments/E1")).json()
@@ -3973,7 +4102,7 @@ def test_run_waits_until_what_a_dead_worker_left_is_settled(client, project, ser
     assert entered.wait(10)
     started = client.post(url(project, "/experiments/E1/run"))
     assert started.status_code == 202, started.text
-    assert launched.calls == [("run", {"experiments": ["E1"]})]
+    assert launched.calls == [("run", {"experiments": ["E1"], "queue": True})]
     # The unfinished run was settled before the worker was started, not beside it.
     view = client.get(url(project, "/experiments/E1")).json()
     assert [(run["number"], run["status"]) for run in view["runs"]] == [(1, "failed")]

@@ -45,7 +45,7 @@ import socket
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as replaced
 from datetime import UTC, datetime
@@ -117,6 +117,7 @@ __all__ = [
     "job_command",
     "job_spec",
     "keep_code_as_run",
+    "line",
     "load_plan",
     "mask_credentials",
     "metrics_table",
@@ -135,6 +136,7 @@ __all__ = [
     "split_problems",
     "supplies_missing_code",
     "unverified_numbers",
+    "waiting_in_line",
     "withdraw",
     "write_code",
 ]
@@ -1172,6 +1174,59 @@ def will_not_run(project: Project, ref: str) -> str | None:
         return "the run it was approved for is over (one approval is one run)"
     fields = _run_fields(_read(project, page).plan)
     return _departure(project, page, fields, _current_digest(project, str(page.id)))
+
+
+def waiting_in_line(project: Project, *, skip: Collection[str] = ()) -> list[ResearchPage]:
+    """The experiments that wait for their run, in the order they are run in.
+
+    Those are the accepted experiments whose page reads ``approved`` or ``queued`` and
+    that would run as they stand (see :func:`will_not_run`: one that is no longer what
+    was approved needs the person again, and holds nobody up).  Nothing records that
+    one experiment needs another's result, so the order is that of the approvals:
+    whoever was approved first runs first, and two of the same moment go by their
+    ids.  ``skip`` are page paths that are left out (what a worker has already tried).
+    """
+    waiting = []
+    for page in project.pages(kind="experiment", review="accepted", state=["approved", "queued"]):
+        if page.path in skip or not page.id:
+            continue
+        try:
+            if will_not_run(project, page.path) is not None:
+                continue
+        except (ProjectError, OSError, ValueError):
+            continue  # what cannot be read cannot be run; its own page says why
+        waiting.append(page)
+
+    def order(page: ResearchPage) -> tuple[bool, str, tuple[int, str]]:
+        stamp = _text(page.meta.get("approved_at"))
+        digits = "".join(ch for ch in str(page.id) if ch.isdigit())
+        return (not stamp, stamp, (int(digits) if digits else 0, str(page.id)))
+
+    return sorted(waiting, key=order)
+
+
+def line(project: Project) -> dict[str, Any]:
+    """Which experiment is being run and which wait for their run, in order:
+    ``{"running": [ids], "waiting": [ids], "after": {id: id or None}}``.
+
+    ``running`` are the accepted experiments whose page reads ``running`` (whether
+    anything still runs them is for whoever watches the workers to say), ``waiting``
+    is :func:`waiting_in_line`, and ``after`` names for each one that waits the
+    experiment it comes after: the one before it in the line, for the first of the
+    line the one being run, and ``None`` when nothing is ahead of it.
+    """
+    running = [
+        str(page.id)
+        for page in project.pages(kind="experiment", review="accepted", state=["running"])
+        if page.id
+    ]
+    waiting = [str(page.id) for page in waiting_in_line(project)]
+    ahead = running[-1] if running else None
+    after: dict[str, str | None] = {}
+    for name in waiting:
+        after[name] = ahead
+        ahead = name
+    return {"running": running, "waiting": waiting, "after": after}
 
 
 def _code_name(name: Any) -> str:

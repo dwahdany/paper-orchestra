@@ -64,6 +64,10 @@ against what the server answers:
   pill and its mark in every view, and Run starts it again; the banner for a server that
   is gone says what that server said becomes of agents and experiments when it ends
   (`stops_workers_on_exit` of `GET /api/health`);
+- experiments approved while another runs wait in line (`queue`): no approval is refused,
+  each one says behind which experiment it waits ("E7 is approved; it runs after E6."),
+  the list shows the run that is going and the ones that wait in the order they run in,
+  and all of them run with no further press;
 - the library lists a project that cannot be opened with the reason, and its rows count
   what waits, suggested edits included;
 - the composer's numbers are those of `GET /api/defaults`, and it takes a research cutoff
@@ -237,7 +241,7 @@ The flows change the project, so every run needs a fresh workspace. Options:
 
 - `--only map,inbox` / `--skip composer`: the checks are `screens`, `phone`, `shell`, `nomodel`, `decisions`, `map`,
   `inbox`, `wiki`, `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`,
-  `composer`, `hostile`. They are written to run in that order on one fresh demo project; a
+  `queue`, `composer`, `hostile`. They are written to run in that order on one fresh demo project; a
   single one also runs alone.
 - `nomodel` looks at the project in the folder `nomodel` (a third copy of the demo
   project, told from the other two by the name of its folder) while the scripted model is

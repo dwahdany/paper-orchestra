@@ -1345,3 +1345,98 @@ def test_the_client_shows_agents_with_a_shell_from_what_the_server_says():
     vocab = _text(STATIC_DIR / "js" / "vocab.js")
     for word in ("AGENT_SAYS", "noSandbox", "your Claude account pays", "federation rule pays"):
         assert word in vocab, f"vocab.js does not say {word!r}"
+
+
+LINE_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago } from './harness.js';
+import { app } from './js/core.js';
+import * as experiments from './js/experiments.js';
+
+const row = (p, more) => Object.assign({ runs: 0, last_run: null, interrupted: false, cancel_does: 'withdraw', will_not_run: null, last_success: null, in_line: null }, p, more || {});
+const inLine = (waits, position, after) => ({ waits, position, after, message: 'said by the server' });
+const approved = (id, more) => page('experiment', id, Object.assign({ state: 'approved', meta: { backend: 'local' } }, more || {}));
+const e6 = approved('E6', { state: 'running' }), e7 = approved('E7'), e8 = approved('E8'), e9 = approved('E9');
+const render = (store, sel) => {
+  const root = { innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
+  app.route = { name: 'project', pid: 'p-1', view: 'experiments', ref: '', sel: sel || '', sub: '', q: {} };
+  experiments.experimentsView.render(root, app.route);
+  return root.innerHTML;
+};
+const text = (markup) => markup.replace(/<[^>]+>/g, ' ').replace(/&middot;/g, '·').replace(/\s+/g, ' ');
+const out = {};
+/* a worker runs E6 and goes on with what is approved: E7 was approved before E8. The server
+   lists the experiments by their ids' pages, here on purpose not in the order they run in. */
+const busy = { state: 'running', kind: 'run', verified: true, queue: true, then_runs: [] };
+const lined = projectStore({ pages: [e9, e8, e7, e6],
+  experiments: [row(e9), row(e8, { in_line: inLine('line', 2, 'E7') }), row(e7, { in_line: inLine('line', 1, 'E6') }), row(e6, { cancel_does: 'cancel', runs: 1, last_run: { number: 1, status: 'running', started: ago(5) } })],
+  project: { state: checkpoint('design', 'run'), next_step: said({}), worker: busy } });
+const table = render(lined);
+out.order = Array.from(table.matchAll(/class="ex-id">[\s\S]*?<b>(E\d+)<\/b>/g)).map((m) => m[1]);
+out.words = { E7: experiments.standingWords(lined.expById.get('E7')), E8: experiments.standingWords(lined.expById.get('E8')), E9: experiments.standingWords(lined.expById.get('E9')) };
+out.table = text(table);
+out.marks = Array.from(table.matchAll(/data-in-line="(\d+)"/g)).map((m) => m[1]);
+/* the experiment's own page: it waits, and there is nothing to press to make it run */
+const detail = (store, eid, more) => {
+  const p = store.expById.get(eid);
+  store.exps.set(eid, { key: store.expKey(eid), gen: 0, loading: false, error: null,
+    data: Object.assign({ page: Object.assign({}, p, { html: '' }), runs: [], plan: { backend: 'local' }, code: { files: [], digest: 'd' }, options: [], approval: { digest: 'd', at: ago(60), matches: true, changed: [] }, cancel_does: 'withdraw', will_not_run: null, last_success: null, interrupted: false }, more || {}) });
+  const markup = render(store, p.path);
+  const callout = (markup.match(/<section class="callout"[\s\S]*?<\/section>/) || [''])[0];
+  return { says: text(callout), run: /data-act="run-now"/.test(callout), off: /data-act="run-now"[^>]*disabled/.test(callout), back: /data-act="cancel-run"/.test(callout), mark: (callout.match(/data-in-line="(\d+)"/) || [])[1] || null };
+};
+out.waiting = detail(lined, 'E8');
+/* the agents are at work on a phase and a run of E7 was asked for: it starts by itself */
+const phase = projectStore({ pages: [e7, e9], experiments: [row(e7, { in_line: inLine('worker', 1, null) }), row(e9)],
+  project: { state: checkpoint('design', 'run', { status: 'running', phase: 'analyze' }), next_step: said({}), worker: { state: 'running', kind: 'advance', phase: 'analyze', verified: true, queue: false, then_runs: ['E7'] } } });
+out.asked = detail(phase, 'E7');
+out.askedWords = experiments.standingWords(phase.expById.get('E7'));
+/* approved without a start while a phase runs: one press arranges the run, and it is offered */
+out.notAsked = detail(phase, 'E9');
+/* nobody is at work: as before */
+const idle = projectStore({ pages: [e7], experiments: [row(e7)], project: { state: checkpoint('design', 'run'), next_step: said({}) } });
+out.idle = detail(idle, 'E7');
+out.idleTable = text(render(idle));
+/* a worker that is being stopped takes nothing on: the button is off, as before */
+const stopping = projectStore({ pages: [e7], experiments: [row(e7)], project: { state: checkpoint('design', 'run'), next_step: said({}), worker: { state: 'stopping', kind: 'run', verified: true, queue: true, then_runs: [] } } });
+out.stopping = detail(stopping, 'E7');
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_experiments_that_wait_in_line_are_shown_in_order_with_what_they_wait_behind(tmp_path):
+    """While a worker runs experiments one after the other, the ones approved meanwhile
+    wait in line (``in_line`` of their rows): the list shows the run that is going and
+    then the line in the order it runs in, each row and page says behind what it waits,
+    and no button is left that the person would have to press."""
+    out = _client(tmp_path, LINE_SCRIPT)
+    # The run that is going, the line by its positions, then what waits for the person.
+    assert out["order"] == ["E6", "E7", "E8", "E9"], out["order"]
+    assert out["marks"] == ["1", "2"]
+    assert "approved · waits in line, no. 1 · runs after E6" in out["table"], out["table"]
+    assert "approved · waits in line, no. 2 · runs after E7" in out["table"], out["table"]
+    assert "approved · runs first when you continue, or now" in out["table"]  # E9: not in line
+    assert out["words"] == {
+        "E7": "approved · runs after E6",
+        "E8": "approved · runs after E7",
+        "E9": "approved",
+    }
+    waiting = out["waiting"]
+    assert "It waits in line: it runs after E7 , with nothing more to press." in waiting["says"]
+    assert waiting["mark"] == "2" and not waiting["run"] and waiting["back"], waiting
+    # During a phase: the run that was asked for starts by itself, and says so.
+    asked = out["asked"]
+    assert (
+        "A run of it is asked for: it starts by itself when the work under way is done"
+        in (asked["says"])
+    )
+    assert not asked["run"] and asked["back"]
+    assert out["askedWords"] == "approved · starts by itself when the work under way is done"
+    # Approved without a start during a phase: one press arranges it, and is offered.
+    not_asked = out["notAsked"]
+    assert not_asked["run"] and not not_asked["off"], not_asked
+    assert "Run when they are done" in not_asked["says"]
+    # With nobody at work everything is as it was; behind a stop nothing is put in line.
+    assert out["idle"]["run"] and not out["idle"]["off"] and "Run now" in out["idle"]["says"]
+    assert "waits in line" not in out["idleTable"]
+    assert out["stopping"]["run"] and out["stopping"]["off"], out["stopping"]

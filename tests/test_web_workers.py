@@ -84,6 +84,13 @@ if mode == "no-model":
     print("The intake phase needs a model, and the model set for research cannot be used "
           "because no Anthropic credentials were found: set ANTHROPIC_API_KEY.", flush=True)
     sys.exit(3)
+if mode == "until-go":
+    # Works until the test lets it end, and then ends as a worker does that is done.
+    ready()
+    while not (root / "go").exists():
+        time.sleep(0.02)
+    (root / "go").unlink()
+    sys.exit(0)
 if mode == "die":
     write_state("running", "running")
     ready()
@@ -1241,6 +1248,14 @@ def test_default_command_is_the_packages_own_cli(tmp_path, monkeypatch):
         str(root),
         "E2",
         "E1",
+    ]
+    # With ``queue`` the worker goes on with what is approved while it runs.
+    assert default_command("run", root, {"experiments": ["E2"], "queue": True}) == [
+        *base,
+        "run",
+        str(root),
+        "E2",
+        "--queue",
     ]
     assert default_command("write", root, {"template": "cvpr2025", "model": "m"}) == [
         *base,
@@ -2486,3 +2501,165 @@ def test_a_start_waits_for_the_runs_of_a_worker_it_finds_dead_itself(script, pro
 def test_the_worker_lock_has_the_engines_name():
     engine = pytest.importorskip("paper_orchestra.research.engine")
     assert workers_module.WORKER_LOCK_FILE == engine.WORKER_LOCK_FILE == LOCK_FILE
+
+
+# ---------------------------------------------------------------------------
+# A run that was asked for while the project's worker is at work
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lined(script):
+    """A supervisor whose workers work until ``<project>/go`` appears and then end with
+    code 0.  ``lined.calls`` are the workers it started, ``lined.waiting`` is what the
+    project's line of approved experiments holds when it is looked at."""
+    calls: list[tuple[str, dict]] = []
+    waiting: list[str] = []
+
+    def launcher(kind, root, options):
+        calls.append((kind, dict(options)))
+        return worker_command(script, kind, root, options.get("mode", "until-go"))
+
+    workers = Workers(
+        launcher=launcher,
+        grace=10.0,
+        settle_runs=lambda root: None,
+        waiting_runs=lambda root: list(waiting),
+    )
+    workers.calls, workers.waiting = calls, waiting
+    yield workers
+    workers.shutdown(grace=1.0)
+
+
+def ready_again(project: Project) -> None:
+    """Wait for a worker that started just now, and forget that it said so."""
+    wait_for(lambda: (project.root / "ready").exists(), message="the worker to be ready")
+    (project.root / "ready").unlink()
+
+
+def let_it_end(workers: Workers, project: Project, pid: int) -> None:
+    (project.root / "go").write_text("")
+    wait_for(lambda: not process_exists(pid), message="the worker to end")
+
+
+def test_a_run_asked_for_with_no_worker_starts_one_that_goes_on_with_the_line(project, lined):
+    status = lined.run_in_line(project.root, "E1")
+
+    assert lined.calls == [("run", {"experiments": ["E1"], "queue": True})]
+    assert (status["state"], status["kind"], status["queue"]) == ("running", "run", True)
+    assert status["waits"] is None and status["then_runs"] == []
+    record = json.loads((project.root / RECORD_FILE).read_text())
+    assert record["options"] == {"experiments": ["E1"], "queue": True}
+    assert lined.status(project.root)["queue"] is True
+    assert lined.status(project.root.parent / "other")["queue"] is False  # idle
+
+
+def test_a_run_asked_for_while_the_queue_runs_waits_in_line_and_starts_nothing(project, lined):
+    first = lined.run_in_line(project.root, "E1")
+    ready_again(project)
+
+    second = lined.run_in_line(project.root, "E2")
+    third = lined.run_in_line(project.root, "E3")
+
+    # Nothing is refused and nothing is started: the worker at work goes on with them.
+    assert second["waits"] == "line" and third["waits"] == "line"
+    assert second["pid"] == first["pid"] and len(lined.calls) == 1
+    assert third["then_runs"] == ["E2", "E3"]
+
+    # It ran them (nothing waits any more): its end starts nothing.
+    let_it_end(lined, project, first["pid"])
+    wait_for(lambda: lined.status(project.root)["state"] == "idle")
+    time.sleep(0.3)
+    assert len(lined.calls) == 1 and lined.status(project.root)["state"] == "idle"
+
+
+def test_an_approval_that_came_after_the_workers_last_look_is_run_all_the_same(project, lined):
+    """The worker that runs the line looked at it for the last time, found nothing, and
+    is on its way out while the person approves E2: the server still sees a worker, and
+    says the experiment waits in line.  Without anything else it would wait for ever."""
+    first = lined.run_in_line(project.root, "E1")
+    ready_again(project)
+    assert lined.run_in_line(project.root, "E2")["waits"] == "line"
+    lined.waiting[:] = ["E3", "E2"]  # E2 still waits when the worker has ended
+
+    let_it_end(lined, project, first["pid"])
+
+    wait_for(lambda: len(lined.calls) == 2, message="a worker for what still waits")
+    # Started for the experiment that was asked for; it goes on with the rest by itself.
+    assert lined.calls[1] == ("run", {"experiments": ["E2"], "queue": True})
+    ready_again(project)
+    status = lined.status(project.root)
+    assert (status["state"], status["kind"], status["then_runs"]) == ("running", "run", [])
+
+
+def test_a_run_asked_for_during_a_phase_starts_by_itself_when_the_phase_has_ended(project, lined):
+    phase = lined.start(project.root, "advance")
+    ready_again(project)
+
+    status = lined.run_in_line(project.root, "E1")
+
+    assert status["waits"] == "worker" and status["kind"] == "advance"
+    assert status["queue"] is False and status["then_runs"] == ["E1"]
+    assert lined.status(project.root)["then_runs"] == ["E1"]
+    assert len(lined.calls) == 1
+    lined.waiting[:] = ["E1"]  # the phase was not the run phase: E1 still waits
+
+    let_it_end(lined, project, phase["pid"])
+
+    wait_for(lambda: len(lined.calls) == 2, message="the run to start by itself")
+    assert lined.calls[1] == ("run", {"experiments": ["E1"], "queue": True})
+
+
+def test_a_run_the_phase_ran_itself_is_not_started_again(project, lined):
+    phase = lined.start(project.root, "advance")
+    ready_again(project)
+    assert lined.run_in_line(project.root, "E1")["waits"] == "worker"
+    # The run phase of that worker ran E1: nothing waits when it has ended.
+
+    let_it_end(lined, project, phase["pid"])
+    wait_for(lambda: lined.status(project.root)["state"] == "idle")
+    time.sleep(0.3)
+
+    assert len(lined.calls) == 1 and lined.status(project.root)["state"] == "idle"
+
+
+def test_a_stop_ends_the_line_nothing_is_started_after_it(project, lined):
+    phase = lined.start(project.root, "advance", mode="sleep")
+    wait_for(lambda: (project.root / "ready").exists())
+    assert lined.run_in_line(project.root, "E1")["waits"] == "worker"
+    lined.waiting[:] = ["E1"]
+
+    stopping = lined.stop(project.root)
+    assert stopping["state"] == "stopping" and stopping["then_runs"] == []
+    # While it is being stopped a run cannot be put in line behind it: said as busy.
+    with pytest.raises(WorkerBusy):
+        lined.run_in_line(project.root, "E2")
+    wait_for(lambda: not process_exists(phase["pid"]))
+    wait_for(lambda: lined.status(project.root)["state"] == "idle")
+    time.sleep(0.3)
+
+    assert len(lined.calls) == 1 and lined.status(project.root)["state"] == "idle"
+
+
+def test_a_plain_run_worker_from_a_terminal_is_told_from_one_that_runs_the_queue(
+    project, script, make_workers
+):
+    """`research run --queue` writes ``queue`` with its name in state.json; a server that
+    finds such a worker says that it goes on with what is approved."""
+    for queue in (False, True):
+        worker = subprocess.Popen(
+            worker_command(script, "run", project.root, "until-go"), start_new_session=True
+        )
+        try:
+            wait_for(lambda: (project.root / "ready").exists())
+            (project.root / "ready").unlink()
+            name = {"pid": worker.pid, "host": HOST, "started": "2026-11-17T09:00:00Z"}
+            name["heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            state = {"schema": 1, "status": "checkpoint", "worker": {**name, "queue": queue}}
+            (project.root / "state.json").write_text(json.dumps(state))
+            status = make_workers().status(project.root)
+            assert (status["state"], status["kind"], status["adopted"]) == ("running", "run", True)
+            assert status["queue"] is queue
+        finally:
+            (project.root / "go").write_text("")
+            worker.wait(timeout=30)

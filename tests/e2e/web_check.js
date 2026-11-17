@@ -3158,6 +3158,75 @@ CHECKS.large = async ({ page, pid, large }) => {
 
 /* hostile text: titles and bodies with markup, scripts, odd Unicode and words longer than any
    column never run and never push a view wider than the window */
+/* Experiments approved while another runs wait in line: nothing is refused, each answer says
+   behind what the experiment waits, the list shows the run that is going and the ones that
+   wait in the order they run in, and all of them run with no further press. (In the second
+   project, so that the experiments made for this do not get in the way of the other checks.) */
+CHECKS.queue = async ({ page, pid, large }) => {
+  const id = large || pid;
+  await idle(id);
+  const ids = [];
+  for (const n of [1, 2, 3]) {
+    const made = await api('POST', '/api/projects/' + id + '/pages', { kind: 'experiment', title: 'Line of runs, number ' + n, body: '## Objective\n\nTake a few seconds, so that the others wait.\n', fields: { mode: 'script', timeout_seconds: 120, summary: 'Waits a few seconds and writes one number.' } });
+    if (!ok(made.status < 300 && made.data && made.data.page && made.data.page.id, 'an experiment for the line can be written: ' + made.status)) return;
+    ids.push(made.data.page.id);
+    await api('PUT', '/api/projects/' + id + '/experiments/' + made.data.page.id + '/code/main.py', { text: 'import json, time\n\ntime.sleep(' + (n === 1 ? 6 : 2) + ')\njson.dump({"n": ' + n + '}, open("metrics.json", "w"))\nprint("done")\n' });
+  }
+  const [a, b, c] = ids;
+  /* what the project already holds approved (the demonstration comes with one) was approved
+     before these: it is ahead of them in the line, and the sentences name it */
+  const earlier = (((await api('GET', '/api/projects/' + id + '/experiments')).data || {}).experiments || []).filter((row) => row.review === 'accepted' && (row.state === 'approved' || row.state === 'queued') && !row.will_not_run).map((row) => row.id);
+  const ahead = earlier.length ? earlier[earlier.length - 1] : a;
+  const starts = [];
+  const listen = (request) => { if (request.method() === 'POST' && /\/(advance|experiments\/[^/]+\/run)$/.test(request.url())) starts.push(request.url()); };
+  page.on('request', listen);
+  const approveAndRun = async (eid) => {
+    await open(page, '#/p/' + id + '/experiments/' + eid, '.approve [data-act="approve"][data-start]');
+    await page.click('.approve [data-act="approve"][data-start]');
+  };
+  const toast = async (pattern, what) => { await until(page, (source) => new RegExp(source).test((document.querySelector('#toast') || {}).textContent || ''), pattern, 10000, what); return text(page, '#toast'); };
+  await approveAndRun(a);
+  await toast(a + ' is approved; its run is starting', 'the first approval starts its run');
+  /* the second and the third are approved while the first runs */
+  await approveAndRun(b);
+  const second = await toast(b + ' is approved; it runs after ' + ahead + '\\.', 'the second approval says behind what it waits');
+  ok(!/could not start|already has a worker|was not approved/.test(second), 'approving while a run is under way is not an error: ' + second.trim());
+  ok((await count(page, '#toast .toast-error')) === 0, 'and is not said as one');
+  await until(page, () => !!document.querySelector('.callout[data-in-line]'), null, 8000, 'the experiment says that it waits in line');
+  const callout = await text(page, '.callout[data-in-line]');
+  ok(new RegExp('waits in line: it runs after ' + ahead + ', with nothing more to press').test(callout), 'its page says behind what, and that nothing more is to be pressed: ' + callout.replace(/\s+/g, ' ').trim().slice(0, 160));
+  ok((await count(page, '.callout[data-in-line] [data-act="run-now"]')) === 0 && (await count(page, '.callout[data-in-line] [data-act="cancel-run"]')) === 1, 'no button to run it is left to press; taking the approval back still is');
+  await approveAndRun(c);
+  await toast(c + ' is approved; it runs after ' + b + '\\.', 'the third approval says that it waits behind the second');
+  /* the list: the run that is going first, then the line in the order it runs in */
+  await open(page, '#/p/' + id + '/experiments', '.ex-row');
+  await until(page, (n) => document.querySelectorAll('.ex-sub [data-in-line]').length === n, earlier.length + 2, 8000, 'the list shows the ones that wait');
+  const listed = await page.evaluate(() => Array.from(document.querySelectorAll('.ex-row')).map((row) => ({ id: (row.querySelector('.ex-id b') || {}).textContent, sub: (row.querySelector('.ex-sub') || {}).textContent.replace(/\s+/g, ' ').trim(), line: (row.querySelector('.ex-sub [data-in-line]') || { dataset: {} }).dataset.inLine || '' })));
+  const at = (eid) => listed.findIndex((row) => row.id === eid);
+  ok(at(a) >= 0 && at(a) < at(b) && at(b) < at(c), 'the run that is going comes first, then the ones that wait, in the order they run in: ' + [a, b, c].map(at).join(', '));
+  const nth = earlier.length + 1;
+  ok(listed[at(b)].line === String(nth) && new RegExp('waits in line, no\\. ' + nth + ' · runs after ' + ahead).test(listed[at(b)].sub), 'the one approved second says where in the line it is: ' + listed[at(b)].sub);
+  ok(listed[at(c)].line === String(nth + 1) && new RegExp('waits in line, no\\. ' + (nth + 1) + ' · runs after ' + b).test(listed[at(c)].sub), 'and so does the third: ' + listed[at(c)].sub);
+  await shot(page, 'experiments-in-line');
+  /* all three run, one after the other, and nothing else is pressed */
+  const end = Date.now() + 120000 * SLOW;
+  let states = [];
+  while (Date.now() < end) {
+    const rows = ((await api('GET', '/api/projects/' + id + '/experiments')).data || {}).experiments || [];
+    states = ids.map((eid) => (rows.find((row) => row.id === eid) || {}).state);
+    if (states.every((state) => state === 'succeeded')) break;
+    await sleep(500);
+  }
+  ok(states.every((state) => state === 'succeeded'), 'all three ran with no further press: ' + states.join(', '));
+  ok(starts.length === 0, 'the page asked for no start besides the three approvals: ' + starts.length);
+  const order = [];
+  for (const eid of ids) order.push((((await api('GET', '/api/projects/' + id + '/experiments/' + eid)).data.runs || [])[0] || {}).started || '');
+  ok(order[0] && order[0] <= order[1] && order[1] <= order[2], 'in the order they were approved in: ' + order.join(' '));
+  page.off('request', listen);
+  await idle(id);
+  await until(page, () => document.querySelectorAll('.ex-sub [data-in-line]').length === 0, null, 15000, 'nothing is shown as waiting when the line has run');
+};
+
 CHECKS.hostile = async ({ page, pid }) => {
   const LONG = 'Pneumonoultramicroscopicsilicovolcanoconiosis'.repeat(5);
   const ODD = '\u202Eevil\u202C Z\u0351\u036B\u0343a\u0363\u0346l\u0367\u034Ago\u0310\u033D \uD83D\uDE80 <img src=x onerror="window.__ran=1"> <script>window.__ran=2</script> &amp; "q" \'s\' ';
@@ -3242,7 +3311,7 @@ CHECKS.hostile = async ({ page, pid }) => {
   const page = await context.newPage();
   watch(page, () => current);
   /* (`nomodel` switches the scripted model off for the whole server while it looks: it comes before any check that starts agents) */
-  const order = ['screens', 'phone', 'shell', 'nomodel', 'decisions', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
+  const order = ['screens', 'phone', 'shell', 'nomodel', 'decisions', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'queue', 'composer', 'hostile'];
   const unknown = (ONLY || []).concat(SKIP).filter((name) => order.indexOf(name) < 0);
   if (unknown.length) { console.error('not a check: ' + unknown.join(', ') + ' (the checks are: ' + order.join(', ') + '; separate several with commas)'); await browser.close(); process.exit(2); }
   /* The checks after `decisions` count the proposals on the tab of the inbox, as they did

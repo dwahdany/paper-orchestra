@@ -100,6 +100,8 @@ class FakeEngine:
         self.project = project
         self.options = options
         self.calls: list[tuple[Any, ...]] = []
+        self.drains = False
+        self.stop_requested = False
         FakeEngine.instances.append(self)
 
     def advance(self, *, phase: str | None = None, instruction: str | None = None) -> dict:
@@ -124,6 +126,8 @@ class FakeEngine:
         self.calls.append(("run_experiment", experiment_ref))
         self.project.emit("run.started", f"{experiment_ref} started on local.", phase="run")
         outcome = FakeEngine.runs[experiment_ref]
+        if callable(outcome):
+            outcome = outcome()  # what happens to the project while the run is under way
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -1349,6 +1353,170 @@ def test_run_takes_named_experiments_and_exits_with_1_when_one_did_not_succeed(a
     out = flat(result.stdout)
     assert "E1 run 2 failed after 4.2 s: exit code 1: NameError: name 'lr' is not defined" in out
     assert "experiments/E1/runs/2/log.txt" in out
+
+
+# -- run --queue: what is approved while a run is under way runs with no further command --
+
+
+@pytest.fixture
+def lined(project: Project, monkeypatch) -> Project:
+    """E1, E2 and E3 accepted, with code; ``approve_now(project, "E2")`` approves one as
+    the person does, a minute after the approval before it."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import format_stamp
+
+    clock = iter(datetime(2026, 11, 17, 9, minute, tzinfo=UTC) for minute in range(60))
+    monkeypatch.setattr(experiments, "_now", lambda: format_stamp(next(clock)))
+    project.review("E1", "accept")
+    for title in ("Warmup length sweep", "Batch size sweep"):
+        project.create_page("experiment", title, "## Objective\n\nSweep.\n", author="human")
+    for name in ("E1", "E2", "E3"):
+        experiments.write_code(project, name, {"main.py": "print('x')\n"}, author="human")
+    return project
+
+
+def approve_now(project: Project, name: str) -> None:
+    from paper_orchestra.research import experiments
+
+    experiments.approve(project, name, backend="local")
+
+
+def test_run_with_queue_goes_on_with_what_is_approved_while_a_run_is_under_way(lined, engine):
+    approve_now(lined, "E1")
+
+    def first():
+        approve_now(lined, "E3")  # approved while E1 runs, and before E2 is
+        return run_record("E1", 1, "succeeded")
+
+    def third():
+        approve_now(lined, "E2")
+        return run_record("E3", 1, "succeeded")
+
+    engine.runs = {"E1": first, "E3": third, "E2": run_record("E2", 1, "succeeded")}
+
+    result = invoke("run", str(lined.root), "E1", "--queue")
+
+    assert result.exit_code == 0, result.output
+    assert engine.instances[0].drains is True
+    assert engine.instances[0].calls == [
+        ("run_experiment", "E1"),
+        ("run_experiment", "E3"),
+        ("run_experiment", "E2"),
+    ]
+    out = flat(result.stdout)
+    assert "E3 was approved meanwhile and waits in line: it runs next." in out
+    assert out.index("E1 run 1 succeeded") < out.index("E3 run 1 succeeded")
+    assert out.index("E3 run 1 succeeded") < out.index("E2 run 1 succeeded")
+
+
+def test_a_plain_run_runs_what_it_was_given_and_nothing_approved_meanwhile(lined, engine):
+    approve_now(lined, "E1")
+
+    def first():
+        approve_now(lined, "E2")
+        return run_record("E1", 1, "succeeded")
+
+    engine.runs = {"E1": first, "E2": run_record("E2", 1, "succeeded")}
+
+    result = invoke("run", str(lined.root), "E1")
+
+    assert result.exit_code == 0, result.output
+    assert engine.instances[0].calls == [("run_experiment", "E1")]
+    assert engine.instances[0].drains is False
+    assert "meanwhile" not in result.stdout
+
+
+def test_the_queue_runs_what_waits_in_the_order_of_the_approvals_and_tries_each_once(lined, engine):
+    for name in ("E2", "E3", "E1"):
+        approve_now(lined, name)
+    # E2 cannot run and stays approved; E3 fails; neither keeps the others from running,
+    # and neither is tried a second time.
+    engine.runs = {
+        "E2": ProjectError("E2 cannot run: the experiment budget is spent."),
+        "E3": run_record("E3", 1, "failed", error="exit code 1"),
+        "E1": run_record("E1", 1, "succeeded"),
+    }
+
+    result = invoke("run", str(lined.root), "--queue")
+
+    assert result.exit_code == 1
+    assert [call[1] for call in engine.instances[0].calls] == ["E2", "E3", "E1"]
+    assert "E2 cannot run: the experiment budget is spent." in flat(result.stderr)
+    assert "E1 run 1 succeeded" in flat(result.stdout)
+
+
+def test_a_stop_request_ends_the_queue(lined, engine):
+    approve_now(lined, "E1")
+    approve_now(lined, "E2")
+
+    def stopped():
+        # What the engine does on a stop request: the run goes back to the queue, its
+        # record is returned, and the engine says that a stop was asked.
+        engine.instances[0].stop_requested = True
+        lined.set_state("E1", "queued", by="system")
+        return run_record("E1", 1, "cancelled", error="The worker was stopped.", requeued=True)
+
+    engine.runs = {"E1": stopped, "E2": run_record("E2", 1, "succeeded")}
+
+    result = invoke("run", str(lined.root), "E1", "--queue")
+
+    assert result.exit_code == cli.INTERRUPTED
+    assert engine.instances[0].calls == [("run_experiment", "E1")]
+    assert "Stopped. The run that was in flight is back in the queue" in flat(result.stderr)
+
+
+def test_a_run_the_person_cancelled_does_not_end_the_queue(lined, engine):
+    approve_now(lined, "E1")
+    approve_now(lined, "E2")
+    engine.runs = {
+        "E1": run_record("E1", 1, "cancelled", error="Cancelled by you."),
+        "E2": run_record("E2", 1, "succeeded"),
+    }
+
+    result = invoke("run", str(lined.root), "E1", "--queue")
+
+    assert [call[1] for call in engine.instances[0].calls] == ["E1", "E2"]
+    assert result.exit_code == 1 and "E2 run 1 succeeded" in flat(result.stdout)
+
+
+def worker_in_state(project: Project, **fields: Any) -> None:
+    """A live worker's name in ``state.json`` (this process, a fresh heartbeat)."""
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    worker = {"pid": os.getpid(), "host": os.uname().nodename, "started": now, "heartbeat": now}
+    state = fields.pop("state", {})
+    write_json(project.root / "state.json", {**state, "worker": {**worker, **fields}})
+
+
+def test_approve_says_behind_what_the_experiment_waits_when_a_worker_runs_the_queue(lined):
+    approve_now(lined, "E1")
+    lined.set_state("E1", "queued", by="system")
+    lined.set_state("E1", "running", by="system")
+    worker_in_state(lined, queue=True)
+
+    first = flat(invoke("approve", str(lined.root), "E2", "--backend", "local").stdout)
+    second = flat(invoke("approve", str(lined.root), "E3", "--backend", "local").stdout)
+
+    assert "E2 is approved to run on local" in first
+    assert "It runs after E1: the worker that is running experiments goes on with it" in first
+    assert "It runs after E2: " in second and "no command is needed" in second
+    assert "research run" not in first
+
+
+def test_approve_says_what_a_worker_of_another_kind_means_for_the_run(lined):
+    idle = flat(invoke("approve", str(lined.root), "E1", "--backend", "local").stdout)
+    assert f"`paper-orchestra research run {lined.root} E1` runs it now" in idle
+
+    # A phase is running: its run phase may still come; otherwise a command runs it.
+    worker_in_state(lined, state={"status": "running", "phase": "design"})
+    phase = flat(invoke("approve", str(lined.root), "E2", "--backend", "local").stdout)
+    assert "A worker is at work on this project: its run phase runs the experiment if" in phase
+    assert f"`paper-orchestra research run {lined.root} E2` runs it" in phase
+
+    # A plain `research run` that was started for other experiments does not go on.
+    worker_in_state(lined)
+    plain = flat(invoke("approve", str(lined.root), "E3", "--backend", "local").stdout)
+    assert "does not go on to this one" in plain
+    assert f"`paper-orchestra research run {lined.root} E3` runs it" in plain
 
 
 def test_run_prints_a_few_metrics_and_points_to_the_record_for_the_rest(approved, engine):

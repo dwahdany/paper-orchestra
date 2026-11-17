@@ -54,7 +54,7 @@ import socket
 import stat
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -891,6 +891,10 @@ class Engine:
         self._unpriced: list[str] = []
         #: Experiments the run phase in flight has executed.
         self._ran = 0
+        #: Whether whoever drives this engine goes on with every experiment that is
+        #: approved while it runs one (`research run --queue`); written with the
+        #: worker's name, for those who approve meanwhile.
+        self.drains = False
         #: What was wrong with state.json when this worker started, before it wrote the
         #: file anew (:func:`state_problem`); ``None`` when nothing was.
         self._lost: str | None = None
@@ -927,6 +931,12 @@ class Engine:
         """A copy of the state as this engine last wrote it."""
         with self._lock:
             return copy.deepcopy(self._state)
+
+    @property
+    def stop_requested(self) -> bool:
+        """Whether this engine was asked to stop and has not begun other work since: a
+        caller that runs experiments one after the other ends its line on it."""
+        return self._stop.is_set()
 
     def stop(self) -> None:
         """Ask a running ``advance()`` to stop.
@@ -1098,6 +1108,10 @@ class Engine:
                     "started": started,
                     "heartbeat": started,
                 }
+                if self.drains:
+                    # `research run --queue`: whoever approves an experiment meanwhile
+                    # can tell that this worker goes on to it.
+                    self._state["worker"]["queue"] = True
                 self._carried = read_carried_usage(self.project.root / USAGE_FILE)
                 self._baseline = self.harness.usage.to_dict()["by_label"]
                 missing = self._carry_recorded_spend()
@@ -2998,13 +3012,28 @@ class Engine:
             "settings.limits.experiment_usd could not limit it."
         ]
 
+    def _waiting_to_run(self, tried: Collection[str] = ()) -> list[ResearchPage]:
+        """The approved experiments the run phase has not tried yet, in the order it
+        runs them: those that wait in line in the order of their approvals (the order
+        the app shows, see ``experiments.waiting_in_line``), then those that read
+        approved and will not run as they stand, which are tried so that the
+        checkpoint says why."""
+        line = experiments.waiting_in_line(self.project, skip=tried)
+        ahead = {page.path for page in line}
+        rest = [
+            page
+            for page in self.project.pages(
+                kind="experiment", review="accepted", state=["approved", "queued"]
+            )
+            if page.path not in tried and page.path not in ahead
+        ]
+        return line + rest
+
     def _run_approved(self, ctx: AgentContext) -> AgentReport:
         """Run every experiment the person approved, one after the other."""
         self._recover()
         self._tidy_hypotheses(release=False)
-        waiting = self.project.pages(
-            kind="experiment", review="accepted", state=["approved", "queued"]
-        )
+        waiting = self._waiting_to_run()
         if not waiting:
             earlier = len(self._new_results())
             if not earlier:
@@ -3039,13 +3068,7 @@ class Engine:
                 notes.append(self._not_run(page, exc))
             # Looked up again after every run: the person may approve one more while
             # another is running, and may cancel or change one that was waiting.
-            waiting = [
-                other
-                for other in self.project.pages(
-                    kind="experiment", review="accepted", state=["approved", "queued"]
-                )
-                if other.path not in tried
-            ]
+            waiting = self._waiting_to_run(tried)
             if record is None:
                 continue
             refused = self._refused_note(page, record)

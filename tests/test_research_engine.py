@@ -2560,6 +2560,84 @@ def test_an_experiment_approved_while_another_runs_is_run_in_the_same_phase(proj
     assert len(project.pages(kind="finding")) == 2
 
 
+def two_experiments_accepted(project: Project, team: Team, backend: FakeBackend) -> None:
+    """E1 and E2 designed and accepted, neither approved."""
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    accept_all(project)
+
+
+def a_minute_between_approvals(monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    from paper_orchestra.research.model import format_stamp
+
+    clock = iter(datetime(2026, 11, 17, 9, minute, tzinfo=UTC) for minute in range(60))
+    monkeypatch.setattr(experiments, "_now", lambda: format_stamp(next(clock)))
+
+
+def test_the_run_phase_runs_what_is_approved_in_the_order_of_the_approvals(
+    project, team, monkeypatch
+):
+    backend = FakeBackend()
+    two_experiments_accepted(project, team, backend)
+    a_minute_between_approvals(monkeypatch)
+    approve(project, "E2", backend)
+    approve(project, "E1", backend)
+    monkeypatch.undo()
+
+    advance(project, team, backend)
+
+    # E2 was approved first: the order the app shows the line in is the order run in.
+    assert [job.parts[-3] for job in backend.jobs] == ["E2", "E1"]
+
+
+def test_a_stop_request_is_still_known_after_the_run_it_ended(project, team):
+    """Whoever runs experiments one after the other (`research run`) asks after each run
+    whether a stop was requested: the run that was stopped returns its record, as any
+    run does, and must not be followed by the next of the line."""
+    backend = FakeBackend()
+    two_experiments_accepted(project, team, backend)
+    approve(project, "E1", backend)
+    approve(project, "E2", backend)
+    engine = make_engine(project, team, backend)
+    assert engine.stop_requested is False
+    backend.before = engine.stop
+
+    engine.run_experiment("E1")
+
+    assert engine.stop_requested is True
+    assert project.page("E1").state in ("queued", "cancelled", "approved")
+    assert project.page("E2").state == "approved"  # nothing went on to it
+
+    # Work that is begun afterwards is not stopped by the old request.
+    backend.before = lambda: None
+    engine.run_experiment("E2")
+    assert engine.stop_requested is False and project.page("E2").state == "succeeded"
+
+
+def test_a_worker_that_goes_on_with_what_is_approved_says_so_with_its_name(project, team):
+    backend = FakeBackend()
+    two_experiments_accepted(project, team, backend)
+    approve(project, "E1", backend)
+    approve(project, "E2", backend)
+    seen: list[dict] = []
+    backend.before = lambda: seen.append(read_state(project)["worker"])
+
+    plain = make_engine(project, team, backend)
+    plain.run_experiment("E1")
+    draining = make_engine(project, team, backend)
+    draining.drains = True
+    draining.run_experiment("E2")
+
+    # `research run --queue` is told from a plain `research run` by who approves meanwhile.
+    assert "queue" not in seen[0] and seen[1]["queue"] is True
+    assert seen[1]["pid"] == os.getpid() and read_state(project)["worker"] is None
+
+
 def test_a_page_deleted_during_its_session_does_not_fail_the_phase(project, team, backend):
     advance(project, team, backend)
     accept_all(project)

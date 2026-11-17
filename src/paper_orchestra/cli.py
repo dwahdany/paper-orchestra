@@ -39,7 +39,7 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -2135,12 +2135,8 @@ def research_approve(
         )
     except (ProjectError, ComputeError) as exc:
         _fail(str(exc) + _how_to_accept(opened, experiment), code=1)
-    name, root = page.id or page.path, _quoted(opened.root)
-    _say(
-        f"{name} is approved to run{_approved_as(page)}. `paper-orchestra research run "
-        f"{root} {name}` runs it now; `paper-orchestra research advance {root}` runs "
-        "everything approved and analyses the results."
-    )
+    name = page.id or page.path
+    _say(f"{name} is approved to run{_approved_as(page)}. {_when_it_runs(opened, str(name))}")
     if _grants_model_access(page):
         _say(MODEL_ACCESS_SAID)
     for line in _what_was_approved(opened, page):
@@ -2345,6 +2341,15 @@ def research_run(
             show_default=False,
         ),
     ] = None,
+    queue: Annotated[
+        bool,
+        typer.Option(
+            "--queue",
+            help="After the experiments named (or every approved one), go on with whatever "
+            "is approved meanwhile, in the order of the approvals, until nothing waits. "
+            "The app starts its runs this way.",
+        ),
+    ] = False,
 ) -> None:
     """Run approved experiments now and write their result records.
 
@@ -2353,6 +2358,12 @@ def research_run(
     out; where the agents cannot start, the command says why and exits with code 3,
     as `research advance` does.  `research advance` then analyses the results first.
     One approval is one run: an experiment whose approved run has ended is not run again.
+
+    Without --queue the command runs the experiments it was given (or the ones that
+    were approved when it started) and ends.  With --queue it looks again after every
+    run and goes on with every experiment that is approved by then, so that one
+    approved while another runs needs no second command; each is tried once, and a
+    stop ends the line.
     """
     from paper_orchestra.research.model import ProjectError
 
@@ -2366,6 +2377,11 @@ def research_run(
         kind="experiment", review="accepted", state=["approved", "queued", "running"]
     )
     refs = list(experiments or ()) or [page.id or page.path for page in waiting]
+    if queue and not experiments:
+        # The line as the app shows it: what a dead worker left running first (it is
+        # settled and started again), then what waits, in the order of the approvals.
+        left = [str(page.id or page.path) for page in waiting if page.state == "running"]
+        refs = left + [name for name in _next_in_line(opened, set()) if name not in left]
     if not refs:
         _say(
             "No experiment is approved to run. Approve one with "
@@ -2378,7 +2394,15 @@ def research_run(
         from paper_orchestra.research.engine import Engine, WorkerBusy
 
         engine = Engine(opened)
-        for ref in refs:
+        engine.drains = queue
+        ahead: list[str] = list(refs)
+        tried: set[str] = set()
+        while ahead:
+            ref = ahead.pop(0)
+            tried.add(_experiment_name(opened, ref))
+            # Looked up again after every run: the person may approve one more while
+            # another runs, and may take one back that was waiting.
+            look_again = queue and not ahead
             try:
                 record = engine.run_experiment(ref)
             except WorkerBusy:
@@ -2393,6 +2417,8 @@ def research_run(
                 events.flush()
                 _say(f"Error: {exc}", fg=typer.colors.RED, err=True)
                 outcomes.append(None)
+                if look_again:
+                    ahead = _next_in_line(opened, tried)[:1]
                 continue
             events.flush()
             _say(_run_line(opened, record))
@@ -2408,6 +2434,14 @@ def research_run(
                     "experiment's code; without that, a new run starts from the approved code."
                 )
             outcomes.append(str(record.get("status")))
+            if getattr(engine, "stop_requested", False):
+                # A stop request (the run in flight went back to the queue) ends the
+                # line: nothing else is started.  A run the person cancelled does not.
+                _stopped(opened, "run")
+            if look_again:
+                ahead = _next_in_line(opened, tried)[:1]
+                if ahead:
+                    _say(f"{ahead[0]} was approved meanwhile and waits in line: it runs next.")
     # A run the person cancelled left nothing to analyse.
     if any(outcome in ("succeeded", "failed") for outcome in outcomes):
         _say(
@@ -2417,6 +2451,77 @@ def research_run(
         )
     if any(outcome != "succeeded" for outcome in outcomes):
         raise typer.Exit(1)
+
+
+def _when_it_runs(project: Project, name: str) -> str:
+    """What follows an approval, as things stand: a worker that runs experiments one
+    after the other goes on with it (`research run --queue`, which the app starts), a
+    worker in a phase may still reach it, and with nobody at work a command runs it."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import ProjectError
+
+    root = _quoted(project.root)
+    run = f"`paper-orchestra research run {root} {name}`"
+    alive = False
+    try:
+        state = _engine_state(project)
+        worker = state.get("worker") if isinstance(state.get("worker"), Mapping) else None
+        if worker is not None:
+            from paper_orchestra.research.engine import worker_alive
+
+            alive = worker_alive(state)
+    except (ProjectError, OSError, ValueError):
+        state, worker = {}, None
+    if worker is not None and alive:
+        if worker.get("queue"):
+            try:
+                after = experiments.line(project)["after"].get(name)
+            except (ProjectError, OSError, ValueError):
+                after = None
+            return (
+                f"It runs after {after}: " if after else "It runs next: "
+            ) + "the worker that is running experiments goes on with it, and no command is needed."
+        if state.get("status") == "running":
+            return (
+                "A worker is at work on this project: its run phase runs the experiment "
+                f"if that phase is still to come. If it is not run by the time the worker "
+                f"reaches its checkpoint, {run} runs it."
+            )
+        return (
+            "A worker is running experiments it was started for and does not go on to "
+            f"this one: when it has ended, {run} runs it."
+        )
+    return (
+        f"{run} runs it now; `paper-orchestra research advance {root}` runs "
+        "everything approved and analyses the results."
+    )
+
+
+def _experiment_name(project: Project, ref: str) -> str:
+    """The id of the experiment ``ref`` names (``E4`` for its path, too); ``ref`` as it
+    is when it names none, which the engine says when it is asked to run it."""
+    from paper_orchestra.research.model import ProjectError
+
+    try:
+        page = project.page(ref)
+    except (ProjectError, OSError, ValueError):
+        return str(ref)
+    return str(page.id or page.path)
+
+
+def _next_in_line(project: Project, tried: Collection[str]) -> list[str]:
+    """The experiments that wait for their run now and were not tried by this command,
+    in the order of their approvals.  The project is read again: another process (the
+    app, a second terminal) is what approves one while this command runs."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.model import ProjectError
+
+    try:
+        project.reload()
+        waiting = experiments.waiting_in_line(project)
+    except (ProjectError, OSError, ValueError):
+        return []
+    return [str(page.id) for page in waiting if str(page.id) not in tried]
 
 
 def _did_to_the_code(as_run: Mapping[str, Any]) -> str:

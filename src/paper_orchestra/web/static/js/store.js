@@ -260,7 +260,7 @@ export class Store {
     const row = this.server.experiments.find((r) => r.id === eid);
     if (!row) return null;
     const run = row.last_run || {};
-    return [row.updated, row.review, row.state, row.runs, run.status, run.finished, (run.repairs || []).length, row.interrupted ? 'interrupted' : '', row.cancel_does || ''].join('|');
+    return [row.updated, row.review, row.state, row.runs, run.status, run.finished, (run.repairs || []).length, row.interrupted ? 'interrupted' : '', row.cancel_does || '', row.in_line ? row.in_line.waits + ' ' + row.in_line.position + ' ' + (row.in_line.after || '') : ''].join('|');
   }
   /** GET .../experiments/{eid} takes up to half a second: only for the experiment that is open. */
   experiment(eid) {

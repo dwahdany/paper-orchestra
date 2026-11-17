@@ -18,6 +18,22 @@ const GROUPS = [
   ['Finished', (x) => x.review === 'accepted' && (x.state === 'succeeded' || x.state === 'cancelled')],
   ['Rejected', (x) => x.review === 'rejected'],
 ];
+/** How an approved experiment gets its run while the project's worker is at work, in a few
+    words (`in_line` of its row, the server's word): behind which experiment it waits in the
+    line of a worker that runs one after the other, or that its run starts by itself when the
+    worker at work has ended. Empty when nothing runs it until the person continues. */
+export function lineWords(x) {
+  const l = x && x.in_line;
+  if (!l) return '';
+  if (l.waits === 'line') return l.after ? 'runs after ' + l.after : 'runs next';
+  return 'starts by itself when the work under way is done' + (l.after && l.position > 1 ? ', after ' + l.after : '');
+}
+/** The experiments of one group in the order they are shown in: those that are being run and
+    those that wait come in the order they run in (the run that is going, then the line by
+    its positions, then what waits for the person to continue); the others as they are listed. */
+const RUN_GROUP = 'Approved, queued and running';
+const rank = (x) => (x.state === 'running' ? 0 : x.in_line ? x.in_line.position : 1e6);
+const inOrder = (g, list) => (g[0] === RUN_GROUP ? list.map((x, i) => [x, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map((p) => p[0]) : list);
 /** The heading an experiment is listed under, in the table and in the rail. */
 export const groupName = (x) => (GROUPS.find((g) => g[1](x)) || [''])[0];
 /** Where an experiment stands, in the few words a narrow list has room for: its state as
@@ -26,6 +42,7 @@ export function standingWords(x) {
   if (x.review === 'proposed') return 'proposed · ' + agentName(x.author);
   if (x.review === 'rejected') return 'rejected';
   const state = shownState(x) || 'planned', won = successWords(x);
+  if ((x.state === 'approved' || x.state === 'queued') && !lapsed(x) && x.in_line) return state + ' · ' + lineWords(x);
   return won ? state + '; ' + won : state;
 }
 const IMAGE = /\.(png|jpe?g|gif|webp|svg)$/i;
@@ -46,6 +63,7 @@ function subline(store, x) {
   if (x.review === 'proposed') return html`waiting for you · proposed ${ago(proposedAt(x))}`;
   if (x.state === 'planned' || !x.state) return (x.meta || {}).state_reason ? html`<span class="t-prop">back to planned · ${plain(x.meta.state_reason)}</span>` : html`accepted · runs only after you approve it`;
   if (lapsed(x)) return html`<span class="t-prop">will not run · ${whyNot(x.will_not_run)} · approve it again</span>`;
+  if ((x.state === 'approved' || x.state === 'queued') && x.in_line) return html`<span data-in-line="${x.in_line.position}">${x.state} · ${x.in_line.waits === 'line' ? 'waits in line, no. ' + x.in_line.position + ' · ' : ''}${lineWords(x)}</span>`;
   if (x.state === 'approved') return html`approved · runs first when you continue, or now`;
   if (x.state === 'queued') return html`queued · runs first when you continue, or now`;
   if (x.state === 'running' && x.interrupted) return html`<span class="t-prop">interrupted · the worker that ran it is gone · run it again, or cancel it</span>`;
@@ -500,9 +518,16 @@ function detailHTML(store, page, route) {
       <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Look and approve again…</button>
         ${cancelButton(eid, does, {})}</div></section>`;
   } else if (page.state === 'approved' || page.state === 'queued') {
-    top = html`<section class="callout"><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
-      <p>${busy ? held : 'It runs first, and is analysed, when you continue the project; or run it now.'}</p>
-      <div class="row"><button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${busy || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Starting…' : 'Run now'}</button><button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
+    /* a worker is at work: the experiment waits in line and runs with nothing more to press
+       (the server's word, from the list read with the page's state), or a press arranges that */
+    const inLine = row.in_line !== undefined ? row.in_line : data.page && data.page.state === page.state ? data.in_line : null;
+    const canFollow = busy && !inLine && worker.state === 'running' && worker.verified !== false;
+    const waits = !inLine ? '' : inLine.waits === 'line'
+      ? html`It waits in line${inLine.after ? html`: it runs after <b>${inLine.after}</b>` : ': it runs next'}, with nothing more to press. The worker that is running experiments goes on with every approved one, in the order you approved them.`
+      : html`A run of it is asked for: it starts by itself when the work under way is done${inLine.after && inLine.position > 1 ? ', after ' + inLine.after : ''} (or in the agents' run phase, if that comes first).`;
+    top = html`<section class="callout"${inLine ? html` data-in-line="${inLine.position}"` : ''}><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
+      <p>${inLine ? waits : canFollow ? 'The agents are at work. Their run phase runs it if that is still to come; press the button and it also starts by itself when they are done.' : busy ? held : 'It runs first, and is analysed, when you continue the project; or run it now.'}</p>
+      <div class="row">${inLine ? '' : html`<button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${(busy && !canFollow) || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Starting…' : canFollow ? 'Run when they are done' : 'Run now'}</button>`}<button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
         ${cancelButton(eid, does, {})}</div></section>`;
   } else if (page.state === 'running' && latest && latest.status === 'running') top = liveHTML(store, page, data, latest, does);
   else if (page.review === 'accepted' && !runs.length && (page.state === 'cancelled' || page.state === 'failed' || page.state === 'succeeded') && app.ui.reapprove !== eid) {
@@ -535,7 +560,7 @@ export const experimentsView = {
     }
     if (!cur) {
       const rows = GROUPS.map((g) => {
-        const list = exps.filter(g[1]);
+        const list = inOrder(g, exps.filter(g[1]));
         if (!list.length) return '';
         return html`<tr class="ex-g"><th colspan="7">${g[0]}<span>${list.length}</span></th></tr>${list.map((x) => html`
           <tr class="ex-row r-${x.review}${related(x) ? ' rel' : ''}" data-go="${link({ view: 'experiments', sel: x.path, sub: '' })}">
@@ -555,7 +580,7 @@ export const experimentsView = {
     }
     /* one experiment open: a rail of all experiments, and the detail */
     const rail = GROUPS.map((g) => {
-      const list = exps.filter(g[1]);
+      const list = inOrder(g, exps.filter(g[1]));
       if (!list.length) return '';
       return html`<div class="idx-group"><h3>${g[0]}<span>${list.length}</span></h3>${list.map((x) => html`
         <a class="idx idx-2 r-${x.review}${x.path === cur.path ? ' cur' : ''}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}"${x.path === cur.path ? raw(' aria-current="page"') : ''}>${pageGlyph(x, 16)}

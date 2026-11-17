@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -3852,3 +3852,47 @@ def test_the_code_of_an_experiment_is_not_read_written_or_run_through_a_link(
         if file.is_file() and file.name != ".run.lock"
     }
     assert after == before and events_of(project, "run.started") == []
+
+
+# -- the line of experiments that wait for their run --------------------------------
+
+
+def one_approval_a_minute(monkeypatch) -> None:
+    """Approvals a minute apart, whatever the clock says: their order is then told by
+    their stamps, as it is when a person approves one experiment after the other."""
+    clock = iter(datetime(2026, 11, 17, 9, minute, tzinfo=UTC) for minute in range(60))
+    monkeypatch.setattr(experiments, "_now", lambda: format_stamp(next(clock)))
+
+
+def test_what_waits_to_run_is_listed_in_the_order_of_the_approvals(project, backend, monkeypatch):
+    one_approval_a_minute(monkeypatch)
+    for _ in range(4):
+        planned(project, {"main.py": script_writing('{"loss": 1}')})
+    for name in ("E3", "E1", "E2"):
+        experiments.approve(project, name, backends={"local": backend})
+
+    # E3 was approved first; E4 is accepted and not approved: it does not wait.
+    assert [page.id for page in experiments.waiting_in_line(project)] == ["E3", "E1", "E2"]
+    tried = {project.page("E1").path}
+    assert [page.id for page in experiments.waiting_in_line(project, skip=tried)] == ["E3", "E2"]
+    line = experiments.line(project)
+    assert line == {
+        "running": [],
+        "waiting": ["E3", "E1", "E2"],
+        "after": {"E3": None, "E1": "E3", "E2": "E1"},
+    }
+
+    # One whose code changed after the approval will not run as it stands: it holds
+    # nobody up, and is not in the line the person is shown.
+    experiments.write_code(project, "E1", {"main.py": "print('other')\n"}, author="human")
+    assert experiments.line(project)["waiting"] == ["E3", "E2"]
+    assert experiments.line(project)["after"]["E2"] == "E3"
+
+    # The one that is being run is who the first of the line comes after.
+    project.set_state("E3", "queued", by="system")
+    project.set_state("E3", "running", by="system")
+    assert experiments.line(project) == {
+        "running": ["E3"],
+        "waiting": ["E2"],
+        "after": {"E2": "E3"},
+    }

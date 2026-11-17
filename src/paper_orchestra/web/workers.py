@@ -82,7 +82,7 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -112,6 +112,7 @@ __all__ = [
     "WorkerError",
     "Workers",
     "default_command",
+    "experiments_in_line",
     "lock_held",
     "read_state",
     "read_state_file",
@@ -226,7 +227,7 @@ def default_command(kind: str, root: Path, options: Mapping[str, Any]) -> list[s
     """The command line of a worker: this interpreter running the package's own CLI.
 
     ``options``: ``phase`` and ``instruction`` for ``advance``; ``experiments`` (ids)
-    for ``run``; ``template`` and ``model`` for ``write``.  Values are passed as ``--name=value`` so
+    and ``queue`` (go on with what is approved meanwhile) for ``run``; ``template`` and ``model`` for ``write``.  Values are passed as ``--name=value`` so
     that a value starting with a dash is still a value.
 
     ``-P`` keeps the directory the server was started in off the module search
@@ -244,6 +245,9 @@ def default_command(kind: str, root: Path, options: Mapping[str, Any]) -> list[s
             command.append(f"--instruction={options['instruction']}")
     elif kind == "run":
         command += [str(experiment) for experiment in options.get("experiments") or ()]
+        if options.get("queue"):
+            # After those it goes on with whatever is approved meanwhile.
+            command.append("--queue")
     elif kind == "write":
         for name in ("template", "model"):
             if options.get(name):
@@ -937,6 +941,15 @@ def settle_stale_runs(root: str | Path) -> list[dict[str, Any]]:
     return list(experiments.recover(project, follow=False))
 
 
+def experiments_in_line(root: str | Path) -> list[str]:
+    """The ids of the experiments that wait for their run in the project in ``root``,
+    in the order they are run in (``experiments.waiting_in_line``)."""
+    from paper_orchestra.research import experiments
+    from paper_orchestra.research.project import Project
+
+    return [str(page.id) for page in experiments.waiting_in_line(Project.open(Path(root)))]
+
+
 def _is_running(run: Any) -> bool:
     return isinstance(run, Mapping) and run.get("status") == "running"
 
@@ -1057,6 +1070,7 @@ class Workers:
         environ: Mapping[str, str] | None = None,
         stop_on_exit: bool = False,
         settle_runs: Callable[[Path], Any] | None = None,
+        waiting_runs: Callable[[Path], Sequence[str]] | None = None,
     ) -> None:
         global _exit_hook_registered
         self.launcher: Launcher = launcher or default_command
@@ -1068,6 +1082,12 @@ class Workers:
         self._entries: dict[Path, _Entry] = {}
         self._last_exit: dict[Path, dict[str, Any]] = {}
         self._settling: dict[Path, threading.Thread] = {}
+        self._waiting_runs: Callable[[Path], Sequence[str]] = waiting_runs or experiments_in_line
+        #: Experiments whose run the person asked for while the project's worker was at
+        #: other work: when that worker ends (and nobody stopped it), a worker is
+        #: started for what still waits.  In memory only: a server that is restarted
+        #: has forgotten it, and the approval then waits for Continue or Run now.
+        self._promised: dict[Path, set[str]] = {}
         #: Projects whose files could not be judged, so that the log says it once.
         self._complained: set[Path] = set()
         self._closed = False
@@ -1115,6 +1135,49 @@ class Workers:
             self._entries[self._key(root)] = entry
             return self._describe(entry)
 
+    def run_in_line(self, root: str | Path, experiment: str) -> dict[str, Any]:
+        """Have an approved experiment run without another request: now, in a worker of
+        its own, or after the work the project's worker is doing.  Returns the worker's
+        status with ``waits``.
+
+        With no worker a ``run`` worker is started for the experiment, which then
+        goes on with whatever else is approved until nothing waits (``waits`` is
+        ``None``).  With a worker at work nothing is started and nothing is
+        refused.  ``waits`` is ``"line"`` when that worker runs experiments and
+        goes on with every approved one (``queue`` in its status, or the run phase
+        of an ``advance``): it reaches this one by itself.  It is ``"worker"`` for any other worker (a phase, a
+        write-up, a run that was started for its experiments only): the
+        experiment is remembered, and when that worker has ended a worker is
+        started for what still waits then.  That also covers a worker that was
+        just past its last look at the line when the approval came.
+
+        ``WorkerBusy`` for a worker that is being stopped (a stop ends the line)
+        and for one this server cannot verify, whose end it cannot see either;
+        ``WorkerError`` when a worker cannot be started.
+        """
+        root = Path(root)
+        self.status(root)
+        self.settled(root, timeout=_SETTLE_WAIT_SECONDS)
+        with self._guard:
+            if self._closed:
+                raise WorkerError("The server is shutting down; no worker was started.")
+            current = self.status(root)
+            key = self._key(root)
+            if current["state"] == "idle":
+                entry = self._launch(root, "run", {"experiments": [experiment], "queue": True})
+                self._entries[key] = entry
+                return {**self._describe(entry), "waits": None}
+            if current["state"] != "running" or current.get("verified") is not True:
+                raise WorkerBusy(current)
+            # Remembered in either case: a worker that drains the line may be past its
+            # last look at it by now, and the one started after it finds what is left.
+            self._promised.setdefault(key, set()).add(str(experiment))
+            in_run_phase = current.get("kind") == "advance" and current.get("phase") == "run"
+            return {
+                **self._describe(self._entries[key]),
+                "waits": "line" if current.get("queue") or in_run_phase else "worker",
+            }
+
     def stop(self, root: str | Path, *, grace: float | None = None) -> dict[str, Any]:
         """Ask the project's worker to stop; returns at once.
 
@@ -1129,6 +1192,8 @@ class Workers:
             entry = self._entries.get(self._key(root))
             if entry is None:
                 return status
+            # A stop ends the line: what was to start after this worker does not.
+            self._promised.pop(self._key(root), None)
             self._begin_stop(entry, self.grace if grace is None else grace)
             return self._describe(entry)
 
@@ -1160,6 +1225,7 @@ class Workers:
                     "it runs."
                 )
             del self._entries[key]
+            self._promised.pop(key, None)
             record = _read_json(root / RECORD_FILE)
             if not isinstance(record, dict) or record.get("host") == self._host:
                 _remove_record(root)  # not the record of another machine's server
@@ -1182,7 +1248,11 @@ class Workers:
         """What the project's worker is doing.
 
         ``{"state": "idle" | "running" | "stopping", "kind", "phase", "pid",
-        "started", "adopted", "host", "log", "verified", "note", "last_exit"}``.
+        "started", "adopted", "host", "log", "verified", "note", "last_exit",
+        "queue", "then_runs"}``.  ``queue`` says the worker runs experiments and
+        goes on with every one that is approved meanwhile; ``then_runs`` are the
+        experiments a worker is started for when this one has ended (see
+        :meth:`run_in_line`).
         ``adopted`` says the worker was found, not started by this server.
         ``verified`` is ``True`` for a worker this server started or has shown to
         be this project's (it can be stopped), ``False`` for one the project's
@@ -1557,7 +1627,9 @@ class Workers:
         entry = _Entry(
             root=root,
             kind=named if isinstance(named, str) and named in KINDS else inferred,
-            options={},
+            # `research run --queue` says with its name that it goes on with what is
+            # approved meanwhile.
+            options={"queue": True} if worker.get("queue") is True else {},
             pid=None,
             started=str(worker.get("started") or ""),
             host=host,
@@ -1732,8 +1804,18 @@ class Workers:
             "interrupted_phase": phase,
             "reason": "needs_model" if needs_model else None,
         }
+        promised = self._promised.pop(key, None)
         if needs_model:
             return  # nothing died, and nothing ran that could have left a run behind
+        if promised and unexpected and not self._closed:
+            # The person asked for a run while this worker was at work: it is started
+            # now, for whatever still waits.  Not after a stop, which ends the line.
+            threading.Thread(
+                target=self._start_what_waits,
+                args=(entry.root, set(promised)),
+                name="run-next",
+                daemon=True,
+            ).start()
         if unexpected and (phase is not None or self._ended_badly(entry, code)):
             self._report_death(entry, code, phase)
         if entry.kind in ("advance", "run") and code != 0:
@@ -1825,6 +1907,26 @@ class Workers:
         except (ProjectError, OSError) as exc:
             log.warning("Could not record the end of the worker in %s: %s", entry.root, exc)
 
+    def _start_what_waits(self, root: Path, promised: Collection[str]) -> None:
+        """Start a worker for the experiments that wait in line, after a worker ended
+        while the person had asked for a run.  On a thread of its own: looking at the
+        line reads pages and code, and starting waits for what the worker left to be
+        settled.  With nothing waiting (the worker that ended ran it, or the person
+        took the approval back) nothing is started.  The worker starts with the first
+        of ``promised`` that still waits, and goes on with everything else in line."""
+        try:
+            waiting = [str(name) for name in self._waiting_runs(root)]
+            asked = [name for name in waiting if name in promised]
+            if asked:
+                self.run_in_line(root, asked[0])
+        except WorkerBusy as exc:
+            # Somebody started a worker first: the run phase of an advance runs what is
+            # approved, and so does a worker that runs experiments.
+            log.info("The runs waiting in %s were not started: %s", root, exc)
+        except Exception:
+            # The approvals stand: Continue, or Run now, runs them.
+            log.exception("Could not start the runs waiting in %s.", root)
+
     def _settle_later(self, root: Path) -> None:
         """Settle, on a thread of its own, the runs the project's dead worker left at
         ``running``.  Not under the lock of the books: recovery reads pages, writes
@@ -1894,6 +1996,8 @@ class Workers:
             "verified": None,
             "note": None,
             "last_exit": self._last_exit.get(self._key(root)),
+            "queue": False,
+            "then_runs": [],
         }
 
     def _describe(self, entry: _Entry) -> dict[str, Any]:
@@ -1911,6 +2015,8 @@ class Workers:
             "verified": entry.unverified is None,
             "note": entry.unverified,
             "last_exit": self._last_exit.get(self._key(entry.root)),
+            "queue": entry.kind == "run" and bool(entry.options.get("queue")),
+            "then_runs": sorted(self._promised.get(self._key(entry.root), ())),
         }
 
 
