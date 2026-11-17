@@ -241,7 +241,8 @@ def test_every_agent_with_a_shell_is_told_to_raise_what_is_the_researchers_choic
         assert "If the choice is the researcher's" in plain
         assert "raise a decision with `mcp__board__ask_decision`" in plain
         assert "a page asks nobody" in plain
-        assert "Raising it is all you can do with a decision" in plain
+        # (That an agent can only ask is said once, in the part both runtimes share.)
+        assert "You can only ask: nothing you write answers a decision" in plain
         assert plain.index("propose it on the board") < plain.index("If the choice is the")
     experimenter = " ".join(prompts.system_prompt("experimenter", index="x", runtime="sdk").split())
     assert "raise a decision with ask_decision that names the experiment as its `page`" in (

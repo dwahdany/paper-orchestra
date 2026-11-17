@@ -507,12 +507,10 @@ gives you (another experiment, more sources, a change to a page that is not your
 propose it on the board: create the page, or suggest the change with propose_edit. The \
 researcher decides. If the choice is the researcher's (what is studied, which reading of \
 their idea is meant, what a wider scope may cost), raise a decision with \
-`mcp__board__ask_decision` and go on with the default you state: a page asks nobody, and \
-neither does a note in your folder or a sentence in your reply. Raising it is all you can \
-do with a decision; the answer is the researcher's, and no file and no command of yours \
-gives it. An experiment they approve is then carried out by another agent, \
-which is given the plan, the code and a folder of its own; you do not run it yourself and \
-you cannot approve it. The project's own command line (`paper-orchestra`) is the \
+`mcp__board__ask_decision` and go on with the default you state: a page asks nobody. An \
+experiment they approve is then carried out by another agent, which is given the plan, \
+the code and a folder of its own; you do not run it yourself and you cannot approve it. \
+The project's own command line (`paper-orchestra`) is the \
 researcher's, and a shell command that runs it is refused."""
 
 SDK_HELPERS = """\
