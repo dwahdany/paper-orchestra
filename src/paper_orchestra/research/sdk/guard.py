@@ -10,7 +10,11 @@ its own:
   the shell can write only inside the agent's own folder, and cannot read the
   person's home directory, the project's directory or the place the identity
   token lies, except for what is named as readable (its own folder, the Python
-  it runs code with).  A write outside the folder does not always fail with an
+  it runs code with).  A file of settings with secrets (``.env``, ``.envrc``,
+  ``*.env``) is named to it as well, which on Linux only holds in the agent's
+  folder and its directory for temporary files: one that lies outside every
+  hidden place (``/srv/app/.env``) can be read by the shell, though not by the
+  file tools.  A write outside the folder does not always fail with an
   error: the sandbox may take it and throw it away, so that the command seems
   to succeed and nothing is changed.  The shell has the web, but not this
   machine's own services: the sandbox refuses link-local addresses (where a
@@ -24,7 +28,8 @@ its own:
   process as the agent's ``PreToolUse`` hook, also for helpers the agent
   starts): built-in tools that write stay inside the agent's folder, the ones
   that read stay out of what the sandbox hides and out of the trees of the
-  system that show processes and devices, the tool that opens a web page does
+  system that show processes and devices, and the ones that search (Grep, Glob)
+  do not start at a directory that has any of that beneath it (``/``, ``/home``), the tool that opens a web page does
   not open this machine's own services, and a shell command that runs the
   project's own command line is refused, with the way that is open instead:
   propose it on the board.  That last refusal reads the text of the command:
@@ -199,6 +204,9 @@ def _temporary_places() -> list[str]:
     return list(dict.fromkeys([tempfile.gettempdir(), *(path for path in named if path)]))
 
 
+#: The names such a file usually has, as patterns for the agent's process and its
+#: sandbox.  (The check before a tool call knows more of them: :func:`_is_env_file`.)
+_ENV_NAMES = (".env", ".env.local", ".envrc", "*.env")
 #: Endings of a file that shows which settings an ``.env`` file takes, without values.
 _ENV_SAMPLES = (".example", ".sample", ".template", ".dist")
 
@@ -337,7 +345,7 @@ class Guard:
         denied = [f"Read(/{place}/**)" for place in credentials if place.suffix == ""]
         denied += [f"Read(/{place})" for place in credentials]
         # (Two spellings: beneath the agent's folder, and anywhere on the machine.)
-        for name in (".env", ".env.local", ".envrc", "*.env"):
+        for name in _ENV_NAMES:
             denied += [f"Read(**/{name})", f"Read(//**/{name})"]
         settings: dict[str, Any] = {"permissions": {"deny": list(dict.fromkeys(denied))}}
         if not self.sandbox:
@@ -357,6 +365,13 @@ class Guard:
                         for place in credentials
                         if not any(_within(place, hidden) for hidden in self.hidden())
                     ),
+                    # A file of settings with secrets outside of that.  On Linux the
+                    # sandbox applies a pattern only where it looks for matches when a
+                    # command starts, which is the agent's folder and its directory for
+                    # temporary files (checked live: `cat` of one there is refused, of
+                    # one in /var/tmp it is not).  Elsewhere the shell can read such a
+                    # file; the file tools cannot, wherever it lies.
+                    *(f"{above}**/{name}" for name in _ENV_NAMES for above in ("", "/")),
                 ],
                 "allowRead": [str(place) for place in self.open_places()],
                 "denyWrite": [str(place) for place in credentials],

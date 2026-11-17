@@ -27,6 +27,7 @@ them and without the optional extras.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import importlib.util
 import json
@@ -924,6 +925,9 @@ class _EventPrinter:
         self._seen = earlier[-1]["seq"] if earlier else 0
         self._size = self._file_size()
         self._done = threading.Event()
+        #: What agents were last said to do: the log of a run an agent carries out
+        #: repeats those sentences, and here a person would read each of them twice.
+        self._told: collections.deque[str] = collections.deque(maxlen=64)
         #: The follower and the command both print; no event is printed twice.
         self._printing = threading.Lock()
         self._thread = threading.Thread(target=self._follow, name="events", daemon=True)
@@ -960,8 +964,35 @@ class _EventPrinter:
             self._size = size
             for event in self._project.events(after=self._seen):
                 self._seen = event["seq"]
-                if event.get("type") not in self._leave_out:
+                if event.get("type") not in self._leave_out and not self._repeats(event):
                     _say(_event_line(event), err=True)
+
+    def _repeats(self, event: Mapping[str, Any]) -> bool:
+        """Whether ``event`` is the line of a run's log that repeats what the feed has
+        just said of the agent that carries the run out."""
+        from paper_orchestra.compute.base import NOTE_PREFIX
+
+        if event.get("type") == "agent.activity":
+            self._told.append(str(event.get("summary") or ""))
+            return False
+        if event.get("type") != "run.log":
+            return False
+        data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+        lines = [str(line) for line in data.get("lines") or []]
+        last = lines[-1] if lines else ""
+        if not last.startswith(NOTE_PREFIX):
+            return False
+        said = last.removeprefix(NOTE_PREFIX)
+        return any(
+            said == told or (len(said) > 40 and told.startswith(said)) for told in self._told
+        )
+
+
+def _limit_usd(amount: float) -> str:
+    """A limit in dollars; one under a cent with the digits that tell it from nothing."""
+    if 0 < amount < 0.01:
+        return "$" + f"{amount:.4f}".rstrip("0")
+    return f"${amount:.2f}"
 
 
 def _event_line(event: Mapping[str, Any]) -> str:
@@ -1229,9 +1260,9 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         else ""
     )
     lines.append(
-        f"  Spent: ${_amount(spent.get('model_usd')):.2f} of ${limits.model_usd:.2f} on "
+        f"  Spent: ${_amount(spent.get('model_usd')):.2f} of {_limit_usd(limits.model_usd)} on "
         f"models{story}; ${_amount(spent.get('experiment_usd')):.2f} of "
-        f"${limits.experiment_usd:.2f} on experiments, which ran for "
+        f"{_limit_usd(limits.experiment_usd)} on experiments, which ran for "
         f"{_amount(spent.get('experiment_seconds')):.0f} s in all (one run may take up to "
         f"{limits.experiment_seconds:.0f} s)"
     )
@@ -1415,6 +1446,92 @@ def _default_project_dir(title: str | None, brief: str) -> Path:
     return _free_dir(WORKSPACE / slugify(name, 48))
 
 
+AgentModelOption = Annotated[
+    str | None,
+    typer.Option(
+        "--agent-model",
+        "--model",
+        metavar="MODEL",
+        help="The model of the sdk agents (default: claude-fable-5-2).",
+    ),
+]
+AgentFastOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--fast/--no-fast",
+        help="Ask for fast mode (sdk agents). It costs several times the usual price and "
+        "works with the `login` credential only.",
+    ),
+]
+AgentUltracodeOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--ultracode/--no-ultracode",
+        help="Let the sdk agents start helper agents and workflows.",
+    ),
+]
+AgentCredentialOption = Annotated[
+    str | None,
+    typer.Option(
+        "--credential",
+        metavar="login|federation",
+        help="Whose account the sdk agents work on: your Claude Code `login`, or the "
+        "worker's Workload Identity `federation` settings.",
+    ),
+]
+AgentSandboxOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--sandbox/--no-sandbox",
+        help="Keep the sdk agents in their own folder, away from credentials and the "
+        "project's files. Turn it off only if you accept that an agent can then reach "
+        "everything you can.",
+    ),
+]
+
+
+def _agent_changes(
+    runtime: str | None,
+    model: str | None,
+    fast: bool | None,
+    ultracode: bool | None,
+    credential: str | None,
+    sandbox: bool | None,
+) -> dict[str, Any]:
+    """The values of ``settings.agents`` that the options of a command name."""
+    given = (
+        ("runtime", runtime.strip().lower() if runtime is not None else None),
+        ("model", model.strip() if model is not None else None),
+        ("fast", fast),
+        ("ultracode", ultracode),
+        ("credential", credential.strip().lower() if credential is not None else None),
+        ("sandbox", sandbox),
+    )
+    return {name: value for name, value in given if value is not None}
+
+
+def _who_pays(agents: Any) -> str:
+    """One line on whose account a project's sdk agents work, and at what speed: said
+    before the first of them starts."""
+    fast = bool(agents.fast) and agents.credential == "login"
+    how = f"{agents.model}{' in fast mode' if fast else ''}"
+    if agents.credential == "login":
+        said = (
+            f"The agents are Claude agents on {how}, signed in with your Claude Code login: "
+            "what they use is billed to your own Claude account"
+        )
+        said += ", and fast mode costs several times the usual price." if fast else "."
+    else:
+        said = (
+            f"The agents are Claude agents on {how}, signed in with the worker's Workload "
+            "Identity Federation settings: what they use is billed to that organization."
+        )
+    return (
+        f"{said} `paper-orchestra research settings` changes that (--credential, "
+        "--agent-model, --fast/--no-fast)."
+    )
+
+
 @research_app.command("new")
 def research_new(
     paths: Annotated[
@@ -1463,6 +1580,11 @@ def research_new(
             "`paper-orchestra research settings` changes it later.",
         ),
     ] = None,
+    model: AgentModelOption = None,
+    fast: AgentFastOption = None,
+    ultracode: AgentUltracodeOption = None,
+    credential: AgentCredentialOption = None,
+    sandbox: AgentSandboxOption = None,
     run: Annotated[
         bool,
         typer.Option(
@@ -1484,11 +1606,15 @@ def research_new(
     given: dict[str, Any] = {}
     if research_cutoff is not None:
         given["research_cutoff"] = research_cutoff
-    if runtime is not None:
-        given["agents"] = {"runtime": runtime.strip().lower()}
+    chosen = _agent_changes(runtime, model, fast, ultracode, credential, sandbox)
+    if chosen:
+        given["agents"] = chosen
     # The runtime is written into the project when it is created: what the environment
     # says later changes nothing about a project that exists.
-    settings = settings_for_new_project(given)
+    try:
+        settings = settings_for_new_project(given)
+    except ProjectError as exc:
+        _fail(str(exc))
     try:
         project = Project.create(
             root, title=title or "", brief=text, files=paths or (), settings=settings
@@ -1499,6 +1625,9 @@ def research_new(
     attached = len(project.attachments())
     if attached:
         _say(f"{attached} file{'s' if attached != 1 else ''} attached.")
+    if project.settings.agents.runtime == "sdk":
+        # Before the first agent starts: on whose account, and at what speed.
+        _say(_who_pays(project.settings.agents))
     shown = _quoted(root)
     if not run:
         _say(
@@ -2074,6 +2203,13 @@ def _what_was_approved(project: Project, page: ResearchPage) -> list[str]:
         )
         where = _quoted(experiments.code_dir(project, name))
         lines.append(f"Its code, in {where}: {listed}; {stamped}.")
+        if digest:
+            # Two digests are shown for one experiment, and they are of different things.
+            code = experiments.code_digest(project, name)[:12]
+            lines.append(
+                "The approved digest covers the plan and the code together; the code "
+                f"alone is sha256 {code}, which is what a result page names under Code."
+            )
     elif digest:
         lines.append(f"It has no code files of its own; {stamped}.")
     with contextlib.suppress(ProjectError):
@@ -2259,39 +2395,11 @@ def research_settings(
             "`sdk` (Claude Agent SDK agents with a shell, the web and the board).",
         ),
     ] = None,
-    model: Annotated[
-        str | None,
-        typer.Option("--agent-model", metavar="MODEL", help="The model of the sdk agents."),
-    ] = None,
-    fast: Annotated[
-        bool | None,
-        typer.Option("--fast/--no-fast", help="Ask for fast mode (sdk agents)."),
-    ] = None,
-    ultracode: Annotated[
-        bool | None,
-        typer.Option(
-            "--ultracode/--no-ultracode",
-            help="Let the sdk agents start helper agents and workflows.",
-        ),
-    ] = None,
-    credential: Annotated[
-        str | None,
-        typer.Option(
-            "--credential",
-            metavar="login|federation",
-            help="Whose account the sdk agents work on: your Claude Code `login`, or the "
-            "worker's Workload Identity `federation` settings.",
-        ),
-    ] = None,
-    sandbox: Annotated[
-        bool | None,
-        typer.Option(
-            "--sandbox/--no-sandbox",
-            help="Keep the sdk agents in their own folder, away from credentials and the "
-            "project's files. Turn it off only if you accept that an agent can then reach "
-            "everything you can.",
-        ),
-    ] = None,
+    model: AgentModelOption = None,
+    fast: AgentFastOption = None,
+    ultracode: AgentUltracodeOption = None,
+    credential: AgentCredentialOption = None,
+    sandbox: AgentSandboxOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Print the settings as JSON.")] = False,
 ) -> None:
     """Show how a project's agents are run, or change it.
@@ -2302,18 +2410,7 @@ def research_settings(
     from paper_orchestra.research.model import ProjectError
 
     opened = _open_project(project)
-    changes = {
-        name: value.strip().lower() if name in ("runtime", "credential") else value
-        for name, value in (
-            ("runtime", runtime),
-            ("model", model.strip() if model is not None else None),
-            ("fast", fast),
-            ("ultracode", ultracode),
-            ("credential", credential),
-            ("sandbox", sandbox),
-        )
-        if value is not None
-    }
+    changes = _agent_changes(runtime, model, fast, ultracode, credential, sandbox)
     if changes:
         try:
             opened.settings.update({"agents": changes})

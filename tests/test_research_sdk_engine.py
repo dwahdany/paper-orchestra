@@ -619,6 +619,30 @@ def test_the_model_budget_ends_an_agents_turn_in_the_middle_and_stops_at_a_check
     assert again["status"] == "checkpoint" and len(engine.driver.opened) == opened
 
 
+def test_the_budget_sentence_on_the_checkpoint_names_what_the_agent_says_it_cost(
+    project, team, backend
+):
+    """The turn is ended on a count from tokens at the list price.  In fast mode the
+    agent's own figure, which arrives when the turn has ended, is several times that:
+    the sentence that stays must not name the smaller sum beside the Spent line."""
+    project.settings.update({"limits": {"model_usd": 0.004}})
+    project.save_settings()
+
+    team.cost = 0.34  # what the process says its one request cost; the list price is cents
+    state = make_engine(project, team, backend).advance()
+    assert (state["status"], state["phase"]) == ("checkpoint", "intake")
+    spent = state["spent"]["model_usd"]
+    assert spent == pytest.approx(0.34)
+    said = state["phases"][-1]["error"]
+    # A limit under one cent is shown with its digits, not as "$0.00".
+    assert f"the intake's work: ${spent:.2f} of $0.004 is spent" in said
+    assert said in json.dumps(state["checkpoint"])
+    (warning,) = events(project, "budget.warning")
+    assert warning["summary"] == said and warning["data"]["spent"] == pytest.approx(spent)
+    status = runner.invoke(cli.app, ["research", "status", str(project.root)])
+    assert f"Spent: ${spent:.2f} of $0.004 on models" in " ".join(status.output.split())
+
+
 # ---------------------------------------------------------------------------
 # The experiment agent
 # ---------------------------------------------------------------------------
@@ -739,6 +763,31 @@ def test_the_record_of_an_agents_run_names_the_code_as_the_agent_left_it(project
     assert experiments.code_digest(project, "E1") == as_run["digest"]
     with pytest.raises(experiments.ProjectError, match="nothing to adopt"):
         experiments.adopt_run_code(project, "E1", 7)
+
+    # Three digests are now on record for E1: the first approval's, the second
+    # approval's, and the code's.  The pages say which is which, and that the person
+    # adopted the code between the runs: an analyst that finds digests that differ
+    # must not take them for code of unknown origin.
+    first_approval = record["approved_digest"]
+    assert first_approval == project.page("E1").meta["approved_digest"]
+    assert f"| Approval | sha256 `{first_approval[:12]}`, the experiment page's" in body
+    assert "it covers the plan and the code together" in body and "Code history" not in body
+    del team.during["experimenter"]
+    approve(project, "E1", backend)
+    second = make_engine(project, team, backend).run_experiment("E1")
+    assert second["code_digest"] == as_run["digest"]
+    assert second["approved_digest"] not in (first_approval, second["code_digest"])
+    body = project.page("E1-run2").body
+    assert f"| Approval | sha256 `{second['approved_digest'][:12]}`" in body
+    assert (
+        "| Code history | before this run the researcher made the code that the agent left "
+        f"after run 1 the experiment's code (code sha256 `{record['code_digest'][:12]}` "
+        f"before, `{as_run['digest'][:12]}` since) and approved the experiment again"
+    ) in body
+    # What an approval prints names both digests, and says what each is of.
+    said = " ".join(cli._what_was_approved(project, project.page("E1")))
+    assert f"approved digest {second['approved_digest'][:12]}" in said
+    assert f"the code alone is sha256 {as_run['digest'][:12]}" in said
 
 
 def test_an_agent_that_leaves_the_code_alone_ran_what_was_approved(project, team, backend):
@@ -871,6 +920,14 @@ def test_an_agent_whose_process_keeps_failing_does_not_cost_the_run_its_approval
     assert (run["status"], run["error_kind"], run["requeued"]) == ("failed", "backend", True)
     assert project.page("E1").state == "queued" and project.pages(kind="result") == []
     assert experiments.will_not_run(project, "E1") is None
+
+    # `research run` ends the same way: with the reason, as a backend that cannot be used.
+    from paper_orchestra.compute.base import BackendUnusable
+
+    with pytest.raises(BackendUnusable, match="could not work"):
+        make_engine(project, team, backend).run_experiment("E1")
+    assert team.calls.count("experimenter") == 4
+    assert project.page("E1").state == "queued" and project.pages(kind="result") == []
 
     # When the agents work again, the same approval is enough.
     del team.during["experimenter"]
@@ -1431,6 +1488,74 @@ def test_new_writes_the_runtime_into_the_project_from_the_option_or_the_environm
     wrong = invoke("new", "--brief", "x y z", "--dir", "wrong", "--no-run", "--runtime", "turbo")
     assert wrong.exit_code == 2 and "settings.agents.runtime is 'turbo'" in wrong.output
     assert not (tmp_path / "wrong").exists()
+
+
+def test_new_takes_the_settings_of_the_agents_before_the_first_of_them_starts(
+    tmp_path, monkeypatch
+):
+    """Without these a project made on the command line starts its first session on the
+    person's own account, on the dearest model, in fast mode, before any setting can be
+    changed."""
+    monkeypatch.chdir(tmp_path)
+    made = invoke(
+        "new", "--brief", "Does warmup help?", "--dir", "p", "--no-run", "--runtime", "sdk",
+        "--credential", "federation", "--model", "claude-haiku-5-5", "--no-fast",
+        "--no-ultracode",
+    )  # fmt: skip
+    assert made.exit_code == 0, made.output
+    assert Project.open(tmp_path / "p").settings.agents.to_dict() == {
+        "runtime": "sdk",
+        "model": "claude-haiku-5-5",
+        "fast": False,
+        "ultracode": False,
+        "credential": "federation",
+        "sandbox": True,
+    }
+    said = " ".join(made.output.split())
+    assert "The agents are Claude agents on claude-haiku-5-5, signed in with the worker's" in said
+    assert "billed to that organization" in said and "fast mode" not in said.split("`")[0]
+
+    # The defaults say whose account pays, and that fast mode is dear, before anything runs.
+    monkeypatch.setenv(AGENT_RUNTIME_ENV, "sdk")
+    plain = invoke("new", "--brief", "Does warmup help?", "--dir", "q", "--no-run")
+    said = " ".join(plain.output.split())
+    assert "Claude agents on claude-fable-5-2 in fast mode, signed in with your Claude Code" in said
+    assert "billed to your own Claude account, and fast mode costs several times" in said
+    assert said.index("billed to your own") < said.index("Next:")
+    # A classic project is told nothing about agents' accounts.
+    classic = invoke("new", "--brief", "x y z", "--dir", "c", "--no-run", "--runtime", "classic")
+    assert "billed" not in classic.output
+
+    wrong = invoke("new", "--brief", "x y z", "--dir", "w", "--no-run", "--credential", "mine")
+    assert wrong.exit_code == 2 and "credential" in wrong.output
+    assert not (tmp_path / "w").exists()
+
+
+def test_settings_takes_model_as_another_name_for_agent_model(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    invoke("new", "--brief", "Does warmup help?", "--dir", "p", "--no-run", "--runtime", "sdk")
+    changed = invoke("settings", "p", "--credential", "federation", "--model", "claude-haiku-5-5")
+    assert changed.exit_code == 0, changed.output
+    agents = Project.open(tmp_path / "p").settings.agents
+    assert (agents.model, agents.credential) == ("claude-haiku-5-5", "federation")
+
+
+def test_research_run_says_each_command_of_the_agent_once(project, team, backend, monkeypatch):
+    """The feed says what the agent that carries a run out does, and the log of the run
+    holds the same sentences: printed side by side, each command reads twice."""
+    to_approved(project, team, backend)
+    monkeypatch.setattr(experiments, "LOG_EVENT_SECONDS", 0.0)  # every line of the log is told
+    printer = cli._EventPrinter(project)
+    printed: list[str] = []
+    monkeypatch.setattr(cli, "_say", lambda line, **how: printed.append(line))
+    make_engine(project, team, backend).run_experiment("E1")
+    printer.flush()
+    ran = [line for line in printed if "python main.py" in line]
+    assert len(ran) == 1 and "(experimenter): The experimenter ran" in ran[0]
+    # Lines of the log that the feed does not have are still printed.
+    assert any("An agent carries out E1" in line for line in printed)
+    log_events = events(project, "run.log")
+    assert any("The experimenter ran" in str(event["data"]["lines"]) for event in log_events)
 
 
 def test_settings_shows_and_changes_how_the_agents_are_run(tmp_path, monkeypatch):

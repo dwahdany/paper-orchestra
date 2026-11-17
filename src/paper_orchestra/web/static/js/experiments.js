@@ -196,7 +196,7 @@ function approveHTML(store, page, data) {
     <div class="backends" role="radiogroup" aria-label="Backend">${options.map(row)}</div>
     ${data.options_error ? html`<p class="note note-warn">${icon('warn')}<span>${data.options_error}</span></p>` : ''}
     <div class="approve-fields">
-      <label><span>Time limit</span><input type="number" id="ap-min-${eid}" min="1" max="${capMin}" step="1" value="${limitMin}" data-input="ap-minutes" data-eid="${eid}" inputmode="numeric"><span class="quiet">minutes, then it is stopped (at most ${capMin} in this project)</span></label>
+      <label><span>Time limit</span><input type="number" id="ap-min-${eid}" min="1" max="${capMin}" step="1" value="${limitMin}" data-input="ap-minutes" data-eid="${eid}" inputmode="numeric"><span class="quiet">${agentWould(store, chosen.backend) ? 'minutes for all of the agent\'s work (reading, running and repairing the code, not one execution of it), then it is stopped' : 'minutes, then it is stopped'} (at most ${capMin} in this project)</span></label>
       ${chosen.backend === 'modal' || plan.mode === 'gpu' ? html`<label><span>GPU</span><input id="ap-gpu-${eid}" value="${gpu}" placeholder="none (CPU)" data-input="ap-gpu" data-eid="${eid}" size="8" autocomplete="off"><span class="quiet">for example T4, L4, A10G</span></label>` : ''}
       ${plan.network ? '' : html`<label class="tick"><input type="checkbox" id="ap-net-${eid}" data-input="ap-network" data-eid="${eid}"${network ? raw(' checked') : ''}> Allow network access<span class="quiet">${chosen.backend === 'local' ? 'off unless you tick this; this machine cannot block it either way' : 'off unless you tick this'}</span></label>`}
     </div>
@@ -358,8 +358,19 @@ function codeAsRunHTML(store, eid, run) {
   const changed = (c.changed || []).length + (c.added || []).length + (c.removed || []).length;
   if (!changed) return html`<p class="run-code" data-code="approved">The agent left the approved code as it was <span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>.</p>`;
   const busy = app.ui.adopting === eid + '/' + run.number;
-  return html`<div class="note note-warn run-code" data-code="changed">${icon('warn')}<div><b>The agent changed the code it was given.</b>
-    <p>It ${part('changed', c.changed, true)}${(c.changed || []).length && ((c.added || []).length || (c.removed || []).length) ? '; ' : ''}${part('added', c.added, true)}${(c.added || []).length && (c.removed || []).length ? '; ' : ''}${part('removed', c.removed, false)}. The results of this run come from that code <span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>, not from the approved code shown under Code, which is unchanged: run again, the experiment would start from the approved code and be repaired again.</p>
+  /* What the sentence may say depends on how the run ended and on whether there was approved
+     code at all: a run that left no results has none that "come from that code", and a plan
+     that came without code has no approved code to compare with. */
+  const hadCode = c.approved != null ? c.approved > 0 : (c.changed || []).length + (c.removed || []).length > 0;
+  const succeeded = run.status === 'succeeded';
+  const digest = html`<span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>`;
+  const did = html`${part('changed', c.changed, true)}${(c.changed || []).length && ((c.added || []).length || (c.removed || []).length) ? '; ' : ''}${part('added', c.added, true)}${(c.added || []).length && (c.removed || []).length ? '; ' : ''}${part('removed', c.removed, false)}`;
+  const means = succeeded
+    ? (hadCode ? html`The results of this run come from that code ${digest}, not from the approved code shown under Code, which is unchanged: run again, the experiment would start from the approved code and be repaired again.`
+      : html`The results of this run come from that code ${digest}. The plan came without code, so the experiment has none of its own yet: run again, an agent would write it anew.`)
+    : html`That is the code as it stood when the run ${run.status === 'cancelled' ? 'was cancelled' : 'ended'} ${digest}; this run left no results that come from it.${hadCode ? ' The approved code shown under Code is unchanged.' : ' The plan came without code, so the experiment has none of its own yet.'}`;
+  return html`<div class="note note-warn run-code" data-code="changed" data-had-code="${tf(hadCode)}">${icon('warn')}<div><b>${hadCode ? 'The agent changed the code it was given.' : 'The agent wrote the code for this run.'}</b>
+    <p>It ${did}. ${means}</p>
     ${(c.changed || []).length + (c.added || []).length ? html`<button class="btn btn-s" data-act="adopt-code" data-eid="${eid}" data-run="${run.number}"${busy ? raw(' disabled') : ''}>${busy ? 'Taking it over…' : 'Make this the experiment\'s code'}</button> <span class="quiet">As your own edit: the earlier version is kept, and the experiment must be approved again to run.</span>` : ''}</div></div>`;
 }
 /** A run whose code could call the Anthropic API: nothing here counted those calls. */

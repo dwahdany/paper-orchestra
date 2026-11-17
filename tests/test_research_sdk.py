@@ -523,6 +523,9 @@ def test_a_file_of_settings_with_secrets_is_closed_under_every_usual_name(tmp_pa
     if name in (".env", ".env.local", ".envrc"):
         assert f"Read(//**/{name})" in deny and f"Read(**/{name})" in deny
     assert "Read(//**/*.env)" in deny
+    # The shell's sandbox is told the same names: `cat` of such a file is refused too.
+    hidden = guard.settings()["sandbox"]["filesystem"]["denyRead"]
+    assert {"**/.env", "/**/.env", "**/*.env", "**/.envrc"} <= set(hidden)
 
 
 def test_a_sample_of_such_a_file_and_a_file_about_environments_stay_readable(tmp_path, home):

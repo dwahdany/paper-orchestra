@@ -206,7 +206,7 @@ function agentTraces(dir) {
   const last = fs.existsSync(two) ? fs.readdirSync(two).map(Number).filter(Boolean).sort((a, b) => b - a)[0] : 0;
   if (last) {
     const lost = JSON.parse(fs.readFileSync(path.join(two, String(last), 'run.json'), 'utf8'));
-    if (lost.status === 'failed' && !lost.timed_out) { lost.carried_out_by = 'agent'; lost.repairs = []; lost.error_kind = 'metrics'; fs.writeFileSync(path.join(two, String(last), 'run.json'), JSON.stringify(lost, null, 2)); failed = true; }
+    if (lost.status === 'failed' && !lost.timed_out) { lost.carried_out_by = 'agent'; lost.repairs = []; lost.error_kind = 'metrics'; lost.code_as_run = { digest: 'c0ffee11223344556677889900aabbccddeeff00112233445566778899aabbcc', approved: 0, changed: [], added: ['main.py'], removed: [] }; fs.writeFileSync(path.join(two, String(last), 'run.json'), JSON.stringify(lost, null, 2)); failed = true; }
   }
   fs.appendFileSync(file, out.join('\n') + '\n');
   /* (the run's four events and the experiment's two states are steps of the run as well) */
@@ -418,6 +418,13 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   /* the default is the server's, which follows its environment (PAPER_ORCHESTRA_AGENT_RUNTIME): named, and its fields shown or not, before anything is chosen */
   ok((base.runtime === 'sdk' ? /shell/ : /tool loop/i).test(await page.$eval('#opt-agent-runtime option', (o) => o.textContent)) && (base.runtime === 'sdk' ? /shell/ : /no shell/).test(await says(page, 'runtime')), 'the default that is named is the server\'s (' + base.runtime + '): ' + (await page.$eval('#opt-agent-runtime option', (o) => o.textContent)));
   ok(((await count(page, '#opt-agent-model')) === 1) === (base.runtime === 'sdk'), 'the fields of agents with a shell are shown where the default is such agents, and not for the tool loop');
+  await page.selectOption('#opt-agent-runtime', 'sdk');
+  await page.waitForSelector('#opt-agent-model');
+  /* the effort is a setting of the tool loop's models: it is not offered for agents with a shell */
+  ok((await count(page, '#opt-effort')) === 0, 'with agents with a shell chosen, the composer does not offer a model effort');
+  await page.selectOption('#opt-agent-runtime', 'classic');
+  await page.waitForSelector('#opt-effort');
+  ok((await count(page, '#opt-agent-model')) === 0, 'for the tool loop it does, and the fields of agents with a shell are gone');
   await page.selectOption('#opt-agent-runtime', 'sdk');
   await page.waitForSelector('#opt-agent-model');
   ok(/shell/.test(await says(page, 'runtime')) && (await page.getAttribute('#opt-agent-model', 'placeholder')) === base.model, 'agents with a shell: the sentence says so, and the model field shows the server\'s default: ' + (await page.getAttribute('#opt-agent-model', 'placeholder')));
@@ -644,6 +651,12 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   await open(page, '#/p/' + pid + '/experiments/E2', '.exp-runs .run');
   await page.waitForSelector('.run.open .failure');
   if (traces.failed) ok(/The agent did not bring the run to a result/.test(await text(page, '.run.open .fail-t')) && /repairs the code while it works/.test(await text(page, '.run.open .failure')) && !/runner has not repaired/.test(await text(page, '.run.open .failure')), 'a run that an agent could not bring to a result says so: ' + (await text(page, '.run.open .fail-t')));
+  /* a run that left no results does not say that its results come from the agent's code, and a
+     plan that came without code is not said to have approved code */
+  if (traces.failed) {
+    const wrote = (await text(page, '.run.open .run-code[data-code="changed"]')).replace(/\s+/g, ' ');
+    ok(/The agent wrote the code for this run/.test(wrote) && /left no results that come from it/.test(wrote) && /came without code/.test(wrote) && !/The results of this run come from that code/.test(wrote) && !/repaired again/.test(wrote) && !/approved code shown under Code/.test(wrote), 'a failed run of a plan without code says what the agent wrote, and claims no results: ' + wrote.slice(0, 200));
+  }
   await shot(page, 'agents-run');
 
   /* on a phone: nothing is wider than the screen, the command wraps under who ran it, and what is typed is 16 px */

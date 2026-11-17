@@ -138,8 +138,10 @@ class Turn:
     """How one message to the agent ended.
 
     ``cost_usd`` and ``model_usage`` are what the agent's process says the session
-    has cost so far: totals, not what this turn added (a resumed session carries
-    on from the totals it had).  ``model_usage`` maps a model to ``input_tokens``,
+    has cost so far: totals, not what this turn added.  The process of a resumed
+    session counts from the totals a process of it saved when it ended in good
+    order: where the last one stood, or, after a kill, an older total or nothing
+    (``session.AgentSession._counts_from`` measures which).  ``model_usage`` maps a model to ``input_tokens``,
     ``output_tokens``, ``cache_read_input_tokens``, ``cache_creation_input_tokens``,
     ``web_searches`` and ``cost_usd``.  ``ended`` is why the turn ended when it did
     not simply complete (``aborted_tools`` after an interrupt, ``error_max_turns``,
@@ -179,9 +181,6 @@ class AgentOptions:
     check: Callable[[ToolUse], str | None] = field(default=lambda use: None, repr=False)
     #: The session to carry on, as an earlier :class:`Turn` named it; ``None`` starts anew.
     resume: str | None = None
-    #: With ``resume``: carry the session on as a new one of its own (a copy of what was
-    #: said so far, under a new name), whose process counts its cost from nothing.
-    fork: bool = False
     max_turns: int | None = None
     #: The agent's process ends the session itself once it has cost this much.
     max_budget_usd: float | None = None

@@ -216,6 +216,9 @@ class _BudgetSpent(Exception):
         self.limit = limit
         self.spent = spent
         self.allowed = allowed
+        #: The same sentence for another amount spent, where the amount in it was a count
+        #: made while a session was at work and the session's own figure came afterwards.
+        self.say: Callable[[float], str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +824,11 @@ def _sentence(text: Any, limit: int = 400) -> str:
 
 
 def _money(amount: float) -> str:
+    """``$0.34``; an amount under one cent with the digits that tell it from nothing
+    (``$0.004``), so that a limit set that low does not read as "$0.00"."""
+    if 0 < amount < 0.01:
+        digits = f"{amount:.4f}".rstrip("0")
+        return f"${digits}" if digits != "0." else "under $0.0001"
     return f"${amount:.2f}"
 
 
@@ -1043,8 +1051,9 @@ class Engine:
                 raise EngineError(str(exc)) from None
             except agents.SessionStopped as exc:
                 if isinstance(exc.reason, _BudgetSpent):
-                    self._warn_budget(exc.reason, phase="run")
-                    raise EngineError(str(exc.reason)) from None
+                    spent = self._as_spent(exc.reason)
+                    self._warn_budget(spent, phase="run")
+                    raise EngineError(str(spent)) from None
                 # A stop request: the run went back to the queue, and its record says so.
                 runs = experiments.runs(self.project, str(page.id))
                 return runs[-1] if runs else {}
@@ -1449,15 +1458,38 @@ class Engine:
             role = _ROLE.get(str(phase or self._state.get("phase")), "agent")
             work = f"the {role}'s work"
             then = "the phase then resumes where it stopped."
-        return _BudgetSpent(
-            "model_usd",
-            f"The model budget ran out in the middle of {work}: {_money(spent)} of "
-            f"{_money(limit)} is spent, so its session was ended at its next model call. What "
-            "it had written until then is kept. Raise settings.limits.model_usd in the "
-            f"project's settings to go on; {then}",
-            spent=spent,
-            allowed=limit,
-        )
+
+        def say(spent: float) -> str:
+            return (
+                f"The model budget ran out in the middle of {work}: {_money(spent)} of "
+                f"{_money(limit)} is spent, so its session was ended at its next model call. "
+                "What it had written until then is kept. Raise settings.limits.model_usd in "
+                f"the project's settings to go on; {then}"
+            )
+
+        exc = _BudgetSpent("model_usd", say(spent), spent=spent, allowed=limit)
+        exc.say = say
+        return exc
+
+    def _as_spent(self, exc: _BudgetSpent) -> _BudgetSpent:
+        """``exc`` with the amount the ledger holds now.
+
+        The amount in the sentence of a session that was ended in the middle of its
+        turn is a count from tokens at the list price.  Under the sdk runtime the
+        agent's own figure arrives when its turn has ended, and with fast mode or
+        helpers it is several times that count: the sentence that stays on the
+        checkpoint must name what the Spent line beside it names.
+        """
+        if exc.say is None:
+            return exc
+        spent = self._write_usage()
+        # Only upwards: in the classic runtime the ledger never learns of a turn that
+        # was cut short, and the count that ended it is then the larger and truer sum.
+        if spent < exc.spent + 0.005:
+            return exc
+        again = _BudgetSpent(exc.limit, exc.say(spent), spent=spent, allowed=exc.allowed)
+        again.say = exc.say
+        return again
 
     def _heed_stop(self) -> None:
         if self._stop.is_set():
@@ -2163,6 +2195,7 @@ class Engine:
         self, record: dict[str, Any], clock: float, ctx: AgentContext, exc: _BudgetSpent
     ) -> _Outcome:
         name = record["phase"]
+        exc = self._as_spent(exc)
         self._settle(record, clock, ctx, "interrupted", str(exc))
         self._warn_budget(exc, phase=name)
         extra = (

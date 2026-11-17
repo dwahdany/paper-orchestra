@@ -73,7 +73,8 @@ export const totalSize = (s) => s.files.reduce((a, f) => a + f.size, 0);
 /** The settings the person changed, as the partial object the API merges into its defaults. */
 export function composerSettings(s) {
   const settings = {};
-  if (s.effort) settings.models = { effort: s.effort };
+  /* the effort is the tool loop's models': agents with a shell do not take it, and the form does not offer it then */
+  if (s.effort && (agentChoice(s) || {}).runtime !== 'sdk') settings.models = { effort: s.effort };
   const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth);
   if (cutoff.value) settings.research_cutoff = cutoff.value;
   if (s.compute) settings.compute = s.compute;
@@ -138,7 +139,7 @@ export const startView = {
       <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
       <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, a research cutoff, limits, what needs your review, how the agents work</span></summary><div class="adv-grid">
         <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea" autocomplete="off"></label>
-        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + effortName(models.effort) + ')' : 'As the project default']].concat(accepted('efforts', s.effort).map((v) => [v, effortName(v)])).map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
+${agents && agents.runtime === 'sdk' ? '' : html`        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + effortName(models.effort) + ')' : 'As the project default']].concat(accepted('efforts', s.effort).map((v) => [v, effortName(v)])).map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>`}
         <div class="adv-cutoff" role="group" aria-labelledby="opt-cutoff-l"><span id="opt-cutoff-l">Only literature before</span><span class="cutoff-fields">
           <label class="sr" for="opt-cutoff-month">Month of the research cutoff</label><select id="opt-cutoff-month" data-input="opt" data-name="cutoffMonth"><option value="0"${+s.cutoffMonth ? '' : raw(' selected')}>any month</option>${MONTH_NAMES.map((name, i) => html`<option value="${i + 1}"${+s.cutoffMonth === i + 1 ? raw(' selected') : ''}>${name}</option>`)}</select>
           <label class="sr" for="opt-cutoff-year">Year of the research cutoff</label><input id="opt-cutoff-year" data-input="opt" data-name="cutoffYear" value="${s.cutoffYear}" placeholder="year" inputmode="numeric" maxlength="4" autocomplete="off"></span>

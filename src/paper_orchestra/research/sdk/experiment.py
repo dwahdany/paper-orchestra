@@ -294,7 +294,7 @@ class AgentBackend:
                         continue
                     log.note(f"The agent could not carry out the run: {why}")
                     raise AgentUnusable(
-                        f"the agent that was to carry out {page.id} could not work ({why}). "
+                        f"The agent that was to carry out {page.id} could not work ({why}). "
                         f"{page.id} keeps its approval and is in the queue again; it is run "
                         "when the work goes on."
                     ) from exc

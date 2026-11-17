@@ -170,7 +170,6 @@ class _Conversation:
             env=dict(options.env),
             hooks={"PreToolUse": [HookMatcher(hooks=[self._hook], on_failure="block")]},
             resume=options.resume,
-            fork_session=bool(options.resume and options.fork),
             max_turns=options.max_turns,
             max_budget_usd=options.max_budget_usd,
             stderr=self._stderr.append,

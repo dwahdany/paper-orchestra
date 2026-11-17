@@ -63,6 +63,7 @@ from paper_orchestra.compute.base import (
     JobStopped,
     human_size,
     spec_problems,
+    write_record,
 )
 from paper_orchestra.compute.local import job_model_access
 from paper_orchestra.errors import stops_the_run
@@ -2603,6 +2604,27 @@ def _facts(record: Mapping[str, Any]) -> list[str]:
         rows.append(("Remote job", f"`{record['handle']}`"))
     if record.get("code_digest") or record.get("code_as_run"):
         rows.append(("Code", _code_cell(record)))
+    if record.get("approved_digest"):
+        rows.append(
+            (
+                "Approval",
+                f"sha256 `{str(record['approved_digest'])[:12]}`, the experiment page's "
+                "`approved_digest`: it covers the plan and the code together, so it "
+                "differs from the digest under Code, which is of the code files alone",
+            )
+        )
+    adopted = record.get("code_adopted")
+    if isinstance(adopted, Mapping) and adopted.get("to") == record.get("code_digest"):
+        rows.append(
+            (
+                "Code history",
+                f"before this run the researcher made the code that the agent left after "
+                f"run {adopted.get('run')} the experiment's code (code sha256 "
+                f"`{str(adopted.get('from'))[:12]}` before, `{str(adopted.get('to'))[:12]}` "
+                "since) and approved the experiment again: the digests of the two runs "
+                "differ for that reason",
+            )
+        )
     if record.get("repo"):
         rows.append(("Repository", _repo_text(record)))
     return ["| | |", "|---|---|", *(f"| {name} | {_cell(value)} |" for name, value in rows)]
@@ -3248,6 +3270,9 @@ def _code_as_run(directory: Path, plan: ExperimentPlan | None) -> dict[str, Any]
 
     return {
         "digest": _digest(ran.items()),
+        # How many files the approved code had: none for a plan that came without code,
+        # which the agent then wrote.
+        "approved": len(approved),
         "changed": sorted(name for name in ran if name in approved and differs(name)),
         "added": sorted(name for name in ran if name not in approved),
         "removed": sorted(name for name in approved if name not in ran),
@@ -3310,13 +3335,33 @@ def adopt_run_code(
                 "large, or no longer there."
             )
         files[str(name)] = text
+    before = code_digest(project, experiment_id)
     problems = write_code(project, experiment_id, files, author=author) if files else []
+    after = code_digest(project, experiment_id)
+    if after != before:
+        # On the record of the run the code came from: a later run names it, so that
+        # nobody takes two digests of one experiment for code of unknown origin.
+        adopted = {"at": _now(), "by": author, "from": before, "to": after}
+        path = _runs_dir(project, experiment_id) / str(run["number"]) / RUN_FILE
+        with contextlib.suppress(OSError, ValueError):
+            write_record(path, {**run, "adopted": adopted})
     return {
         "run": run["number"],
         "files": sorted(files),
         "removed": [str(name) for name in as_run.get("removed", [])],
         "problems": problems,
     }
+
+
+def _adoption_before(project: Project, experiment_id: str) -> dict[str, Any] | None:
+    """The latest time the person made the code an agent left after a run the
+    experiment's code: ``{"run", "from", "to", "at"}``, or ``None``."""
+    found = None
+    for record in runs(project, experiment_id):
+        adopted = record.get("adopted")
+        if isinstance(adopted, dict) and adopted.get("to"):
+            found = {"run": record.get("number"), **adopted}
+    return found
 
 
 def _clear_results(copy: Path) -> list[str]:
@@ -3569,6 +3614,13 @@ class _Session:
         number, directory = _new_run_dir(self.project, self.plan.id)
         record = _new_record(self.plan, number, self.backend_name, self._repairs)
         record["approval"] = _text(self.page.meta.get("approved_at")) or None
+        # The digest of that approval (plan and code together), for the result page to
+        # name beside the digest of the code alone: two digests with one name read as
+        # a contradiction.
+        record["approved_digest"] = _text(self.page.meta.get("approved_digest")) or None
+        adopted = _adoption_before(self.project, self.plan.id)
+        if adopted:
+            record["code_adopted"] = adopted
         # Who does the job is a fact of this run, kept with it: the project's runtime
         # can be changed afterwards, and the run stays what it was.
         by_agent = bool(getattr(self.backend, "carried_out_by_agent", False))
