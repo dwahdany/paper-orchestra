@@ -2142,6 +2142,17 @@ def test_a_decision_keeps_its_number_when_another_is_answered(project):
     assert project.decision(first.id).answer.option == 2
 
 
+def test_what_was_answered_is_said_in_the_words_it_was_given(project):
+    decision = asked(project, "Is the rating done by the human or by a model?")
+
+    answered = invoke("decide", str(project.root), "1", "--say", "Rated by the human.")
+
+    assert flat(answered.stdout) == (
+        f'Answered {decision.id}, "Is the rating done by the human or by a model?": Rated '
+        "by the human. Every later session of the agents is shown it."
+    )
+
+
 def test_a_new_answer_says_what_it_dropped_of_the_earlier_one(project):
     """A new answer is the whole answer.  When the earlier one had an option or words
     that the new one does not repeat, the terminal says that they no longer hold and

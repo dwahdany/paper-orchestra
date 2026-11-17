@@ -2398,11 +2398,12 @@ def research_decide(
         _fail(str(exc))
     changed = "Changed your answer to" if found.state != "open" else "Answered"
     # The question is said with the id: an id alone does not tell which one was answered.
+    # (As it was written: the question and the answer are not sentences of the project
+    # whose "by the human" would be said as "by you".)
+    said = _sentence(f'{changed} {done.id}, "{done.question}": {answer_words(done)}')
     _say(
-        _readable(
-            f'{changed} {done.id}, "{done.question}": {answer_words(done)}. Every later '
-            f"session of the agents is shown it.{_what_a_new_answer_drops(found, done)}"
-        )
+        f"{said} Every later session of the agents is shown it."
+        f"{_what_a_new_answer_drops(found, done)}"
     )
 
 
