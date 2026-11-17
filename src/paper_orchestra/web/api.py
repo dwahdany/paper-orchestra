@@ -191,6 +191,7 @@ from paper_orchestra.web.workers import (
     lock_held,
     read_state_file,
 )
+from paper_orchestra.web.workers import _phase_in_words as phase_in_words
 
 __all__ = [
     "PHASES",
@@ -3084,18 +3085,27 @@ def _in_line(
     ``{"waits", "position", "after", "message"}``: ``waits`` as :func:`_waits_for`
     says; ``position`` counts from 1 among those that wait; ``after`` is the
     experiment it runs after (the one before it in the line, or the one being run),
-    ``None`` when none is ahead; ``message`` is the sentence for the person.
+    ``None`` when none is ahead; ``message`` is the sentence for the person.  For an
+    experiment that waits for the worker to end (``"worker"``) ``position`` counts
+    among the runs that were asked for and ``after`` is ``None``.
     """
     waiting = [str(name) for name in line.get("waiting") or ()]
     waits = _waits_for(worker, experiment_id)
     if waits is None or experiment_id not in waiting:
         return None
-    position = waiting.index(experiment_id) + 1
-    after = (line.get("after") or {}).get(experiment_id)
-    if after is None and position > 1:
-        after = waiting[position - 2]
-    if after is None and line.get("running"):
-        after = str(list(line["running"])[-1])
+    if waits == "worker":
+        # The worker that is started when this one has ended begins with the first of
+        # the runs that were asked for, whatever else waits: no order is promised
+        # beyond that, so none is said.
+        asked = [name for name in waiting if name in (worker.get("then_runs") or ())]
+        position, after = asked.index(experiment_id) + 1, None
+    else:
+        position = waiting.index(experiment_id) + 1
+        after = (line.get("after") or {}).get(experiment_id)
+        if after is None and position > 1:
+            after = waiting[position - 2]
+        if after is None and line.get("running"):
+            after = str(list(line["running"])[-1])
     if waits == "line":
         message = (
             f"{experiment_id} is approved; it runs after {after}."
@@ -3115,14 +3125,14 @@ def _in_line(
         else:
             busy = "A worker is running other experiments"
             then = "it starts by itself when that worker has ended"
-        behind = f", after {after}" if after and position > 1 else ""
-        message = f"{experiment_id} is approved. {busy}: {then}{behind}."
+        message = f"{experiment_id} is approved. {busy}: {then}."
     return {"waits": waits, "position": position, "after": after, "message": message}
 
 
 def _phase_words(phase: Any) -> str:
-    """``the design phase`` for ``design``; ``a phase`` when none is named."""
-    return f"the {phase} phase" if isinstance(phase, str) and phase else "a phase"
+    """``the design phase`` for ``design``, in the engine's words for people (``the
+    hypothesis phase`` for ``hypothesize``); ``a phase`` when none is named."""
+    return phase_in_words(phase) if isinstance(phase, str) and phase else "a phase"
 
 
 def _failure(exc: Exception) -> dict[str, Any]:

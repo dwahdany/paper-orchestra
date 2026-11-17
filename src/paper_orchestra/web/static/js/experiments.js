@@ -26,7 +26,7 @@ export function lineWords(x) {
   const l = x && x.in_line;
   if (!l) return '';
   if (l.waits === 'line') return l.after ? 'runs after ' + l.after : 'runs next';
-  return 'starts by itself when the work under way is done' + (l.after && l.position > 1 ? ', after ' + l.after : '');
+  return 'starts by itself when the work under way is done';
 }
 /** The experiments of one group in the order they are shown in: those that are being run and
     those that wait come in the order they run in (the run that is going, then the line by
@@ -524,7 +524,7 @@ function detailHTML(store, page, route) {
     const canFollow = busy && !inLine && worker.state === 'running' && worker.verified !== false;
     const waits = !inLine ? '' : inLine.waits === 'line'
       ? html`It waits in line${inLine.after ? html`: it runs after <b>${inLine.after}</b>` : ': it runs next'}, with nothing more to press. The worker that is running experiments goes on with every approved one, in the order you approved them.`
-      : html`A run of it is asked for: it starts by itself when the work under way is done${inLine.after && inLine.position > 1 ? ', after ' + inLine.after : ''} (or in the agents' run phase, if that comes first).`;
+      : html`A run of it is asked for: it starts by itself when the work under way is done (or in the agents' run phase, if that comes first).`;
     top = html`<section class="callout"${inLine ? html` data-in-line="${inLine.position}"` : ''}><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
       <p>${inLine ? waits : canFollow ? 'The agents are at work. Their run phase runs it if that is still to come; press the button and it also starts by itself when they are done.' : busy ? held : 'It runs first, and is analysed, when you continue the project; or run it now.'}</p>
       <div class="row">${inLine ? '' : html`<button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${(busy && !canFollow) || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Starting…' : canFollow ? 'Run when they are done' : 'Run now'}</button>`}<button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
