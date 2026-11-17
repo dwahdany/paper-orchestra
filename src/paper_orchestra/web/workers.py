@@ -1717,8 +1717,12 @@ class Workers:
             log.exception("Could not settle the state of %s.", entry.root)
         # The command's own word for "the next phase needs a model, nothing was started".
         # With a phase left running it is not that, whatever the number.
+        # (`run` says it too: under the sdk runtime an agent carries a run out.)
         needs_model = (
-            unexpected and entry.kind == "advance" and code == NEEDS_A_MODEL_EXIT and phase is None
+            unexpected
+            and entry.kind in ("advance", "run")
+            and code == NEEDS_A_MODEL_EXIT
+            and phase is None
         )
         self._last_exit[key] = {
             "kind": entry.kind,

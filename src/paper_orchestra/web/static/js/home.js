@@ -3,9 +3,9 @@
 import { app, defaults } from './core.js';
 import { api } from './api.js';
 import { MONTH_NAMES, ago, bytes, checkpointDid, codeSpans, cutoffFrom, cutoffParts, cutoffWords, html, money, plain, plural, raw, setHTML, storage } from './util.js';
-import { KIND, STAGES, computeName, effortName, icon, phaseName } from './vocab.js';
+import { KIND, STAGES, computeName, credentialName, effortName, icon, phaseName, runtimeName } from './vocab.js';
 import { stripMapSmall } from './overview.js';
-import { DEMO_COST } from './shell.js';
+import { DEMO_COST, agentFields } from './shell.js';
 
 /* ---------- start: one box for the idea ---------- */
 const EXAMPLE = 'Learning-rate warmup is assumed to matter most for large batches. I suspect that with adaptive optimisers it is small batches that need it, because early second-moment estimates are noisy.';
@@ -28,6 +28,27 @@ function accepted(name, kept) {
   const list = d && Array.isArray(d[name]) ? d[name].filter((x) => typeof x === 'string' && x) : [];
   return kept && list.indexOf(kept) < 0 && !d ? list.concat([kept]) : list;
 }
+/** How the agents of a new project are run when the composer says nothing: the server's
+    `settings.agents`, whose runtime follows the server's environment; or `null`. */
+const agentDefaults = () => { const d = defaults(); const a = d && d.settings && d.settings.agents; return a && typeof a === 'object' ? a : null; };
+/** What the composer's choices about the agents come to: the person's where one was made, the
+    server's default otherwise; `null` until the defaults are known. */
+/** What a person should know before they press Start when the agents are Claude agents
+    with a shell: on which model, on whose account, and that fast mode costs more. Said on
+    the page itself, not only inside the closed Options. */
+function agentsWord(a) {
+  const fast = a.fast && a.credential === 'login';
+  return 'The agents are Claude agents with a shell on ' + a.model + (fast ? ' in fast mode' : '') + ', billed to '
+    + (a.credential === 'login' ? 'your own Claude account' : 'the account of the server\'s federation settings')
+    + (fast ? '; fast mode costs several times the usual price, and the start of each agent alone can cost about a dollar' : '')
+    + '. Change it under Options.';
+}
+function agentChoice(s) {
+  const a = agentDefaults();
+  if (!a) return null;
+  const flag = (name) => (typeof s[name] === 'boolean' ? s[name] : !!a[name]);
+  return { runtime: s.runtime || a.runtime, model: String(s.model || '').trim() || a.model, credential: s.credential || a.credential, fast: flag('fast'), ultracode: flag('ultracode'), sandbox: flag('sandbox') };
+}
 /** The limits a new project gets when the composer says nothing: the server's, or `null`. */
 const limitDefaults = () => { const d = defaults(); return (d && d.settings && d.settings.limits) || null; };
 
@@ -43,6 +64,9 @@ export function composer() {
       title: saved.title || '', effort: saved.effort || '', compute: saved.compute || '',
       cutoffYear: saved.cutoffYear || (old && old.raw == null ? old.year : ''), cutoffMonth: +saved.cutoffMonth || (old && old.raw == null ? old.month : 0),
       model_usd: saved.model_usd || '', exp_minutes: saved.exp_minutes || '', exp_usd: saved.exp_usd || '',
+      /* how the agents are run: empty, or `null` for a tick, where the person chose nothing and the server's default holds */
+      runtime: saved.runtime || '', model: saved.model || '', credential: saved.credential || '',
+      fast: typeof saved.fast === 'boolean' ? saved.fast : null, ultracode: typeof saved.ultracode === 'boolean' ? saved.ultracode : null, sandbox: typeof saved.sandbox === 'boolean' ? saved.sandbox : null,
       /* kind -> true: accepted as it is written; false: waits for the person. Only what the person changed. */
       auto: saved.auto || {}, uploading: false, progress: 0, error: null, request: null,
     };
@@ -51,7 +75,7 @@ export function composer() {
 }
 export function keepComposer() {
   const s = composer();
-  storage.set(COMPOSER_KEY, { text: s.text, adv: s.adv, title: s.title, effort: s.effort, cutoffYear: s.cutoffYear, cutoffMonth: s.cutoffMonth, compute: s.compute, model_usd: s.model_usd, exp_minutes: s.exp_minutes, exp_usd: s.exp_usd, auto: s.auto, fileCount: s.files.length });
+  storage.set(COMPOSER_KEY, { text: s.text, adv: s.adv, title: s.title, effort: s.effort, cutoffYear: s.cutoffYear, cutoffMonth: s.cutoffMonth, compute: s.compute, model_usd: s.model_usd, exp_minutes: s.exp_minutes, exp_usd: s.exp_usd, runtime: s.runtime, model: s.model, credential: s.credential, fast: s.fast, ultracode: s.ultracode, sandbox: s.sandbox, auto: s.auto, fileCount: s.files.length });
 }
 export function clearComposer() { app.ui.start = null; storage.remove(COMPOSER_KEY); }
 export const composerReady = (s) => (s.text.trim().length > 0 || s.files.length > 0) && !s.uploading;
@@ -59,7 +83,8 @@ export const totalSize = (s) => s.files.reduce((a, f) => a + f.size, 0);
 /** The settings the person changed, as the partial object the API merges into its defaults. */
 export function composerSettings(s) {
   const settings = {};
-  if (s.effort) settings.models = { effort: s.effort };
+  /* the effort is the tool loop's models': agents with a shell do not take it, and the form does not offer it then */
+  if (s.effort && (agentChoice(s) || {}).runtime !== 'sdk') settings.models = { effort: s.effort };
   const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth);
   if (cutoff.value) settings.research_cutoff = cutoff.value;
   if (s.compute) settings.compute = s.compute;
@@ -72,6 +97,14 @@ export function composerSettings(s) {
   const review = {};
   Object.keys(s.auto || {}).forEach((kind) => { const wanted = s.auto[kind] ? 'auto' : 'review'; if (wanted !== (reviewDefault(kind) || 'review')) review[kind] = wanted; });
   if (Object.keys(review).length) settings.review = review;
+  /* how the agents are run: only what the person chose. A runtime that is not named is the
+     server's to choose, from its environment (PAPER_ORCHESTRA_AGENT_RUNTIME). */
+  const agents = {};
+  if (s.runtime) agents.runtime = s.runtime;
+  if (String(s.model || '').trim()) agents.model = String(s.model).trim();
+  if (s.credential) agents.credential = s.credential;
+  ['fast', 'ultracode', 'sandbox'].forEach((name) => { if (typeof s[name] === 'boolean') agents[name] = s[name]; });
+  if (Object.keys(agents).length) settings.agents = agents;
   return settings;
 }
 
@@ -92,6 +125,10 @@ export const startView = {
     const cutoff = cutoffFrom(s.cutoffYear, s.cutoffMonth), cutoffNow = cutoff.value ? cutoffParts(cutoff.value) : null;
     /* a choice kept from an earlier visit that the server no longer lists is not sent behind a list that does not show it */
     if (d) { if (s.effort && accepted('efforts').indexOf(s.effort) < 0) s.effort = ''; if (s.compute && accepted('compute_backends').indexOf(s.compute) < 0) s.compute = ''; }
+    if (d) { if (s.runtime && accepted('agent_runtimes').indexOf(s.runtime) < 0) s.runtime = ''; if (s.credential && accepted('agent_credentials').indexOf(s.credential) < 0) s.credential = ''; }
+    /* how the agents are run: the server's default named as the default, the person's choice beside it */
+    const agents = agentChoice(s), agentBase = agentDefaults();
+    const offer = (list, kept, base, name) => [['', base ? 'Default (' + name(base) + ')' : 'As the project default']].concat(accepted(list, kept).map((v) => [v, name(v)]));
     const kinds = reviewKinds();
     const waits = (kind) => (s.auto[kind] != null ? !s.auto[kind] : reviewDefault(kind) !== 'auto');
     setHTML(root, html`<div class="start"><div class="start-col">
@@ -109,10 +146,10 @@ export const startView = {
           <span class="composer-go">${s.text || n ? '' : html`<button class="btn btn-quiet" type="button" data-act="start-example">Use an example</button>`}
             <button class="btn btn-primary btn-l" type="submit"${ready ? '' : raw(' disabled')}>Start research ${icon('right')}</button></span></div>
         <div class="drop-veil" aria-hidden="true">Drop to attach</div></form>
-      <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
-      <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, a research cutoff, limits, what needs your review</span></summary><div class="adv-grid">
+      <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}${agents && agents.runtime === 'sdk' ? html`<span class="start-agents" data-agents-say="${agents.credential}">${agentsWord(agents)}</span>` : ''}</p>
+      <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, a research cutoff, limits, what needs your review, how the agents work</span></summary><div class="adv-grid">
         <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea" autocomplete="off"></label>
-        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + effortName(models.effort) + ')' : 'As the project default']].concat(accepted('efforts', s.effort).map((v) => [v, effortName(v)])).map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>
+${agents && agents.runtime === 'sdk' ? '' : html`        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + effortName(models.effort) + ')' : 'As the project default']].concat(accepted('efforts', s.effort).map((v) => [v, effortName(v)])).map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>`}
         <div class="adv-cutoff" role="group" aria-labelledby="opt-cutoff-l"><span id="opt-cutoff-l">Only literature before</span><span class="cutoff-fields">
           <label class="sr" for="opt-cutoff-month">Month of the research cutoff</label><select id="opt-cutoff-month" data-input="opt" data-name="cutoffMonth"><option value="0"${+s.cutoffMonth ? '' : raw(' selected')}>any month</option>${MONTH_NAMES.map((name, i) => html`<option value="${i + 1}"${+s.cutoffMonth === i + 1 ? raw(' selected') : ''}>${name}</option>`)}</select>
           <label class="sr" for="opt-cutoff-year">Year of the research cutoff</label><input id="opt-cutoff-year" data-input="opt" data-name="cutoffYear" value="${s.cutoffYear}" placeholder="year" inputmode="numeric" maxlength="4" autocomplete="off"></span>
@@ -122,7 +159,10 @@ export const startView = {
         <label><span>Time limit per run</span><input id="opt-exp-min" data-input="opt" data-name="exp_minutes" value="${s.exp_minutes}" placeholder="${limits && limits.experiment_seconds != null ? hint(Math.round(limits.experiment_seconds / 6) / 10, 'minutes') : 'the default'}" inputmode="decimal" autocomplete="off"></label>
         <label><span>Experiment spend limit</span><input id="opt-exp-usd" data-input="opt" data-name="exp_usd" value="${s.exp_usd}" placeholder="${limits && limits.experiment_usd != null ? Number(limits.experiment_usd).toFixed(2) + ' dollars' : 'the default'}" inputmode="decimal" autocomplete="off"></label>
         <fieldset class="adv-review"><legend>Needs your review before it counts</legend>${kinds.length ? kinds.map((kind) => html`<label class="tick"><input type="checkbox" data-input="opt-review" data-kind="${kind}"${waits(kind) ? raw(' checked') : ''}> ${KIND[kind].many}</label>`) : html`<span class="quiet">As the project default.</span>`}
-          ${reviewDefault('source') === 'auto' ? html`<label class="tick"><input type="checkbox" disabled> Sources <span class="quiet">verified by code, accepted on creation</span></label>` : ''}</fieldset></div></details>
+          ${reviewDefault('source') === 'auto' ? html`<label class="tick"><input type="checkbox" disabled> Sources <span class="quiet">verified by code, accepted on creation</span></label>` : ''}</fieldset>
+        ${agents ? html`<fieldset class="adv-agents"><legend>How the agents work</legend>${agentFields(agents, { id: 'opt-agent', input: 'opt', tick: 'opt-agent',
+          runtimes: offer('agent_runtimes', s.runtime, agentBase.runtime, runtimeName), credentials: offer('agent_credentials', s.credential, agentBase.credential, credentialName),
+          picked: { runtime: s.runtime, model: s.model, credential: s.credential }, modelHint: agentBase.model })}</fieldset>` : ''}</div></details>
       <div class="start-route" aria-label="What happens next"><div class="smap smap-route">
         ${[['Idea', 'yours'], ['Sources', 'verified papers'], ['Topics', 'what is known'], ['Questions', 'what is open'], ['Hypotheses', 'you accept or reject'], ['Experiments', 'you approve each run'], ['Results', 'written by code'], ['Findings', 'traced to results']].map((x, i) => html`<div class="smap-st${i ? ' none' : ' here'}"><div class="smap-dot"></div><div class="smap-name">${x[0]}</div><div class="smap-hint">${x[1]}</div></div>`)}</div></div>
     </div></div>`);
@@ -265,8 +305,16 @@ export const setupView = {
       ${item(local.pdflatex ? 'ok' : 'optional', 'LaTeX', local.pdflatex || '', local.pdflatex ? 'A paper can be compiled on this machine.' : 'pdflatex was not found. Only needed for the optional paper step, and Modal can compile instead.', '')}</section>`;
     const lit = html`<section class="doc-g"><h2>Literature</h2>
       ${item(d.semantic_scholar_api_key ? 'ok' : 'warn', 'Semantic Scholar', d.semantic_scholar_api_key ? 'API key found' : 'no API key', d.semantic_scholar_api_key ? 'Papers are verified at the rate your key allows.' : 'Papers are still verified, at the slow rate of the public interface. A key makes the research phase faster.', d.semantic_scholar_api_key ? '' : 'export SEMANTIC_SCHOLAR_API_KEY=…')}</section>`;
+    /* What agents with a shell (`settings.agents.runtime: sdk`) need on this machine: the
+       package and its command line, and one of the two credentials a project can choose. */
+    const ag = d.agents || null;
+    const agentsSec = !ag ? '' : html`<section class="doc-g" data-setup="agents"><h2>Agents with a shell <span class="quiet">for projects whose agents are Claude Agent SDK agents</span></h2>
+      ${ag.error ? item('optional', 'Claude Agent SDK', '', 'This could not be checked: ' + ag.error, '')
+        : html`${item(ag.package && ag.command_line ? 'ok' : 'optional', 'Claude Agent SDK', ag.package ? 'package installed' : 'package not installed', ag.package && ag.command_line ? 'Agents with a shell can be started. Which model they use, and whose account, is set per project: on its overview under "How the agents work".' : ag.package ? 'The package is installed, but the Claude Code command line the agents run in was not found.' : 'Only needed for projects whose agents are Claude agents with a shell.', ag.package ? '' : "uv sync --extra agents")}
+          ${item(ag.login ? 'ok' : 'optional', 'Your Claude Code login', ag.login ? 'found' : ag.login === false ? 'not found' : 'not kept in a file here', ag.login ? 'Projects set to the credential "login" work on your own Claude account; fast mode works there.' : ag.login === false ? 'Projects set to the credential "login" cannot start their agents until you have signed in.' : 'On this system the login is not kept in a file; the first agent\'s start shows whether you are signed in.', ag.login === false ? 'claude' : '')}
+          ${item(ag.federation ? 'ok' : 'optional', 'Workload Identity Federation', ag.federation ? 'settings found' : 'not set up', ag.federation ? 'Projects set to the credential "federation" work on the worker\'s account.' : (ag.federation_missing || []).length ? 'Not set for this server: ' + ag.federation_missing.join(', ') + '. Only needed for projects set to the credential "federation".' : 'The file that ANTHROPIC_IDENTITY_TOKEN_FILE names is not there.', '')}`}</section>`;
     const pk = d.packages || {};
-    setHTML(root, html`<div class="setup"><div class="setup-wrap">${head}${models}${compute}${lit}
+    setHTML(root, html`<div class="setup"><div class="setup-wrap">${head}${models}${agentsSec}${compute}${lit}
       <p class="quiet setup-foot">Checked ${ago(new Date(doc.at).toISOString())} · PaperOrchestra ${d.version || ''} · Python ${d.python || ''}${app.ui.health && app.ui.health.workspace ? html` · workspace <code>${app.ui.health.workspace}</code>` : ''} · server at ${location.host}
         ${Object.keys(pk).length ? html`<br>Packages: ${Object.keys(pk).filter((k) => pk[k]).map((k) => k + ' ' + pk[k]).join(', ')}` : ''}</p></div></div>`);
   },

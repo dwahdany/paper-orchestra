@@ -42,6 +42,14 @@ SPEC_DEFAULT_SETTINGS = {
         "max_hypotheses": 6,
         "max_experiments": 6,
     },
+    "agents": {
+        "runtime": "classic",
+        "model": "claude-fable-5-2",
+        "fast": True,
+        "ultracode": True,
+        "credential": "login",
+        "sandbox": True,
+    },
     "lab_memory": True,
     # Section 10.1: the person's repository for experiments in repo mode.
     "repo": None,
@@ -120,6 +128,7 @@ def test_records_and_roles():
         "theorist": ("hypothesis", "question"),
         "designer": ("experiment",),
         "analyst": ("finding", "question", "hypothesis", "experiment", "journal"),
+        "experimenter": ("experiment", "question"),
     }
     assert model.may_create("theorist", "hypothesis")
     assert not model.may_create("theorist", "experiment")

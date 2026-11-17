@@ -3,9 +3,9 @@
 
 import { app, defaults, link } from './core.js';
 import { MONTH_NAMES, ago, checkpointDid, clock, cutoffParts, cutoffWords, dayOf, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, setHTML, whyNot } from './util.js';
-import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, icon, lapsed, pageGlyph, phaseName, roleName, shownState } from './vocab.js';
+import { AGENT_SAYS, CHECKPOINT_AFTER, KIND, PHASES, RUNTIME, ROLE, STAGES, TONE, agentName, credentialName, glyph, icon, lapsed, pageGlyph, phaseName, roleName, runtimeName, shownState } from './vocab.js';
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
-import { DEMO_COST, UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
+import { DEMO_COST, UNVERIFIED, actHTML, agentFields, agentsSentence, continueControl, continueNotes, crashText, engineView, foldRuns, foldSteps, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, runWho, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
 import { decisionLink, openDecisions } from './decisions.js';
 
@@ -100,7 +100,7 @@ function argumentHTML(store) {
 }
 
 function feedHTML(store) {
-  const events = foldRuns(store.activity.filter((ev) => ev.type !== 'run.log')).slice(-app.ui.feedLimit).reverse();
+  const events = foldSteps(foldRuns(store.activity.filter((ev) => ev.type !== 'run.log'))).slice(-app.ui.feedLimit).reverse();
   if (!events.length) return html`<p class="quiet">Nothing has happened yet.</p>`;
   let day = '';
   const rows = events.map((ev) => {
@@ -109,9 +109,15 @@ function feedHTML(store) {
     day = d;
     if (ev.run) {
       const path = (store.expById.get(ev.eid) || {}).path;
-      return html`${head}<li class="ev ev-run ev-${ev.status}"><time>${hm(ev.ts)}</time><span class="ev-who">runner</span>
+      return html`${head}<li class="ev ev-run ev-${ev.status}"><time>${hm(ev.ts)}</time><span class="ev-who">${runWho(ev)}</span>
         <span class="ev-run-l">${path ? html`<a href="${link({ view: 'experiments', sel: path, sub: '' })}">${runSentence(ev)}</a>` : runSentence(ev)}
-          <details class="ev-steps" data-keep="run:${ev.key}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${plain(p.summary)}</span></li>`)}</ol></details></span></li>`;
+          <details class="ev-steps" data-keep="run:${ev.key}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${actHTML(p)}</span></li>`)}</ol></details></span></li>`;
+    }
+    /* an agent with a shell that did much in a row: its latest step, and all of them behind it */
+    if (ev.work) {
+      return html`${head}<li class="ev ev-agent-activity ev-work"><time>${hm(ev.ts)}</time><span class="ev-who">${whoOf(ev.last)}</span>
+        <span class="ev-work-l">${actHTML(ev.last)}
+          <details class="ev-steps" data-keep="work:${ev.seq}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${actHTML(p)}</span></li>`)}</ol></details></span></li>`;
     }
     /* a phase that starts says which of the person's instructions it was given */
     const told = ev.type === 'phase.started' ? ((ev.data || {}).requests || []).map((id) => store.requests.find((r) => r.id === id)).filter(Boolean) : [];
@@ -123,7 +129,7 @@ function feedHTML(store) {
     const ref = pause ? null : (ev.refs || []).find((r) => store.byPath.has(r));
     return html`${head}<li class="ev ev-${String(ev.type).replace(/[^a-z]/g, '-')}${you ? ' ev-you' : who === 'engine' && !pause ? ' ev-engine' : ''}"><time>${hm(ev.ts)}</time><span class="ev-who">${who}</span>
       ${/^decision\./.test(ev.type) ? html`<a href="${decisionLink((ev.data || {}).decision)}">${plain(ev.summary)}</a>` /* (a decision is answered, and found again, in the inbox) */
-        : ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${plain(ev.summary)}${given}</span>`}</li>`;
+        : ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${actHTML(ev)}${given}</span>`}</li>`;
   });
   const more = store.activity.length > app.ui.feedLimit || store.moreActivity;
   return html`<ol class="feed">${rows}</ol>${more ? html`<button class="btn btn-quiet btn-s feed-more" data-act="feed-more">Show earlier activity</button>` : ''}`;
@@ -208,13 +214,35 @@ function cutoffHTML(store) {
       ${ui.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span>${ui.error}</span></p>` : ''}</form>` : ''}</details>`;
 }
 
+/** How the project's agents are run (`settings.agents`), said in a sentence and changed in
+    place: the runtime, and for agents with a shell their model, fast mode, helpers, the
+    credential and the sandbox, each with what it means. A change holds from the next phase
+    on: what is at work goes on as it was started. */
+function agentsHTML(store, e) {
+  const a = (store.project.settings || {}).agents;
+  if (!a || typeof a !== 'object') return '';
+  const ui = app.ui.agentsEdit, d = defaults();
+  const list = (name, kept, words) => { const l = d && Array.isArray(d[name]) ? d[name].filter((x) => typeof x === 'string' && x) : []; return (l.indexOf(kept) < 0 ? l.concat([kept]) : l).map((v) => [v, words(v)]); };
+  return html`<section class="ov-sec ov-agents"><h2>How the agents work</h2>
+    <p class="agents-now" data-agents="${a.runtime}"><b>${agentsSentence(a)}</b> ${(RUNTIME[a.runtime] || ['', ''])[1]}</p>
+    ${a.runtime === 'sdk' && !a.sandbox ? html`<p class="note note-warn agents-open-box">${icon('warn')}<span><b>The sandbox is off.</b> ${AGENT_SAYS.noSandbox}</span></p>` : ''}
+    <details class="spend-more agents-more"${ui ? raw(' open') : ''}><summary data-act="agents-open">Change how the agents work</summary>
+    ${ui ? html`<form class="agents-form" data-form="agents">${agentFields(ui, { id: 'ag', input: 'agents', tick: 'agents', runtimes: list('agent_runtimes', ui.runtime, runtimeName), credentials: list('agent_credentials', ui.credential, credentialName), picked: ui, modelHint: '' })}
+      <p class="quiet agents-when">${e.working ? 'The agents at work now go on as they were started; the change holds from the next phase on.' : 'The change holds from the next phase on.'}</p>
+      ${ui.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span><b>Not changed.</b> ${ui.error}</span></p>` : ''}
+      <button class="btn btn-s" type="submit"${ui.saving ? raw(' disabled') : ''}>Save how the agents work</button></form>` : ''}</details></section>`;
+}
+
 function spendHTML(store) {
   const p = store.project, limits = (p.settings || {}).limits || {}, spent = (p.state || {}).spent || {};
+  const unreported = Number((p.usage || {}).unreported_usd) || 0;
+  /* agents that were stopped on a model without a list price: in the sum with nothing */
+  const unpriced = ((p.usage || {}).unreported_unpriced || []).map(String);
   const frac = (a, b) => (b > 0 ? Math.max(0, Math.min(1, a / b)) : 0);
   const phases = ((p.state || {}).phases || []).filter((ph) => ph.seconds != null);
   const agentSeconds = phases.reduce((a, ph) => a + (ph.seconds || 0), 0);
   return html`${p.demonstration ? html`<p class="quiet spend-demo" data-demonstration>${DEMO_COST}</p>` : ''}<div class="spend-big">
-    <div><b>${money(spent.model_usd || 0)}</b><span>of ${money(limits.model_usd)} for models${p.demonstration ? ', in the story' : ''}</span><progress class="meter-p${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend, of the limit"></progress></div>
+    <div><b>${money(spent.model_usd || 0)}</b><span>of ${money(limits.model_usd)} for models${p.demonstration ? ', in the story' : ''}${unreported > 0 ? html` <span class="quiet spend-least" title="An agent that was stopped before it reported its cost is counted from its tokens at the list price, which is a lower bound.">· at least: ${money(unreported)} of it is counted from the tokens of agents that were stopped</span>` : ''}${unpriced.length ? html` <span class="quiet spend-least" data-unpriced="1" title="Its tokens are in usage.json; its cost is not in the sum.">· at least: an agent on ${unpriced.join(', ')} was stopped before it reported its cost, and that model has no list price here</span>` : ''}</span><progress class="meter-p${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend, of the limit"></progress></div>
     <div><b>${money(spent.experiment_usd || 0)}</b><span>of ${money(limits.experiment_usd)} for experiments</span><progress class="meter-p" max="1" value="${frac(spent.experiment_usd || 0, limits.experiment_usd)}" aria-label="Experiment spend, of the limit"></progress></div>
     <div><b>${duration(agentSeconds) || '0 s'}</b><span>of agent time · ${duration(spent.experiment_seconds || 0) || '0 s'} of runs</span></div></div>
     ${phases.length ? html`<details class="spend-more"><summary>Time by phase</summary><table class="metrics"><tbody>${phases.map((ph) => html`<tr><td>Round ${ph.round} · ${phaseName(ph.phase)}${ph.status !== 'completed' ? ' (' + ph.status + ')' : ''}</td><td class="n">${duration(ph.seconds)}</td><td class="n">${plural((ph.produced || []).length, 'page')}</td></tr>`)}</tbody></table></details>` : ''}
@@ -252,7 +280,7 @@ export const overviewView = {
       : !idle ? html`<a class="btn btn-l" href="${link({ view: 'map', sel: '', sub: '' })}">Watch on the map</a><button class="btn btn-l" data-act="stop"${e.stopping ? raw(' disabled') : ''}>${icon('stop')}${e.stopping ? 'Stopping…' : 'Stop'}</button>`
       : html`${items.length ? html`<a class="btn btn-l" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${items.length}</a>` : ''}
         ${continueControl(store, e, 'overview', true)}
-        ${e.mode === 'failed' || e.died || e.crashed ? html`<a class="btn btn-l" href="#/setup">Open Setup</a>` : ''}`;
+        ${e.mode === 'failed' || e.died || e.crashed ? html`${((p.settings || {}).agents || {}).runtime === 'sdk' ? html`<button class="btn btn-l" data-act="agents-show">How the agents work</button>` : ''}<a class="btn btn-l" href="#/setup">Open Setup</a>` : ''}`;
     const waiting = items.length ? items.map((it) => { const sum = summaryOf(it); return html`<div class="ov-item" data-ref="${it.ref}"><a class="ov-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', shownState(it.page), 18)}
         <span class="in-name">${pageName(it.page)}</span>${sum ? html`<span class="in-sum">${sum}</span>` : ''}<span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)} · ${ago(it.when)}</span>${checkMark(it)}</a>
         <span class="in-quick on"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="${acceptTip(it)}" aria-label="${acceptTip(it)}">${icon('check')}</button><button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-view="inbox" data-tip="Reject, with a reason" aria-label="Reject">${icon('x')}</button></span></div>`; })
@@ -294,6 +322,7 @@ export const overviewView = {
       </div><div class="ov-col">
         <section class="ov-sec"><h2>Activity</h2>${feedHTML(store)}</section>
         <section class="ov-sec"><h2>Spend</h2>${spendHTML(store)}</section>
+        ${agentsHTML(store, e)}
         <section class="ov-sec"><h2>Write it up <span>optional</span></h2><p class="ov-paper">When the wiki says what you want to say, it can be written up as a paper with one of the bundled templates. <a class="linkish" href="${link({ view: 'paper', sel: '', sub: '' })}">Open the paper step</a></p></section>
       </div></div></div></div>`);
     afterRender(root);

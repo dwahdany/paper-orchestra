@@ -208,7 +208,7 @@ def _never() -> bool:
     return False
 
 
-def _within_budget(model: str, usage: Usage) -> BaseException | None:
+def _within_budget(model: str, usage: Usage, **more: Any) -> BaseException | None:
     return None
 
 
@@ -245,7 +245,8 @@ class AgentContext:
     instead of running to its end.  ``over_budget`` is asked after every model
     request of a turn with the model and what the turn has used so far (which the
     harness's ledger learns only when the turn ends); it returns why the work must
-    stop, or ``None``, and a turn it stopped ends where a stop request ends one.
+    stop, or ``None``, and a turn it stopped ends where a stop request ends one
+    (it is also given ``more_usd=`` when helpers of the turn worked on other models).
     ``compute`` is a backend, or a
     callable choosing one for a plan, as ``research.experiments.run`` takes it.
     ``handover`` names the roles whose undecided pages of this round the session
@@ -264,26 +265,45 @@ class AgentContext:
     instruction: str | None = None
     guard: Callable[[], None] = _no_guard
     stopping: Callable[[], bool] = _never
-    over_budget: Callable[[str, Usage], BaseException | None] = _within_budget
+    over_budget: Callable[..., BaseException | None] = _within_budget
     scholar: SemanticScholar | None = None
     compute: ComputeBackend | Callable[[Any], ComputeBackend] | None = None
     handover: Sequence[str] = ()
     produced: list[str] = field(default_factory=list)
+    #: The ``sdk`` runtime (``research.sdk.session.AgentRuntime``) when the project's
+    #: roles are Claude Agent SDK agents; ``None`` for the classic tool loop.
+    runtime: Any = None
+    #: What is left of the model budget, in dollars, for a session that can be told a
+    #: sum it must not pass; ``None`` when nobody says.
+    left: Callable[[], float | None] = _no_guard
+    #: Asked before an agent is started with what a start was seen to cost, in dollars:
+    #: why it must not start (what is left of the model budget is less), or ``None``.
+    short_of: Callable[[float], BaseException | None] = lambda needed: None
+    #: The sessions this run of the phase opened that hold something to close (an SDK
+    #: agent's process); whoever runs the phase closes them when it ends.
+    sessions: list[Any] = field(default_factory=list, repr=False)
     #: Why ``over_budget`` said the work must stop, once it has.
     _spent: BaseException | None = field(default=None, init=False, repr=False)
 
     def session_id(self, role: str) -> str:
         return f"{self.session}-{role}"
 
-    def used(self, model: str, usage: Usage) -> None:
+    def used(self, model: str, usage: Usage, *, more_usd: float = 0.0) -> None:
         """Take note of what the turn in flight has used after one more model request.
+
+        ``more_usd`` is what the turn has cost besides, already priced: the requests
+        of helpers that work on another model than ``model``.
 
         Nothing is raised here.  A turn that is past the budget ends at
         :meth:`heed_stop`, which the session asks before each of its tool calls and
         after each model request that leads to another.
         """
         if self._spent is None:
-            self._spent = self.over_budget(model, usage)
+            self._spent = (
+                self.over_budget(model, usage, more_usd=more_usd)
+                if more_usd
+                else self.over_budget(model, usage)
+            )
 
     def ending(self) -> bool:
         """Whether the turn in flight ends the next time :meth:`heed_stop` is asked."""
@@ -296,14 +316,40 @@ class AgentContext:
         if self._spent is not None:
             raise SessionStopped(str(self._spent), reason=self._spent)
 
+    def budget_left(self) -> float | None:
+        """What is left of the model budget in dollars (never below zero), or ``None``."""
+        left = self.left()
+        return None if left is None else max(0.0, float(left))
+
+    def close_sessions(self) -> None:
+        """End what the sessions of this run of the phase still hold (agent processes)."""
+        sessions, self.sessions[:] = list(self.sessions), []
+        for session in sessions:
+            with contextlib.suppress(Exception):
+                session.close()
+
     def note(self, paths: Iterable[str]) -> None:
         """Remember pages this run of the phase created."""
         self.produced += [path for path in paths if path not in self.produced]
 
-    def activity(self, summary: str, *, agent: str, refs: Iterable[str] = ()) -> None:
-        """One line for the activity feed about what an agent is doing."""
+    def activity(
+        self,
+        summary: str,
+        *,
+        agent: str,
+        refs: Iterable[str] = (),
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """One line for the activity feed about what an agent is doing.  ``data`` says
+        the same in parts, for a reader that sets a command apart from the sentence."""
         self.project.emit(
-            "agent.activity", summary, phase=self.phase, agent=agent, refs=refs, round=self.round
+            "agent.activity",
+            summary,
+            phase=self.phase,
+            agent=agent,
+            refs=refs,
+            data=dict(data) if data else None,
+            round=self.round,
         )
 
     def backend(self, plan: Any = None) -> ComputeBackend | None:
@@ -890,6 +936,33 @@ class _Session:
         ]
 
 
+def _open_session(
+    ctx: AgentContext,
+    role: str,
+    *,
+    tools: Sequence[ToolSpec] | Callable[[_SessionBackend], Sequence[ToolSpec]] = (),
+    web_search: WebSearch | None = None,
+    caps: Mapping[str, int] | None = None,
+) -> Any:
+    """The session of ``role`` in the project's runtime: the classic tool loop
+    (:class:`_Session`), or a Claude Agent SDK agent with the same face
+    (``research.sdk.session.AgentSession``) when the engine handed over the ``sdk``
+    runtime.  Everything a role function does with its session is the same for both."""
+    if ctx.runtime is None:
+        return _Session(ctx, role, tools=tools, web_search=web_search, caps=caps)
+    from paper_orchestra.research.sdk.session import AgentSession
+
+    return AgentSession(ctx, role, tools=tools, web_search=web_search, caps=caps)
+
+
+def _capabilities(ctx: AgentContext, role: str) -> Capabilities:
+    """What the model of ``role`` takes in a message.  An SDK agent is not asked through
+    a client of this package, so none is built for it (there may be no API key at all)."""
+    if ctx.runtime is not None:
+        return ctx.runtime.capabilities
+    return ctx.harness.client_for(model_for(ctx.project, role)).capabilities
+
+
 def _idea(project: Project) -> str:
     return project.page(IDEA_PATH).body
 
@@ -1240,10 +1313,12 @@ def name_project_tool(ctx: AgentContext) -> ToolSpec:
 def run_intake(ctx: AgentContext) -> AgentReport:
     """Put into the wiki what the person's attached files contribute."""
     project = ctx.project
-    capabilities = ctx.harness.client_for(model_for(project, "intake")).capabilities
-    inputs = read_inputs(project, capabilities)
+    inputs = read_inputs(project, _capabilities(ctx, "intake"))
     untitled = project.title_is_provisional
-    session = _Session(ctx, "intake", tools=[name_project_tool(ctx)] if untitled else ())
+    session = _open_session(ctx, "intake", tools=[name_project_tool(ctx)] if untitled else ())
+    if ctx.runtime is not None:
+        # An agent is sent text; the images and PDFs lie in its folder for its file tools.
+        session.give_inputs()
     message = prompts.intake_message(
         idea=_idea(project),
         attached=inputs.attached,
@@ -1288,8 +1363,8 @@ def run_scout(ctx: AgentContext) -> AgentReport:
     project = ctx.project
     cutoff = project_cutoff(project)
     verifier = SourceVerifier(project, scholar=ctx.scholar, harness=ctx.harness, round=ctx.round)
-    capabilities = ctx.harness.client_for(model_for(project, "scout")).capabilities
-    session = _Session(
+    capabilities = _capabilities(ctx, "scout")
+    session = _open_session(
         ctx,
         "scout",
         tools=[verify_paper_tool(verifier)],
@@ -1342,7 +1417,7 @@ def run_theorist(ctx: AgentContext) -> AgentReport:
     """Propose hypotheses an experiment could contradict."""
     project = ctx.project
     limit = int(project.settings.limits.max_hypotheses)
-    session = _Session(ctx, "theorist", caps={"hypothesis": limit})
+    session = _open_session(ctx, "theorist", caps={"hypothesis": limit})
     session.send(
         prompts.theorist_message(
             idea=_idea(project),
@@ -1845,7 +1920,7 @@ def run_designer(ctx: AgentContext, *, spent: Mapping[str, float] | None = None)
         return [write_code_tool(ctx, backend), *(repo_tools(root) if root else [])]
 
     limit = int(project.settings.limits.max_experiments)
-    session = _Session(ctx, "designer", tools=tools, caps={"experiment": limit})
+    session = _open_session(ctx, "designer", tools=tools, caps={"experiment": limit})
     waiting = [
         {"id": page.id, "title": page.title}
         for page in project.pages(kind="experiment", review="accepted", state="planned")
@@ -2156,10 +2231,15 @@ def _next_step_notes(ctx: AgentContext, session: _Session) -> list[str]:
                 ctx.project.update_page(
                     page.path, author="system", fields={"problems": found or None}
                 )
+        after = (
+            "Once you accept it and approve its run, the agent that carries it out writes "
+            "the code from the plan."
+            if ctx.runtime is not None
+            else "Once you accept it, the designer writes its code in the next design "
+            "phase; its run can be approved after that."
+        )
         notes.append(
-            f"{page.id} is a next step the analyst proposed as a plan, without code. Once "
-            "you accept it, the designer writes its code in the next design phase; its "
-            "run can be approved after that."
+            f"{page.id} is a next step the analyst proposed as a plan, without code. {after}"
             + (
                 f" Its page lists what else stands in the way: {_short(found[0], 200)}"
                 + (f" (and {len(found) - 1} more)" if found[1:] else "")
@@ -2194,7 +2274,7 @@ def run_analyst(
     project = ctx.project
     limits = project.settings.limits
     caps = {"hypothesis": int(limits.max_hypotheses), "experiment": int(limits.max_experiments)}
-    session = _Session(ctx, "analyst", caps=caps)
+    session = _open_session(ctx, "analyst", caps=caps)
     journal_path = f"{SECTIONS['journal']}/{journal}.md"
     session.send(
         prompts.analyst_message(

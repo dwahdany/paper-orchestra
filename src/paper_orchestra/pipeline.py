@@ -39,6 +39,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import secrets
@@ -557,6 +558,15 @@ def _usage_of(row: dict[str, Any]) -> Usage:
     return Usage(**{name: int(row.get(name) or 0) for name in _USAGE_FIELDS})
 
 
+def _reported_cost(row: dict[str, Any]) -> dict[str, float]:
+    """The dollar figure a ledger row carries (``cost_usd``), as the entry it is; nothing
+    for a row that is priced from its tokens."""
+    cost = row.get("cost_usd")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost):
+        return {}
+    return {"cost_usd": float(cost)}
+
+
 def read_carried_usage(path: Path) -> list[dict[str, Any]]:
     """Usage rows recorded by the earlier invocations of a resumed run."""
     if not path.is_file():
@@ -564,7 +574,12 @@ def read_carried_usage(path: Path) -> list[dict[str, Any]]:
     try:
         rows = json.loads(path.read_text(encoding="utf-8"))["by_label"]
         return [
-            {"label": str(row["label"]), "model": str(row["model"]), **_usage_of(row).to_dict()}
+            {
+                "label": str(row["label"]),
+                "model": str(row["model"]),
+                **_usage_of(row).to_dict(),
+                **_reported_cost(row),
+            }
             for row in rows
         ]
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -584,25 +599,41 @@ def usage_report(
     from ``usage.json``) accounts for, so only what was added since is counted.
     """
     before = {(row["label"], row["model"]): _usage_of(row) for row in baseline}
+    paid_before = {
+        (row["label"], row["model"]): _reported_cost(row).get("cost_usd", 0.0) for row in baseline
+    }
     merged = UsageTracker()
     for row in carried:
-        merged.record(row["label"], row["model"], _usage_of(row))
+        merged.record(
+            row["label"], row["model"], _usage_of(row), cost_usd=_reported_cost(row).get("cost_usd")
+        )
     for row in tracker.to_dict()["by_label"]:
         spent = _usage_of(row)
-        earlier = before.get((row["label"], row["model"]))
+        key = (row["label"], row["model"])
+        earlier = before.get(key)
         if earlier is not None:
             spent = Usage(
                 **{name: getattr(spent, name) - getattr(earlier, name) for name in _USAGE_FIELDS}
             )
-        if any(spent.to_dict().values()):
-            merged.record(row["label"], row["model"], spent)
+        # A row with a dollar figure of its own (a Claude Agent SDK session) is priced
+        # by that figure, never from its tokens: what it adds is what was reported since.
+        paid = _reported_cost(row).get("cost_usd")
+        if paid is not None:
+            paid -= paid_before.get(key, 0.0)
+        if any(spent.to_dict().values()) or paid:
+            merged.record(row["label"], row["model"], spent, cost_usd=paid)
     report = merged.to_dict()
     try:
         from paper_orchestra.llm.pricing import estimate_cost_usd
     except ImportError:
         return report
     costs = [
-        (row["model"], estimate_cost_usd(row["model"], _usage_of(row)))
+        (
+            row["model"],
+            row["cost_usd"]
+            if "cost_usd" in row
+            else estimate_cost_usd(row["model"], _usage_of(row)),
+        )
         for row in report["by_label"]
     ]
     priced = [cost for _, cost in costs if cost is not None]

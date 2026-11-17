@@ -583,6 +583,7 @@ const ACT = {
   'forget-worker': () => forgetWorker(),
   'notices-seen': () => { dismissNotices(store()); app.render('ui'); },
   'show-problems': () => { if (app.route.view !== 'overview') go({ view: 'overview', sel: '', sub: '' }); setTimeout(() => { const el = $('#problems'); if (el) el.scrollIntoView({ block: 'start', behavior: glide() }); }, 60); },
+  'show-agents': () => { if (app.route.view !== 'overview') go({ view: 'overview', sel: '', sub: '' }); setTimeout(() => { const el = $('.ov-agents'); if (el) el.scrollIntoView({ block: 'start', behavior: glide() }); }, 60); },
   'cutoff-open': () => {
     if (app.ui.cutoffEdit) { app.ui.cutoffEdit = null; return; }
     const parts = cutoffParts(((store().project.settings || {}).research_cutoff));
@@ -590,6 +591,19 @@ const ACT = {
     app.render('ui');
   },
   'cutoff-none': () => saveCutoff(null),
+  'agents-open': () => {
+    if (app.ui.agentsEdit) { app.ui.agentsEdit = null; return; }
+    const a = (store().project.settings || {}).agents || {};
+    app.ui.agentsEdit = { runtime: a.runtime, model: a.model || '', fast: !!a.fast, ultracode: !!a.ultracode, credential: a.credential, sandbox: !!a.sandbox, error: null, saving: false };
+    app.render('ui');
+  },
+  /* From a phase that failed: to where the model and the credential of agents with a shell
+     are set, opened for a change (a mistyped model fails there, not in Setup). */
+  'agents-show': () => {
+    if (!app.ui.agentsEdit) ACT['agents-open']();
+    else app.render('ui');
+    requestAnimationFrame(() => { const sec = $('.ov-agents'); if (sec) { sec.scrollIntoView({ block: 'start', behavior: 'smooth' }); const first = $('.ov-agents input, .ov-agents select'); if (first) first.focus({ preventScroll: true }); } });
+  },
   stop: () => stopAgents(),
   'limit-edit': () => { const limits = (store().project.settings || {}).limits || {}; app.ui.limitEdit = { value: limits.model_usd > 0 ? String(Math.ceil(limits.model_usd * 1.5)) : '' }; app.render('limit'); setTimeout(() => { const el = $('#limit-usd'); if (el) el.select(); }, 0); },
   'limit-cancel': () => { app.ui.limitEdit = null; app.render('limit'); },
@@ -648,6 +662,25 @@ const ACT = {
     catch (error) { sayError(eid + ' was not started: ' + message(error)); s.invalidateExperiment(eid); s.refresh(); }
     delete app.ui.starting[eid];
     app.render('run');
+  },
+  /* The code an agent left after a run becomes the experiment's code, as the person's own
+     edit: the earlier version is kept, and the experiment must be approved again to run. */
+  'adopt-code': async (el) => {
+    const s = store(), eid = el.dataset.eid, run = el.dataset.run;
+    if (app.ui.adopting) return;
+    app.ui.adopting = eid + '/' + run;
+    app.render('adopt');
+    try {
+      const answer = await api.adoptCode(s.pid, eid, run);
+      s.invalidateExperiment(eid);
+      await s.refreshNow();
+      const files = (answer.files || []).join(', '), problems = answer.problems || [];
+      const left = (answer.removed || []).length ? ' ' + answer.removed.join(', ') + ' (removed by the agent) was left in place.' : '';
+      if (problems.length) sayError('The code of run ' + run + ' is now the code of ' + eid + ' (' + files + ').' + left + ' The check found: ' + problems.join(' '));
+      else say('The code of run ' + run + ' is now the code of ' + eid + ' (' + files + '); the earlier version is kept.' + left + ' Approve the experiment again to run it.');
+    } catch (error) { sayError('The code of run ' + run + ' was not taken over: ' + message(error)); }
+    app.ui.adopting = null;
+    app.render('adopt');
   },
   /* Take an approval back, or cancel a run: which of the two the press does is what the
      button said (`data-does`, the server's `cancel_does`), and the server is told so: it
@@ -710,6 +743,46 @@ async function saveCutoff(value) {
     say(parts ? 'The research cutoff is set: only literature published before ' + cutoffWords(parts) + ' is in scope.' : 'The project has no research cutoff now.');
   } catch (error) { ui.error = message(error); ui.saving = false; }
   app.render('cutoff');
+}
+
+/** Change how the project's agents are run (`settings.agents`): the runtime alone for the
+    tool loop, every field for agents with a shell. */
+async function saveAgents() {
+  const s = store(), ui = app.ui.agentsEdit;
+  if (!ui || ui.saving) return;
+  const agents = { runtime: ui.runtime };
+  if (ui.runtime === 'sdk') {
+    const model = String(ui.model || '').trim();
+    if (!model) { ui.error = 'Name the model the agents work with.'; app.render('agents'); return; }
+    Object.assign(agents, { model, fast: !!ui.fast, ultracode: !!ui.ultracode, credential: ui.credential, sandbox: !!ui.sandbox });
+  }
+  ui.saving = true; ui.error = null;
+  app.render('agents');
+  try {
+    const before = (s.project.settings || {}).agents || {};
+    await api.patchProject(s.pid, { settings: { agents } });
+    app.ui.agentsEdit = null;
+    await s.refreshNow();
+    say(agentsChange(before, agents));
+  } catch (error) { ui.error = message(error); ui.saving = false; }
+  app.render('agents');
+}
+
+/** What a change of `settings.agents` did, from the values that changed: the runtime when
+    it is another one, else each value by its name ("Fast mode off, helper agents off"). */
+export function agentsChange(before, after) {
+  const when = ', from the next phase on.';
+  if (after.runtime !== before.runtime) return 'The agents are now ' + (after.runtime === 'sdk' ? 'Claude agents with a shell' : after.runtime === 'classic' ? 'run in the tool loop' : after.runtime) + when;
+  if (after.runtime !== 'sdk') return 'Nothing changed: the agents are run in the tool loop, as before.';
+  const onOff = (v) => (v ? 'on' : 'off'), changed = [];
+  if (after.model !== before.model) changed.push('the model is ' + after.model);
+  if (!!after.fast !== !!before.fast) changed.push('fast mode ' + onOff(after.fast));
+  if (!!after.ultracode !== !!before.ultracode) changed.push('helper agents ' + onOff(after.ultracode));
+  if (after.credential !== before.credential) changed.push(after.credential === 'login' ? 'they work on your Claude Code login' : 'they work on the worker\'s federation');
+  if (!!after.sandbox !== !!before.sandbox) changed.push('the sandbox is ' + onOff(after.sandbox));
+  if (!changed.length) return 'Nothing changed: the agents work as before.';
+  const said = changed.join(', ');
+  return said.charAt(0).toUpperCase() + said.slice(1) + when;
 }
 
 async function saveCode(form) {
@@ -779,6 +852,7 @@ export function installActions() {
       if (made.error) { ui.error = made.error; app.render('cutoff'); return; }
       saveCutoff(made.value);
     }
+    else if (kind === 'agents') saveAgents();
     else if (kind === 'code') saveCode(form);
     else if (kind === 'start') startProject();
     else if (kind === 'request') {
@@ -860,6 +934,7 @@ export function installActions() {
     else if (what === 'paper-model') app.ui.paper.model = t.value;
     else if (what === 'limits' && app.ui.limits) app.ui.limits[t.dataset.name] = t.value;
     else if (what === 'cutoff' && app.ui.cutoffEdit) app.ui.cutoffEdit[t.dataset.name] = t.value;
+    else if (what === 'agents' && app.ui.agentsEdit && t.type !== 'checkbox' && t.tagName !== 'SELECT') app.ui.agentsEdit[t.dataset.name] = t.value;
     else if (what === 'limit' && app.ui.limitEdit) app.ui.limitEdit.value = t.value;
     else if (what === 'new-page-title' && app.ui.newPage) app.ui.newPage.title = t.value;
   });
@@ -877,9 +952,13 @@ export function installActions() {
     else if (what === 'ap-net-choice') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).network = t.value === 'yes'; if (app.ui.netNudge === t.dataset.eid) app.ui.netNudge = null; app.render('backend'); }
     else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.tagName === 'SELECT') app.render('start'); }
     else if (what === 'opt-review') { const s = composer(); s.auto[t.dataset.kind] = !t.checked; keepComposer(); }
+    /* a tick about the agents: what it means is said beside it, and reads otherwise once it is changed */
+    else if (what === 'opt-agent') { const s = composer(); s[t.dataset.name] = t.checked; keepComposer(); app.render('start'); }
     else if (what === 'request-about') { app.ui.request.about = t.checked; }
     else if (what === 'request-for') { app.ui.request.for = t.value; keepRequest(); app.render('request'); }
     else if (what === 'cutoff' && app.ui.cutoffEdit) { app.ui.cutoffEdit[t.dataset.name] = t.value; }
+    /* a choice about the agents: the sentence beside it, and which fields there are, follow it */
+    else if (what === 'agents' && app.ui.agentsEdit) { const ui = app.ui.agentsEdit; if (t.type === 'checkbox') ui[t.dataset.name] = t.checked; else ui[t.dataset.name] = t.value; if (t.type === 'checkbox' || t.tagName === 'SELECT') { ui.error = null; app.render('agents'); } }
     else if (what === 'map-round') { app.ui.map.round = t.value === '' ? null : +t.value; mapView.reset(); app.render('map'); }
     else if (what === 'map-lineage') { const m = app.ui.map; m.deep = t.value === 'all'; m.lineageOnly = t.value === 'only'; mapView.reset(); app.render('map'); }
     else if (what === 'paper-template') app.ui.paper.template = t.value;

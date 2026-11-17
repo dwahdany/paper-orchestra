@@ -183,15 +183,27 @@ class Usage:
 
 
 class UsageTracker:
-    """Thread-safe per-(label, model) usage ledger shared by a pipeline run."""
+    """Thread-safe per-(label, model) usage ledger shared by a pipeline run.
+
+    A row can also carry what its usage cost in dollars as whoever served it said
+    (``cost_usd``): a Claude Agent SDK session reports its own figure, which covers
+    what a price per token cannot know (fast mode, sub-agents).  Whoever prices the
+    ledger takes that figure for such a row instead of an estimate from its tokens.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._by_key: dict[tuple[str, str], Usage] = {}
+        self._cost_by_key: dict[tuple[str, str], float] = {}
 
-    def record(self, label: str, model: str, usage: Usage) -> None:
+    def record(
+        self, label: str, model: str, usage: Usage, *, cost_usd: float | None = None
+    ) -> None:
         with self._lock:
             self._by_key.setdefault((label, model), Usage()).add(usage)
+            if cost_usd is not None:
+                key = (label, model)
+                self._cost_by_key[key] = self._cost_by_key.get(key, 0.0) + float(cost_usd)
 
     def total(self) -> Usage:
         with self._lock:
@@ -202,10 +214,12 @@ class UsageTracker:
 
     def to_dict(self) -> dict[str, Any]:
         with self._lock:
-            rows = [
-                {"label": label, "model": model, **usage.to_dict()}
-                for (label, model), usage in sorted(self._by_key.items())
-            ]
+            rows = []
+            for (label, model), usage in sorted(self._by_key.items()):
+                row: dict[str, Any] = {"label": label, "model": model, **usage.to_dict()}
+                if (label, model) in self._cost_by_key:
+                    row["cost_usd"] = round(self._cost_by_key[(label, model)], 6)
+                rows.append(row)
         return {"total": self.total().to_dict(), "by_label": rows}
 
 

@@ -15,7 +15,8 @@
    every run a fresh copy. With a third copy in a folder named `nomodel`, and
    PAPER_ORCHESTRA_E2E_NO_MODEL naming a file (for the server and for this script alike), a
    project whose models cannot be used is looked at too: the scripted model is switched off
-   while that file exists, and this script writes and removes it. tests/test_web_e2e.py does
+   while that file exists, and this script writes and removes it. With a fourth copy in a
+   folder named `shell`, how agents with a shell are chosen and shown is looked at there. tests/test_web_e2e.py does
    all of that; README.md says how to do it by hand.
 
    Exit status 0 when every check passed. */
@@ -154,6 +155,83 @@ const pageFile = (dir, pagePathInProject) => path.join(dir, ...pagePathInProject
 /** A stamp as the project's files write them. */
 const stamp = (date) => (date || new Date()).toISOString().replace(/\.\d+Z$/, 'Z');
 
+/** What agents with a shell leave in a project's files, written by hand into `dir` (the
+    project is at rest): the events of a scout at work (its start, a search, a page, shell
+    commands, a file, board tools, a helper, a call that was refused), a second run of E1
+    that an agent carried out (its record says so, its log is what the agent did), and the
+    mark of an agent on the failed run of E2. The shapes are those of a real project
+    (`data.did` and `data.text` of `agent.activity`, `carried_out_by` of `run.started` and of
+    run.json). Returns what was written, for the check to compare with. */
+function agentTraces(dir) {
+  const file = path.join(dir, 'events.jsonl');
+  const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n');
+  let seq = +(/^\{"seq": (\d+)/.exec(lines[lines.length - 1]) || [0, 0])[1];
+  const round = JSON.parse(lines[lines.length - 1]).round || 1;
+  const t0 = Date.now() - 120000;
+  const out = [];
+  /* `seq` first, as the project writes it: the server finds its place in the file by it */
+  const emit = (type, agent, phase, summary, data, refs) => { seq += 1; out.push('{"seq": ' + seq + ', ' + JSON.stringify({ ts: stamp(new Date(t0 + out.length * 1500)), type, phase, round, agent, summary, refs: refs || [], data: data || {} }).slice(1)); };
+  const act = (agent, phase, summary, data) => emit('agent.activity', agent, phase, summary, data);
+  const command = 'python3 -m venv .venv && ./.venv/bin/pip install -q numpy scikit-learn 2>&1 | tail -3; ./.venv/bin/python -c \'import sklearn, numpy; print(sklearn.__version__, numpy.__version__)\' && ls -la';
+  const url = 'https://arxiv.org/abs/1906.02629?context=cs.LG&utm_source=a-very-long-query-string-that-does-not-break-anywhere-by-itself';
+  /* a second run of E1, which an agent carried out */
+  const runs = path.join(dir, 'experiments', 'E1', 'runs');
+  fs.cpSync(path.join(runs, '1'), path.join(runs, '2'), { recursive: true });
+  const record = JSON.parse(fs.readFileSync(path.join(runs, '2', 'run.json'), 'utf8'));
+  /* ... and changed the code it was given: the record names no exit status, and the code as
+     the agent left it lies beside the approved code */
+  const approvedCode = fs.readFileSync(path.join(runs, '2', 'code', 'main.py'), 'utf8');
+  const changedCode = approvedCode + '\n# CHANGED-BY-THE-AGENT: the call that failed was corrected here.\n';
+  fs.mkdirSync(path.join(runs, '2', 'code-as-run'), { recursive: true });
+  fs.writeFileSync(path.join(runs, '2', 'code-as-run', 'main.py'), changedCode);
+  Object.assign(record, { number: 2, carried_out_by: 'agent', exit_code: null, model_access: true, code_as_run: { digest: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90', changed: ['main.py'], added: [], removed: [] }, started: stamp(new Date(t0 + 30000)), finished: stamp(new Date(t0 + 48000)), seconds: 17.9, result: null });
+  fs.writeFileSync(path.join(runs, '2', 'run.json'), JSON.stringify(record, null, 2));
+  const page = 'wiki/experiments/' + fs.readdirSync(path.join(dir, 'wiki', 'experiments')).find((name) => /^E1-/.test(name));
+  const said = ['The experimenter works as a Claude agent on claude-haiku-5-5; fast mode was asked for and is not on (“preference”).', 'The experimenter ran “ls -la && cat main.py” in its shell.', 'The experimenter wrote main.py in its folder.', 'The experimenter ran “' + command + '” in its shell.', 'The experimenter ran “timeout 200 ./.venv/bin/python main.py; echo exit=$?; cat metrics.json” in its shell.'];
+  fs.writeFileSync(path.join(runs, '2', 'log.txt'), ['An agent carries out E1; it has 300 seconds.'].concat(said, ['E1 ran once and passed; metrics.json and the figure are in place.']).map((l) => '[paper-orchestra] ' + l + '\n').join(''));
+  const state = (to) => emit('experiment.state', '', 'run', 'Experiment E1 is now ' + to + '.', { path: page, kind: 'experiment', id: 'E1', review: 'accepted', state: to, by: 'system' }, [page]);
+  state('queued'); state('running');
+  emit('run.started', 'runner', '', 'Run 2 of experiment E1 started on the local backend.', { experiment: 'E1', run: 2, backend: 'local', carried_out_by: 'agent' }, [page]);
+  const parts = [{ did: 'start', model: 'claude-haiku-5-5', fast: 'off', fast_asked: true }, { did: 'shell', text: 'ls -la && cat main.py' }, { did: 'write', text: 'main.py' }, { did: 'shell', text: command }, { did: 'shell', text: 'timeout 200 ./.venv/bin/python main.py; echo exit=$?; cat metrics.json' }];
+  said.forEach((summary, i) => act('experimenter', 'run', summary, parts[i]));
+  emit('run.finished', 'runner', '', 'Run 2 of experiment E1 succeeded after 17.9 s.', { experiment: 'E1', run: 2, status: 'succeeded', seconds: 17.9, error: null, requeued: false, result: null }, [page]);
+  state('succeeded');
+  /* (a line of that agent after its run has ended stands by itself, under the agent's own name) */
+  act('experimenter', 'run', 'The experimenter read wiki/idea.md.', { did: 'board', tool: 'memory' });
+  /* then a scout at work: the newest lines of the feed, so that a further step joins them */
+  emit('phase.started', 'scout', 'research', 'Round ' + round + ': the research phase started.', {});
+  act('scout', 'research', 'The scout works as a Claude agent on claude-haiku-5-5; fast mode was asked for and is not on (“preference”).', { did: 'start', model: 'claude-haiku-5-5', fast: 'off', fast_asked: true });
+  const scout = [
+    ['The scout read wiki/idea.md.', { did: 'board', tool: 'memory' }],
+    ['The scout searched the web for “label smoothing calibration expected calibration error”.', { did: 'search', text: 'label smoothing calibration expected calibration error' }],
+    ['The scout opened “' + url + '”.', { did: 'fetch', text: url }],
+    ['The scout ran “' + command + '” in its shell.', { did: 'shell', text: command }],
+    ['The scout wrote notes/calibration.md in its folder.', { did: 'write', text: 'notes/calibration.md' }],
+    ['The scout searched the wiki for “warmup”.', { did: 'board', tool: 'wiki_search' }],
+    ['The scout checked “When Does Label Smoothing Help?” against Semantic Scholar.', { did: 'board', tool: 'verify_paper' }],
+    ['The scout started a helper agent: “Read three papers on calibration”.', { did: 'helper', text: 'Read three papers on calibration' }],
+    ['A helper of the scout ran “ls papers/” in its shell.', { did: 'shell', text: 'ls papers/', helper: true }],
+    ['The scout tried “paper-orchestra research approve . E1” with Bash; that is not an agent\'s to do, and it was refused.', { did: 'shell', text: 'paper-orchestra research approve . E1', refused: true }],
+  ];
+  scout.forEach(([summary, data]) => act('scout', 'research', summary, data));
+  /* the failed run of E2, as an agent's */
+  let failed = false;
+  const two = path.join(dir, 'experiments', 'E2', 'runs');
+  const last = fs.existsSync(two) ? fs.readdirSync(two).map(Number).filter(Boolean).sort((a, b) => b - a)[0] : 0;
+  if (last) {
+    const lost = JSON.parse(fs.readFileSync(path.join(two, String(last), 'run.json'), 'utf8'));
+    if (lost.status === 'failed' && !lost.timed_out) { lost.carried_out_by = 'agent'; lost.repairs = []; lost.error_kind = 'metrics'; lost.code_as_run = { digest: 'c0ffee11223344556677889900aabbccddeeff00112233445566778899aabbcc', approved: 0, changed: [], added: ['main.py'], removed: [] }; fs.writeFileSync(path.join(two, String(last), 'run.json'), JSON.stringify(lost, null, 2)); failed = true; }
+  }
+  fs.appendFileSync(file, out.join('\n') + '\n');
+  /* (the run's four events and the experiment's two states are steps of the run as well) */
+  return { seq, round, command, scoutSteps: scout.length, runSteps: said.length + 5, failed };
+}
+/** One more step of the scout, written while a page is open. */
+agentTraces.more = (dir, traces) => {
+  traces.seq += 1;
+  fs.appendFileSync(path.join(dir, 'events.jsonl'), '{"seq": ' + traces.seq + ', ' + JSON.stringify({ ts: stamp(), type: 'agent.activity', phase: 'research', round: traces.round, agent: 'scout', summary: 'The scout ran “wc -l notes/calibration.md” in its shell.', refs: [], data: { did: 'shell', text: 'wc -l notes/calibration.md' } }).slice(1) + '\n');
+};
+
 const OVERFLOW = () => {
   const out = [];
   const de = document.documentElement;
@@ -218,6 +296,15 @@ CHECKS.phone = async ({ browser, pid }) => {
       if (!r.width || (el.closest('.in-scroll') && (y <= list.top || y >= list.bottom))) return;
       const at = document.elementFromPoint(x, y); if (at && at.closest('#toast')) out.push((el.dataset.act || el.className) + ' at ' + Math.round(x) + ',' + Math.round(y)); });
     return out; };
+  /* text that has no room: narrower than its longest word needs, many times taller than
+     wide, or a name of the route under the form on more than two lines */
+  const SQUEEZED = () => { const out = [];
+    document.querySelectorAll('.composer-bar *, .start-est, .start-lede, .smap-route .smap-name, .smap-route .smap-hint').forEach((el) => { const r = el.getBoundingClientRect(), words = (el.textContent || '').trim();
+      if (!r.width || !words || el.children.length) return;
+      const longest = Math.max.apply(null, words.split(/\s+/).map((w) => w.length)), font = parseFloat(getComputedStyle(el).fontSize);
+      if (r.width < Math.min(longest, 12) * font * 0.45 || r.height > 6 * Math.max(r.width, 1)) out.push((el.className || el.tagName) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' "' + words.slice(0, 24) + '"'); });
+    const names = Array.from(document.querySelectorAll('.smap-route .smap-name')).filter((el) => el.getBoundingClientRect().height > parseFloat(getComputedStyle(el).fontSize) * 2.2).map((el) => el.textContent);
+    return { out, names }; };
   const focusIn = (page, selector) => page.evaluate((sel) => !!document.activeElement && document.activeElement.matches(sel), selector);
   const reach = async (page, width, where, selectors, least) => {
     const boxes = await page.evaluate(BOXES, selectors), high = await page.evaluate(() => window.innerHeight);
@@ -235,6 +322,13 @@ CHECKS.phone = async ({ browser, pid }) => {
       hash = r.replace('PID', pid);
       await open(page, hash);
       await page.waitForTimeout(350);
+      if (r === '#/start') {
+        /* the new-project page: no piece of text is squeezed to a letter's width (the hint
+           beside "Add files" was, and the route under the form broke its words in the middle) */
+        const squeezed = await page.evaluate(SQUEEZED);
+        ok(!squeezed.out.length && !squeezed.names.length, width + ' the new-project page on a phone squeezes no text: ' + JSON.stringify(squeezed));
+        await shot(page, 'start-phone-' + width);
+      }
       const over = await page.evaluate(NARROW);
       ok(!over.length, width + ' ' + hash + ' horizontal overflow: ' + over.join('; '));
       if (hash.includes(pid)) ok(await page.evaluate(() => { const nav = document.querySelector('.views'), a = nav.querySelector('a[aria-current]').getBoundingClientRect(), b = nav.getBoundingClientRect(); return a.left >= b.left - 1 && a.right <= b.right + 1; }), width + ' ' + hash + ': the open view is not in sight in the top bar');
@@ -347,6 +441,317 @@ CHECKS.phone = async ({ browser, pid }) => {
   ok(side.length === 3, 'on its side: the answers of a proposal and the way back are not on the screen: ' + side.map((b) => b[0]).join(', '));
   await shot(page, 'phone-side');
   await ctx.close();
+};
+
+/* Agents with a shell (the `sdk` runtime). How the agents are run is chosen in the composer
+   and changed on the overview, each choice with the sentence that says what it means, and
+   the server holds what the app says. What such agents do, and a run one of them carried
+   out, cannot be brought about here (no agent can be started on the scripted model): the
+   check writes what they leave into the project's files, the events of a scout at work and
+   of a run an agent carried out, and looks at the feed and the experiment, at a desk and on
+   a phone. On a fourth copy of the demo project, in a folder named `shell`, which no other
+   check touches. */
+CHECKS.shell = async ({ browser, page, shell }) => {
+  if (!shell) { notes.push('shell: agents with a shell were not looked at (the workspace has no demo project in a folder named shell)'); return; }
+  const pid = shell, project = '/api/projects/' + pid;
+  const defaults = (await api('GET', '/api/defaults')).data;
+  const base = defaults.settings.agents;
+  const says = (page, name) => page.evaluate((n) => { const el = document.querySelector('[data-says="' + n + '"]'); return el ? el.textContent.replace(/\s+/g, ' ').trim() : ''; }, name);
+
+  /* the composer: the runtimes the server lists, its default named as the default, and nothing about the agents sent that the person did not choose */
+  await open(page, '#/start?adv=1', '#opt-agent-runtime');
+  ok(JSON.stringify(await page.$$eval('#opt-agent-runtime option', (options) => options.map((o) => o.value))) === JSON.stringify([''].concat(defaults.agent_runtimes)) && defaults.agent_runtimes.length === 2, 'the composer offers the runtimes the server says its settings accept: ' + (await page.$$eval('#opt-agent-runtime option', (options) => options.map((o) => o.value)).then((v) => v.join())));
+  ok(/^Default \(/.test(await page.$eval('#opt-agent-runtime option', (o) => o.textContent)) && (await page.inputValue('#opt-agent-runtime')) === '', 'with the runtime a new project would get named as the default: ' + (await page.$eval('#opt-agent-runtime option', (o) => o.textContent)));
+  ok((await says(page, 'runtime')).length > 40, 'and one sentence says what that runtime means: ' + (await says(page, 'runtime')));
+  /* the default is the server's, which follows its environment (PAPER_ORCHESTRA_AGENT_RUNTIME): named, and its fields shown or not, before anything is chosen */
+  ok((base.runtime === 'sdk' ? /shell/ : /tool loop/i).test(await page.$eval('#opt-agent-runtime option', (o) => o.textContent)) && (base.runtime === 'sdk' ? /shell/ : /no shell/).test(await says(page, 'runtime')), 'the default that is named is the server\'s (' + base.runtime + '): ' + (await page.$eval('#opt-agent-runtime option', (o) => o.textContent)));
+  ok(((await count(page, '#opt-agent-model')) === 1) === (base.runtime === 'sdk'), 'the fields of agents with a shell are shown where the default is such agents, and not for the tool loop');
+  await page.selectOption('#opt-agent-runtime', 'sdk');
+  await page.waitForSelector('#opt-agent-model');
+  /* the effort is a setting of the tool loop's models: it is not offered for agents with a shell */
+  ok((await count(page, '#opt-effort')) === 0, 'with agents with a shell chosen, the composer does not offer a model effort');
+  await page.selectOption('#opt-agent-runtime', 'classic');
+  await page.waitForSelector('#opt-effort');
+  ok((await count(page, '#opt-agent-model')) === 0, 'for the tool loop it does, and the fields of agents with a shell are gone');
+  ok((await count(page, '.start-agents')) === 0, 'and nothing under the box speaks of agents with a shell');
+  await page.selectOption('#opt-agent-runtime', 'sdk');
+  await page.waitForSelector('#opt-agent-model');
+  /* whose account pays, and that fast mode is dear, stands on the page itself: Options may be closed when Start is pressed */
+  const paid = await text(page, '.start-est .start-agents');
+  ok(paid.includes(base.model) && (base.credential === 'login' ? /billed to your own Claude account/ : /federation/).test(paid) && (!(base.fast && base.credential === 'login') || /fast mode costs several times/.test(paid)) && /Change it under Options/.test(paid), 'under the box, outside the options, the page says on which model and whose account the agents work: ' + paid);
+  await page.selectOption('#opt-agent-credential', 'federation');
+  await until(page, () => /federation/.test((document.querySelector('.start-agents') || {}).textContent || '') && !/fast mode/.test((document.querySelector('.start-agents') || {}).textContent || ''), null, 3000, 'with the federation credential it names that account, and no fast mode');
+  await page.selectOption('#opt-agent-credential', '');
+  ok(/shell/.test(await says(page, 'runtime')) && (await page.getAttribute('#opt-agent-model', 'placeholder')) === base.model, 'agents with a shell: the sentence says so, and the model field shows the server\'s default: ' + (await page.getAttribute('#opt-agent-model', 'placeholder')));
+  ok(JSON.stringify(await page.$$eval('#opt-agent-credential option', (options) => options.map((o) => o.value))) === JSON.stringify([''].concat(defaults.agent_credentials)), 'the credentials are the ones the server lists');
+  ok((await page.isChecked('#opt-agent-fast')) === base.fast && (await page.isChecked('#opt-agent-ultracode')) === base.ultracode && (await page.isChecked('#opt-agent-sandbox')) === base.sandbox, 'the ticks start as the server\'s defaults');
+  for (const name of ['model', 'credential', 'fast', 'ultracode', 'sandbox']) ok((await says(page, name)).length > 40, 'a sentence says what ' + name + ' means: ' + (await says(page, name)));
+  const login = await says(page, 'credential');
+  ok(/your Claude account pays/.test(login) && /fast mode works/.test(login), 'the login: whose account pays, and that fast mode works: ' + login);
+  await page.selectOption('#opt-agent-credential', 'federation');
+  await until(page, () => /federation rule pays/.test((document.querySelector('[data-says="credential"]') || {}).textContent || ''), null, 3000, 'the sentence follows the credential that is chosen');
+  ok(/refused/.test(await says(page, 'credential')) && /refused/.test(await says(page, 'fast')), 'federation: who pays, and that fast mode is refused there, said at the tick for fast mode too: ' + (await says(page, 'fast')));
+  const safe = await says(page, 'sandbox');
+  await page.uncheck('#opt-agent-sandbox');
+  await until(page, (before) => { const el = document.querySelector('[data-says="sandbox"]'); return !!el && el.textContent.replace(/\s+/g, ' ').trim() !== before; }, safe, 3000, 'the sentence about the sandbox changes when it is switched off');
+  ok(/reach whatever you can reach/.test(await says(page, 'sandbox')) && (await count(page, '[data-says="sandbox"].agent-warn')) === 1, 'without the sandbox: what the agents can then reach, said as a warning: ' + (await says(page, 'sandbox')));
+  /* what a press sends: caught on its way, so that no project is made of it */
+  let sent = null;
+  await page.route('**/api/projects', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    sent = route.request().postData() || '';
+    return route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: { code: 'invalid', message: 'Caught by the check.' } }) });
+  });
+  await page.fill('#idea-text', 'A project that is never made.');
+  await page.click('.composer button[type=submit]');
+  await until(page, () => !!document.querySelector('.composer-error'), null, 8000, 'the composer shows the answer to its press');
+  await page.unroute('**/api/projects');
+  const settingsSent = (() => { const m = /name="settings"\r?\n\r?\n([^\r\n]+)/.exec(sent || ''); try { return m ? JSON.parse(m[1]) : null; } catch (e) { return null; } })();
+  ok(!!settingsSent && JSON.stringify(settingsSent.agents) === JSON.stringify({ runtime: 'sdk', credential: 'federation', sandbox: false }), 'the composer sends what the person chose about the agents and nothing else: ' + JSON.stringify(settingsSent));
+  /* a reload keeps what was chosen about the agents, as it keeps the text */
+  await page.reload();
+  await page.waitForSelector('#opt-agent-credential');
+  ok((await page.inputValue('#opt-agent-runtime')) === 'sdk' && (await page.inputValue('#opt-agent-credential')) === 'federation' && !(await page.isChecked('#opt-agent-sandbox')), 'the choices about the agents survive a reload');
+  /* left alone, the composer names no runtime: the server's environment decides it */
+  await page.evaluate(() => { localStorage.removeItem('po-composer'); });
+  await page.goto(BASE + '/#/library');
+  await page.reload();
+  await open(page, '#/start?adv=1', '#opt-agent-runtime');
+  sent = null;
+  await page.route('**/api/projects', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    sent = route.request().postData() || '';
+    return route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: { code: 'invalid', message: 'Caught by the check.' } }) });
+  });
+  await page.fill('#idea-text', 'Another project that is never made.');
+  await page.click('.composer button[type=submit]');
+  await until(page, () => !!document.querySelector('.composer-error'), null, 8000, 'the composer shows the answer to its second press');
+  await page.unroute('**/api/projects');
+  ok(typeof sent === 'string' && !/name="settings"/.test(sent), 'a composer that was left alone sends no settings: the runtime is then the server\'s to choose, from its environment');
+  await page.evaluate(() => { localStorage.removeItem('po-composer'); });
+  await page.goto(BASE + '/#/library');
+  await page.reload();
+
+  /* the overview says how the agents work, and changes it */
+  await api('PATCH', project, { settings: { agents: { runtime: 'classic', model: base.model, fast: true, ultracode: true, credential: 'login', sandbox: true } } });
+  await open(page, '#/p/' + pid + '/overview', '.ov-agents');
+  ok((await page.getAttribute('.agents-now', 'data-agents')) === 'classic' && /tool loop/i.test(await text(page, '.agents-now')), 'the overview says that the agents work in the tool loop: ' + (await text(page, '.agents-now')));
+  await page.click('[data-act="agents-open"]');
+  await page.waitForSelector('#ag-runtime');
+  ok((await page.inputValue('#ag-runtime')) === 'classic' && (await count(page, '#ag-model')) === 0, 'the form opens on what is in force');
+  await page.selectOption('#ag-runtime', 'sdk');
+  await page.waitForSelector('#ag-model');
+  ok((await page.inputValue('#ag-model')) === base.model, 'the model field holds the project\'s model: ' + (await page.inputValue('#ag-model')));
+  /* a model without a name is refused before anything is sent, and the form stays */
+  await page.fill('#ag-model', '  ');
+  await page.click('.agents-form button[type=submit]');
+  await until(page, () => /Name the model/.test((document.querySelector('.agents-form [role="alert"]') || {}).textContent || ''), null, 3000, 'a model without a name is not sent');
+  ok((await api('GET', project)).data.settings.agents.runtime === 'classic', 'and nothing was changed');
+  await page.fill('#ag-model', 'claude-haiku-5-5');
+  await page.uncheck('#ag-fast');
+  await page.selectOption('#ag-credential', 'federation');
+  await page.click('.agents-form button[type=submit]');
+  await until(page, () => (document.querySelector('.agents-now') || { dataset: {} }).dataset.agents === 'sdk' && !document.querySelector('.agents-form'), null, 8000, 'the overview says that the agents now have a shell');
+  const now = (await api('GET', project)).data.settings.agents;
+  ok(JSON.stringify(now) === JSON.stringify({ runtime: 'sdk', model: 'claude-haiku-5-5', fast: false, ultracode: true, credential: 'federation', sandbox: true }), 'the server holds what the form said: ' + JSON.stringify(now));
+  ok(/claude-haiku-5-5/.test(await text(page, '.agents-now')) && /federation/.test(await text(page, '.agents-now')) && /inside the sandbox/.test(await text(page, '.agents-now')) && !/fast mode/.test(await text(page, '.agents-now b')), 'and the sentence on the overview says it: ' + (await text(page, '.agents-now b')));
+  ok(/next phase/.test(await text(page, '.toast')) && /Claude agents with a shell/.test(await text(page, '.toast')), 'the toast says what changed and from when it holds: ' + (await text(page, '.toast')));
+  /* a change of one value says that value, not that the agents are now what they were already */
+  await page.click('[data-act="agents-open"]');
+  await page.waitForSelector('#ag-ultracode');
+  await page.uncheck('#ag-ultracode');
+  await page.click('.agents-form button[type=submit]');
+  await until(page, () => /helper agents off/i.test((document.querySelector('.toast') || {}).textContent || ''), null, 8000, 'the toast names the value that changed');
+  ok(!/are now Claude agents/.test(await text(page, '.toast')) && /next phase/.test(await text(page, '.toast')), 'and does not say that the runtime changed: ' + (await text(page, '.toast')));
+  await api('PATCH', project, { settings: { agents: { ultracode: true } } });
+  /* a value the group does not have is refused, not stored and ignored */
+  const bogus = await api('PATCH', project, { settings: { agents: { sandbx: false } } });
+  ok(bogus.status >= 400 && bogus.status < 500 && !('sandbx' in (await api('GET', project)).data.settings.agents), 'a misspelt value of the agents\' settings is refused: ' + bogus.status);
+  /* Setup says what this machine has of what agents with a shell need */
+  await open(page, '#/setup', '.setup [data-setup="agents"]');
+  const needs = await text(page, '.setup [data-setup="agents"]');
+  ok(/Claude Agent SDK/.test(needs) && /Your Claude Code login/.test(needs) && /Workload Identity Federation/.test(needs) && (await count(page, '.setup [data-setup="agents"] .doc-i')) === 3, 'Setup has the package, the login and the federation settings of agents with a shell: ' + needs.replace(/\s+/g, ' ').slice(0, 200));
+  await open(page, '#/p/' + pid + '/overview', '.ov-agents');
+  /* the server's refusal is shown in the server's words, and the form keeps what was chosen */
+  await page.click('[data-act="agents-open"]');
+  await page.waitForSelector('#ag-runtime');
+  await page.route('**' + project, async (route) => {
+    if (route.request().method() !== 'PATCH') return route.continue();
+    const body = JSON.parse(route.request().postData() || '{}');
+    body.settings.agents.credential = 'a password';
+    return route.continue({ postData: JSON.stringify(body) });
+  });
+  await page.uncheck('#ag-sandbox');
+  ok((await count(page, '.agents-form [data-says="sandbox"].agent-warn')) === 1, 'switching the sandbox off says what the agents can then reach, before it is saved');
+  await page.click('.agents-form button[type=submit]');
+  await until(page, () => /credential/.test((document.querySelector('.agents-form [role="alert"]') || {}).textContent || ''), null, 8000, 'a change the server refuses is said in the server\'s words');
+  await page.unroute('**' + project);
+  ok((await api('GET', project)).data.settings.agents.sandbox === true && !(await page.isChecked('#ag-sandbox')), 'nothing was changed, and the form still holds the choice');
+  await page.click('.agents-form button[type=submit]');
+  await until(page, () => !!document.querySelector('.agents-open-box') && !document.querySelector('.agents-form'), null, 8000, 'a project without the sandbox says so on its overview');
+  ok(/sandbox is off/i.test(await text(page, '.agents-open-box')) && /without the sandbox/.test(await text(page, '.agents-now b')), 'with what the agents can reach: ' + (await text(page, '.agents-open-box')).slice(0, 120));
+  await api('PATCH', project, { settings: { agents: { sandbox: true } } });
+  /* a reload shows the same: it is the project's setting, not this window's */
+  await reopen(page, '#/p/' + pid + '/overview', '.ov-agents');
+  ok((await page.getAttribute('.agents-now', 'data-agents')) === 'sdk' && /inside the sandbox/.test(await text(page, '.agents-now b')), 'after a reload the overview says the same: ' + (await text(page, '.agents-now b')));
+  await shot(page, 'agents-settings');
+
+  /* Where such agents cannot start (the package or the credential is missing on this machine),
+     the engine says so beside the main button, and the button leads to where the agents are
+     changed, not to Setup, which shows the models of the tool loop. */
+  const blocked = ((await api('GET', project)).data.next_step || {}).blocked;
+  if (blocked && (blocked.settings || []).indexOf('agents') >= 0) {
+    const need = await text(page, '.ov-next [data-needs="agents"]');
+    ok(need.replace(/\s+/g, ' ').includes(blocked.message.replace(/`/g, '').replace(/\s+/g, ' ')) && /How the agents work/.test(need), 'agents that cannot start: the engine\'s sentence stands beside the button, with where it is put right: ' + need.replace(/\s+/g, ' ').slice(0, 160));
+    ok((await count(page, '.ov-next a[href="#/setup"]')) === 0, 'and nothing sends the person to Setup for it');
+    const main = page.locator('.ov-actions a[data-go-main]');
+    if ((await main.count()) && /See how the agents work/.test(await main.textContent())) {
+      await main.click();
+      await until(page, () => { const el = document.querySelector('.ov-agents'); return !!el && el.getBoundingClientRect().top < window.innerHeight; }, null, 4000, 'the main button shows how the agents work');
+    }
+  } else notes.push('shell: agents with a shell can start on this machine, so what the app says when they cannot was not looked at');
+
+  /* an experiment approved now for this machine is an agent's to carry out, and the approval says so */
+  const listed = (await api('GET', project + '/experiments')).data.experiments || [];
+  let approvalSeen = false;
+  for (const x of listed.filter((x) => x.review === 'proposed' || x.state === 'planned' || x.state === 'approved')) {
+    await open(page, '#/p/' + pid + '/experiments/' + x.id, '.exp-page .page-title');
+    if (!(await count(page, '#approve'))) { if (!(await count(page, '[data-act="reapprove"]'))) continue; await page.click('[data-act="reapprove"]'); }
+    await page.waitForSelector('#approve .backend');
+    const local = await page.evaluate(() => { const radio = document.querySelector('.backend input[value="local"]'); return radio ? { off: radio.disabled, on: radio.checked, desc: radio.closest('.backend').querySelector('.be-desc').textContent } : null; });
+    if (!local || local.off) continue;
+    if (!local.on) { await page.check('.backend input[value="local"]'); await page.waitForSelector('.backend.on input[value="local"]'); }
+    ok(/agent/i.test(local.desc), 'this machine, as a place to run: an agent carries the run out there: ' + local.desc);
+    const approves = (await text(page, '.approve-go p')).replace(/\s+/g, ' ');
+    ok(/lets an agent carry out this experiment once/.test(approves) && /metrics\.json/.test(approves) && /reaches the web whether or not/.test(approves) && !/lets the runner execute/.test(approves), 'the approval says what it approves: ' + approves.slice(0, 200));
+    if ((await count(page, '.backend input[value="modal"]:not(:disabled)'))) {
+      await page.check('.backend input[value="modal"]');
+      await until(page, () => /lets the runner execute/.test((document.querySelector('.approve-go p') || {}).textContent || ''), null, 3000, 'a run approved for Modal is the runner\'s as ever, and the approval says that');
+    }
+    await page.reload();
+    approvalSeen = true;
+    break;
+  }
+  if (!approvalSeen) notes.push('shell: the approval of a run on this machine was not looked at (no experiment of the demo project can be approved for it)');
+
+  /* what agents with a shell leave behind, written by hand */
+  const dir = await projectDir(pid);
+  if (!dir) { notes.push('shell: the activity of agents with a shell and a run one carried out were not looked at (the server is on another machine)'); return; }
+  await idle(pid);
+  const traces = agentTraces(dir);
+  await reopen(page, '#/p/' + pid + '/overview', '.feed .ev');
+  await until(page, () => !!document.querySelector('.feed .ev-work') && !!document.querySelector('.feed .ev-run'), null, 8000, 'the feed shows what the agents did');
+  const feed = () => page.evaluate(() => Array.from(document.querySelectorAll('.feed > .ev')).map((li) => ({ cls: li.className, who: (li.querySelector('.ev-who') || {}).textContent, says: (li.children[2] || li).textContent.replace(/\s+/g, ' ').trim(), steps: li.querySelectorAll('.ev-steps li').length, code: Array.from(li.querySelectorAll(':scope > span code.ev-text, :scope > span > .ev-act code.ev-text')).map((c) => c.textContent) })));
+  let rows = await feed();
+  /* the newest first: the run an agent carried out, then the scout's work, folded */
+  const run = rows.find((r) => / ev-run /.test(r.cls + ' '));
+  ok(!!run && run.who === 'agent' && /^An agent carried out E1 on this machine \(run 2\): succeeded after/.test(run.says), 'a run an agent carried out is one line that says so, from the agent: ' + JSON.stringify(run && [run.who, run.says.slice(0, 90)]));
+  ok(!!run && run.steps === traces.runSteps, 'what the agent did meanwhile are steps of that run: ' + (run && run.steps) + ' of ' + traces.runSteps);
+  const work = rows.find((r) => / ev-work/.test(r.cls));
+  ok(!!work && work.who === 'scout' && work.steps === traces.scoutSteps && new RegExp(traces.scoutSteps + ' steps').test(work.says), 'what the scout did in a row is one line with all its steps behind it: ' + JSON.stringify(work && [work.who, work.steps]));
+  ok(!!work && /tried/.test(work.says) && /refused/.test(work.says), 'which shows the latest step, here one that was refused: ' + (work && work.says.slice(0, 120)));
+  const start = rows.find((r) => r.who === 'scout' && /works as a Claude agent/.test(r.says));
+  ok(!!start && /fast mode was asked for and is not on/.test(start.says) && !/ ev-work/.test(start.cls), 'the line that says whether fast mode is on stands by itself: ' + (start && start.says));
+  const own = await page.evaluate(() => { const li = Array.from(document.querySelectorAll('.feed > .ev')).find((x) => (x.querySelector('.ev-who') || {}).textContent === 'experimenter'); if (!li) return null; const who = li.querySelector('.ev-who'), r = who.getBoundingClientRect(), next = li.children[2].getBoundingClientRect(); return { lines: Math.round(r.height / parseFloat(getComputedStyle(who).lineHeight)), clear: who.scrollWidth <= who.clientWidth + 1 && r.right <= next.left + 1 }; });
+  ok(!!own && own.lines === 1 && own.clear, 'the longest name of an agent stands on one line in its column: ' + JSON.stringify(own));
+  /* unfolded: each step sets what the agent chose apart from the words around it */
+  await page.click('.feed .ev-work .ev-steps > summary');
+  const steps = await page.evaluate(() => Array.from(document.querySelectorAll('.feed .ev-work .ev-steps li')).map((li) => ({ did: (li.querySelector('.ev-act') || { dataset: {} }).dataset.did || '', verb: (li.querySelector('.ev-did') || {}).textContent || '', text: (li.querySelector('.ev-text') || {}).textContent || '', code: !!li.querySelector('code.ev-text'), helper: !!li.querySelector('.ev-helper'), refused: !!li.querySelector('.ev-refused'), says: li.textContent.replace(/\s+/g, ' ').trim() })));
+  const of = (did) => steps.find((x) => x.did === did && !x.refused && !x.helper) || {};
+  ok(of('shell').verb === 'ran' && of('shell').code && of('shell').text === traces.command, 'a shell command is shown as the command it was: ' + JSON.stringify(of('shell')).slice(0, 160));
+  ok(of('search').verb === 'searched the web for' && !of('search').code && /label smoothing/.test(of('search').text), 'a web search with what was searched for: ' + of('search').says);
+  ok(of('fetch').verb === 'opened' && /^https:\/\/arxiv\.org/.test(of('fetch').text) && (await count(page, '.feed .ev-work .ev-steps a')) === 0, 'a page that was fetched with its address, which is text and no link: ' + of('fetch').says);
+  ok(of('write').verb === 'wrote' && of('write').text === 'notes/calibration.md', 'a file that was written with its name: ' + of('write').says);
+  ok(/started a helper agent/.test(of('helper').verb) && steps.some((x) => x.helper && x.did === 'shell'), 'a helper that was started, and what the helper did as the helper\'s: ' + of('helper').says);
+  ok(steps.some((x) => !x.did && /searched the wiki for/.test(x.says)) && steps.some((x) => !x.did && /against Semantic Scholar/.test(x.says)), 'a board tool is told in the project\'s sentence, as in the tool loop');
+  ok(steps.some((x) => x.refused && /paper-orchestra research approve/.test(x.text) && /tried/.test(x.verb)), 'a call that was refused says what was tried, and that it was refused');
+  ok(!(await page.evaluate(OVERFLOW)).length, 'the feed with a long command is not wider than its column: ' + (await page.evaluate(OVERFLOW)).join('; '));
+  await shot(page, 'agents-feed');
+  /* a line that is written while the page is open arrives, and the fold grows by it */
+  agentTraces.more(dir, traces);
+  await until(page, (n) => document.querySelectorAll('.feed .ev-work .ev-steps li').length === n + 1 && !!document.querySelector('.feed .ev-work .ev-steps[open]'), traces.scoutSteps, 8000, 'a further step arrives over the event stream, and the list that is open stays open');
+  ok(/ran/.test(await text(page, '.feed .ev-work .ev-work-l > .ev-act')) && /wc -l notes/.test(await text(page, '.feed .ev-work .ev-work-l > .ev-act')), 'the line shows the newest step: ' + (await text(page, '.feed .ev-work .ev-work-l > .ev-act')));
+  /* lines of the tool loop, and lines from before lines had parts, read as before */
+  for (let i = 0; i < 4 && (await count(page, '.feed-more')) && (await count(page, '.feed .ev-run')) < 2; i++) { const had = await count(page, '.feed > .ev'); await page.click('.feed-more'); await until(page, (n) => document.querySelectorAll('.feed > .ev').length > n, had, 6000, 'earlier activity is shown'); }
+  rows = await feed();
+  ok(rows.some((r) => / ev-run /.test(r.cls + ' ') && r.who === 'runner' && /^E\d+ ran on this machine/.test(r.says)), 'a run the runner made still says so: ' + JSON.stringify(rows.filter((r) => / ev-run /.test(r.cls + ' ')).map((r) => r.who + ': ' + r.says.slice(0, 40))));
+
+  /* the experiment: the run says that an agent carried it out, with its log and what it left */
+  await open(page, '#/p/' + pid + '/experiments/E1', '.exp-runs .run');
+  await until(page, () => !!document.querySelector('.run.open [data-log]') && !document.querySelector('.run.open [data-log][data-empty]'), null, 8000, 'the log of the agent\'s run is shown');
+  ok(/Run 2/.test(await text(page, '.run.open .run-h')) && /by an agent/.test(await text(page, '.run.open .run-h .run-by')), 'the heading of the run says that an agent carried it out: ' + (await text(page, '.run.open .run-h')).replace(/\s+/g, ' ').slice(0, 120));
+  ok(/An agent carried out this run/.test(await text(page, '.run.open .run-agent')), 'and a sentence says what that means: ' + (await text(page, '.run.open .run-agent')).slice(0, 100));
+  ok((await text(page, '.run.open [data-log]')).includes('The experimenter ran') && (await text(page, '.run.open [data-log]')).includes(traces.command), 'its log is what the agent did and said');
+  /* the run names the code as the agent left it, not only the approved code, and no exit status */
+  ok(/changed the code it was given/.test(await text(page, '.run.open .run-code[data-code="changed"]')) && /main\.py/.test(await text(page, '.run.open .run-code')) && /not from the approved code/.test(await text(page, '.run.open .run-code')), 'the run says that the agent changed the code: ' + (await text(page, '.run.open .run-code')).replace(/\s+/g, ' ').slice(0, 160));
+  ok(!/exit \d/.test(await text(page, '.run.open .run-h')) && /Nobody measured an exit status/.test(await text(page, '.run.open .run-agent')), 'and names no exit status, because none was measured');
+  ok(/could call the Anthropic API/.test(await text(page, '.run.open [data-model-access]')) && /counted nowhere here/.test(await text(page, '.run.open [data-model-access]')), 'a run whose code could call the model API says that those calls are not counted');
+  const keptHref = await page.getAttribute('.run.open .run-code a.linkish', 'href');
+  const keptFile = await page.evaluate(async (href) => { const r = await fetch(href, { credentials: 'same-origin' }); return { status: r.status, text: await r.text() }; }, keptHref);
+  ok(keptFile.status === 200 && /CHANGED-BY-THE-AGENT/.test(keptFile.text), 'the changed file is a link to the code as the agent left it: ' + keptHref + ' ' + keptFile.status);
+  ok(/may have tried it in its own sandboxed folder/.test(await text(page, '.exp-code .sec-t')) && !/never executed/.test(await text(page, '.exp-code .sec-t')), 'the code of a project whose agents have a shell does not claim that it was never executed: ' + (await text(page, '.exp-code .sec-t')));
+  ok(!/CHANGED-BY-THE-AGENT/.test(await text(page, '.exp-code')), 'the Code section still shows the approved code');
+  await page.click('.run.open [data-act="adopt-code"]');
+  await until(page, () => /is now the code of E1/.test((document.querySelector('.toast') || {}).textContent || ''), null, 8000, 'the person makes the agent\'s code the experiment\'s');
+  const adopted = (await api('GET', '/api/projects/' + pid + '/experiments/E1')).data;
+  ok(/CHANGED-BY-THE-AGENT/.test(((adopted.code.files || []).find((f) => f.name === 'main.py') || {}).text || '') && ((adopted.code.files || []).find((f) => f.name === 'main.py') || {}).author === 'human', 'the experiment\'s code is then the agent\'s, as the person\'s edit: ' + JSON.stringify((adopted.code.files || []).map((f) => [f.name, f.author])));
+  await until(page, () => /CHANGED-BY-THE-AGENT/.test((document.querySelector('.exp-code') || {}).textContent || ''), null, 8000, 'the Code section shows the adopted code');
+  ok((await count(page, '.run.open table.metrics tr')) >= 1 && /as the agent's work left it/.test(await text(page, '.run.open .res-grid .sec-h')), 'its metrics are shown as what the agent\'s work left: ' + (await text(page, '.run.open .res-grid .sec-h')));
+  const first = page.locator('.exp-runs .run:not(.open) .run-h');
+  ok((await first.count()) === 1 && !/by an agent/.test(await first.textContent()), 'the run before it, which the runner made, does not say so');
+  await first.click();
+  await page.waitForSelector('.run.open [data-run="1"]');
+  ok((await count(page, '.run.open .run-agent')) === 0 && /as the run wrote it/.test(await text(page, '.run.open .res-grid .sec-h')), 'and reads as it always did');
+  /* a failed run of an agent's is not "a programming error the runner has not repaired" */
+  await open(page, '#/p/' + pid + '/experiments/E2', '.exp-runs .run');
+  await page.waitForSelector('.run.open .failure');
+  if (traces.failed) ok(/The agent did not bring the run to a result/.test(await text(page, '.run.open .fail-t')) && /repairs the code while it works/.test(await text(page, '.run.open .failure')) && !/runner has not repaired/.test(await text(page, '.run.open .failure')), 'a run that an agent could not bring to a result says so: ' + (await text(page, '.run.open .fail-t')));
+  /* a run that left no results does not say that its results come from the agent's code, and a
+     plan that came without code is not said to have approved code */
+  if (traces.failed) {
+    const wrote = (await text(page, '.run.open .run-code[data-code="changed"]')).replace(/\s+/g, ' ');
+    ok(/The agent wrote the code for this run/.test(wrote) && /left no results that come from it/.test(wrote) && /came without code/.test(wrote) && !/The results of this run come from that code/.test(wrote) && !/repaired again/.test(wrote) && !/approved code shown under Code/.test(wrote), 'a failed run of a plan without code says what the agent wrote, and claims no results: ' + wrote.slice(0, 200));
+  }
+  await shot(page, 'agents-run');
+
+  /* on a phone: nothing is wider than the screen, the command wraps under who ran it, and what is typed is 16 px */
+  const NARROW = () => { const de = document.documentElement, out = de.scrollWidth > de.clientWidth ? ['document ' + de.scrollWidth + '>' + de.clientWidth] : [];
+    document.querySelectorAll('.feed *, .run.open .run-agent, .run.open .run-h, .agent-set *, .agents-now').forEach((el) => { Array.from(el.getClientRects()).forEach((r) => { if (r.width && (r.right > de.clientWidth + 1 || r.left < -1)) out.push((el.className || el.tagName) + ' ' + Math.round(r.left) + '..' + Math.round(r.right) + ' of ' + de.clientWidth); }); });
+    return out; };
+  const SMALL = () => Array.from(document.querySelectorAll('input:not([type=checkbox]):not([type=radio]), select, textarea')).filter((el) => el.getBoundingClientRect().width && parseFloat(getComputedStyle(el).fontSize) < 16).map((el) => (el.id || el.name || el.tagName) + ' ' + getComputedStyle(el).fontSize);
+  for (const width of [320, 390]) {
+    const ctx = await entered(await browser.newContext({ ...devices['iPhone 14'], viewport: { width, height: 760 }, colorScheme: arg('scheme', 'light'), reducedMotion: 'reduce' }));
+    const phone = await ctx.newPage();
+    watch(phone, () => 'shell, phone ' + width);
+    await open(phone, '#/p/' + pid + '/overview', '.feed .ev-work');
+    await phone.tap('.feed .ev-work .ev-steps > summary');
+    await phone.waitForSelector('.feed .ev-work .ev-steps[open]');
+    ok(!(await phone.evaluate(NARROW)).length, width + ' the feed of agents with a shell is wider than the phone: ' + (await phone.evaluate(NARROW)).join('; '));
+    const laid = await phone.evaluate(() => { const li = document.querySelector('.feed .ev-work'), who = li.querySelector('.ev-who').getBoundingClientRect(), what = li.querySelector('.ev-work-l').getBoundingClientRect(), time = li.querySelector('time').getBoundingClientRect();
+      const cmd = Array.from(document.querySelectorAll('.feed .ev-work .ev-steps code.ev-text')).sort((a, b) => b.textContent.length - a.textContent.length)[0].getBoundingClientRect();
+      return { under: what.top >= who.bottom - 1, left: what.left - time.left, wide: what.width / li.getBoundingClientRect().width, lines: cmd.height / 16 }; });
+    ok(laid.under && laid.left <= 1 && laid.wide > 0.95, width + ' what an agent did stands under when and who, on the whole width: ' + JSON.stringify(laid));
+    ok(laid.lines > 2, width + ' a long command wraps over several lines instead of being cut: ' + laid.lines.toFixed(1));
+    const tall = await phone.evaluate(() => { const s = document.querySelector('.feed .ev-work .ev-steps > summary').getBoundingClientRect(); return s.height; });
+    ok(tall >= 24, width + ' the fold of the steps is tall enough to touch: ' + tall);
+    await phone.tap('[data-act="agents-open"]');
+    await phone.waitForSelector('#ag-model');
+    ok(!(await phone.evaluate(NARROW)).length && !(await phone.evaluate(SMALL)).length, width + ' the form about the agents on a phone: ' + (await phone.evaluate(NARROW)).concat(await phone.evaluate(SMALL)).join('; '));
+    const ticks = await phone.evaluate(() => Array.from(document.querySelectorAll('.agents-form .tick, .agents-form select, .agents-form input:not([type=checkbox]), .agents-form button[type=submit]')).map((el) => Math.round(el.getBoundingClientRect().height)));
+    ok(ticks.length >= 6 && ticks.every((h) => h >= 40), width + ' every field about the agents is a finger high: ' + ticks.join(' '));
+    await shot(phone, 'agents-phone-' + width);
+    await open(phone, '#/start?adv=1', '#opt-agent-runtime');
+    await phone.selectOption('#opt-agent-runtime', 'sdk');
+    await phone.waitForSelector('#opt-agent-model');
+    ok(!(await phone.evaluate(NARROW)).length && !(await phone.evaluate(SMALL)).length, width + ' the composer\'s fields about the agents on a phone: ' + (await phone.evaluate(NARROW)).concat(await phone.evaluate(SMALL)).join('; '));
+    await phone.evaluate(() => { localStorage.removeItem('po-composer'); });
+    await open(phone, '#/p/' + pid + '/experiments/E1', '.exp-runs .run');
+    await phone.waitForSelector('.run.open .run-agent');
+    const over = await phone.evaluate(NARROW);
+    ok(!over.length, width + ' the run an agent carried out is wider than the phone: ' + over.join('; '));
+    ok(/by an agent/.test(await text(phone, '.run.open .run-h')), width + ' and its heading says who carried it out');
+    await ctx.close();
+  }
 };
 
 /** The words on the control that continues the project: a button that starts the agents, or
@@ -2814,10 +3219,12 @@ CHECKS.hostile = async ({ page, pid }) => {
   if (listing.status !== 200) { console.error('The server at ' + BASE + ' does not answer: ' + listing.status + ' ' + JSON.stringify(listing.data)); process.exit(2); }
   /* the demo project and, when it is there, the large one (`research demo --pages 150`
      gives both the same title): told apart by how many pages they hold */
-  let demo = null, large = '', spare = '';
+  let demo = null, large = '', spare = '', shell = '';
   for (const row of listing.data.projects) {
     /* a third copy, in a folder named `nomodel`: the project that is looked at without a model */
     if (row.dir === 'nomodel') { spare = spare || row.id; continue; }
+    /* a fourth, in a folder named `shell`: the project whose agents have a shell */
+    if (row.dir === 'shell') { shell = shell || row.id; continue; }
     const view = (await api('GET', '/api/projects/' + row.id)).data;
     const pages = Object.values((view && view.counts && view.counts.by_kind) || {}).reduce((a, b) => a + b, 0);
     if (/150 pages/.test(row.title) || pages >= 140) large = large || row.id;
@@ -2835,7 +3242,7 @@ CHECKS.hostile = async ({ page, pid }) => {
   const page = await context.newPage();
   watch(page, () => current);
   /* (`nomodel` switches the scripted model off for the whole server while it looks: it comes before any check that starts agents) */
-  const order = ['screens', 'phone', 'nomodel', 'decisions', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
+  const order = ['screens', 'phone', 'shell', 'nomodel', 'decisions', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
   const unknown = (ONLY || []).concat(SKIP).filter((name) => order.indexOf(name) < 0);
   if (unknown.length) { console.error('not a check: ' + unknown.join(', ') + ' (the checks are: ' + order.join(', ') + '; separate several with commas)'); await browser.close(); process.exit(2); }
   /* The checks after `decisions` count the proposals on the tab of the inbox, as they did
@@ -2843,7 +3250,7 @@ CHECKS.hostile = async ({ page, pid }) => {
      of them empties the inbox". So what the designer of the demonstration asks is answered
      before the first of them, the way the person would answer it, in the demo project and
      the large one; the checks before that look at it while it waits. */
-  const beforeAnswer = ['screens', 'phone', 'nomodel', 'decisions'];
+  const beforeAnswer = ['screens', 'phone', 'shell', 'nomodel', 'decisions'];
   let answered = false;
   for (const name of order) {
     if ((ONLY && ONLY.indexOf(name) < 0) || SKIP.indexOf(name) >= 0) continue;
@@ -2856,7 +3263,7 @@ CHECKS.hostile = async ({ page, pid }) => {
     }
     current = name;
     const before = fails.length, t0 = Date.now();
-    try { await CHECKS[name]({ browser, context, page, pid: demo.id, large, spare }); }
+    try { await CHECKS[name]({ browser, context, page, pid: demo.id, large, spare, shell }); }
     catch (error) { fails.push(name + ' stopped: ' + String(error && error.message).split('\n')[0]); await shot(page, 'stopped-' + name); await context.setOffline(false).catch(() => {}); }
     const csp = await page.evaluate(() => (window.__csp || []).splice(0)).catch(() => []);
     if (csp.length) fails.push(name + ': blocked by the Content-Security-Policy: ' + csp.join('; '));

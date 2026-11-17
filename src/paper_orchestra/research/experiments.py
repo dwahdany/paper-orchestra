@@ -63,7 +63,9 @@ from paper_orchestra.compute.base import (
     JobStopped,
     human_size,
     spec_problems,
+    write_record,
 )
+from paper_orchestra.compute.local import job_model_access
 from paper_orchestra.errors import stops_the_run
 
 # The scan that keeps a paper's results out of the shared memory already knows how
@@ -99,7 +101,9 @@ from paper_orchestra.research.project import EXPERIMENTS_DIR, INPUTS_DIR, MANIFE
 from paper_orchestra.utils.common import write_json, write_text
 
 __all__ = [
+    "CODE_AS_RUN_DIR",
     "ExperimentPlan",
+    "adopt_run_code",
     "approval",
     "approve",
     "check_code",
@@ -112,6 +116,7 @@ __all__ = [
     "edited_record",
     "job_command",
     "job_spec",
+    "keep_code_as_run",
     "load_plan",
     "mask_credentials",
     "metrics_table",
@@ -119,11 +124,13 @@ __all__ = [
     "number_report",
     "options",
     "plan_digest",
+    "read_metrics",
     "recover",
     "reportable_text",
     "request_cancel",
     "result_records",
     "run",
+    "run_code_changed",
     "runs",
     "split_problems",
     "supplies_missing_code",
@@ -1510,6 +1517,18 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
     plan = _plan_for_code(project, experiment_id)
     files = dict(_code_paths(code_dir(project, experiment_id)))
     in_repo = plan.mode == "repo"
+    # Under the ``sdk`` runtime an approved experiment is carried out by an agent that
+    # writes and repairs code itself: what is wrong with the starting code is then
+    # something the person should know when approving, not something that stops them.
+    # (Only where an agent does: a run on a remote backend, and so every GPU run, is
+    # executed there as it is, and nobody repairs it.)
+    where = plan.backend or ("modal" if plan.mode == "gpu" else project.settings.compute)
+    by_agent = bool(project.settings.agents.sdk) and not in_repo and where == "local"
+    if not files and by_agent:
+        return [
+            f"{WARNING}{experiment_id} has no code yet. The agent that carries out the "
+            "experiment writes it from the plan, so read the plan as what will run."
+        ]
     if not files and not in_repo:
         return [
             f"{experiment_id} has no code yet: write its files to "
@@ -1548,6 +1567,10 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
             "not a Python file of the experiment or the repository. Read the command "
             "before approving it."
         )
+    if by_agent and errors:
+        said = "the agent that carries out the experiment has to put this right first."
+        warnings = [f"{WARNING}{error} With the sdk runtime, {said}" for error in errors] + warnings
+        errors = []
     return errors + warnings[:20]
 
 
@@ -2287,6 +2310,12 @@ def _metric(name: str, value: Any) -> tuple[Any, str]:
     raise ValueError(f"{label} is {kind} ({_shown(value)})")
 
 
+def read_metrics(directory: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """The metrics a run left in ``directory`` (see :func:`_read_metrics`), for whoever
+    has to know before the run is judged whether they are there."""
+    return _read_metrics(directory)
+
+
 def _read_metrics(directory: Path) -> tuple[dict[str, Any], dict[str, str]]:
     """The metrics of a run and their text as written.  ``ValueError`` says, quoting the
     file, why it does not hold metrics: it is read strictly, because what it says goes
@@ -2492,7 +2521,34 @@ def _cost_text(record: Mapping[str, Any]) -> str:
     cost = record.get("cost_usd")
     if isinstance(cost, int | float) and not isinstance(cost, bool):
         return f"about ${cost:.2f} (an estimate)"
-    return "nothing is billed" if record.get("backend") == "local" else "not known"
+    if record.get("backend") != "local":
+        return "not known"
+    said = "nothing is billed for the machine"
+    if record.get("carried_out_by") == "agent":
+        said += "; the model of the agent that carried it out counts as model spend"
+    if record.get("model_access"):
+        said += (
+            "; its code could call the Anthropic API, and those calls are billed to the "
+            "worker's account and counted nowhere here"
+        )
+    return said if said != "nothing is billed for the machine" else "nothing is billed"
+
+
+def _code_cell(record: Mapping[str, Any]) -> str:
+    """The code of a run for its result page: the digest of what was approved, and for a
+    run an agent carried out what it made of that code."""
+    approved = f"sha256 `{str(record['code_digest'])[:12]}`" if record.get("code_digest") else ""
+    if record.get("carried_out_by") != "agent":
+        return approved
+    as_run = record.get("code_as_run")
+    did = _code_changes(as_run)
+    if not isinstance(as_run, Mapping):
+        return f"{approved} as approved; what the agent made of it was not kept".strip()
+    if not did:
+        return f"{approved}, as approved: the agent left it as it was".strip()
+    return f"sha256 `{str(as_run.get('digest'))[:12]}` as the agent left it: it {did}" + (
+        f" (approved: {approved})" if approved else ""
+    )
 
 
 def _repo_text(record: Mapping[str, Any]) -> str:
@@ -2515,25 +2571,60 @@ def _repo_text(record: Mapping[str, Any]) -> str:
 
 
 def _facts(record: Mapping[str, Any]) -> list[str]:
+    by_agent = record.get("carried_out_by") == "agent"
     rows = [
         ("Status", record.get("status")),
         ("Started", record.get("started")),
         ("Finished", record.get("finished")),
         ("Duration", _seconds_text(record.get("seconds"))),
         ("Backend", record.get("backend") or "none"),
-        ("Exit status", "none" if record.get("exit_code") is None else record["exit_code"]),
+        (
+            "Exit status",
+            "not measured: an agent carried the run out, and its log says what it ran"
+            if by_agent
+            else "none"
+            if record.get("exit_code") is None
+            else record["exit_code"],
+        ),
         ("Estimated cost", _cost_text(record)),
     ]
     plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
     if plan.get("command"):
         # What was executed, and with what reach: the code digest alone does not say.
-        rows.append(("Command", _plain(shlex.join(map(str, plan["command"])))))
+        command = _plain(shlex.join(map(str, plan["command"])))
+        if by_agent:
+            # The plan's command, which the agent was told to start from; nothing shows
+            # that this, and only this, is what it ran.
+            rows.append(("Command of the plan", f"{command} (the agent's log says what ran)"))
+        else:
+            rows.append(("Command", command))
     if "network" in plan:
         rows.append(("Network access", "allowed" if plan["network"] else "not allowed"))
     if record.get("handle"):
         rows.append(("Remote job", f"`{record['handle']}`"))
-    if record.get("code_digest"):
-        rows.append(("Code", f"sha256 `{str(record['code_digest'])[:12]}`"))
+    if record.get("code_digest") or record.get("code_as_run"):
+        rows.append(("Code", _code_cell(record)))
+    if by_agent and record.get("approved_digest"):
+        rows.append(
+            (
+                "Approval",
+                f"sha256 `{str(record['approved_digest'])[:12]}`, the experiment page's "
+                "`approved_digest`: it covers the plan and the code together, so it "
+                "differs from the digest under Code, which is of the code files alone",
+            )
+        )
+    adopted = record.get("code_adopted")
+    if isinstance(adopted, Mapping) and adopted.get("to") == record.get("code_digest"):
+        rows.append(
+            (
+                "Code history",
+                f"before this run the researcher made the code that the agent left after "
+                f"run {adopted.get('run')} the experiment's code (code sha256 "
+                f"`{str(adopted.get('from'))[:12]}` before, `{str(adopted.get('to'))[:12]}` "
+                "since) and approved the experiment again: the digests of the two runs "
+                "differ for that reason",
+            )
+        )
     if record.get("repo"):
         rows.append(("Repository", _repo_text(record)))
     return ["| | |", "|---|---|", *(f"| {name} | {_cell(value)} |" for name, value in rows)]
@@ -2773,11 +2864,25 @@ def _finish(
     metrics_text = _masked_entries(outcome.metrics_text, secrets)
     cloned = _clone_notes(record, attempt.directory)
     notes = [*attempt.notes, *cloned, *(result.notes if result else []), *dropped]
+    by_agent = record.get("carried_out_by") == "agent"
+    if by_agent:
+        as_run = _code_as_run(attempt.directory, attempt.plan)
+        if as_run is not None:
+            record["code_as_run"] = as_run
+        did = _code_changes(as_run)
+        if did:
+            notes.append(
+                f"The agent that carried out this run {did}. The code as the agent left "
+                f"it is kept in runs/{record['number']}/{CODE_AS_RUN_DIR}; the experiment's "
+                "own code is still what was approved."
+            )
     record.update(
         status=outcome.status,
         finished=_now(),
         seconds=round(seconds, 3) if seconds is not None else None,
-        exit_code=result.returncode if result is not None else None,
+        # An agent may have run the code any number of times, or not at all: nobody
+        # measured an exit status, so the record names none.
+        exit_code=result.returncode if result is not None and not by_agent else None,
         timed_out=bool(result is not None and result.timed_out),
         metrics=metrics,
         artifacts=artifacts,
@@ -2904,6 +3009,17 @@ def _judge(
         limit = plan.timeout_seconds
         return _Outcome(
             "failed", f"The run was stopped after its time limit of {limit:g} s.", kind="timeout"
+        )
+    declared = getattr(result, "declared_failed", None)
+    if declared:
+        # An agent carried the run out and says that it failed (the result of a job
+        # an agent did, ``research.sdk.experiment.AgentJobResult``).  Its words are a
+        # quotation; the files it left are kept, and count as no result.
+        said = quotable(declared, 600)
+        return _Outcome(
+            "failed",
+            f'The agent that carried out the run says that it failed: "{said}".',
+            kind="declared",
         )
     if result.returncode is None:
         lost = "The backend lost track of the job: it reported no exit status."
@@ -3088,6 +3204,177 @@ def _snapshot(source: Path, dest: Path) -> str:
     return _digest(_code_paths(dest))
 
 
+#: Where the code lies as an agent left it when it had carried a run out, in the run
+#: directory beside ``code/`` (the approved code the agent started from).
+CODE_AS_RUN_DIR = "code-as-run"
+#: Files an agent added to its folder that count as code of the run, by their ending.
+#: Anything else it left there (data, outputs, notes) is not kept as code.
+_SCRIPT_SUFFIXES = frozenset(
+    {".py", ".sh", ".toml", ".cfg", ".ini", ".yaml", ".yml", ".ipynb", ".r", ".jl"}
+)
+#: Directories of an agent's folder that hold no code of the run.
+_NOT_CODE_DIRS = frozenset({"artifacts", "venv", "env", "node_modules", "site-packages", "inputs"})
+#: How many files an agent added are kept as code of a run.
+_MAX_ADDED_FILES = 200
+
+
+def keep_code_as_run(
+    work: Path, run_dir: Path, *, whole: bool = True, skip: Sequence[str] = ()
+) -> None:
+    """Keep the code as an agent left it in ``work`` when it had carried the run out, in
+    ``run_dir/code-as-run``.
+
+    The agent starts from the approved code and may change it: what the run's
+    record names as its code must be what was there when the metrics were, not
+    only what was approved.  Kept are the files of the approved code as they
+    now are, and, when the folder was made from that code alone (``whole``), the
+    scripts the agent added.  Links are not followed, hidden files, results and
+    environments are not code, and the limits on code hold as for any run.
+    ``skip`` names files in the folder that are neither (the launcher).
+    """
+    approved = {name for name, _ in _code_paths(Path(run_dir) / CODE_DIR)}
+    dest = Path(run_dir) / CODE_AS_RUN_DIR
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = added = 0
+    for name, path in _code_paths(Path(work)):
+        parts = name.split("/")
+        if name in skip or name == "metrics.json" or _NOT_CODE_DIRS.intersection(parts[:-1]):
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if name not in approved:
+            fits = size <= MAX_CODE_FILE_BYTES and added < _MAX_ADDED_FILES
+            script = path.suffix.lower() in _SCRIPT_SUFFIXES or parts[-1].startswith("requirements")
+            if not (whole and script and fits):
+                continue
+            added += 1
+        if copied + size > MAX_CODE_BYTES:
+            continue
+        copied += size
+        (dest / name).parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            # Not through a link that appeared since the look: a link is copied as one,
+            # and no reader of this directory takes a link for code.
+            shutil.copyfile(path, dest / name, follow_symlinks=False)
+
+
+def _code_as_run(directory: Path, plan: ExperimentPlan | None) -> dict[str, Any] | None:
+    """What became of the approved code in the hands of the agent that carried the run
+    out: the digest of the code as it left it (as :func:`code_digest` counts) and the
+    names of the files it changed, added and removed.  ``None`` when nothing was kept."""
+    kept = directory / CODE_AS_RUN_DIR
+    if not kept.is_dir():
+        return None
+    approved = dict(_code_paths(directory / CODE_DIR))
+    if plan is not None and plan.mode == "repo":
+        approved.pop(repositories.PATCH_NAME, None)  # applied to the copy, not a file of it
+    ran = dict(_code_paths(kept))
+
+    def differs(name: str) -> bool:
+        try:
+            return approved[name].read_bytes() != ran[name].read_bytes()
+        except OSError:
+            return True
+
+    return {
+        "digest": _digest(ran.items()),
+        # How many files the approved code had: none for a plan that came without code,
+        # which the agent then wrote.
+        "approved": len(approved),
+        "changed": sorted(name for name in ran if name in approved and differs(name)),
+        "added": sorted(name for name in ran if name not in approved),
+        "removed": sorted(name for name in approved if name not in ran),
+    }
+
+
+def _code_changes(as_run: Mapping[str, Any] | None) -> str:
+    """ "changed main.py, added util.py": what an agent did to the approved code, as the
+    rest of a sentence; empty when it left it as it was."""
+    if not isinstance(as_run, Mapping):
+        return ""
+    parts = []
+    for verb in ("changed", "added", "removed"):
+        names = [str(name) for name in as_run.get(verb) or []]
+        if names:
+            more = f" and {len(names) - 6} more" if len(names) > 6 else ""
+            parts.append(f"{verb} {', '.join(_inert(name) for name in names[:6])}{more}")
+    return ", ".join(parts)
+
+
+def run_code_changed(record: Mapping[str, Any]) -> bool:
+    """Whether the agent that carried ``record``'s run out left other code than the
+    approved code it started from."""
+    return bool(_code_changes(record.get("code_as_run")))
+
+
+def adopt_run_code(
+    project: Project, experiment_id: str, number: int | None = None, *, author: str = "human"
+) -> dict[str, Any]:
+    """Make the code an agent left after a run the experiment's code, as the person's
+    own edit: ``{"run", "files", "removed", "problems"}``.
+
+    The agent that carries an experiment out repairs the code in its own folder,
+    and the experiment's code stays what was approved: run again, it would fail
+    the same way and be repaired again.  This writes the files the agent
+    changed or added in run ``number`` (default: the latest run that has any)
+    into the experiment's code through :func:`write_code`, so every rule about
+    code holds: earlier versions are kept, and an experiment whose approved
+    code changes must be approved again.  A file the agent removed is left in
+    place and named in ``removed``.
+    """
+    experiment_id = _experiment_id(project, experiment_id)
+    wanted = [
+        run
+        for run in runs(project, experiment_id)
+        if (number is None or run.get("number") == number) and run_code_changed(run)
+    ]
+    if not wanted:
+        which = f"Run {number} of {experiment_id}" if number is not None else experiment_id
+        raise ProjectError(f"{which} has no code that an agent changed: there is nothing to adopt.")
+    run = wanted[-1]
+    as_run = run["code_as_run"]
+    kept = _runs_dir(project, experiment_id) / str(run["number"]) / CODE_AS_RUN_DIR
+    files: dict[str, str] = {}
+    for name in [*as_run.get("changed", []), *as_run.get("added", [])]:
+        text = _read_code(kept / str(name)) if _within(kept / str(name), kept) else None
+        if text is None:
+            raise ProjectError(
+                f"{name} of run {run['number']} cannot be adopted: it is not text, too "
+                "large, or no longer there."
+            )
+        files[str(name)] = text
+    before = code_digest(project, experiment_id)
+    problems = write_code(project, experiment_id, files, author=author) if files else []
+    after = code_digest(project, experiment_id)
+    if after != before:
+        # On the record of the run the code came from: a later run names it, so that
+        # nobody takes two digests of one experiment for code of unknown origin.
+        adopted = {"at": _now(), "by": author, "from": before, "to": after}
+        path = _runs_dir(project, experiment_id) / str(run["number"]) / RUN_FILE
+        with contextlib.suppress(OSError, ValueError):
+            write_record(path, {**run, "adopted": adopted})
+    return {
+        "run": run["number"],
+        "files": sorted(files),
+        "removed": [str(name) for name in as_run.get("removed", [])],
+        "problems": problems,
+    }
+
+
+def _adoption_before(project: Project, experiment_id: str) -> dict[str, Any] | None:
+    """The latest time the person made the code an agent left after a run the
+    experiment's code: ``{"run", "from", "to", "at"}``, or ``None``."""
+    found = None
+    for record in runs(project, experiment_id):
+        adopted = record.get("adopted")
+        if isinstance(adopted, dict) and adopted.get("to"):
+            found = {"run": record.get("number"), **adopted}
+    return found
+
+
 def _clear_results(copy: Path) -> list[str]:
     """Remove what a run writes its results to (``metrics.json``, ``artifacts/``) from
     the copy of a repository, and return what was there.
@@ -3177,7 +3464,7 @@ class _Session:
         repair: Callable[..., Mapping[str, str] | None] | None,
         on_log: Callable[[str], None] | None,
         limits: Mapping[str, Any] | None,
-        unrepaired: str | None = None,
+        unrepaired: str | Callable[[Mapping[str, Any]], str] | None = None,
     ) -> None:
         self.project = project
         self._compute = compute
@@ -3195,7 +3482,7 @@ class _Session:
         self._user_log = on_log
         self._repair = repair
         #: Why there is no repairer, for the notes of a run that one could have repaired.
-        self._unrepaired = _one_line(unrepaired) if unrepaired else None
+        self._unrepaired = unrepaired or None
         self._repairs: list[dict[str, Any]] = []
         self._rounds = 0
         self._current: _Attempt | None = None
@@ -3338,6 +3625,23 @@ class _Session:
         number, directory = _new_run_dir(self.project, self.plan.id)
         record = _new_record(self.plan, number, self.backend_name, self._repairs)
         record["approval"] = _text(self.page.meta.get("approved_at")) or None
+        adopted = _adoption_before(self.project, self.plan.id)
+        if adopted:
+            record["code_adopted"] = adopted
+        # Who does the job is a fact of this run, kept with it: the project's runtime
+        # can be changed afterwards, and the run stays what it was.
+        by_agent = bool(getattr(self.backend, "carried_out_by_agent", False))
+        if by_agent:
+            record["carried_out_by"] = "agent"
+            # The digest of the approval (plan and code together), for the result page
+            # to name beside the digest of the code as the agent left it: two digests
+            # with one name read as a contradiction.  Only for a run by an agent: the
+            # record and the result page of a classic run are what they always were.
+            record["approved_digest"] = _text(self.page.meta.get("approved_digest")) or None
+        if self.plan.network and self.backend_name == "local" and job_model_access():
+            # The run's code can call the Anthropic API with the worker's federation
+            # settings.  Nothing here counts those calls: the record says so.
+            record["model_access"] = True
         attempt = _Attempt(
             number,
             directory,
@@ -3362,7 +3666,12 @@ class _Session:
             f"Run {number} of experiment {self.plan.id} started on the "
             f"{self.backend_name or 'compute'} backend.",
             refs=[self.page.path],
-            data={"experiment": self.plan.id, "run": number, "backend": self.backend_name},
+            data={
+                "experiment": self.plan.id,
+                "run": number,
+                "backend": self.backend_name,
+                **({"carried_out_by": "agent"} if by_agent else {}),
+            },
         )
         return attempt
 
@@ -3550,7 +3859,8 @@ class _Session:
         if wanted and self._repair is None and self._unrepaired:
             # Nobody is there to repair it (no model can be used): the failure stands,
             # and the run says why nothing was tried.
-            self._note(record, f"The failure was not repaired: {self._unrepaired}")
+            why = self._unrepaired(record) if callable(self._unrepaired) else self._unrepaired
+            self._note(record, f"The failure was not repaired: {_one_line(str(why))}")
         curable = wanted and self._repair is not None
         if curable:
             self._interrupted = self._stop_reason()
@@ -3734,9 +4044,11 @@ class _Session:
     @staticmethod
     def _abandoned(exc: BaseException, requeue: bool, said: str) -> _Outcome:
         if getattr(exc, "unusable", False) is True:
-            return _Outcome(
-                "failed", f"The compute backend cannot be used: {exc}", "backend", requeued=True
-            )
+            # (An agent that could not work says so in a sentence of its own: the
+            # compute backend is not what failed then.)
+            whole = getattr(exc, "whole_sentence", False) is True
+            said = str(exc) if whole else f"The compute backend cannot be used: {exc}"
+            return _Outcome("failed", said, "backend", requeued=True)
         if requeue:
             return _Outcome(
                 "cancelled",
@@ -3770,7 +4082,7 @@ def run(
     repair: Callable[[ExperimentPlan, dict[str, Any], str], Mapping[str, str] | None] | None = None,
     on_log: Callable[[str], None] | None = None,
     limits: Mapping[str, Any] | None = None,
-    unrepaired: str | None = None,
+    unrepaired: str | Callable[[Mapping[str, Any]], str] | None = None,
 ) -> dict[str, Any]:
     """Run one approved experiment and return the record of its last run.
 

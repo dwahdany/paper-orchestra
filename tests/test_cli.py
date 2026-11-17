@@ -611,6 +611,45 @@ def test_doctor_reports_the_credential_source_and_warnings(monkeypatch, tmp_path
     assert not (tmp_path / "lab").exists()
 
 
+def test_doctor_says_what_agents_with_a_shell_need_on_this_machine(monkeypatch, tmp_path):
+    """The sentence that refuses a phase of an sdk project points to `doctor`: it has to
+    say something about the package, a login and the federation settings."""
+    from paper_orchestra import doctor
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_FEDERATION_RULE_ID", raising=False)
+    report = doctor.collect()
+    rows = {
+        check: (status, details) for check, status, details in doctor._agents_rows(report["agents"])
+    }
+    assert set(rows) == {
+        "agents: sdk runtime (optional)",
+        "agents: sandbox of the shell",
+        "agents: credential login",
+        "agents: credential federation",
+    }
+    # Whether the sandbox of an agent's shell can start: without it no agent starts.
+    assert rows["agents: sandbox of the shell"][0] in ("ok", "missing")
+    bare = doctor._agents_rows({**report["agents"], "sandbox": False, "sandbox_missing": "why"})
+    assert ("agents: sandbox of the shell", "missing") in [(c, s) for c, s, _ in bare]
+    assert rows["agents: credential federation"][0] == "not configured"
+    assert "ANTHROPIC_FEDERATION_RULE_ID" in rows["agents: credential federation"][1]
+    if sys.platform != "darwin":
+        assert rows["agents: credential login"][0] == "not configured"
+        assert "run `claude` once and sign in" in rows["agents: credential login"][1]
+    (home / ".claude" / ".credentials.json").write_text("{}")
+    again = doctor._agents_rows(doctor.collect()["agents"])
+    assert ("agents: credential login", "ok") in [(check, status) for check, status, _ in again]
+    # Not installed is said as such, with how to install it; it is no fault of the report.
+    missing = doctor._agents_rows({"package": False, "install": "install it with X"})
+    assert missing[0][1] == "not installed" and "install it with X" in missing[0][2]
+    printed = runner.invoke(cli.app, ["doctor"]).output
+    assert "agents: sdk runtime" in printed and "agents: credential" in printed
+
+
 def test_doctor_exits_with_1_when_the_default_provider_is_unusable(monkeypatch):
     register_client("anthropic", DescribedClient({"credential_source": "none", "warnings": []}))
     result = runner.invoke(cli.app, ["doctor"], env={"COLUMNS": "240"})

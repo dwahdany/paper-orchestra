@@ -20,8 +20,9 @@ at its checkpoint as well.
 What ``advance()`` does when no phase is named: it first runs what the person
 approved and analyses results that have no analysis yet, pauses after that
 analysis when anything ran, and otherwise goes on with the phase that was next.
-A run needs no model and never waits for one.  Every other phase does: where the
-project's models cannot be used, ``advance()`` stops before the first such phase,
+Under the classic runtime a run needs no model and never waits for one (under
+``sdk`` an agent carries it out, and it waits like the rest).  Every other phase
+does: where the project's models cannot be used, ``advance()`` stops before the first such phase,
 at a checkpoint when something was done before it and with :class:`ModelNeeded`
 (one sentence, nothing recorded) when nothing was.
 Which phase is next is never changed by what an agent or a request says: more
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import json
 import logging
 import os
@@ -186,6 +188,12 @@ class WorkerBusy(EngineError):
     """Another worker is running this project."""
 
 
+#: How the ledger rows end that hold spend an SDK agent never reported
+#: (``research.sdk.session.UNREPORTED_SUFFIX`` after its label; not imported from
+#: there, so that reading a ledger needs nothing of the sdk runtime).
+UNREPORTED_LABEL = ".agent.unreported"
+
+
 class ModelNeeded(EngineError):
     """The phase that would run needs a model, and the project's models cannot be used.
 
@@ -208,6 +216,9 @@ class _BudgetSpent(Exception):
         self.limit = limit
         self.spent = spent
         self.allowed = allowed
+        #: The same sentence for another amount spent, where the amount in it was a count
+        #: made while a session was at work and the session's own figure came afterwards.
+        self.say: Callable[[float], str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +824,21 @@ def _sentence(text: Any, limit: int = 400) -> str:
 
 
 def _money(amount: float) -> str:
+    """``$0.34``; an amount under one cent with the digits that tell it from nothing
+    (``$0.004``), so that a limit set that low does not read as "$0.00"."""
+    if 0 < amount < 0.01:
+        digits = f"{amount:.4f}".rstrip("0")
+        return f"${digits}" if digits != "0." else "under $0.0001"
     return f"${amount:.2f}"
+
+
+def _limit_money(limit: float) -> str:
+    """A limit the person set, with the digits they gave it: ``$0.145`` and not
+    ``$0.14``, beside which "$0.15 is spent" would read as an error of arithmetic.
+    A limit in whole cents reads as any amount does."""
+    if limit >= 0.01 and abs(limit * 100 - round(limit * 100)) > 1e-6:
+        return "$" + f"{limit:.4f}".rstrip("0")
+    return _money(limit)
 
 
 # ---------------------------------------------------------------------------
@@ -835,13 +860,18 @@ class Engine:
         compute: ComputeBackend | Callable[[Any], ComputeBackend] | None = None,
         client_for: Callable[[str], Any] | None = None,
         scholar: SemanticScholar | None = None,
+        driver: Any = None,
     ) -> None:
         """``harness`` is the context harness every model call goes through; without one
         the engine builds the project's own (``client_for`` then chooses the clients).
         ``compute`` is a backend, or a callable choosing one for a plan; without one the
         backend named at approval, or in the project's settings, is used.  ``scholar``
-        is the Semantic Scholar client of the research phase."""
+        is the Semantic Scholar client of the research phase.  ``driver`` starts the
+        agents of a project whose runtime is ``sdk`` (``research.sdk.driver``); without
+        one the Claude Agent SDK is used, which is an optional package."""
         self.project = project
+        self._driver = driver
+        self._agents: Any = None
         self.harness = harness or agents.build_harness(project, client_for=client_for)
         self._client_for: Callable[[str], Any] | None = self.harness.client_for
         #: Whether the project's models can be used, asked once for each call that works
@@ -886,6 +916,8 @@ class Engine:
         reader._lock = threading.RLock()
         reader._client_for = client_for
         reader._needs = {}
+        reader._driver = None
+        reader._agents = None
         return reader
 
     # -- public ------------------------------------------------------------------
@@ -934,7 +966,8 @@ class Engine:
         failed twice, or cannot run as the project is set; ``error`` says why).
 
         Nothing that needs no model waits for one.  Every phase but the run needs
-        the project's models; where they cannot be used (no credential, a model
+        the project's models (under the ``sdk`` runtime the run does too: an agent
+        carries it out); where they cannot be used (no credential, a model
         without tools), the call stops before the first phase that needs them.
         When a phase completed before that (the run of what was approved), it
         pauses at that phase's checkpoint, which says in one sentence what is
@@ -1006,6 +1039,14 @@ class Engine:
                     "research approve` or in the app, then run it again."
                 )
             self._tidy_hypotheses(release=False)
+            named = backend if isinstance(backend, str) else getattr(backend, "name", None)
+            if self._sdk() and self._agent_carries_out(page, named):
+                # An agent carries the experiment out: it needs what every agent needs.
+                # (A run approved for a remote backend runs there, without an agent.)
+                need = self._agents_need()
+                if need is not None:
+                    sentence = agents.need_sentence(need, f"Carrying out {page.id}")
+                    raise ModelNeeded(sentence, phase="run", need=need)
             try:
                 self._check_experiment_budget(page, self._limits_with(limits))
             except _BudgetSpent as exc:
@@ -1014,7 +1055,19 @@ class Engine:
             compute = self._compute.named(backend) if isinstance(backend, str) else backend
             round = max(1, self._state["round"])
             ctx = self._context("run", round, f"r{round}-run-{page.id}", (), None)
-            return self._run_one(page, ctx, compute=compute, limits=limits)
+            try:
+                return self._run_one(page, ctx, compute=compute, limits=limits)
+            except _BudgetSpent as exc:
+                self._warn_budget(exc, phase="run")
+                raise EngineError(str(exc)) from None
+            except agents.SessionStopped as exc:
+                if isinstance(exc.reason, _BudgetSpent):
+                    spent = self._as_spent(exc.reason)
+                    self._warn_budget(spent, phase="run")
+                    raise EngineError(str(spent)) from None
+                # A stop request: the run went back to the queue, and its record says so.
+                runs = experiments.runs(self.project, str(page.id))
+                return runs[-1] if runs else {}
 
     # -- the worker --------------------------------------------------------------
 
@@ -1219,6 +1272,29 @@ class Engine:
                 # was lost.  On file, so that the next worker carries it too.
                 report["carried_usd"] = self._carried_usd
                 report["estimated_cost_usd"] = round(spent, 4)
+            # What agents that were stopped or killed never reported, counted from their
+            # tokens at the list price: part of the sum, and a lower bound of what it
+            # stands for.  Said beside the sum by whoever shows it.
+            unreported = sum(
+                _number(row.get("cost_usd"))
+                for row in report.get("by_label") or []
+                if str(row.get("label") or "").endswith(UNREPORTED_LABEL)
+            )
+            if unreported:
+                report["unreported_usd"] = round(unreported, 4)
+            # Such an agent on a model without a list price is in the sum with nothing:
+            # named here, so that the sum is still shown as the lower bound it is.
+            unpriced = sorted(
+                {
+                    str(row.get("model"))
+                    for row in report.get("by_label") or []
+                    if str(row.get("label") or "").endswith(UNREPORTED_LABEL)
+                    and "cost_usd" not in row
+                    and str(row.get("model")) in self._unpriced
+                }
+            )
+            if unpriced:
+                report["unreported_unpriced"] = unpriced
             write_json(self.project.root / USAGE_FILE, report)
             self._state["spent"]["model_usd"] = round(spent, 4)
             return spent
@@ -1270,7 +1346,66 @@ class Engine:
         models can be used, as before: a round whose research can be paid for and
         whose design then cannot be done is refused before anything is spent.
         """
+        if self._sdk():
+            if name == "run" and not self._runs_need_agents():
+                return None
+            return self._agents_need()
         return None if name == "run" else self._models_need()
+
+    @staticmethod
+    def _agent_carries_out(page: ResearchPage, backend: Any = None) -> bool:
+        """Whether a run of ``page`` under the sdk runtime is an agent's work: one that
+        was approved for this machine.  A run approved for a remote backend runs there
+        as it always did, and waits for nothing the agents need."""
+        named = str(backend or page.meta.get("backend") or "local")
+        return named == "local"
+
+    def _runs_need_agents(self) -> bool:
+        """Whether the run phase would start an agent: some approved run is for this
+        machine (or nothing tells, and the gate then asks as for every phase)."""
+        try:
+            waiting = [
+                page
+                for page in self.project.pages(kind="experiment")
+                if page.review == "accepted" and page.state in ("approved", "queued")
+            ]
+        except Exception:
+            return True
+        return not waiting or any(self._agent_carries_out(page) for page in waiting)
+
+    def _sdk(self) -> bool:
+        """Whether the project's agents are Claude Agent SDK agents (``settings.agents``)."""
+        return bool(self.project.settings.agents.sdk)
+
+    def _runtime(self) -> Any:
+        """The ``sdk`` runtime of this engine: how its agents are started."""
+        if self._agents is None:
+            from paper_orchestra.research.sdk.session import AgentRuntime
+
+            self._agents = AgentRuntime(self.project, self._driver)
+        return self._agents
+
+    def _agents_need(self) -> dict[str, Any] | None:
+        """What keeps the project's SDK agents from starting, in the shape of
+        :meth:`_models_need`; ``None`` when they can start, and for an engine that
+        was not told to look.
+
+        Under the ``sdk`` runtime this is the whole gate, for every phase: the
+        models of ``settings.models`` are not used, so they are not asked about,
+        and the run phase is no exception, because an approved experiment is
+        carried out by an agent too.
+        """
+        if self._client_for is None:
+            return None
+        key = ("agents",)
+        if key not in self._needs:
+            self._needs[key] = self._runtime().need()
+        return self._needs[key]
+
+    def _budget_left(self) -> float:
+        """What is left of the model budget, for a session that is told a sum."""
+        with self._lock:
+            return float(self.project.settings.limits.model_usd) - self._ledger_usd()
 
     def _wait_for_a_model(
         self,
@@ -1327,15 +1462,27 @@ class Engine:
         if spent >= limit:
             raise _BudgetSpent(
                 "model_usd",
-                f"The model budget is used up: {_money(spent)} of {_money(limit)} is spent. "
+                f"The model budget is used up: {_money(spent)} of {_limit_money(limit)} is spent. "
                 "Raise settings.limits.model_usd in the project's settings to go on; the "
                 "phase then resumes where it stopped.",
                 spent=spent,
                 allowed=limit,
             )
 
-    def _over_budget(self, model: str, usage: Usage) -> _BudgetSpent | None:
+    def _over_budget(
+        self,
+        model: str,
+        usage: Usage,
+        *,
+        phase: str | None = None,
+        experiment: str | None = None,
+        more_usd: float = 0.0,
+    ) -> _BudgetSpent | None:
         """Asked after every model request of a session's turn: is the model budget spent?
+
+        ``phase`` is the phase whose agent is at work, and ``experiment`` the one an
+        agent carries out where it is that agent: the sentence names who was
+        stopped, and what happens to the work when the limit is raised.
 
         ``usage`` is what the turn has used so far on ``model``.  The ledger does not
         hold it yet, so it is priced here and added to what the ledger holds.  A turn
@@ -1344,22 +1491,87 @@ class Engine:
         before a session; without this, one turn of up to ``agents.MAX_TURNS``
         requests could spend many times the limit before anything looked.  A model
         without a known price counts as nothing here, as it does in the ledger.
+        ``more_usd`` is what the turn cost on other models, priced by whoever asks.
         """
         limit = float(self.project.settings.limits.model_usd)
         with self._lock:
-            spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0)
+            spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0) + more_usd
         if spent < limit:
             return None
-        role = _ROLE.get(str(self._state.get("phase")), "agent")
+        if experiment:
+            work = f"the work of the agent that carries out {experiment}"
+            then = f"{experiment} is in the queue again and is run when the work goes on."
+        else:
+            role = _ROLE.get(str(phase or self._state.get("phase")), "agent")
+            work = f"the {role}'s work"
+            then = "the phase then resumes where it stopped."
+
+        def say(spent: float) -> str:
+            return (
+                f"The model budget ran out in the middle of {work}: {_money(spent)} of "
+                f"{_limit_money(limit)} is spent, so its session was ended at its next model "
+                "call. "
+                "What it had written until then is kept. Raise settings.limits.model_usd in "
+                f"the project's settings to go on; {then}"
+            )
+
+        exc = _BudgetSpent("model_usd", say(spent), spent=spent, allowed=limit)
+        exc.say = say
+        return exc
+
+    def _short_of(
+        self, needed: float, *, phase: str | None = None, experiment: str | None = None
+    ) -> _BudgetSpent | None:
+        """Asked before an agent is started (sdk runtime) with what the start of an agent
+        was seen to cost in this project: is less than that left of the model budget?
+
+        An agent's first request sends everything it is given, and in fast mode that
+        alone was seen to cost most of a dollar.  Started with less than that left,
+        the agent passes the limit within seconds, before any count can end it: it is
+        not started, and the work stops at a checkpoint as for a budget that is spent.
+        """
+        limit = float(self.project.settings.limits.model_usd)
+        with self._lock:
+            spent = self._ledger_usd()
+        if limit - spent >= needed:
+            return None
+        if experiment:
+            who = f"the agent that carries out {experiment}"
+            then = f"{experiment} keeps its approval and is run when the work goes on."
+        else:
+            role = _ROLE.get(str(phase or self._state.get("phase")), "agent")
+            who = f"the {role}"
+            then = "the phase then starts where it stopped."
         return _BudgetSpent(
             "model_usd",
-            f"The model budget ran out in the middle of the {role}'s work: {_money(spent)} of "
-            f"{_money(limit)} is spent, so its session was ended at its next model call. What "
-            "it had written until then is kept. Raise settings.limits.model_usd in the "
-            "project's settings to go on; the phase then resumes where it stopped.",
+            f"What is left of the model budget does not cover the start of {who}: "
+            f"{_money(spent)} of {_limit_money(limit)} is spent, and the first request of an "
+            f"agent was last seen to cost about {_money(needed)} here, so it was not "
+            "started. Raise settings.limits.model_usd in the project's settings to go on; "
+            f"{then}",
             spent=spent,
             allowed=limit,
         )
+
+    def _as_spent(self, exc: _BudgetSpent) -> _BudgetSpent:
+        """``exc`` with the amount the ledger holds now.
+
+        The amount in the sentence of a session that was ended in the middle of its
+        turn is a count from tokens at the list price.  Under the sdk runtime the
+        agent's own figure arrives when its turn has ended, and with fast mode or
+        helpers it is several times that count: the sentence that stays on the
+        checkpoint must name what the Spent line beside it names.
+        """
+        if exc.say is None:
+            return exc
+        spent = self._write_usage()
+        # Only upwards: in the classic runtime the ledger never learns of a turn that
+        # was cut short, and the count that ended it is then the larger and truer sum.
+        if spent < exc.spent + 0.005:
+            return exc
+        again = _BudgetSpent(exc.limit, exc.say(spent), spent=spent, allowed=exc.allowed)
+        again.say = exc.say
+        return again
 
     def _heed_stop(self) -> None:
         if self._stop.is_set():
@@ -1769,10 +1981,15 @@ class Engine:
             instruction=instruction,
             guard=self._guard,
             stopping=self._stopping,
-            over_budget=self._over_budget,
+            # (Named here: the state's phase is the last one that ran, which is another
+            # one while a run is started by itself.)
+            over_budget=functools.partial(self._over_budget, phase=name),
             scholar=self._scholar,
             compute=self._compute,
             handover=self._handover(name, round),
+            runtime=self._runtime() if self._sdk() else None,
+            left=self._budget_left,
+            short_of=functools.partial(self._short_of, phase=name),
         )
 
     def _handover(self, name: str, round: int) -> tuple[str, ...]:
@@ -1857,7 +2074,13 @@ class Engine:
                 # (A setting that cannot be read is no better read a second time.)
                 if attempt == 2 or stops_the_run(exc) or isinstance(exc, CutoffError):
                     return self._failed(record, clock, ctx, exc)
-                log.warning("The %s phase failed; trying once more.", name, exc_info=True)
+                # (An agent's own account of why it ended is a sentence for the person,
+                # said in the feed below: a traceback of this process adds nothing to it.)
+                log.warning(
+                    "The %s phase failed; trying once more.",
+                    name,
+                    exc_info=not getattr(exc, "plain", False),
+                )
                 # An error can carry text a model wrote: it stands there as a quotation.
                 self._emit(
                     "agent.activity",
@@ -1913,6 +2136,22 @@ class Engine:
         )
 
     def _execute(self, ctx: AgentContext) -> AgentReport:
+        """Run the phase of ``ctx`` in the project's runtime.
+
+        This is where the runtime is chosen.  With ``settings.agents.runtime`` set
+        to ``sdk``, the context carries the runtime, and every role function below
+        opens its session as a Claude Agent SDK agent (``agents._open_session``);
+        the functions themselves, their messages and their checks are the same.
+        Whatever the phase's agents still hold when it ends, also by a stop or a
+        failure, is closed here.
+        """
+        ctx.runtime = self._runtime() if self._sdk() else None
+        try:
+            return self._execute_phase(ctx)
+        finally:
+            ctx.close_sessions()
+
+    def _execute_phase(self, ctx: AgentContext) -> AgentReport:
         name = ctx.phase
         if name == "intake":
             return agents.run_intake(ctx)
@@ -2017,7 +2256,9 @@ class Engine:
         # What is written of an error is read by the app, the command line and later
         # sessions: no credential a library quoted in it gets that far.
         told = self._clean(exc)
-        error = f"{type(exc).__name__}: {_one_line(told, 1000)}"
+        # (An error that is a whole sentence to the person stands without its class.)
+        named = "" if getattr(exc, "whole_sentence", False) is True else f"{type(exc).__name__}: "
+        error = f"{named}{_one_line(told, 1000)}"
         log.error("The %s phase failed.", name, exc_info=exc)
         self._settle(record, clock, ctx, "failed", error)
         with self._lock:
@@ -2039,6 +2280,7 @@ class Engine:
         self, record: dict[str, Any], clock: float, ctx: AgentContext, exc: _BudgetSpent
     ) -> _Outcome:
         name = record["phase"]
+        exc = self._as_spent(exc)
         self._settle(record, clock, ctx, "interrupted", str(exc))
         self._warn_budget(exc, phase=name)
         extra = (
@@ -2400,7 +2642,7 @@ class Engine:
             return []
         exc = _BudgetSpent(
             "model_usd",
-            f"The model budget is used up: {_money(spent)} of {_money(limit)} is spent. No "
+            f"The model budget is used up: {_money(spent)} of {_limit_money(limit)} is spent. No "
             "agent starts again until settings.limits.model_usd is raised in the project's "
             "settings; what awaits your review can be decided all the same.",
             spent=spent,
@@ -2560,17 +2802,35 @@ class Engine:
 
         before = set(settled())
         repair, unrepaired = self._repairer(ctx)
+        carried_out: list[Any] = []
+        chosen = compute or self._compute
+        if self._sdk():
+            # The seam of the sdk runtime: the job of the run is an agent's.  Its model
+            # spend is the model budget's, which is looked at before it starts.
+            ctx.runtime = self._runtime()
+            ctx.over_budget = functools.partial(self._over_budget, experiment=experiment)
+            ctx.short_of = functools.partial(self._short_of, experiment=experiment)
+            self._guard()
+            chosen = self._agent_backend(page, ctx, chosen, carried_out)
         try:
-            return experiments.run(
+            record = experiments.run(
                 project,
                 experiment,
-                compute=compute or self._compute,
+                compute=chosen,
                 should_stop=self._stopping,
                 repair=repair,
                 unrepaired=unrepaired,
                 limits=self._run_limits(limits),
             )
+            for backend in carried_out:
+                stopped = backend.stopped
+                if isinstance(stopped, agents.SessionStopped):
+                    # A stop request or the model budget ended the agent; the run is
+                    # queued again, and the phase ends the way it does for any session.
+                    raise stopped
+            return record
         finally:
+            ctx.close_sessions()
             self._count_runs()
             self._save()
             # Also a run found unfinished and settled on the way: it ended now.
@@ -2578,14 +2838,56 @@ class Engine:
             pages = [project.resolve(f"{experiment}-run{run.get('number')}") for run in new]
             ctx.note(path for path in pages if path)
 
-    def _repairer(self, ctx: AgentContext) -> tuple[Callable[..., Any] | None, str | None]:
+    def _agent_backend(
+        self, page: ResearchPage, ctx: AgentContext, compute: Any, made: list[Any]
+    ) -> Callable[[Any], Any]:
+        """The chooser of the backend for a run that an agent carries out.
+
+        The backend is still the one the person approved; where that is the local
+        one, an agent does its job (``research.sdk.experiment.AgentBackend``).  A
+        run approved for a remote backend runs there as it always did: an agent
+        works on this machine.
+        """
+        from paper_orchestra.research.sdk.experiment import AgentBackend
+
+        def choose(plan: Any) -> Any:
+            inner = compute if hasattr(compute, "run_job") else compute(plan)
+            if getattr(inner, "name", "") != "local":
+                return inner
+            backend = AgentBackend(ctx, inner, page)
+            made.append(backend)
+            return backend
+
+        return choose
+
+    def _repairer(
+        self, ctx: AgentContext
+    ) -> tuple[Callable[..., Any] | None, str | Callable[[Mapping[str, Any]], str] | None]:
         """The callback that repairs a failed run, or ``None`` and why there is none.
 
-        A run needs no model and never waits for one.  The repair of a run that
-        failed for a programming error does, the runner's: where that model cannot
-        be used, the run happens all the same, a failure stands, and its record
-        says why nothing was tried (``experiments.run(..., unrepaired=...)``).
+        Under the classic runtime a run needs no model and never waits for one.  The
+        repair of a run that failed for a programming error does, the runner's:
+        where that model cannot be used, the run happens all the same, a failure
+        stands, and its record says why nothing was tried
+        (``experiments.run(..., unrepaired=...)``).  Under ``sdk`` nobody repairs
+        afterwards, and why is said of the run that failed: an agent carried it
+        out and repaired while it worked, or it ran where no agent works.
         """
+        if self._sdk():
+
+            def unrepaired(record: Mapping[str, Any]) -> str:
+                if record.get("carried_out_by") == "agent":
+                    return (
+                        "under the sdk runtime the agent that carries out an experiment "
+                        "repairs its code itself, so no separate repair is made."
+                    )
+                return (
+                    f"this run was on the {record.get('backend') or 'remote'} backend, where "
+                    "no agent works, and under the sdk runtime no separate repair is made "
+                    "afterwards. Correct the code and approve the experiment again."
+                )
+
+            return None, unrepaired
         setting = agents.MODEL_ROLES["runner"]
         try:
             need = self._models_need((setting,))

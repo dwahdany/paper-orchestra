@@ -1143,6 +1143,9 @@ a.choice { text-decoration: none; }
 .net-ask.unanswered.nudge { border-style: solid; border-color: var(--neg); }
 .net-ask .net-need { display: block; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
 .review .net-ask { background: var(--surface); }
+.net-models { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--ink-2); min-width: 0; overflow-wrap: anywhere; } .net-models svg { flex: none; margin-top: 2px; }
+.approve > .net-models { margin-top: 8px; }
+.start-agents { display: block; margin-top: 4px; overflow-wrap: anywhere; }
 .approve-fields .tick .quiet { margin-left: 2px; }
 /* approved, and then the code or the plan changed */
 .callout-changed { border-style: dashed; border-color: var(--prop-line); background: var(--prop-wash); }
@@ -1511,4 +1514,65 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
   .dc-go.dc-unsent { bottom: -28px; margin: 10px -12px -12px; padding: 9px 12px 12px; } .dc-wait { font-size: 14px; } .dc-count { font-size: 13.5px; }
   .dc-old > summary { min-height: 48px; padding: 8px 10px; } .dc-oq { font-size: 15px; } .dc-oa { font-size: 14px; } .dc-in { margin-left: 2px; }
   .dc-ref { font-size: 14px; } .dc-ref a { display: inline-block; padding: 6px 0; }
+}
+
+/* ---------- agents with a shell: how they are run, what they do, the runs they carry out ---------- */
+/* the fields of settings.agents, in the composer and on the overview: a name, its field, and under it the one sentence that says what the choice means */
+.agent-set { display: grid; gap: 10px; }
+.agent-f { display: grid; grid-template-columns: 148px minmax(0, 1fr); align-items: center; gap: 4px 8px; font-size: 12px; color: var(--ink-3); }
+.agent-f > label:not(.tick) { color: var(--ink-3); } .agent-f select, .agent-f input:not([type=checkbox]) { height: 30px; min-width: 0; width: 100%; max-width: 340px; }
+.agent-f .tick, .agent-says { grid-column: 2; } .agent-f .tick { font-size: 12.5px; }
+.agent-says { margin: 0; max-width: 68ch; line-height: 1.45; color: var(--ink-3); }
+.agent-warn { color: var(--prop); }
+.adv-agents { grid-column: 1 / -1; border: 0; border-top: 1px solid var(--rule); padding: 12px 0 0; margin: 6px 0 0; min-width: 0; } .adv-agents legend { font-size: 12px; color: var(--ink-3); padding: 0 8px 0 0; }
+.agents-now { margin-top: 12px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-width: 68ch; } .agents-now b { color: var(--ink); font-weight: 600; }
+.agents-open-box { margin-top: 10px; }
+.agents-form { display: grid; gap: 10px; margin-top: 10px; } .agents-form .agent-f { grid-template-columns: 112px minmax(0, 1fr); } .agents-form .btn { justify-self: start; } .agents-form .note { margin: 0; }
+.agents-when { margin: 0; font-size: 12px; }
+
+/* the feed: an agent's name fits its column; what an agent chose (a command, a file, an address) is set apart from the words around it */
+.ev { grid-template-columns: 40px 88px minmax(0, 1fr); }
+.ev-act .ev-did, .ev-act .ev-helper { color: var(--ink-3); }
+.ev-text { color: var(--ink); } code.ev-text { font-size: 11.5px; padding: .08em .3em; border-radius: 3px; background: var(--sunk); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+.ev-act-refused code.ev-text { text-decoration: line-through; text-decoration-color: var(--neg); }
+.ev-refused { color: var(--neg); }
+.ev-work-l, .ev-act { min-width: 0; }
+.ev-steps li > span { min-width: 0; overflow-wrap: anywhere; }
+
+/* a run an agent carried out says so: in its heading, and once in a sentence */
+.run-by { color: var(--ink-2); font-style: italic; }
+.run-agent { margin: 0 0 12px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-width: 86ch; }
+
+@media (max-width: 960px) {
+  .agent-f, .agents-form .agent-f { grid-template-columns: minmax(0, 1fr); } .agent-f .tick, .agent-says { grid-column: 1; }
+}
+@media (max-width: 700px), (max-height: 480px) and (pointer: coarse) {
+  /* the overview on a phone: its one column is as wide as the phone, whatever it holds */
+  .ov-cols { grid-template-columns: minmax(0, 1fr); } .ov-col { min-width: 0; }
+  /* the feed on a phone: when and who on one line, what happened on the whole width under it */
+  .ev { grid-template-columns: 40px minmax(0, 1fr); gap: 0 8px; padding: 6px 0; font-size: 13.5px; }
+  .ev > :nth-child(n+3) { grid-column: 1 / -1; }
+  .ev-steps li { font-size: 13px; } .ev-steps > summary { min-height: 32px; font-size: 13px; }
+  code.ev-text { font-size: 12.5px; }
+  .agent-f select, .agent-f input:not([type=checkbox]) { height: auto; min-height: 44px; max-width: none; }
+  .agent-f .tick { min-height: 44px; font-size: 14.5px; } .agent-f .tick input { width: 20px; height: 20px; margin: 0 4px 0 0; }
+  .agent-says, .agents-now { font-size: 13.5px; }
+  .agents-form .btn { height: 44px; padding: 0 14px; font-size: 14.5px; }
+}
+
+/* what the agent that carried a run out made of the approved code, and what its code could reach */
+.run-code { margin: 0 0 12px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-width: 86ch; }
+.run-code p { margin: 4px 0 8px; } .run-code code { overflow-wrap: anywhere; }
+.run-models { margin: 0 0 12px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); max-width: 86ch; }
+.spend-least { display: block; margin-top: 2px; font-size: 11.5px; }
+
+@media (max-width: 700px), (max-height: 480px) and (pointer: coarse) {
+  /* the new-project page on a phone.  Nothing is dropped onto a phone, and the hint beside
+     "Add files" had no width left: it stood one letter to a line. */
+  .composer-bar { flex-wrap: wrap; } .drop-hint { display: none; }
+  /* the route under the form: three to a row, so that each name has room for its word
+     (eight in a row broke "Hypotheses" in the middle) */
+  .smap-route { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 14px; }
+  .smap-route .smap-st { padding-right: 8px; }
+  .smap-route .smap-name, .smap-route .smap-hint { overflow-wrap: normal; word-break: normal; hyphens: none; }
 }

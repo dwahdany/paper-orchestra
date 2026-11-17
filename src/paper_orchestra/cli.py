@@ -27,6 +27,7 @@ them and without the optional extras.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import importlib.util
 import json
@@ -924,6 +925,9 @@ class _EventPrinter:
         self._seen = earlier[-1]["seq"] if earlier else 0
         self._size = self._file_size()
         self._done = threading.Event()
+        #: What agents were last said to do: the log of a run an agent carries out
+        #: repeats those sentences, and here a person would read each of them twice.
+        self._told: collections.deque[str] = collections.deque(maxlen=64)
         #: The follower and the command both print; no event is printed twice.
         self._printing = threading.Lock()
         self._thread = threading.Thread(target=self._follow, name="events", daemon=True)
@@ -960,8 +964,35 @@ class _EventPrinter:
             self._size = size
             for event in self._project.events(after=self._seen):
                 self._seen = event["seq"]
-                if event.get("type") not in self._leave_out:
+                if event.get("type") not in self._leave_out and not self._repeats(event):
                     _say(_event_line(event), err=True)
+
+    def _repeats(self, event: Mapping[str, Any]) -> bool:
+        """Whether ``event`` is the line of a run's log that repeats what the feed has
+        just said of the agent that carries the run out."""
+        from paper_orchestra.compute.base import NOTE_PREFIX
+
+        if event.get("type") == "agent.activity":
+            self._told.append(str(event.get("summary") or ""))
+            return False
+        if event.get("type") != "run.log":
+            return False
+        data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+        lines = [str(line) for line in data.get("lines") or []]
+        last = lines[-1] if lines else ""
+        if not last.startswith(NOTE_PREFIX):
+            return False
+        said = last.removeprefix(NOTE_PREFIX)
+        return any(
+            said == told or (len(said) > 40 and told.startswith(said)) for told in self._told
+        )
+
+
+def _limit_usd(amount: float) -> str:
+    """A limit in dollars; one under a cent with the digits that tell it from nothing."""
+    if 0 < amount < 0.01:
+        return "$" + f"{amount:.4f}".rstrip("0")
+    return f"${amount:.2f}"
 
 
 def _event_line(event: Mapping[str, Any]) -> str:
@@ -1005,6 +1036,19 @@ def _needs_a_model(exc: BaseException) -> bool:
     engine = sys.modules.get("paper_orchestra.research.engine")
     refusal = getattr(engine, "ModelNeeded", None)
     return isinstance(refusal, type) and isinstance(exc, refusal)
+
+
+def _unreported_spend(project: Project) -> tuple[float, list[str]]:
+    """What of the model spend is a count from tokens for agents that never reported
+    their cost (``unreported_usd`` of the usage ledger), and the models of such agents
+    that have no list price and are in the sum with nothing (``unreported_unpriced``);
+    nothing and none when there are none."""
+    try:
+        ledger = read_json(project.root / "usage.json")
+        unpriced = [str(model) for model in ledger.get("unreported_unpriced") or []]
+        return max(0.0, float(ledger.get("unreported_usd") or 0.0)), unpriced
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        return 0.0, []
 
 
 def _sweep(project: Project) -> None:
@@ -1232,12 +1276,26 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         else ""
     )
     lines.append(
-        f"  Spent: ${_amount(spent.get('model_usd')):.2f} of ${limits.model_usd:.2f} on "
+        f"  Spent: ${_amount(spent.get('model_usd')):.2f} of {_limit_usd(limits.model_usd)} on "
         f"models{story}; ${_amount(spent.get('experiment_usd')):.2f} of "
-        f"${limits.experiment_usd:.2f} on experiments, which ran for "
+        f"{_limit_usd(limits.experiment_usd)} on experiments, which ran for "
         f"{_amount(spent.get('experiment_seconds')):.0f} s in all (one run may take up to "
         f"{limits.experiment_seconds:.0f} s)"
     )
+    unreported, unpriced = _unreported_spend(project)
+    if unreported:
+        lines.append(
+            f"  The model spend is at least that: ${unreported:.2f} of it stands for agents "
+            "that were stopped before they reported their cost, counted from their tokens "
+            "at the list price"
+        )
+    if unpriced:
+        lines.append(
+            "  The model spend is at least that: an agent on "
+            f"{', '.join(repr(model) for model in unpriced)} was stopped before it "
+            "reported its cost, and that model has no list price here, so its tokens are "
+            "in usage.json and its cost is not in the sum"
+        )
     lines += _problem_lines(project)
     lines.append(_next_steps(project, state, counts))
     return lines
@@ -1411,6 +1469,92 @@ def _default_project_dir(title: str | None, brief: str) -> Path:
     return _free_dir(WORKSPACE / slugify(name, 48))
 
 
+AgentModelOption = Annotated[
+    str | None,
+    typer.Option(
+        "--agent-model",
+        "--model",
+        metavar="MODEL",
+        help="The model of the sdk agents (default: claude-fable-5-2).",
+    ),
+]
+AgentFastOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--fast/--no-fast",
+        help="Ask for fast mode (sdk agents). It costs several times the usual price and "
+        "works with the `login` credential only.",
+    ),
+]
+AgentUltracodeOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--ultracode/--no-ultracode",
+        help="Let the sdk agents start helper agents and workflows.",
+    ),
+]
+AgentCredentialOption = Annotated[
+    str | None,
+    typer.Option(
+        "--credential",
+        metavar="login|federation",
+        help="Whose account the sdk agents work on: your Claude Code `login`, or the "
+        "worker's Workload Identity `federation` settings.",
+    ),
+]
+AgentSandboxOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--sandbox/--no-sandbox",
+        help="Keep the sdk agents in their own folder, away from credentials and the "
+        "project's files. Turn it off only if you accept that an agent can then reach "
+        "everything you can.",
+    ),
+]
+
+
+def _agent_changes(
+    runtime: str | None,
+    model: str | None,
+    fast: bool | None,
+    ultracode: bool | None,
+    credential: str | None,
+    sandbox: bool | None,
+) -> dict[str, Any]:
+    """The values of ``settings.agents`` that the options of a command name."""
+    given = (
+        ("runtime", runtime.strip().lower() if runtime is not None else None),
+        ("model", model.strip() if model is not None else None),
+        ("fast", fast),
+        ("ultracode", ultracode),
+        ("credential", credential.strip().lower() if credential is not None else None),
+        ("sandbox", sandbox),
+    )
+    return {name: value for name, value in given if value is not None}
+
+
+def _who_pays(agents: Any) -> str:
+    """One line on whose account a project's sdk agents work, and at what speed: said
+    before the first of them starts."""
+    fast = bool(agents.fast) and agents.credential == "login"
+    how = f"{agents.model}{' in fast mode' if fast else ''}"
+    if agents.credential == "login":
+        said = (
+            f"The agents are Claude agents on {how}, signed in with your Claude Code login: "
+            "what they use is billed to your own Claude account"
+        )
+        said += ", and fast mode costs several times the usual price." if fast else "."
+    else:
+        said = (
+            f"The agents are Claude agents on {how}, signed in with the worker's Workload "
+            "Identity Federation settings: what they use is billed to that organization."
+        )
+    return (
+        f"{said} `paper-orchestra research settings` changes that (--credential, "
+        "--agent-model, --fast/--no-fast)."
+    )
+
+
 @research_app.command("new")
 def research_new(
     paths: Annotated[
@@ -1448,6 +1592,22 @@ def research_new(
             "Default: no cutoff.",
         ),
     ] = None,
+    runtime: Annotated[
+        str | None,
+        typer.Option(
+            "--runtime",
+            metavar="classic|sdk",
+            help="How the project's agents are run: `classic` (this package's tool loop "
+            "over a model API) or `sdk` (Claude Agent SDK agents with a shell, the web and "
+            "the board). Default: classic, or what PAPER_ORCHESTRA_AGENT_RUNTIME says. "
+            "`paper-orchestra research settings` changes it later.",
+        ),
+    ] = None,
+    model: AgentModelOption = None,
+    fast: AgentFastOption = None,
+    ultracode: AgentUltracodeOption = None,
+    credential: AgentCredentialOption = None,
+    sandbox: AgentSandboxOption = None,
     run: Annotated[
         bool,
         typer.Option(
@@ -1461,12 +1621,23 @@ def research_new(
     The agents read what you gave, research prior work and fill the project's wiki.
     Everything they write is a suggestion until you accept it.
     """
-    from paper_orchestra.research.model import ProjectError
+    from paper_orchestra.research.model import ProjectError, settings_for_new_project
     from paper_orchestra.research.project import Project
 
     text = _brief_text(brief, brief_file)
     root = directory or _default_project_dir(title, text)
-    settings = {"research_cutoff": research_cutoff} if research_cutoff is not None else None
+    given: dict[str, Any] = {}
+    if research_cutoff is not None:
+        given["research_cutoff"] = research_cutoff
+    chosen = _agent_changes(runtime, model, fast, ultracode, credential, sandbox)
+    if chosen:
+        given["agents"] = chosen
+    # The runtime is written into the project when it is created: what the environment
+    # says later changes nothing about a project that exists.
+    try:
+        settings = settings_for_new_project(given)
+    except ProjectError as exc:
+        _fail(str(exc))
     try:
         project = Project.create(
             root, title=title or "", brief=text, files=paths or (), settings=settings
@@ -1477,6 +1648,9 @@ def research_new(
     attached = len(project.attachments())
     if attached:
         _say(f"{attached} file{'s' if attached != 1 else ''} attached.")
+    if project.settings.agents.runtime == "sdk":
+        # Before the first agent starts: on whose account, and at what speed.
+        _say(_who_pays(project.settings.agents))
     shown = _quoted(root)
     if not run:
         _say(
@@ -1967,8 +2141,60 @@ def research_approve(
         f"{root} {name}` runs it now; `paper-orchestra research advance {root}` runs "
         "everything approved and analyses the results."
     )
+    if _grants_model_access(page):
+        _say(MODEL_ACCESS_SAID)
     for line in _what_was_approved(opened, page):
         _say(line)
+
+
+@research_app.command("adopt-code")
+def research_adopt_code(
+    project: ProjectArgument,
+    experiment: Annotated[
+        str,
+        typer.Argument(
+            metavar="EXPERIMENT", help="The experiment, for example E1.", show_default=False
+        ),
+    ],
+    run: Annotated[
+        int | None,
+        typer.Option(
+            "--run",
+            min=1,
+            help="The run whose code to take. Default: the latest run an agent changed "
+            "the code in.",
+            show_default=False,
+        ),
+    ] = None,
+) -> None:
+    """Make the code an agent left after a run the experiment's code.
+
+    Under the sdk runtime the agent that carries an experiment out repairs the code in
+    its own folder, and the experiment's code stays what you approved: run again, it
+    would fail the same way and be repaired again.  This writes the files the agent
+    changed or added into the experiment's code as your own edit.  The earlier
+    versions are kept, and the experiment must be approved again before it runs.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    try:
+        from paper_orchestra.research import experiments
+
+        page = opened.page(experiment)
+        adopted = experiments.adopt_run_code(opened, str(page.id or experiment), run)
+    except (ProjectError, ComputeError) as exc:
+        _fail(str(exc), code=1)
+    name, root = page.id or page.path, _quoted(opened.root)
+    _say(
+        f"The code of run {adopted['run']} is now the code of {name}: "
+        f"{', '.join(adopted['files'])}. The earlier versions are kept. `paper-orchestra "
+        f"research approve {root} {name}` approves it to run again."
+    )
+    if adopted["removed"]:
+        _say(f"Left in place, though the agent had removed it: {', '.join(adopted['removed'])}.")
+    for problem in adopted["problems"]:
+        _say(f"The check of the code found: {problem}", fg=typer.colors.YELLOW)
 
 
 def _how_to_accept(project: Project, ref: str) -> str:
@@ -2007,6 +2233,13 @@ def _what_was_approved(project: Project, page: ResearchPage) -> list[str]:
         )
         where = _quoted(experiments.code_dir(project, name))
         lines.append(f"Its code, in {where}: {listed}; {stamped}.")
+        if digest:
+            # Two digests are shown for one experiment, and they are of different things.
+            code = experiments.code_digest(project, name)[:12]
+            lines.append(
+                "The approved digest covers the plan and the code together; the code "
+                f"alone is sha256 {code}, which is what a result page names under Code."
+            )
     elif digest:
         lines.append(f"It has no code files of its own; {stamped}.")
     with contextlib.suppress(ProjectError):
@@ -2036,6 +2269,24 @@ def _asks_for_network(page: ResearchPage) -> bool:
     """Whether an experiment's page says that its run reaches the network."""
     value = page.meta.get("network")
     return value is True or str(value).strip().lower() in _TRUE
+
+
+#: Said when a run is approved whose code will be able to call the Anthropic API: the
+#: person learns of a spend that nothing here counts before they grant it, not after.
+MODEL_ACCESS_SAID = (
+    "With network access this run's code can call the Anthropic API with the worker's "
+    "federation settings (PAPER_ORCHESTRA_JOB_MODEL_ACCESS is on): those calls are billed "
+    "to that account and are counted against no limit of the project."
+)
+
+
+def _grants_model_access(page: ResearchPage) -> bool:
+    """Whether the approval on ``page`` lets the run's code call the Anthropic API: a
+    local run with network access while model access for jobs is on."""
+    from paper_orchestra.compute.local import job_model_access
+
+    local = str(page.meta.get("backend") or "local") == "local"
+    return local and _asks_for_network(page) and job_model_access()
 
 
 def _approved_as(page: ResearchPage) -> str:
@@ -2097,9 +2348,11 @@ def research_run(
 ) -> None:
     """Run approved experiments now and write their result records.
 
-    No model is involved unless a run fails for a programming error and the code is
-    repaired.  `research advance` then analyses the results first.  One approval is one
-    run: an experiment whose approved run has ended is not run again.
+    Under the classic runtime no model is involved unless a run fails for a programming
+    error and the code is repaired.  Under the sdk runtime an agent carries each run
+    out; where the agents cannot start, the command says why and exits with code 3,
+    as `research advance` does.  `research advance` then analyses the results first.
+    One approval is one run: an experiment whose approved run has ended is not run again.
     """
     from paper_orchestra.research.model import ProjectError
 
@@ -2131,6 +2384,11 @@ def research_run(
             except WorkerBusy:
                 raise  # true of the project, so of every experiment: said once
             except (ProjectError, ComputeError) as exc:
+                if _needs_a_model(exc):
+                    # The agents that carry experiments out cannot start (the sdk
+                    # runtime): true of every experiment, and no error of the project.
+                    # Said once, with the exit code `advance` gives for the same thing.
+                    raise
                 # One experiment that cannot run does not keep the others from running.
                 events.flush()
                 _say(f"Error: {exc}", fg=typer.colors.RED, err=True)
@@ -2138,6 +2396,17 @@ def research_run(
                 continue
             events.flush()
             _say(_run_line(opened, record))
+            changed = _mapping(record.get("code_as_run"))
+            if any(changed.get(verb) for verb in ("changed", "added", "removed")):
+                # The result comes from other code than was approved: said where the
+                # result is, with what makes that code the experiment's.  A plan that
+                # came without code was given none to change: the agent wrote it.
+                _say(
+                    f"  The agent that carried it out {_did_to_the_code(changed)} "
+                    f"(kept in runs/{record.get('number')}/code-as-run). `paper-orchestra "
+                    f"research adopt-code {root} {record.get('experiment')}` makes it the "
+                    "experiment's code; without that, a new run starts from the approved code."
+                )
             outcomes.append(str(record.get("status")))
     # A run the person cancelled left nothing to analyse.
     if any(outcome in ("succeeded", "failed") for outcome in outcomes):
@@ -2148,6 +2417,14 @@ def research_run(
         )
     if any(outcome != "succeeded" for outcome in outcomes):
         raise typer.Exit(1)
+
+
+def _did_to_the_code(as_run: Mapping[str, Any]) -> str:
+    """What the agent that carried a run out did to the code, from the record's
+    ``code_as_run``: it wrote the code where the plan came with none (``approved`` is
+    the number of files that were approved), and changed what it was given otherwise."""
+    wrote = "approved" in as_run and not as_run.get("approved") and not as_run.get("changed")
+    return "wrote the code for this run" if wrote else "changed the code it was given"
 
 
 def _settle_what_ended(project: Project) -> None:
@@ -2161,6 +2438,61 @@ def _settle_what_ended(project: Project) -> None:
         from paper_orchestra.research import experiments
 
         experiments.recover(project, follow=False)
+
+
+@research_app.command("settings")
+def research_settings(
+    project: ProjectArgument,
+    runtime: Annotated[
+        str | None,
+        typer.Option(
+            "--runtime",
+            metavar="classic|sdk",
+            help="How the agents are run: `classic` (the tool loop over a model API) or "
+            "`sdk` (Claude Agent SDK agents with a shell, the web and the board).",
+        ),
+    ] = None,
+    model: AgentModelOption = None,
+    fast: AgentFastOption = None,
+    ultracode: AgentUltracodeOption = None,
+    credential: AgentCredentialOption = None,
+    sandbox: AgentSandboxOption = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the settings as JSON.")] = False,
+) -> None:
+    """Show how a project's agents are run, or change it.
+
+    Without an option this prints `settings.agents`. With options it changes the
+    values named and leaves the rest; the change holds from the next phase on.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    changes = _agent_changes(runtime, model, fast, ultracode, credential, sandbox)
+    if changes:
+        try:
+            opened.settings.update({"agents": changes})
+            opened.save_settings()
+        except ProjectError as exc:
+            _fail(str(exc))
+    agents = opened.settings.agents
+    if as_json:
+        typer.echo(json.dumps(agents.to_dict(), indent=2, ensure_ascii=False, default=str))
+        return
+    if changes:
+        _say(f"Changed {', '.join(changes)} for {opened.title}.")
+    if agents.runtime != "sdk":
+        _say(
+            "Agents: classic (this package's tool loop, with the models under "
+            "settings.models). `--runtime sdk` makes them Claude Agent SDK agents."
+        )
+        return
+    whose = "your Claude Code login" if agents.credential == "login" else "the worker's federation"
+    _say(
+        f"Agents: sdk (Claude Agent SDK agents on {agents.model}; fast mode "
+        f"{'asked for' if agents.fast else 'off'}; helper agents and workflows "
+        f"{'on' if agents.ultracode else 'off'}; credential: {whose}; sandbox "
+        f"{'on' if agents.sandbox else 'OFF'})."
+    )
 
 
 @research_app.command("request")

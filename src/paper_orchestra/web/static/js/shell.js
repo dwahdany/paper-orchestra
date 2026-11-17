@@ -4,7 +4,7 @@
 import { VIEWS, app, hrefOf, link } from './core.js';
 import { connection, RESTARTED } from './api.js';
 import { clock, codeSpans, dateTime, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, storage, tf, whyNot } from './util.js';
-import { KIND, PHASE_DO, STAGES, icon, lapsed, phaseName } from './vocab.js';
+import { AGENT_SAYS, CREDENTIAL, DID, KIND, PHASE_DO, RUNTIME, STAGES, credentialName, icon, lapsed, phaseName, runtimeName } from './vocab.js';
 import { decisionsSentence, openDecisions, waitingCount } from './decisions.js';
 
 const MARK = raw('<svg class="brand-mark" width="18" height="18" viewBox="-10 -10 20 20" aria-hidden="true"><circle r="8"/><circle class="core" r="3"/></svg>');
@@ -148,9 +148,14 @@ export function nextStep(store, e) {
   out.held = (Array.isArray(said.not_running) ? said.not_running : []).filter((x) => x && typeof x.id === 'string' && x.id).map((x) => ({ id: x.id, reason: whyNot(typeof x.reason === 'string' && x.reason ? x.reason : 'it is no longer what was approved') }));
   /* a phase that needs a model where none can be used: the press stops before it */
   const stop = said.blocked && typeof said.blocked === 'object' && typeof said.blocked.message === 'string' && said.blocked.message ? said.blocked : null;
-  out.need = stop ? { phase: typeof stop.phase === 'string' ? stop.phase : '', message: plain(stop.message) } : null;
+  /* (`agents`: what is missing is what agents with a shell need, which Setup does not show; how the agents are run is on the overview) */
+  out.need = stop ? { phase: typeof stop.phase === 'string' ? stop.phase : '', message: plain(stop.message), agents: Array.isArray(stop.settings) && stop.settings.indexOf('agents') >= 0 } : null;
   /* nothing a press could start needs no model: the button leads to where that is put right */
-  const setUp = () => { out.label = 'Set up a model'; out.href = '#/setup'; out.steps = []; out.tip = 'Nothing can go on without a model: Setup shows what is configured, and what is missing.'; };
+  const setUp = () => {
+    out.steps = [];
+    if (out.need && out.need.agents) { out.label = 'See how the agents work'; out.href = link({ view: 'overview', sel: '', sub: '' }); out.act = 'show-agents'; out.tip = 'Nothing can go on until the project\'s agents can start: the overview says how they are run, and changes it.'; }
+    else { out.label = 'Set up a model'; out.href = '#/setup'; out.tip = 'Nothing can go on without a model: Setup shows what is configured, and what is missing.'; }
+  };
   if (said.needs_phase) {
     /* nothing on file says where the project stands: a press without a phase would be refused */
     out.pick = true;
@@ -269,7 +274,7 @@ export function continueControl(store, e, where, large) {
   if (step.pick && choices.length) {
     return html`<span class="go go-pick${open ? ' open' : ''}" data-menu="${where}"><button class="${cls} go-more" data-act="go-menu" data-where="${where}" data-go-main aria-haspopup="menu" aria-expanded="${tf(open)}" data-tip="Nothing on file says where the project stands, so the agents go on with the phase you name">${step.label} ${icon('down')}</button>${menu}</span>`;
   }
-  const main = step.href ? html`<a class="${cls}" href="${step.href}" data-go-main data-tip="${tip}">${step.label} ${icon('right')}</a>`
+  const main = step.href ? html`<a class="${cls}" href="${step.href}" data-go-main${step.act ? html` data-act="${step.act}"` : ''} data-tip="${tip}">${step.label} ${icon('right')}</a>`
     : html`<button class="${cls}" data-act="continue" data-tip="${tip}">${step.label} ${icon('right')}</button>`;
   if (!choices.length) return main;
   return html`<span class="go${open ? ' open' : ''}" data-menu="${where}">${main}<button class="${cls} go-more" data-act="go-menu" data-where="${where}" aria-haspopup="menu" aria-expanded="${tf(open)}" aria-label="Choose another phase to run" data-tip="Choose another phase to run">${icon('down')}</button>${menu}</span>`;
@@ -277,11 +282,14 @@ export function continueControl(store, e, where, large) {
 /** What the app adds to the engine's sentence about a model that cannot be used. The server
     reads its credentials when it starts, so one that is set while it runs is not seen. */
 const RESTART = 'After you set a credential, start the app again: credentials are read when it starts.';
+/** The same for agents with a shell that cannot start: where the person changes how they are run. */
+const AGENTS_WHERE = 'How the agents are run (the runtime, and the credential they sign in with) is changed on the overview, under “How the agents work”.';
 /** The model a phase needs and cannot use, as something to set up: the engine's one
     sentence (`need` of the step), where to put it right, and that the app has to be started
     again. Nothing where the forecast says nothing of it. */
 function needHTML(step) {
   if (!step.need) return '';
+  if (step.need.agents) return html`<p class="go-rec go-need" data-needs="agents">${icon('warn')}<span>${codeSpans(step.need.message)} ${AGENTS_WHERE}</span>${step.act === 'show-agents' ? '' : html`<a class="btn btn-s" href="${link({ view: 'overview', sel: '', sub: '' })}" data-act="show-agents">How the agents work</a>`}</p>`;
   return html`<p class="go-rec go-need" data-needs="model">${icon('warn')}<span>${codeSpans(step.need.message)} ${RESTART}</span>${step.href === '#/setup' ? '' : html`<a class="btn btn-s" href="#/setup">Open Setup</a>`}</p>`;
 }
 /** An experiment that reads approved and will not run when the button is pressed: the
@@ -396,6 +404,39 @@ export function topbar(route) {
 }
 const cap1 = (text) => (text ? text.charAt(0).toUpperCase() + text.slice(1) : '');
 
+/* ---------- how the agents are run: the same fields in the composer and on the overview ---------- */
+/** The fields of `settings.agents`, each with the one sentence that says what the choice
+    means. `v` holds what is in force (`runtime`, `model`, `fast`, `ultracode`, `credential`,
+    `sandbox`), `o` what the form is: `id` (prefix of the fields' ids), `input` and `tick`
+    (the `data-input` of its fields and of its checkboxes), `runtimes` and `credentials` (the
+    choices, `[value, words]`, as the server lists them), `picked` (what the two lists and
+    the model field show: the composer's are empty until the person chooses) and
+    `modelHint`. The fields after the first concern agents with a shell only, and are
+    shown for those. */
+export function agentFields(v, o) {
+  const sdk = v.runtime === 'sdk';
+  const says = (name, text, cls) => html`<p class="agent-says${cls ? ' ' + cls : ''}" data-says="${name}">${text}</p>`;
+  const pick = (name, label, list, value) => html`<label for="${o.id}-${name}">${label}</label><select id="${o.id}-${name}" data-input="${o.input}" data-name="${name}">${list.map(([val, words]) => html`<option value="${val}"${val === value ? raw(' selected') : ''}>${words}</option>`)}</select>`;
+  const tick = (name, label, text, cls) => html`<div class="agent-f agent-tick"><label class="tick"><input type="checkbox" id="${o.id}-${name}" data-input="${o.tick}" data-name="${name}"${v[name] ? raw(' checked') : ''}> ${label}</label>${says(name, text, cls)}</div>`;
+  /* fast mode that is asked for where it is refused is said here, before the feed has to say it */
+  const fast = AGENT_SAYS.fast + (v.fast && v.credential === 'federation' ? ' With the federation settings it is refused where the organization has not enabled it, and the agents then work at normal speed.' : '');
+  return html`<div class="agent-set" data-runtime="${v.runtime}">
+    <div class="agent-f">${pick('runtime', 'The agents are', o.runtimes, o.picked.runtime)}${says('runtime', (RUNTIME[v.runtime] || ['', ''])[1])}</div>
+    ${sdk ? html`<div class="agent-f"><label for="${o.id}-model">Model</label><input id="${o.id}-model" data-input="${o.input}" data-name="model" value="${o.picked.model}" placeholder="${o.modelHint || ''}" autocomplete="off" spellcheck="false">${says('model', AGENT_SAYS.model)}</div>
+    <div class="agent-f">${pick('credential', 'They sign in with', o.credentials, o.picked.credential)}${says('credential', (CREDENTIAL[v.credential] || ['', ''])[1])}</div>
+    ${tick('fast', 'Fast mode', fast)}
+    ${tick('ultracode', 'Helper agents and workflows', AGENT_SAYS.ultracode)}
+    ${tick('sandbox', 'Sandbox', v.sandbox ? AGENT_SAYS.sandbox : AGENT_SAYS.noSandbox, v.sandbox ? '' : 'agent-warn')}` : ''}</div>`;
+}
+/** How the agents of a project are run, in one sentence: "Claude agents with a shell, on
+    claude-…, in fast mode, with helper agents, signed in with your Claude Code login,
+    inside the sandbox." */
+export function agentsSentence(a) {
+  if (!a || a.runtime !== 'sdk') return runtimeName((a || {}).runtime) + '.';
+  return runtimeName(a.runtime) + ', on ' + a.model + (a.fast ? ', asked for in fast mode' : '') + (a.ultracode ? ', with helper agents' : '') + ', signed in with ' + lower(credentialName(a.credential)) + ', ' + (a.sandbox ? 'inside the sandbox.' : 'without the sandbox.');
+}
+const lower = (text) => (text ? text.charAt(0).toLowerCase() + text.slice(1) : '');
+
 /* ---------- the strip ---------- */
 /** Who an event is from: the person, an agent, or the engine. */
 export const whoOf = (ev) => (ev.type === 'review.decided' || ev.type === 'request.created' || (ev.data || {}).by === 'human' ? 'you' : ev.agent || 'engine');
@@ -404,7 +445,7 @@ export const whoOf = (ev) => (ev.type === 'review.decided' || ev.type === 'reque
     A line is `{run: true, key, eid, n, backend, status, seconds, error, ts, parts}`. */
 export function foldRuns(events) {
   const out = [], open = new Map(), byKey = new Map();
-  const start = (eid, ev) => { const line = { run: true, key: eid + '#next', eid, n: null, backend: '', status: 'queued', seconds: null, error: '', ts: ev.ts, seq: ev.seq, parts: [] }; open.set(eid, line); out.push(line); return line; };
+  const start = (eid, ev) => { const line = { run: true, key: eid + '#next', eid, n: null, backend: '', agent: false, status: 'queued', seconds: null, error: '', ts: ev.ts, seq: ev.seq, parts: [] }; open.set(eid, line); out.push(line); return line; };
   const number = (line, n) => { line.n = n; line.key = line.eid + '#' + n; byKey.set(line.key, line); };
   events.forEach((ev) => {
     const d = ev.data || {};
@@ -423,9 +464,16 @@ export function foldRuns(events) {
       if (!line || (line.n != null && line.n !== d.run)) line = start(d.experiment, ev);
       number(line, d.run);
       line.backend = d.backend || '';
+      /* who does the job is the run's own word (`carried_out_by` of its start), not the project's setting of today */
+      line.agent = d.carried_out_by === 'agent';
       line.status = 'running';
       line.parts.push(ev);
       return;
+    }
+    /* what the agent that carries out a run does meanwhile are steps of that run */
+    if (ev.type === 'agent.activity' && ev.phase === 'run' && typeof d.did === 'string') {
+      const line = Array.from(open.values()).reverse().find((l) => l.agent && l.status === 'running');
+      if (line) { line.parts.push(ev); return; }
     }
     if (ev.type === 'run.finished' && d.experiment) {
       let line = byKey.get(d.experiment + '#' + d.run);
@@ -459,10 +507,44 @@ export function foldRuns(events) {
   });
   return lines;
 }
+/** What an agent with a shell does, folded where it does much in a row: three or more lines
+    of one agent that tell a call of a tool (`data.did`) and follow one another are one line,
+    `{work: true, agent, ts, seq, last, parts}`, which shows the latest and opens to all of
+    them. Lines of the tool loop carry no such word and stay as they are. */
+export function foldSteps(lines) {
+  const out = [];
+  let group = [];
+  const close = () => {
+    if (group.length >= 3) { const last = group[group.length - 1]; out.push({ work: true, agent: last.agent, ts: last.ts, seq: group[0].seq, last, parts: group }); }
+    else out.push(...group);
+    group = [];
+  };
+  lines.forEach((ev) => {
+    const d = ev.data || {};
+    const step = !ev.run && ev.type === 'agent.activity' && typeof d.did === 'string' && d.did !== 'start';
+    if (step && group.length && group[0].agent !== ev.agent) close();
+    if (step) { group.push(ev); return; }
+    close();
+    out.push(ev);
+  });
+  close();
+  return out;
+}
+/** One line of an agent's activity. A line that tells a call of a tool in parts (`data.did`
+    with `data.text`: a shell command, a search, an address, a file) sets what the agent
+    chose apart from the words around it; every other line is the server's sentence. */
+export function actHTML(ev) {
+  const d = (ev && ev.data) || {}, text = typeof d.text === 'string' ? d.text : '';
+  const verb = d.refused ? 'tried' : typeof d.did === 'string' && Object.prototype.hasOwnProperty.call(DID, d.did) ? DID[d.did] : '';
+  if (!verb || (!text && d.did !== 'workflow')) return html`${plain(ev.summary)}`;
+  const code = d.did === 'shell' || d.did === 'write' || d.did === 'fetch' || d.refused;
+  return html`<span class="ev-act${d.refused ? ' ev-act-refused' : ''}" data-did="${d.did}">${d.helper ? html`<span class="ev-helper">a helper</span> ` : ''}<span class="ev-did">${verb}</span>${text ? html` ${code ? html`<code class="ev-text">${text}</code>` : html`<span class="ev-text">“${text}”</span>`}` : ''}${d.refused ? html` <span class="ev-refused">refused: that is not an agent’s to do</span>` : ''}</span>`;
+}
 /** What a folded run says. */
 export function runSentence(line) {
   const where = line.backend === 'local' ? ' on this machine' : line.backend === 'modal' ? ' on Modal' : line.backend ? ' on ' + line.backend : '';
   const which = line.n > 1 ? ' (run ' + line.n + ')' : '';
+  if (line.agent) return agentRunSentence(line, where, which);
   if (line.n == null) return line.eid + (line.status === 'running' ? ' is starting' : ' is queued to run');
   if (line.status === 'running') return line.eid + ' is running' + where + which;
   if (line.status === 'requeued') return line.eid + ' was stopped' + where + ' and is queued again' + which;
@@ -470,9 +552,19 @@ export function runSentence(line) {
   const why = line.status === 'failed' && line.error ? '. ' + (line.error.length > 150 ? line.error.slice(0, 149) + '…' : line.error) : '';
   return line.eid + ' ran' + where + which + ': ' + line.status + after + why;
 }
+/** The same of a run an agent carried out: the run says so of itself. */
+function agentRunSentence(line, where, which) {
+  if (line.status === 'running') return 'An agent is carrying out ' + line.eid + where + which;
+  if (line.status === 'requeued') return 'The agent carrying out ' + line.eid + ' was stopped' + where + ', and ' + line.eid + ' is queued again' + which;
+  const after = line.seconds == null ? '' : ' after ' + duration(line.seconds);
+  const why = line.status === 'failed' && line.error ? '. ' + (line.error.length > 150 ? line.error.slice(0, 149) + '…' : line.error) : '';
+  return 'An agent carried out ' + line.eid + where + which + ': ' + line.status + after + why;
+}
+/** Who a folded run is from: the runner, or the agent that carried it out. */
+export const runWho = (line) => (line.agent ? 'agent' : 'runner');
 function activityLines(store, limit) {
   const lines = foldRuns(store.activity.filter((ev) => ev.type !== 'run.log')).slice(-limit);
-  return lines.map((ev) => html`<div><time>${hm(ev.ts)}</time><b>${ev.run ? 'runner' : whoOf(ev)}</b><span>${ev.run ? runSentence(ev) : plain(ev.summary)}</span></div>`);
+  return lines.map((ev) => html`<div><time>${hm(ev.ts)}</time><b>${ev.run ? runWho(ev) : whoOf(ev)}</b><span>${ev.run ? runSentence(ev) : plain(ev.summary)}</span></div>`);
 }
 /** Stop, for a worker that is this server's to stop. */
 function stopButton(store, e) {

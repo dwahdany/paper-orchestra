@@ -6,7 +6,7 @@ import { app, link } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf, whyNot } from './util.js';
 import { TONE, agentName, glyph, icon, lapsed, pageGlyph, shownState, successWords } from './vocab.js';
-import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, planProblemsHTML, proposedAt, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
+import { afterRender, approvalChoice, backendName, label, modelAccessNote, networkAsk, pageName, pageTip, planProblemsHTML, proposedAt, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
 
 const GROUPS = [
   /* (also one that reads approved and is no longer what was approved: it will not run until it is approved again) */
@@ -29,6 +29,12 @@ export function standingWords(x) {
   return won ? state + '; ' + won : state;
 }
 const IMAGE = /\.(png|jpe?g|gif|webp|svg)$/i;
+/** Whether an agent carried a run out: the run's own word (`carried_out_by` of its record),
+    which stays true when the project's runtime is changed afterwards. */
+const byAgent = (run) => !!run && run.carried_out_by === 'agent';
+/** Whether a run approved now for `backend` would be carried out by an agent: the project's
+    agents have a shell, and an agent works on this machine (a run on Modal runs there as ever). */
+const agentWould = (store, backend) => ((store.project.settings || {}).agents || {}).runtime === 'sdk' && backend === 'local';
 
 const whereOf = (x) => { const m = x.meta || {}; return m.backend ? backendName(m.backend, m.gpu) : m.mode === 'gpu' ? 'not chosen · needs a GPU' : m.mode === 'repo' ? 'not chosen · your repository' : 'not chosen'; };
 const metricLine = (run) => { const m = (run && (run.metrics_text || run.metrics)) || {}; return Object.keys(m).slice(0, 2).map((k) => k + ' ' + m[k]).join(' · '); };
@@ -178,7 +184,7 @@ function approveHTML(store, page, data) {
     const on = o.backend === chosen.backend;
     return html`<label class="backend${on ? ' on' : ''}${o.can_run ? '' : ' off'}"><input type="radio" name="backend-${eid}" value="${o.backend}" data-input="backend" data-eid="${eid}"${on ? raw(' checked') : ''}${o.can_run ? '' : raw(' disabled')}>
       <span class="be-name">${backendName(o.backend, o.backend === 'modal' ? gpu : '')}${plan.backend === o.backend && o.can_run ? html`<span class="flag">suggested</span>` : ''}</span>
-      <span class="be-desc">${o.can_run ? (o.notes || []).join(' ') || (o.backend === 'local' ? 'A subprocess on this machine.' : 'A sandbox made for this job.') : 'Cannot run this plan.'}</span>
+      <span class="be-desc">${o.can_run ? (agentWould(store, o.backend) ? 'An agent with a shell carries it out here. ' : '') + ((o.notes || []).join(' ') || (o.backend === 'local' ? (agentWould(store, 'local') ? '' : 'A subprocess on this machine.') : 'A sandbox made for this job.')) : 'Cannot run this plan.'}</span>
       <span class="be-num">${o.est_minutes != null ? 'about ' + minutes(o.est_minutes) : 'not estimated'}</span><span class="be-num">${o.est_usd ? 'about ' + money(o.est_usd) : o.backend === 'local' ? 'no cost' : o.est_usd === 0 ? '$0.00' : 'not estimated'}</span>
       ${o.can_run ? '' : html`<span class="be-flag">${icon('warn')}<span>${(o.reasons || []).join(' ')}</span></span>`}</label>`;
   };
@@ -190,15 +196,18 @@ function approveHTML(store, page, data) {
     <div class="backends" role="radiogroup" aria-label="Backend">${options.map(row)}</div>
     ${data.options_error ? html`<p class="note note-warn">${icon('warn')}<span>${data.options_error}</span></p>` : ''}
     <div class="approve-fields">
-      <label><span>Time limit</span><input type="number" id="ap-min-${eid}" min="1" max="${capMin}" step="1" value="${limitMin}" data-input="ap-minutes" data-eid="${eid}" inputmode="numeric"><span class="quiet">minutes, then it is stopped (at most ${capMin} in this project)</span></label>
+      <label><span>Time limit</span><input type="number" id="ap-min-${eid}" min="1" max="${capMin}" step="1" value="${limitMin}" data-input="ap-minutes" data-eid="${eid}" inputmode="numeric"><span class="quiet">${agentWould(store, chosen.backend) ? 'minutes for all of the agent\'s work (reading, running and repairing the code, not one execution of it), then it is stopped' : 'minutes, then it is stopped'} (at most ${capMin} in this project)</span></label>
       ${chosen.backend === 'modal' || plan.mode === 'gpu' ? html`<label><span>GPU</span><input id="ap-gpu-${eid}" value="${gpu}" placeholder="none (CPU)" data-input="ap-gpu" data-eid="${eid}" size="8" autocomplete="off"><span class="quiet">for example T4, L4, A10G</span></label>` : ''}
       ${plan.network ? '' : html`<label class="tick"><input type="checkbox" id="ap-net-${eid}" data-input="ap-network" data-eid="${eid}"${network ? raw(' checked') : ''}> Allow network access<span class="quiet">${chosen.backend === 'local' ? 'off unless you tick this; this machine cannot block it either way' : 'off unless you tick this'}</span></label>`}
     </div>
-    ${networkAsk(eid, plan)}
+    ${plan.network ? '' : modelAccessNote(!!data.model_access && chosen.backend === 'local')}
+    ${networkAsk(eid, plan, !!data.model_access && chosen.backend === 'local')}
     <div class="approve-opts"><span><b>Mode</b> ${plan.mode || 'script'}</span>${(plan.packages || []).length ? html`<span><b>Packages</b> ${plan.packages.join(', ')}</span>` : ''}${plan.repo ? html`<span><b>Repository</b> ${plan.repo}</span>` : ''}
       <span><b>Left for experiments</b> ${money(Math.max(0, (limits.experiment_usd || 0) - (((store.project.state || {}).spent || {}).experiment_usd || 0)))}</span></div>
     ${app.ui.rejecting === page.path ? html`<form class="reject-form" data-form="reject" data-ref="${page.path}"><label class="sr" for="why-x-${eid}">Reason</label><input id="why-x-${eid}" name="reason" data-input="reason" data-ref="${page.path}" value="${app.ui.reasons[page.path] || ''}" placeholder="Why? The agents read this reason." autocomplete="off"><button class="btn btn-neg" type="submit">Reject</button><button class="btn btn-quiet" type="button" data-act="reject-cancel">Cancel</button></form>`
-      : html`<div class="approve-go">${runnable.length ? html`<p>Approving lets the runner execute <code>${(plan.command || ['python', plan.entrypoint || 'main.py']).join(' ')}</code> once on ${sum}. Nothing else is approved.</p>` : html`<p><b>No backend can run this plan as it is.</b> You can still accept the plan and change it, or the code, before approving a run.</p>`}
+      : html`<div class="approve-go">${runnable.length ? (pick && agentWould(store, pick.backend)
+        ? html`<p data-approves="agent">Approving lets an agent carry out this experiment once on ${sum}: it works in a shell in the run's own folder, starts from the code below (or writes it from the plan), may change and rerun it, and must leave <code>metrics.json</code>. The time limit is for all of its work, and its shell reaches the web whether or not you allow network access. Nothing else is approved.</p>`
+        : html`<p>Approving lets the runner execute <code>${(plan.command || ['python', plan.entrypoint || 'main.py']).join(' ')}</code> once on ${sum}. Nothing else is approved.</p>`) : html`<p><b>No backend can run this plan as it is.</b> You can still accept the plan and change it, or the code, before approving a run.</p>`}
         <div class="review-actions">${proposed
           ? html`<button class="btn btn-primary" data-act="accept-run" data-ref="${page.path}"${runnable.length ? '' : raw(' disabled')}>${icon('play')}Accept and run</button>
               <button class="btn" data-act="accept" data-ref="${page.path}">Accept, keep planned <kbd>A</kbd></button>
@@ -232,7 +241,7 @@ export function failureKind(run) {
   if (run.timed_out || k === 'timeout') return 'timeout';
   if (k === 'budget') return 'budget';
   if (['backend', 'setup', 'worker', 'internal'].indexOf(k) >= 0) return 'backend';
-  if (['exit', 'metrics', 'code', 'patch', 'command'].indexOf(k) >= 0) return 'program';
+  if (['exit', 'metrics', 'code', 'patch', 'command', 'declared'].indexOf(k) >= 0) return 'program';
   return run.error && run.exit_code == null ? 'backend' : 'program';
 }
 const choice = (act, attrs, title, sub, primary) => html`<button class="choice${primary ? ' choice-primary' : ''}" data-act="${act}"${raw(Object.entries(attrs).map(([k, v]) => ' data-' + k + '="' + String(v).replace(/[^\w.-]/g, '') + '"').join(''))}><b>${title}</b><span>${sub}</span></button>`;
@@ -255,7 +264,8 @@ function failureHTML(store, page, data, run) {
     const capMin = Math.floor((limits.experiment_seconds || 0) / 60);
     const more = Math.min(capMin, Math.max(usedMin * 2, usedMin + 1));
     title = 'Stopped at the time limit';
-    say = html`<p>This is a limit, not a bug: the run was stopped after ${usedSeconds < 90 ? duration(usedSeconds) : minutes(usedMin)}. The runner did not attempt a repair because no code is wrong.</p>`;
+    say = byAgent(run) ? html`<p>This is a limit, not a bug: the agent was stopped after ${usedSeconds < 90 ? duration(usedSeconds) : minutes(usedMin)}. The limit is for all of its work (writing, running and repairing the code), not for one execution.</p>`
+      : html`<p>This is a limit, not a bug: the run was stopped after ${usedSeconds < 90 ? duration(usedSeconds) : minutes(usedMin)}. The runner did not attempt a repair because no code is wrong.</p>`;
     actions = html`${elsewhere}${more > usedMin && same && same.can_run ? choice('rerun', { eid, backend: run.backend, minutes: more }, 'Raise the limit to ' + minutes(more), backendName(run.backend, plan.gpu) + ' · ' + (same.est_usd ? money(same.est_usd) : run.backend === 'local' ? 'no cost' : 'cost not estimated'), !others.length)
       : html`<div class="choice choice-off"><b>The limit cannot be raised here</b><span>${minutes(usedMin)} is the most one run may take in this project. Raise the limit for one run on the overview first.</span></div>`}${edit}`;
   } else if (kind === 'budget') {
@@ -275,8 +285,8 @@ function failureHTML(store, page, data, run) {
     actions = run.requeued ? '' : html`${again}${elsewhere}`;
   } else {
     const repairs = run.repairs || [];
-    title = 'Failed with a programming error';
-    say = html`<p>${repairs.length ? html`The runner repaired the code ${repairs.length === 1 ? 'once' : repairs.length + ' times'} before this run (${repairs.length}${limits.repair_rounds != null ? ' of ' + limits.repair_rounds : ''} repairs used), and it failed again.` : 'The code ended with an error. The runner has not repaired it.'}</p>`;
+    title = byAgent(run) ? 'The agent did not bring the run to a result' : 'Failed with a programming error';
+    say = byAgent(run) ? html`<p>The agent that carried out this run repairs the code while it works, so no separate repair is made afterwards. Its log below says what it tried.</p>` : html`<p>${repairs.length ? html`The runner repaired the code ${repairs.length === 1 ? 'once' : repairs.length + ' times'} before this run (${repairs.length}${limits.repair_rounds != null ? ' of ' + limits.repair_rounds : ''} repairs used), and it failed again.` : 'The code ended with an error. The runner has not repaired it.'}</p>`;
     actions = html`${edit}${again}${elsewhere}`;
   }
   /* a run the person cancelled is their own doing: it is said plainly, not as an alarm */
@@ -335,27 +345,60 @@ function findingsOf(store, run) {
   return a ? a.inn.filter((e) => e.type === 'based_on').map((e) => store.byPath.get(e.s)).filter(Boolean) : [];
 }
 
+/** What it means that an agent carried a run out, said once on the run. */
+const AGENT_RUN = 'An agent carried out this run. It worked in a shell in the run\'s own folder, starting from the approved code; the log is what it did and said, and the metrics and artifacts are what its work left. Nobody measured an exit status: the agent may have run the code more than once.';
+/** What the agent that carried a run out made of the approved code (`run.code_as_run`):
+    the files it changed, added and removed, each one a link to the file as it left it,
+    and for the person the choice to make that code the experiment's. */
+function codeAsRunHTML(store, eid, run) {
+  const c = run.code_as_run;
+  if (!byAgent(run)) return '';
+  if (!c) return run.status === 'running' ? '' : html`<p class="run-code" data-code="unknown">What the agent made of the approved code was not kept for this run.</p>`;
+  const kept = (name) => html`<a class="linkish" href="${api.fileUrl(store.pid, 'experiments/' + eid + '/runs/' + run.number + '/code-as-run/' + name)}" target="_blank" rel="noopener"><code>${name}</code></a>`;
+  const part = (verb, names, linked) => ((names || []).length ? html`<span class="run-code-part">${verb} ${names.map((n, i) => html`${i ? ', ' : ''}${linked ? kept(n) : html`<code>${n}</code>`}`)}</span>` : '');
+  const changed = (c.changed || []).length + (c.added || []).length + (c.removed || []).length;
+  if (!changed) return html`<p class="run-code" data-code="approved">The agent left the approved code as it was <span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>.</p>`;
+  const busy = app.ui.adopting === eid + '/' + run.number;
+  /* What the sentence may say depends on how the run ended and on whether there was approved
+     code at all: a run that left no results has none that "come from that code", and a plan
+     that came without code has no approved code to compare with. */
+  const hadCode = c.approved != null ? c.approved > 0 : (c.changed || []).length + (c.removed || []).length > 0;
+  const succeeded = run.status === 'succeeded';
+  const digest = html`<span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>`;
+  const did = html`${part('changed', c.changed, true)}${(c.changed || []).length && ((c.added || []).length || (c.removed || []).length) ? '; ' : ''}${part('added', c.added, true)}${(c.added || []).length && (c.removed || []).length ? '; ' : ''}${part('removed', c.removed, false)}`;
+  const means = succeeded
+    ? (hadCode ? html`The results of this run come from that code ${digest}, not from the approved code shown under Code, which is unchanged: run again, the experiment would start from the approved code and be repaired again.`
+      : html`The results of this run come from that code ${digest}. The plan came without code, so the experiment has none of its own yet: run again, an agent would write it anew.`)
+    : html`That is the code as it stood when the run ${run.status === 'cancelled' ? 'was cancelled' : 'ended'} ${digest}; this run left no results that come from it.${hadCode ? ' The approved code shown under Code is unchanged.' : ' The plan came without code, so the experiment has none of its own yet.'}`;
+  return html`<div class="note note-warn run-code" data-code="changed" data-had-code="${tf(hadCode)}">${icon('warn')}<div><b>${hadCode ? 'The agent changed the code it was given.' : 'The agent wrote the code for this run.'}</b>
+    <p>It ${did}. ${means}</p>
+    ${(c.changed || []).length + (c.added || []).length ? html`<button class="btn btn-s" data-act="adopt-code" data-eid="${eid}" data-run="${run.number}"${busy ? raw(' disabled') : ''}>${busy ? 'Taking it over…' : 'Make this the experiment\'s code'}</button> <span class="quiet">As your own edit: the earlier version is kept, and the experiment must be approved again to run.</span>` : ''}</div></div>`;
+}
+/** A run whose code could call the Anthropic API: nothing here counted those calls. */
+const modelAccessHTML = (run) => (run.model_access ? html`<p class="run-models" data-model-access>This run was approved with network access while model access for jobs was on: its code could call the Anthropic API with the worker's federation settings. Those calls are billed to that account and are counted nowhere here.</p>` : '');
 function runBlock(store, page, data, run, open) {
   const eid = page.id, failed = run.status === 'failed' || run.status === 'cancelled';
   const head = html`<button class="run-h" data-act="show-run" data-eid="${eid}" data-run="${run.number}" aria-expanded="${tf(open)}">${icon(open ? 'down' : 'right')}<b>Run ${run.number}</b>
     <span class="st-word t-${TONE[run.status] || 'open'}">${glyph('result', 'accepted', run.status, 12)}${run.status}</span>
-    <span class="run-m">${backendName(run.backend, run.plan && run.plan.gpu)}</span><span class="run-m">${dateTime(run.started)}</span>
+    <span class="run-m">${backendName(run.backend, run.plan && run.plan.gpu)}${byAgent(run) ? html` <span class="run-by" data-by="agent">by an agent</span>` : ''}</span><span class="run-m">${dateTime(run.started)}</span>
     <span class="run-m n">${run.status === 'running' ? sinceClock(run.started) : duration(run.seconds)}</span><span class="run-m n">${run.cost_usd != null ? money(run.cost_usd) : run.backend === 'local' ? 'no cost' : ''}</span>
-    <span class="run-m n">${run.exit_code == null ? '' : 'exit ' + run.exit_code}</span><span class="run-m">${(run.repairs || []).length ? plural(run.repairs.length, 'repair') : ''}</span></button>`;
+    <span class="run-m n">${run.exit_code == null || byAgent(run) ? '' : 'exit ' + run.exit_code}</span><span class="run-m">${(run.repairs || []).length ? plural(run.repairs.length, 'repair') : ''}</span></button>`;
   if (!open) return html`<div class="run">${head}</div>`;
   const findings = findingsOf(store, run);
   const result = run.result_page && store.byPath.get(run.result_page);
   return html`<div class="run open">${head}<div class="run-b">
+    ${byAgent(run) ? html`<p class="run-agent" data-by="agent">${AGENT_RUN}</p>` : ''}
+    ${codeAsRunHTML(store, eid, run)}${modelAccessHTML(run)}
     ${failed ? failureHTML(store, page, data, run) : ''}
     ${run.status === 'succeeded' ? repairsHTML(run, true) : ''}
-    ${run.status === 'succeeded' ? html`<div class="res-grid"><div><h3 class="sec-h">Metrics <span class="quiet">metrics.json, as the run wrote it</span></h3>${metricsHTML(run, data)}</div>
+    ${run.status === 'succeeded' ? html`<div class="res-grid"><div><h3 class="sec-h">Metrics <span class="quiet">${byAgent(run) ? 'metrics.json, as the agent\'s work left it' : 'metrics.json, as the run wrote it'}</span></h3>${metricsHTML(run, data)}</div>
       <div><h3 class="sec-h">Artifacts</h3>${artifactsHTML(store, eid, run)}
         ${findings.length ? html`<h3 class="sec-h res-h">Findings from this run</h3>${findings.map((f) => html`<a class="lin" href="${link({ view: 'wiki', sel: f.path, sub: '' })}" data-sel="${f.path}">${pageGlyph(f, 16)}<span class="lin-name"><b>${f.id}</b> ${f.title}</span></a>`)}` : ''}</div></div>` : ''}
     ${failed && Object.keys(run.metrics || {}).length ? html`<h3 class="sec-h">Metrics <span class="quiet">what the run had written when it ended</span></h3>${metricsHTML(run, data)}` : ''}
     ${(run.notes || []).length ? html`<ul class="run-notes">${run.notes.map((n) => html`<li>${n}</li>`)}</ul>` : ''}
     ${logHTML(store, eid, run)}
     <p class="run-rec">${result ? html`Result record <a class="chip" href="${link({ view: 'wiki', sel: result.path, sub: '' })}" data-sel="${result.path}">${pageGlyph(result, 12)}${label(result)}</a> was written by code from this run${(result.meta || {}).edited_by_person ? html`, and <b class="rec-edited">edited by hand since</b>: it no longer reads as code wrote it` : ''}.` : run.status === 'running' ? 'The result record is written by code when the run ends.' : ''}
-      ${run.code_digest ? html`<span class="quiet">Code digest ${String(run.code_digest).slice(0, 12)}…</span>` : ''}</p></div></div>`;
+      ${run.code_digest ? html`<span class="quiet">${byAgent(run) ? 'Digest of the approved code' : 'Code digest'} ${String(run.code_digest).slice(0, 12)}…</span>` : ''}</p></div></div>`;
 }
 
 function liveHTML(store, page, data, run, does) {
@@ -363,12 +406,12 @@ function liveHTML(store, page, data, run, does) {
   const est = plan.est_minutes ? plan.est_minutes * 60 : null, limit = (run.plan && run.plan.timeout_seconds) || plan.timeout_seconds || null;
   const elapsed = (Date.now() - (parseStamp(run.started) || Date.now())) / 1000;
   const total = est || limit || 0;
-  return html`<section class="run-live"><div class="run-top"><h2><span class="live-dot" aria-hidden="true"></span>Run ${run.number} is running on ${backendName(run.backend, plan.gpu)}</h2>
+  return html`<section class="run-live"><div class="run-top"><h2><span class="live-dot" aria-hidden="true"></span>${byAgent(run) ? html`An agent is carrying out run ${run.number} on ${backendName(run.backend, plan.gpu)}` : html`Run ${run.number} is running on ${backendName(run.backend, plan.gpu)}`}</h2>
     ${cancelButton(eid, does, { cls: 'btn-neg-quiet', stop: true, label: 'Cancel run', tip: 'The job is ended and the run recorded as cancelled' })}</div>
     ${total ? html`<progress class="meter-p" max="1" value="${Math.min(1, elapsed / total)}" data-since="${run.started}" data-total="${total}" aria-label="Elapsed, of the ${est ? 'estimate' : 'time limit'}"></progress>` : ''}
     <dl class="run-facts"><div><dt>Elapsed</dt><dd>${sinceClock(run.started)}${est ? html` <span class="quiet">of about ${minutes(plan.est_minutes)}</span>` : ''}</dd></div>
-      <div><dt>Limit</dt><dd>${limit ? minutes(limit / 60) : 'none'} <span class="quiet">then it is stopped</span></dd></div>
-      <div><dt>Cost</dt><dd>${run.backend === 'local' ? 'no cost' : plan.est_usd != null ? 'about ' + money(plan.est_usd) : 'not estimated'}</dd></div>
+      <div><dt>Limit</dt><dd>${limit ? minutes(limit / 60) : 'none'} <span class="quiet">${byAgent(run) ? 'for all of the agent\'s work, then it is stopped' : 'then it is stopped'}</span></dd></div>
+      <div><dt>Cost</dt><dd>${byAgent(run) ? html`no cost <span class="quiet">for the machine; the agent's model counts as model spend</span>` : run.backend === 'local' ? 'no cost' : plan.est_usd != null ? 'about ' + money(plan.est_usd) : 'not estimated'}</dd></div>
       <div><dt>Started</dt><dd>${dateTime(run.started)}</dd></div></dl>
     ${logHTML(store, eid, run)}</section>`;
 }
@@ -389,7 +432,7 @@ function codeSection(store, page, data) {
   const file = files.find((f) => f.name === name);
   const editKey = eid + '/' + name, editing = app.ui.codeEdit[editKey];
   const locked = page.state === 'running' || page.state === 'queued';
-  return html`<section class="exp-code"><h2 class="sec-t">Code <span class="quiet">${plan.mode === 'repo' ? 'runs inside a copy of your repository; the working tree is never modified' : 'parsed, never executed before you approve'}</span></h2>
+  return html`<section class="exp-code"><h2 class="sec-t">Code <span class="quiet">${plan.mode === 'repo' ? 'runs inside a copy of your repository; the working tree is never modified' : agentWould(store, 'local') ? 'parsed; the designer may have tried it in its own sandboxed folder, and it does not run for the record before you approve' : 'parsed, never executed before you approve'}</span></h2>
     ${problems.length ? html`<div class="note note-warn">${icon('warn')}<div><b>The check of the code found:</b><ul class="reasons">${problems.map((p) => html`<li>${p}</li>`)}</ul></div></div>` : ''}
     ${files.length ? html`<div class="tabs" role="tablist" aria-label="Code files">${files.map((f) => html`<button role="tab" class="tab${f.name === name ? ' on' : ''}" aria-selected="${tf(f.name === name)}" data-act="code-tab" data-eid="${eid}" data-name="${f.name}">${f.name}<span>${plural(String(f.text).replace(/\n$/, '').split('\n').length, 'line')}</span></button>`)}
         ${editing == null ? html`<button class="btn btn-quiet btn-s tabs-r" data-act="edit-code" data-eid="${eid}"${locked ? raw(' disabled data-tip="The code cannot be changed while it runs"') : ''}>${icon('pencil')}Edit code</button>` : ''}</div>
@@ -398,7 +441,7 @@ function codeSection(store, page, data) {
           ${editing.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span><b>Not saved.</b> ${editing.error} Your text is still here.</span></p>` : ''}
           <div class="code-bar"><span class="quiet">${editing.restored ? html`<b>Your unsaved edit of ${name} was restored.</b> ` : ''}The earlier version is kept. A changed file is parsed, not run; an approved run must be approved again.</span><button class="btn btn-quiet" type="button" data-act="code-cancel" data-key="${editKey}">Discard</button><button class="btn btn-primary" type="submit"${editing.saving ? raw(' disabled') : ''}>Save ${name}</button></div></form>`
         : file ? html`${codeBy(page, file, data.approval)}${codeHTML(file.text)}` : ''}`
-      : html`<p class="quiet">${plan.mode === 'repo' ? 'No patch: the command runs on a clean copy of the repository.' : 'No code has been written for this experiment yet.'}</p>`}
+      : html`<p class="quiet">${plan.mode === 'repo' ? 'No patch: the command runs on a clean copy of the repository.' : 'No code has been written for this experiment yet.' + (agentWould(store, 'local') ? ' The agent that carries it out on this machine writes it from the plan.' : '')}</p>`}
   </section>`;
 }
 

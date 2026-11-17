@@ -12,6 +12,7 @@ that enforces these rules on disk is :mod:`paper_orchestra.research.project`.
 from __future__ import annotations
 
 import math
+import os
 import re
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
@@ -209,7 +210,15 @@ SYSTEM = "system"
 AGENT_PREFIX = "agent:"
 _AGENT_NAME = re.compile(r"^[a-z][a-z0-9_\-]*$")
 
-ROLES: tuple[str, ...] = ("intake", "scout", "theorist", "designer", "runner", "analyst")
+ROLES: tuple[str, ...] = (
+    "intake",
+    "scout",
+    "theorist",
+    "designer",
+    "runner",
+    "analyst",
+    "experimenter",
+)
 
 #: What each role may create through its memory tool.  Sources and results are records,
 #: written by code; the runner executes experiments and writes no page.
@@ -219,6 +228,11 @@ ROLE_MAY_CREATE: dict[str, tuple[str, ...]] = {
     "theorist": ("hypothesis", "question"),
     "designer": ("experiment",),
     "analyst": ("finding", "question", "hypothesis", "experiment", "journal"),
+    # The agent that carries out an approved experiment (the ``sdk`` runtime).  Unlike
+    # the runner it is a model with a will of its own, so it is an agent like the others:
+    # it moves no experiment and writes no record, and what it wants next (a follow-up
+    # experiment, a question) it proposes.
+    "experimenter": ("experiment", "question"),
 }
 
 
@@ -1425,6 +1439,92 @@ class Limits(_Section):
                 setattr(self, name, int(value))
 
 
+#: How the roles that use a model are run: ``classic`` is the tool loop of this package
+#: over a provider's API; ``sdk`` makes each of them a Claude Agent SDK agent with a
+#: shell, the web and the board tools.
+AGENT_RUNTIMES: tuple[str, ...] = ("classic", "sdk")
+#: Whose account an SDK agent works on: the person's Claude Code login, or the worker's
+#: Workload Identity Federation settings.
+AGENT_CREDENTIALS: tuple[str, ...] = ("login", "federation")
+#: Makes ``sdk`` the runtime of projects that are created while it is set to ``sdk``.
+AGENT_RUNTIME_ENV = "PAPER_ORCHESTRA_AGENT_RUNTIME"
+
+
+#: What the name of a model looks like: letters, digits and the few marks model names
+#: and their regional or versioned forms use.
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}\Z")
+
+
+@dataclass
+class AgentSettings(_Section):
+    """How the project's agents are run (``settings.agents``).
+
+    ``runtime`` chooses between the two ways (:data:`AGENT_RUNTIMES`).  The other
+    values concern the ``sdk`` runtime only: the ``model`` every agent works with,
+    whether it is asked for in ``fast`` mode and with ``ultracode`` (sub-agents and
+    workflows), which ``credential`` the agents use (:data:`AGENT_CREDENTIALS`), and
+    whether they work inside the ``sandbox`` (their own folder, no credentials, no
+    control files of the project).
+    """
+
+    runtime: str = "classic"
+    model: str = DEFAULT_MODEL
+    fast: bool = True
+    ultracode: bool = True
+    credential: str = "login"
+    sandbox: bool = True
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def invalid(self) -> dict[str, str]:
+        wrong: dict[str, str] = {}
+        if self.runtime not in AGENT_RUNTIMES:
+            wrong["runtime"] = (
+                f"is {self.runtime!r}; it must be one of: {', '.join(AGENT_RUNTIMES)}"
+            )
+        if not isinstance(self.model, str) or not _MODEL_NAME.match(self.model):
+            # The name goes to the agents' command line as it stands: a name, nothing
+            # with spaces or punctuation of a shell in it.
+            wrong["model"] = (
+                f"is {self.model!r}; it must be the name of a Claude model, such as {DEFAULT_MODEL}"
+            )
+        for name in ("fast", "ultracode", "sandbox"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                wrong[name] = f"is {value!r}; it must be true or false"
+        if self.credential not in AGENT_CREDENTIALS:
+            wrong["credential"] = (
+                f"is {self.credential!r}; it must be one of: {', '.join(AGENT_CREDENTIALS)}"
+            )
+        return wrong
+
+    @property
+    def sdk(self) -> bool:
+        """Whether the project's agents are Claude Agent SDK agents."""
+        return self.runtime == "sdk"
+
+
+def default_agent_runtime(environ: Mapping[str, str] | None = None) -> str:
+    """The runtime a project gets when it is created and nothing names one:
+    ``classic``, or ``sdk`` where :data:`AGENT_RUNTIME_ENV` says so.  Only asked when
+    a project is created: a project that exists keeps what its file says, whatever
+    the environment of the process that opens it."""
+    environ = os.environ if environ is None else environ
+    asked = str(environ.get(AGENT_RUNTIME_ENV) or "").strip().lower()
+    return asked if asked in AGENT_RUNTIMES else "classic"
+
+
+def settings_for_new_project(
+    settings: Mapping[str, Any] | None, environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """``settings`` as given for a project about to be created, with the runtime of its
+    agents named: the one given, else :func:`default_agent_runtime`."""
+    chosen = dict(settings or {})
+    agents = chosen.get("agents")
+    if agents is None or (isinstance(agents, Mapping) and "runtime" not in agents):
+        chosen["agents"] = {**(agents or {}), "runtime": default_agent_runtime(environ)}
+    return chosen
+
+
 class RepoSettings(dict):
     """The person's repository for experiments in ``repo`` mode.
 
@@ -1493,6 +1593,8 @@ class ProjectSettings:
     #: kind -> ``auto`` (an agent's page is accepted on creation) or ``review``.
     review: dict[str, str] = field(default_factory=default_review_policy)
     limits: Limits = field(default_factory=Limits)
+    #: How the agents are run: the classic tool loop, or Claude Agent SDK agents.
+    agents: AgentSettings = field(default_factory=AgentSettings)
     lab_memory: bool = True
     #: The person's repository for experiments in ``repo`` mode; ``None`` when there is none.
     repo: RepoSettings | None = None
@@ -1516,6 +1618,7 @@ class ProjectSettings:
             "compute": self.compute,
             "review": dict(self.review),
             "limits": self.limits.to_dict(),
+            "agents": self.agents.to_dict(),
             "lab_memory": self.lab_memory,
             # Written in its usual form whatever was assigned; an invalid value is written
             # as it is so that ``validate`` and a reader can see it.
@@ -1568,6 +1671,7 @@ class ProjectSettings:
         found += [f"settings.{name} {text}" for name, text in self._own_problems().items()]
         found += [f"settings.{name} {text}" for name, text in self._review_problems().items()]
         found += [f"settings.limits.{name} {text}" for name, text in self.limits.invalid().items()]
+        found += [f"settings.agents.{name} {text}" for name, text in self.agents.invalid().items()]
         return found
 
     def validate(self) -> None:
@@ -1589,10 +1693,20 @@ class ProjectSettings:
         if data is not None and not isinstance(data, Mapping):
             problems.append(f"settings is {data!r}, not an object; the defaults are used")
         raw: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
-        known = {"models", "research_cutoff", "compute", "review", "limits", "lab_memory", "repo"}
+        known = {
+            "models",
+            "research_cutoff",
+            "compute",
+            "review",
+            "limits",
+            "agents",
+            "lab_memory",
+            "repo",
+        }
         settings = cls(
             models=ModelSettings.load(raw.get("models"), "settings.models", problems),
             limits=Limits.load(raw.get("limits"), "settings.limits", problems),
+            agents=AgentSettings.load(raw.get("agents"), "settings.agents", problems),
             extra={str(key): value for key, value in raw.items() if key not in known},
         )
         for name in ("research_cutoff", "compute", "lab_memory", "repo"):
@@ -1636,6 +1750,17 @@ class ProjectSettings:
         """
         if not isinstance(changes, Mapping):
             raise ProjectError(f"settings must be an object, not {changes!r}")
+        agents = changes.get("agents")
+        if isinstance(agents, Mapping):
+            # A misspelt name here would be stored and silently do nothing, and one of
+            # these values is the sandbox.  (A file that holds a name this version does
+            # not know is still read: that is a newer version's value, kept as it is.)
+            unknown = sorted(str(key) for key in agents if key not in AgentSettings.names())
+            if unknown:
+                raise ProjectError(
+                    f"settings.agents has no value named {', '.join(unknown)}; it has: "
+                    f"{', '.join(AgentSettings.names())}."
+                )
         merged = self.to_dict()
         for key, value in changes.items():
             if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
@@ -1649,6 +1774,7 @@ class ProjectSettings:
             "compute",
             "review",
             "limits",
+            "agents",
             "lab_memory",
             "repo",
         ):

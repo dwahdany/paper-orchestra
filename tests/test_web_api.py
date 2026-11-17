@@ -343,6 +343,7 @@ POST /api/projects/{pid}/experiments/{eid}/approve
 POST /api/projects/{pid}/experiments/{eid}/cancel
 GET /api/projects/{pid}/experiments/{eid}/runs/{number}
 GET /api/projects/{pid}/experiments/{eid}/runs/{number}/log
+POST /api/projects/{pid}/experiments/{eid}/runs/{number}/adopt-code
 GET /api/projects/{pid}/files/{path}
 POST /api/projects/{pid}/paper
 GET /api/projects/{pid}/paper
@@ -1361,6 +1362,33 @@ def test_experiments_are_listed_with_their_runs(client, project):
         "artifacts/curve.png": f"/api/projects/{project.id}/files/experiments/E1/runs/2/artifacts/curve.png"
     }
     assert "body" not in row
+
+
+def test_the_experiment_view_says_whether_network_access_grants_the_model_api(
+    client, project, monkeypatch, tmp_path
+):
+    """With model access for jobs on, approving a local run with network access lets its
+    code call the Anthropic API on the worker's account, counted nowhere.  The form says
+    so where the approval is given, which needs the view to say whether it is on."""
+    from paper_orchestra import cli
+
+    assert client.get(url(project, "/experiments/E1")).json()["model_access"] is False
+    token = tmp_path / "identity.jwt"
+    token.write_text("jwt", encoding="utf-8")
+    monkeypatch.setenv("PAPER_ORCHESTRA_JOB_MODEL_ACCESS", "1")
+    monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "rule")
+    monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN_FILE", str(token))
+    assert client.get(url(project, "/experiments/E1")).json()["model_access"] is True
+
+    # The command line says the same when the approval is given.
+    page = project.page("E1")
+    page.meta.update(backend="local", network=True)
+    assert cli._grants_model_access(page)
+    assert "counted against no limit of the project" in cli.MODEL_ACCESS_SAID
+    page.meta.update(network=False)
+    assert not cli._grants_model_access(page)
+    page.meta.update(backend="modal", network=True)
+    assert not cli._grants_model_access(page)
 
 
 def test_an_experiment_comes_with_plan_code_runs_and_options(client, project):
@@ -5764,3 +5792,245 @@ def test_the_events_of_a_decision_are_in_the_activity(client, project):
     assert sorted(kinds) == ["decision.answered", "decision.asked"]
     asked = next(event for event in events if event["type"] == "decision.asked")
     assert asked["agent"] == "theorist" and "asks you to decide" in asked["summary"]
+
+
+# ---------------------------------------------------------------------------
+# How the agents are run (settings.agents), their lines in the feed, their runs
+# ---------------------------------------------------------------------------
+
+AGENT_RUNTIME_ENV = "PAPER_ORCHESTRA_AGENT_RUNTIME"
+
+
+def test_the_defaults_offer_the_runtimes_and_credentials_the_settings_accept(client, monkeypatch):
+    from paper_orchestra.research.model import ProjectSettings
+
+    monkeypatch.delenv(AGENT_RUNTIME_ENV, raising=False)
+    body = client.get("/api/defaults").json()
+    assert body["agent_runtimes"] == ["classic", "sdk"]
+    assert body["agent_credentials"] == ["login", "federation"]
+    for runtime in body["agent_runtimes"]:
+        for credential in body["agent_credentials"]:
+            given = {"agents": {"runtime": runtime, "credential": credential}}
+            agents = ProjectSettings.from_dict(given, strict=True).agents
+            assert (agents.runtime, agents.credential) == (runtime, credential)
+    # Every field a form shows has its default here: a client carries none of its own.
+    assert body["settings"]["agents"] == {
+        "runtime": "classic",
+        "model": "claude-fable-5-2",
+        "fast": True,
+        "ultracode": True,
+        "credential": "login",
+        "sandbox": True,
+    }
+
+
+def test_a_new_project_gets_the_runtime_the_servers_environment_names(
+    client, workspace, monkeypatch
+):
+    def created(settings: dict[str, Any] | None) -> dict[str, Any]:
+        data = {"brief": "An idea."}
+        if settings is not None:
+            data["settings"] = json.dumps(settings)
+        response = client.post("/api/projects", data=data)
+        assert response.status_code == 201, response.text
+        pid = response.json()["id"]
+        shown = client.get(f"/api/projects/{pid}").json()["settings"]["agents"]
+        # ... and it is written into the project: the environment of whoever opens it
+        # later changes nothing.
+        on_file = json.loads((workspace / response.json()["dir"] / "project.json").read_text())
+        assert on_file["settings"]["agents"] == shown
+        return shown
+
+    monkeypatch.delenv(AGENT_RUNTIME_ENV, raising=False)
+    assert created(None)["runtime"] == "classic"
+
+    monkeypatch.setenv(AGENT_RUNTIME_ENV, "sdk")
+    assert client.get("/api/defaults").json()["settings"]["agents"]["runtime"] == "sdk"
+    assert created(None)["runtime"] == "sdk"
+    # A form that says something else about the agents, and nothing about the runtime,
+    # still gets the environment's.
+    partly = created({"agents": {"fast": False, "credential": "federation"}})
+    assert (partly["runtime"], partly["fast"], partly["credential"]) == ("sdk", False, "federation")
+    # What the form names wins.
+    assert created({"agents": {"runtime": "classic"}})["runtime"] == "classic"
+    refused = client.post(
+        "/api/projects",
+        data={"brief": "x", "settings": json.dumps({"agents": {"runtime": "abacus"}})},
+    )
+    assert refused.status_code == 422 and "runtime" in error_of(refused)["message"]
+
+    monkeypatch.setenv(AGENT_RUNTIME_ENV, "nonsense")
+    assert created(None)["runtime"] == "classic"
+
+
+def test_how_the_agents_are_run_can_be_changed_and_a_refused_change_changes_nothing(
+    client, project, monkeypatch
+):
+    monkeypatch.delenv(AGENT_RUNTIME_ENV, raising=False)
+    assert client.get(url(project)).json()["settings"]["agents"]["runtime"] == "classic"
+    changed = client.patch(
+        url(project),
+        json={
+            "settings": {
+                "agents": {
+                    "runtime": "sdk",
+                    "model": "claude-haiku-5-5",
+                    "fast": False,
+                    "ultracode": False,
+                    "credential": "federation",
+                    "sandbox": False,
+                }
+            }
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    wanted = {
+        "runtime": "sdk",
+        "model": "claude-haiku-5-5",
+        "fast": False,
+        "ultracode": False,
+        "credential": "federation",
+        "sandbox": False,
+    }
+    assert changed.json()["settings"]["agents"] == wanted
+    assert Project.open(project.root).settings.agents.sdk
+    # One field alone: the others stay.
+    one = client.patch(url(project), json={"settings": {"agents": {"sandbox": True}}})
+    assert one.json()["settings"]["agents"] == {**wanted, "sandbox": True}
+
+    before = (project.root / "project.json").read_text()
+    for wrong, named in (
+        ({"runtime": "abacus"}, "runtime"),
+        ({"credential": "password"}, "credential"),
+        ({"fast": "yes"}, "fast"),
+        ({"model": " "}, "model"),
+        ({"sandbox": True, "ultracode": 1}, "ultracode"),
+        # A name the group does not have: stored, it would silently do nothing.
+        ({"bogus": 1}, "bogus"),
+        ({"sandbx": False}, "sandbx"),
+        # Not the name of a model: it goes to the agents' command line as it stands.
+        ({"model": "claude-haiku-5-5 ; rm -rf"}, "model"),
+    ):
+        refused = client.patch(url(project), json={"settings": {"agents": wrong}})
+        assert refused.status_code == 422, (wrong, refused.text)
+        assert named in error_of(refused)["message"]
+        assert (project.root / "project.json").read_text() == before
+        assert client.get(url(project)).json()["settings"]["agents"] == {**wanted, "sandbox": True}
+
+
+def test_the_person_can_make_the_code_an_agent_left_the_experiments_code(real, project):
+    """An agent that carries a run out repairs the code in its own folder; the run's
+    record names what it changed, and the person can take that code over as their edit."""
+    from paper_orchestra.research import experiments
+
+    page = second_experiment(project)
+    eid = str(page.id)
+    runs = project.experiment_dir(eid) / "runs" / "1"
+    (runs / "code").mkdir(parents=True)
+    (runs / "code" / "main.py").write_text("print('hello')\n")
+    (runs / "code-as-run").mkdir()
+    (runs / "code-as-run" / "main.py").write_text("print('hello, repaired')\n")
+    (runs / "code-as-run" / "util.py").write_text("X = 1\n")
+    record = {
+        "experiment": eid,
+        "number": 1,
+        "status": "succeeded",
+        "backend": "local",
+        "carried_out_by": "agent",
+        "exit_code": None,
+        "code_as_run": {
+            "digest": "d" * 64,
+            "changed": ["main.py"],
+            "added": ["util.py"],
+            "removed": [],
+        },
+    }
+    (runs / "run.json").write_text(json.dumps(record))
+    shown = real.get(f"{url(project)}/experiments/{eid}/runs/1").json()["run"]
+    assert shown["code_as_run"]["changed"] == ["main.py"] and shown["exit_code"] is None
+    # The file as the agent left it can be opened from the run.
+    kept = real.get(f"{url(project)}/files/experiments/{eid}/runs/1/code-as-run/main.py")
+    assert kept.status_code == 200 and "repaired" in kept.text
+
+    adopted = real.post(f"{url(project)}/experiments/{eid}/runs/1/adopt-code")
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.json()["files"] == ["main.py", "util.py"] and adopted.json()["run"] == 1
+    assert experiments.code_files(project, eid) == {
+        "main.py": "print('hello, repaired')\n",
+        "util.py": "X = 1\n",
+    }
+    assert experiments.code_authors(project, eid)["main.py"]["author"] == "human"
+    # A run whose agent changed nothing has nothing to take over; neither has a run there is not.
+    record["code_as_run"] = {"digest": "d" * 64, "changed": [], "added": [], "removed": []}
+    (runs / "run.json").write_text(json.dumps(record))
+    assert real.post(f"{url(project)}/experiments/{eid}/runs/1/adopt-code").status_code in (
+        409,
+        422,
+    )
+    assert real.post(f"{url(project)}/experiments/{eid}/runs/9/adopt-code").status_code == 404
+
+
+def test_the_doctor_says_what_this_machine_has_for_agents_with_a_shell(
+    workspace, monkeypatch, tmp_path
+):
+    """Setup shows it: the package and its command line, a login, the federation
+    settings.  It is information; it never makes the report not ok, and no value of a
+    setting is in it."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    for name in ("ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "org-must-not-be-shown")
+    with TestClient(create_app(workspace), base_url=BASE_URL) as client:
+        report = client.get("/api/doctor").json()
+        agents = report["agents"]
+        assert agents["login"] in (False, None) and agents["federation"] is False
+        assert "ANTHROPIC_FEDERATION_RULE_ID" in agents["federation_missing"]
+        assert isinstance(agents["package"], bool) and isinstance(agents["command_line"], bool)
+        assert "org-must-not-be-shown" not in json.dumps(report)
+        (home / ".claude" / ".credentials.json").write_text("{}")
+        assert client.get("/api/doctor").json()["agents"]["login"] is True
+
+
+def test_the_feed_carries_the_parts_of_an_agents_line(client, project):
+    """What an agent with a shell did reaches the app as the sentence and as its parts
+    (``data``), over the listing and over the stream alike; a credential is in neither."""
+    project.emit(
+        "agent.activity",
+        "The scout ran “ls -la && cat main.py” in its shell.",
+        phase="research",
+        agent="scout",
+        round=1,
+        data={"did": "shell", "text": "ls -la && cat main.py"},
+    )
+    project.emit(
+        "agent.activity",
+        "The scout read wiki/idea.md.",
+        phase="research",
+        agent="scout",
+        round=1,
+    )
+    told, plain = client.get(url(project, "/activity?limit=2")).json()["events"]
+    assert told["agent"] == "scout" and told["summary"].startswith("The scout ran")
+    assert told["data"] == {"did": "shell", "text": "ls -la && cat main.py"}
+    # A line of the tool loop, and one written before lines had parts, has none.
+    assert not plain["data"]
+
+
+def test_a_run_an_agent_carried_out_says_so_wherever_the_run_is_shown(client, project):
+    run_dir = add_run(project)
+    record = json.loads((run_dir / "run.json").read_text())
+    by_hand = client.get(url(project, "/experiments/E1")).json()["runs"][0]
+    assert "carried_out_by" not in by_hand  # a run of the runner's says nothing of the kind
+
+    (run_dir / "run.json").write_text(json.dumps({**record, "carried_out_by": "agent"}))
+    view = client.get(url(project, "/experiments/E1")).json()
+    assert view["runs"][0]["carried_out_by"] == "agent"
+    # ... with its log and what it left, like any run.
+    assert view["runs"][0]["log_url"] and view["runs"][0]["artifact_urls"]
+    log = client.get(url(project, "/experiments/E1/runs/1/log")).json()
+    assert "done" in log["text"]
+    (row,) = client.get(url(project, "/experiments")).json()["experiments"]
+    assert row["last_run"]["carried_out_by"] == "agent"

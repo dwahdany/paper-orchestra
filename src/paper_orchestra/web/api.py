@@ -119,6 +119,8 @@ from paper_orchestra import __version__
 from paper_orchestra.memory.wiki import slugify, split_front_matter
 from paper_orchestra.research.decisions import DECISIONS_DIR, SAY_CHARS
 from paper_orchestra.research.model import (
+    AGENT_CREDENTIALS,
+    AGENT_RUNTIMES,
     COMPUTE_BACKENDS,
     EFFORTS,
     FOR_ALL,
@@ -145,6 +147,7 @@ from paper_orchestra.research.model import (
     phase_name,
     plain_links,
     role_of,
+    settings_for_new_project,
 )
 from paper_orchestra.research.project import (
     BRIEF_FILE,
@@ -543,6 +546,13 @@ class Services:
     def check_code(self, project: Project, experiment_id: str) -> list[str]:
         return list(self._experiments().check_code(project, experiment_id))
 
+    def adopt_run_code(self, project: Project, experiment_id: str, number: int) -> dict[str, Any]:
+        """Make the code an agent left after run ``number`` the experiment's code, as the
+        person's edit."""
+        return dict(
+            self._experiments().adopt_run_code(project, experiment_id, number, author="human")
+        )
+
     def code_digest(self, project: Project, experiment_id: str) -> str:
         """What identifies the code as it is now; ``approve`` takes it back as
         ``code_digest`` and refuses when the code changed in between."""
@@ -758,7 +768,7 @@ class Services:
 
     def default_settings(self) -> dict[str, Any]:
         """The settings a project starts with when nothing else is said."""
-        return ProjectSettings().to_dict()
+        return ProjectSettings.from_dict(settings_for_new_project(None)).to_dict()
 
     def doctor(self, model: str | None = None) -> dict[str, Any]:
         from paper_orchestra import doctor
@@ -1510,12 +1520,17 @@ def defaults(context: Ctx) -> dict[str, Any]:
     addressed to (``POST .../requests``, field ``for``).
 
     Also the values a form may offer, which are the ones the settings accept:
-    ``efforts`` (``settings.models.effort``) and ``compute_backends``
-    (``settings.compute``).  ``phase_words`` is how a sentence for the person names
-    each phase (``{"hypothesize": "the hypothesis phase"}``), as the engine's own
-    sentences and the server's refusals name it, and ``phase_names`` what a phase
-    is called by itself (``{"hypothesize": "hypotheses"}``: "checkpoint after
-    hypotheses"), as the command line says it too.
+    ``efforts`` (``settings.models.effort``), ``compute_backends``
+    (``settings.compute``), ``agent_runtimes`` (``settings.agents.runtime``) and
+    ``agent_credentials`` (``settings.agents.credential``).  The runtime in
+    ``settings.agents`` is the one a project created now would get: ``sdk`` where the
+    server's environment asks for it (``PAPER_ORCHESTRA_AGENT_RUNTIME``).
+
+    ``phase_words`` is how a sentence for the person names each phase
+    (``{"hypothesize": "the hypothesis phase"}``), as the engine's own sentences and
+    the server's refusals name it, and ``phase_names`` what a phase is called by
+    itself (``{"hypothesize": "hypotheses"}``: "checkpoint after hypotheses"), as the
+    command line says it too.
 
     ``creatable_kinds`` are the kinds of page the person can write (``kind`` of
     ``POST .../pages``), and ``kind_writers`` says for each kind which agents write
@@ -1526,6 +1541,8 @@ def defaults(context: Ctx) -> dict[str, Any]:
         "request_for": list(REQUEST_FOR),
         "efforts": list(EFFORTS),
         "compute_backends": list(COMPUTE_BACKENDS),
+        "agent_runtimes": list(AGENT_RUNTIMES),
+        "agent_credentials": list(AGENT_CREDENTIALS),
         "phase_words": context.services.phase_words(),
         "phase_names": {phase: phase_name(phase) for phase in PHASES},
         "creatable_kinds": list(_PERSON_KINDS),
@@ -2083,8 +2100,14 @@ def _create_project(
         for _ in range(20):
             directory = workspace.new_directory(name)
             try:
+                # A new project gets the runtime its form named, else the one the
+                # environment of the app asks for (PAPER_ORCHESTRA_AGENT_RUNTIME).
                 project = Project.create(
-                    directory, title=title, brief=brief, files=tops, settings=settings
+                    directory,
+                    title=title,
+                    brief=brief,
+                    files=tops,
+                    settings=settings_for_new_project(settings),
                 )
                 break
             except ProjectError:
@@ -3515,7 +3538,16 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
         ],
         "options": options,
         "options_error": options_error,
+        # Whether a run approved for this machine with network access can call the
+        # Anthropic API with the worker's settings: said where the approval is given.
+        "model_access": _job_model_access(),
     }
+
+
+def _job_model_access() -> bool:
+    from paper_orchestra.compute.local import job_model_access
+
+    return job_model_access()
 
 
 @router.get("/projects/{pid}/experiments/{eid}")
@@ -3979,6 +4011,23 @@ def get_run(eid: str, number: int, project: Proj, context: Ctx) -> dict[str, Any
     run = _find_run(context, project, str(page.id), number)
     tail = _log_piece(context, project, _run_log(str(page.id), number), -_LOG_TAIL_BYTES)
     return {"run": _run_view(context, project, str(page.id), run), "log": tail}
+
+
+@router.post("/projects/{pid}/experiments/{eid}/runs/{number}/adopt-code")
+def adopt_code(eid: str, number: int, project: Proj, context: Ctx) -> dict[str, Any]:
+    """The person makes the code that the agent of run ``number`` left the experiment's
+    code: ``{"run", "files", "removed", "problems"}``.
+
+    An agent that carries a run out repairs the code in its own folder, and the
+    experiment's code stays what was approved (``run.code_as_run`` names what the
+    agent changed).  This writes the changed and added files as the person's own
+    edit, with everything that follows from one: earlier versions are kept, and
+    an approval of the experiment no longer holds.  422 when the run has no
+    changed code, or a file of it cannot be taken over.
+    """
+    page = _experiment(project, eid)
+    _find_run(context, project, str(page.id), number)
+    return context.services.adopt_run_code(project, str(page.id), number)
 
 
 @router.get("/projects/{pid}/experiments/{eid}/runs/{number}/log")
