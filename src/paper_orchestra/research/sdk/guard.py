@@ -325,9 +325,10 @@ class Guard:
                 "allowRead": [str(place) for place in self.open_places()],
                 "denyWrite": [str(place) for place in credentials],
             },
-            # The shell has the web.  It does not have this machine's own services:
-            # the sandbox refuses the loopback and link-local addresses by itself
-            # (checked live); these names say so whatever a later version does.
+            # The shell has the web.  It does not have this machine's own services.
+            # The sandbox refused link-local addresses before these names were here
+            # (checked live); with them, the live check shows the metadata server and
+            # the loopback both closed, and a later version cannot quietly open them.
             "network": {"deniedDomains": list(CLOSED_HOSTS)},
         }
         return settings

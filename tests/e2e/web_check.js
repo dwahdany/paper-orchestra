@@ -282,6 +282,15 @@ CHECKS.phone = async ({ browser, pid }) => {
       if (!r.width || (el.closest('.in-scroll') && (y <= list.top || y >= list.bottom))) return;
       const at = document.elementFromPoint(x, y); if (at && at.closest('#toast')) out.push((el.dataset.act || el.className) + ' at ' + Math.round(x) + ',' + Math.round(y)); });
     return out; };
+  /* text that has no room: narrower than its longest word needs, many times taller than
+     wide, or a name of the route under the form on more than two lines */
+  const SQUEEZED = () => { const out = [];
+    document.querySelectorAll('.composer-bar *, .start-est, .start-lede, .smap-route .smap-name, .smap-route .smap-hint').forEach((el) => { const r = el.getBoundingClientRect(), words = (el.textContent || '').trim();
+      if (!r.width || !words || el.children.length) return;
+      const longest = Math.max.apply(null, words.split(/\s+/).map((w) => w.length)), font = parseFloat(getComputedStyle(el).fontSize);
+      if (r.width < Math.min(longest, 12) * font * 0.45 || r.height > 6 * Math.max(r.width, 1)) out.push((el.className || el.tagName) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' "' + words.slice(0, 24) + '"'); });
+    const names = Array.from(document.querySelectorAll('.smap-route .smap-name')).filter((el) => el.getBoundingClientRect().height > parseFloat(getComputedStyle(el).fontSize) * 2.2).map((el) => el.textContent);
+    return { out, names }; };
   const focusIn = (page, selector) => page.evaluate((sel) => !!document.activeElement && document.activeElement.matches(sel), selector);
   const reach = async (page, width, where, selectors, least) => {
     const boxes = await page.evaluate(BOXES, selectors), high = await page.evaluate(() => window.innerHeight);
@@ -299,6 +308,13 @@ CHECKS.phone = async ({ browser, pid }) => {
       hash = r.replace('PID', pid);
       await open(page, hash);
       await page.waitForTimeout(350);
+      if (r === '#/start') {
+        /* the new-project page: no piece of text is squeezed to a letter's width (the hint
+           beside "Add files" was, and the route under the form broke its words in the middle) */
+        const squeezed = await page.evaluate(SQUEEZED);
+        ok(!squeezed.out.length && !squeezed.names.length, width + ' the new-project page on a phone squeezes no text: ' + JSON.stringify(squeezed));
+        await shot(page, 'start-phone-' + width);
+      }
       const over = await page.evaluate(NARROW);
       ok(!over.length, width + ' ' + hash + ' horizontal overflow: ' + over.join('; '));
       if (hash.includes(pid)) ok(await page.evaluate(() => { const nav = document.querySelector('.views'), a = nav.querySelector('a[aria-current]').getBoundingClientRect(), b = nav.getBoundingClientRect(); return a.left >= b.left - 1 && a.right <= b.right + 1; }), width + ' ' + hash + ': the open view is not in sight in the top bar');
@@ -660,19 +676,6 @@ CHECKS.shell = async ({ browser, page, shell }) => {
     await phone.selectOption('#opt-agent-runtime', 'sdk');
     await phone.waitForSelector('#opt-agent-model');
     ok(!(await phone.evaluate(NARROW)).length && !(await phone.evaluate(SMALL)).length, width + ' the composer\'s fields about the agents on a phone: ' + (await phone.evaluate(NARROW)).concat(await phone.evaluate(SMALL)).join('; '));
-    /* the new-project page itself: no piece of text is squeezed to a letter's width (the hint
-       beside "Add files" was, and the route under the form broke its words in the middle) */
-    await open(phone, '#/start', '.composer-bar');
-    const squeezed = await phone.evaluate(() => { const out = [];
-      document.querySelectorAll('.composer-bar *, .start-est, .start-lede, .smap-route .smap-name, .smap-route .smap-hint').forEach((el) => { const r = el.getBoundingClientRect(), words = (el.textContent || '').trim();
-        if (!r.width || !words || el.children.length) return;
-        const longest = Math.max.apply(null, words.split(/\s+/).map((w) => w.length)), font = parseFloat(getComputedStyle(el).fontSize);
-        /* narrower than its longest word needs, or many times taller than its width */
-        if (r.width < Math.min(longest, 12) * font * 0.45 || r.height > 6 * Math.max(r.width, 1)) out.push((el.className || el.tagName) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' "' + words.slice(0, 24) + '"'); });
-      const names = Array.from(document.querySelectorAll('.smap-route .smap-name')).filter((el) => el.getBoundingClientRect().height > parseFloat(getComputedStyle(el).fontSize) * 2.2).map((el) => el.textContent);
-      return { out, names, wide: document.documentElement.scrollWidth > document.documentElement.clientWidth }; });
-    ok(!squeezed.out.length && !squeezed.names.length && !squeezed.wide, width + ' the new-project page on a phone squeezes no text: ' + JSON.stringify(squeezed));
-    await shot(phone, 'start-phone-' + width);
     await phone.evaluate(() => { localStorage.removeItem('po-composer'); });
     await open(phone, '#/p/' + pid + '/experiments/E1', '.exp-runs .run');
     await phone.waitForSelector('.run.open .run-agent');
