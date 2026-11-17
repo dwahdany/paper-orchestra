@@ -189,6 +189,7 @@ _KEPT_ENV_PREFIXES = ("LC_",)
 PASS_ENV = "PAPER_ORCHESTRA_AGENT_ENV"
 _NOT_PASSED_ON = ("ANTHROPIC_", "CLAUDE")
 #: An address with a name and a password before the host (a proxy's, a database's).
+_PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
 _USERINFO = re.compile(r"[a-z][a-z0-9+.-]*://[^/?#\s]*@", re.IGNORECASE)
 #: What separates the words of a shell command, for finding the programs it names.
 _WORD_BREAKS = re.compile(r"[\s;|&()<>`$\"'=,{}\[\]]+")
@@ -785,6 +786,8 @@ def agent_env(
             return True
         if name not in KEPT_ENV and not name.startswith(_KEPT_ENV_PREFIXES):
             return False
+        if name.upper() in _PROXY_NAMES and "@" in str(value):
+            return False  # also without a scheme: `me:word@proxy:3128`
         return not _is_secret(name) and not _USERINFO.search(str(value))
 
     env = {name: "" for name, value in environ.items() if not stays(name, value)}

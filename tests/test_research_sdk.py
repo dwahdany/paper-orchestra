@@ -994,11 +994,12 @@ def test_a_proxy_with_a_password_in_its_address_does_not_reach_the_agent():
         {
             "HTTPS_PROXY": "http://me:word@proxy.example:3128",
             "http_proxy": "http://word@proxy.example:3128",
+            "all_proxy": "me:word@proxy.example:1080",  # also without a scheme
             "ALL_PROXY": "socks5://proxy.example:1080",
             "NO_PROXY": "me@example.com",  # no address: left alone
         },
     )
-    assert env == {"HTTPS_PROXY": "", "http_proxy": ""}
+    assert env == {"HTTPS_PROXY": "", "http_proxy": "", "all_proxy": ""}
 
 
 def test_the_person_can_name_more_variables_for_the_agents_to_keep():
