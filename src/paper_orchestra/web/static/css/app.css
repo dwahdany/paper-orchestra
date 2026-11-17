@@ -691,7 +691,7 @@ table { border-collapse: collapse; }
   .wiki, .wiki-editing { grid-template-columns: 196px minmax(0, 1fr); } .page-wiki { padding: 24px 26px 60px; } .ed-wiki .ed-split, .ed-wiki .ed-fields { grid-template-columns: 1fr; } .ed-wiki .ed-pane textarea, .ed-wiki .ed-prev { height: auto; }
   .inbox { grid-template-columns: 1fr; grid-template-rows: minmax(220px, 46%) minmax(0, 1fr); } .in-list { border-right: 0; border-bottom: 1px solid var(--rule); }
   .exp { grid-template-columns: 1fr; } .exp-rail { display: none; } .exp-page { padding: 20px 24px 60px; }
-  .ov-wrap { padding: 28px 24px 60px; } .ov-cols { grid-template-columns: 1fr; } .ov-head h1 { font-size: 26px; }
+  .ov-wrap { padding: 28px 24px 60px; } .ov-cols { grid-template-columns: minmax(0, 1fr); } .ov-head h1 { font-size: 26px; }
   .smap { grid-template-columns: repeat(4, 1fr); row-gap: 18px; } .smap-st:nth-child(4)::before { right: auto; width: 6px; }
   .smap-s, .smap-route { grid-template-columns: repeat(8, 1fr); }
   .lib-row { grid-template-columns: minmax(0, 1fr) 170px; gap: 20px; } .lib-map { display: none; }
@@ -1227,7 +1227,8 @@ a.choice { text-decoration: none; }
 
 /* instructions: who they are for, and which phases were given them */
 .rq-bar { flex-wrap: wrap; }
-.rq-for { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-3); margin-right: auto; min-width: 0; } .rq-for select { height: 28px; max-width: 100%; color: var(--ink); font-size: 12.5px; }
+/* (the list is as wide as its longest name unless it may shrink: on a phone it would push the whole column off the screen) */
+.rq-for { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-3); margin-right: auto; min-width: 0; max-width: 100%; } .rq-for select { height: 28px; min-width: 0; max-width: 100%; color: var(--ink); font-size: 12.5px; }
 .rq-send { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-top: 8px; } .rq-send .btn { flex: none; }
 .rq-when { font-size: 12px; line-height: 1.5; }
 .rq-m { line-height: 1.5; } .rq-for-who { color: var(--ink-2); } .rq-had { display: block; }
@@ -1483,12 +1484,21 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
 .dc-note { margin-top: 9px; font-size: 13px; line-height: 1.45; color: var(--ink-2); } .dc-note b { font-weight: 600; color: var(--ink); }
 .dc-say { display: block; width: 100%; min-height: 44px; margin-top: 12px; padding: 9px 12px; resize: vertical; font: 15px/1.45 var(--serif); }
 .dc-err { margin-top: 8px; font-size: 13px; color: var(--neg); }
+.dc-count { margin-top: 4px; font-size: 12.5px; line-height: 1.4; color: var(--ink-3); font-variant-numeric: tabular-nums; } .dc-count.over { color: var(--neg); }
+/* an option that is pressed, or words that are typed, are not sent: the card says so beside
+   the button that sends, and the two stay at the foot of the list while the card is in it
+   (a list keeps what sticks out of its padding: the offset is the list's padding at its foot) */
+.dc-wait { display: none; flex: 1 1 100%; margin: 0; font-size: 13px; line-height: 1.4; color: var(--ink-2); } .dc-wait b { font-weight: 600; color: var(--prop); }
+.dc-go.dc-unsent { position: sticky; bottom: -20px; z-index: 2; margin: 10px -14px -12px; padding: 9px 14px 12px; border-top: 1px solid var(--prop-line); border-radius: 0 0 7px 7px; background: var(--surface); }
+.dc-unsent .dc-wait { display: block; }
 .dc-go { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; } .dc-go .btn { height: auto; min-height: 36px; white-space: normal; text-align: left; } .dc-pick { font-weight: 400; }
 .dc-done { margin-top: 22px; padding-top: 6px; border-top: 1px solid var(--rule); }
 .dc-old { border-radius: 6px; } .dc-old[open] { margin-bottom: 8px; }
 .dc-old > summary { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 1px 8px; align-items: start; min-height: 36px; padding: 6px 10px; border-radius: 6px; cursor: pointer; list-style: none; } .dc-old > summary::-webkit-details-marker { display: none; }
 .dc-old > summary:hover { background: var(--hover); }
 .dc-oq { font: 13.5px/1.4 var(--serif); color: var(--ink-2); } .dc-oa { grid-column: 2; font-size: 12.5px; line-height: 1.4; color: var(--ink); overflow-wrap: anywhere; } .dc-old .in-when { grid-column: 2; white-space: normal; }
+/* on its row a long answer in the person's own words is its beginning; the field of the open card has all of it */
+.dc-old .dc-oa { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
 .dc-in { margin: 4px 4px 0 30px; border-color: var(--rule-2); border-left-width: 1px; }
 .dc-on-page { margin-top: 12px; }
 .dc-ref { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; padding: 9px 12px; border: 1px solid var(--prop-line); border-radius: 6px; font-size: 13px; line-height: 1.5; background: var(--prop-wash); overflow-wrap: anywhere; } .dc-ref .ic { flex: none; margin-top: 3px; color: var(--prop); } .dc-ref q { font-family: var(--serif); font-style: italic; }
@@ -1498,6 +1508,7 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
   .dc { margin: 0 2px 12px; padding: 14px 12px 12px; } .dc .dc-q { font-size: 19px; } .dc-by { font-size: 13px; } .dc-by a { display: inline-block; padding: 6px 0; }
   .dc-opt { min-height: 56px; padding: 12px 12px 12px 10px; } .dc-l { font-size: 16px; } .dc-m { font-size: 14px; } .dc-note { font-size: 14px; }
   .dc-go .btn { flex: 1 1 100%; min-height: 48px; justify-content: center; text-align: center; }
+  .dc-go.dc-unsent { bottom: -28px; margin: 10px -12px -12px; padding: 9px 12px 12px; } .dc-wait { font-size: 14px; } .dc-count { font-size: 13.5px; }
   .dc-old > summary { min-height: 48px; padding: 8px 10px; } .dc-oq { font-size: 15px; } .dc-oa { font-size: 14px; } .dc-in { margin-left: 2px; }
   .dc-ref { font-size: 14px; } .dc-ref a { display: inline-block; padding: 6px 0; }
 }

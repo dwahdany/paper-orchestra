@@ -117,7 +117,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from paper_orchestra import __version__
 from paper_orchestra.memory.wiki import slugify, split_front_matter
-from paper_orchestra.research.decisions import DECISIONS_DIR
+from paper_orchestra.research.decisions import DECISIONS_DIR, SAY_CHARS
 from paper_orchestra.research.model import (
     COMPUTE_BACKENDS,
     EFFORTS,
@@ -3225,7 +3225,12 @@ def _decision_view(context: Context, project: Project, decision: Any) -> dict[st
     pid = context.workspace.key_of(project)
     text = _blank(decision.context, context.services.secrets(project))
     html = render_markdown(text, project=project, pid=pid, page_path=decision.page)
-    return {**decision.to_dict(), "context_html": html if decision.context.strip() else ""}
+    # ``say_chars``: how long the person's own words may be, for the field that counts them.
+    return {
+        **decision.to_dict(),
+        "context_html": html if decision.context.strip() else "",
+        "say_chars": SAY_CHARS,
+    }
 
 
 @router.get("/projects/{pid}/decisions")
@@ -3235,7 +3240,7 @@ def list_decisions(project: Proj, context: Ctx, state: str = "all") -> dict[str,
     (``research.decisions.Decision.to_dict``: ``options`` with ``label`` and
     ``meaning``, ``recommended`` as a number from 1, ``default``, ``page``,
     ``raised_by``, ``state``, the ``answer`` that holds and every one in ``answers``)
-    with ``context_html``."""
+    with ``context_html`` and ``say_chars``, the length the person's own words may have."""
     wanted = None if state == "all" else state
     found = project.decisions(state=wanted)
     return {"decisions": [_decision_view(context, project, decision) for decision in found]}

@@ -2110,6 +2110,21 @@ def test_decide_answers_with_an_option_words_or_both_and_can_change_it(project):
     assert f"1. {decision.id} Which batch sizes does the idea mean? -> Small ones only." in listed
 
 
+def test_the_list_names_a_long_answer_by_its_beginning(project):
+    decision = asked(project)
+    long = "The sweep I mean is this one. " + "and so on " * 380 + "to the very end."
+    assert invoke("decide", str(project.root), "1", "--say", long).exit_code == 0
+
+    listed = flat(invoke("decide", str(project.root)).stdout)
+
+    line = listed[listed.index(f"1. {decision.id}") :]
+    assert "-> The sweep I mean is this one. and so on" in line and line.endswith("…")
+    assert "to the very end." not in listed and len(line) < 300
+    # Asked for by itself, the decision says all of it; so does what an agent is told.
+    assert "to the very end." in flat(invoke("decide", str(project.root), "1").stdout)
+    assert project.decision(decision.id).answer.text.endswith("to the very end.")
+
+
 def test_a_decision_keeps_its_number_when_another_is_answered(project):
     """Answering 1 and then 2 from one listing answers the first and the second: the
     numbers are not places among what still waits."""

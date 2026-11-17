@@ -809,6 +809,11 @@ out.when = store.pending().map((it) => it.when === edited.created);
 out.did = checkpointDid({ did: 'Round 2, design: 2 experiments are planned.', summary: 'Round 2, design: 2 experiments are planned. 9 questions await your review. Next: running what you approved.' });
 out.didOld = checkpointDid({ summary: 'The theorist proposed 2 hypotheses. 2 hypotheses and 6 findings await your review. Next: designing experiments for the hypotheses you accepted.' });
 out.didText = checkpointDid('The theorist proposed 2 hypotheses. 2 hypotheses await your review.');
+/* a checkpoint rebuilt from the events has only the sentence, which also counts the decisions that waited */
+out.didAsked = [1, 2, 12].map((n) => checkpointDid({ summary: 'The theorist proposed 2 hypotheses. 2 hypotheses await your review. ' + (n === 1 ? '1 decision waits' : n + ' decisions wait') + ' for your answer. Next: designing experiments for the hypotheses you accepted.' }));
+out.didAskedOnly = checkpointDid({ summary: '2 hypotheses await your review. 1 decision waits for your answer.' });
+out.didDemo = checkpointDid('Round 1, analysis: 2 findings were written. 3 questions are waiting for you. 1 decision waits for your answer.');
+out.didKept = checkpointDid({ summary: 'The analyst left the decision to you. Nothing awaits your review. Next: more.' });
 /* the round as a line: a phase that ran twice is one mark, and one that comes again says so */
 const phases = ['intake', 'research', 'hypothesize', 'design', 'run', 'run', 'analyze'].map((phase) => ({ round: 1, phase, status: 'completed', produced: [], seconds: 1 }));
 const twice = projectStore({ pages: [], project: { state: { status: 'checkpoint', round: 1, phase: 'analyze', next_phase: 'hypothesize', phases, spent: {} }, next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
@@ -838,6 +843,11 @@ def test_the_words_say_what_is_so(tmp_path):
     assert out["did"] == "2 experiments are planned."
     assert out["didOld"] == "The theorist proposed 2 hypotheses."
     assert out["didText"] == "The theorist proposed 2 hypotheses."
+    # What waited then is no part of what was done: the decisions no more than the proposals.
+    assert out["didAsked"] == ["The theorist proposed 2 hypotheses."] * 3, out["didAsked"]
+    assert out["didAskedOnly"] == ""
+    assert out["didDemo"] == "2 findings were written."
+    assert out["didKept"] == "The analyst left the decision to you."
     assert out["rounds"] == {"runs": 1, "twice": True, "again": True}, out["rounds"]
     assert out["counts"] == "1 source · 1 hypothesis · 1 experiment · 1 finding"
     assert out["many"] == "14 sources · 5 hypotheses · 4 experiments · 2 findings"
@@ -1176,6 +1186,103 @@ def test_changing_an_answer_starts_from_the_answer_that_holds(tmp_path):
     # A row that is in front only by default does not move the list off the decisions.
     assert "(route.sel ? ', .in-scroll .in-row.cur' : '')" in main
     assert "decisionLink(d.id)" in _js("overview.js")
+
+
+UNSENT_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago } from './harness.js';
+import { app } from './js/core.js';
+import { api } from './js/api.js';
+import * as decisions from './js/decisions.js';
+
+const q9 = page('question', 'Q9', { title: 'The re-test channel', author: 'agent:analyst' });
+const options = [{ label: 'Cheap', meaning: '' }, { label: 'Wide', meaning: '' }];
+const base = { id: 'd-0000cccc', question: 'How wide?', context: '', context_html: '', options, recommended: null, reason: '', default: 'Cheap.', page: q9.path, blocks: [], raised_by: { role: 'analyst', round: 1 }, created: ago(600), say_chars: 4000 };
+const open = Object.assign({}, base, { state: 'open', answer: null, answers: [] });
+const answered = (option, text, at) => Object.assign({}, base, { state: 'answered', answer: { option, text, at, dismissed: false }, answers: [{ option, text, at, dismissed: false }] });
+const store = projectStore({ pages: [q9], decisions: [open], project: { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
+app.route = { name: 'project', pid: 'p-1', view: 'inbox', ref: '', sel: '', sub: '', q: {} };
+app.render = () => {};
+const sent = [], told = [];
+api.answerDecision = async (pid, id, option, text) => { sent.push([id, option, [...text].length]); store.decisions = [answered(option, text, ago(1))]; return { decision: store.decisions[0] }; };
+store.refreshNow = async () => {};
+const acts = decisions.decisionActs((words) => told.push(words));
+const el = { dataset: { ref: base.id } };
+const type = (value) => decisions.decisionTyped({ dataset: { ref: base.id }, value });
+const panel = () => String(decisions.decisionsPanel(store));
+const waits = (markup) => /class="dc-go dc-unsent"/.test(markup);
+const counted = (markup) => { const m = markup.match(/<p class="dc-count( over)?"[^>]*?( hidden)?>([^<]*)<\/p>/); return m ? [!!m[1], !!m[2], m[3]] : null; };
+const out = {};
+/* nothing touched: nothing waits to be sent, and the words that say so are not shown */
+out.fresh = [waits(panel()), panel().includes('Not sent yet.')];
+/* an option is pressed: chosen, not sent, and the card says so; pressed again, nothing is chosen */
+acts['decide-pick']({ dataset: { ref: base.id, i: '2' } });
+out.picked = [waits(panel()), sent.length];
+acts['decide-pick']({ dataset: { ref: base.id, i: '2' } });
+out.unpicked = waits(panel());
+/* words alone wait as well; blanks do not */
+type('   ');
+out.blank = waits(panel());
+type('Only what fits.');
+out.typed = [waits(panel()), counted(panel())];
+/* the field counts towards the server's limit from four fifths of it on, in whole characters */
+type('é'.repeat(3199));
+out.short = counted(panel());
+type('  ' + '😀'.repeat(3990) + '  ');
+out.near = counted(panel());
+type('x'.repeat(4100));
+out.over = counted(panel());
+/* over the limit nothing is sent, the words stay, and the card says why */
+await acts['decide-send'](el);
+out.refused = [sent.length, /Not sent: 4,100 characters: 100 characters more than the 4,000/.test(panel()), panel().includes('x'.repeat(4100))];
+/* a long answer goes out whole; where it is repeated it is named by its beginning */
+const long = 'The sweep I mean. ' + 'and so on '.repeat(390) + 'to the very end.';
+type(long);
+acts['decide-pick']({ dataset: { ref: base.id, i: '1' } });
+await acts['decide-send'](el);
+out.sent = sent.slice();
+out.toast = [told.length, (told[0] || '').length, /^Answered: option 1, “Cheap”; “The sweep I mean\. and so on/.test(told[0] || ''), (told[0] || '').includes('to the very end.')];
+const onPage = String(decisions.pageDecisions(store, q9.path));
+out.page = [onPage.includes('The sweep I mean.'), onPage.includes('to the very end.')];
+/* the row under "Your decisions" has all of it (the stylesheet shows its beginning, the field of its card the whole), and nothing waits there */
+const old = String(decisions.decidedDecisions(store));
+out.row = [old.includes('to the very end.'), waits(old)];
+/* an answered card whose option is changed waits; put back as it was, it does not */
+acts['decide-pick']({ dataset: { ref: base.id, i: '2' } });
+out.changed = [waits(String(decisions.decidedDecisions(store))), String(decisions.decidedDecisions(store)).includes('The earlier answer holds until you send this one.')];
+acts['decide-pick']({ dataset: { ref: base.id, i: '1' } });
+out.back = waits(String(decisions.decidedDecisions(store)));
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_a_chosen_option_is_said_to_be_unsent_and_a_long_answer_is_counted_and_cut(tmp_path):
+    """Pressing an option sends nothing, and the card says so beside the button that
+    sends (the stylesheet keeps the two in sight).  The person's own words are counted
+    towards the server's limit before they are sent, and a long answer is named by its
+    beginning where it is repeated."""
+    out = _client(tmp_path, UNSENT_SCRIPT)
+    assert out["fresh"] == [False, True]  # (the words are in the card, shown when it waits)
+    assert out["picked"] == [True, 0]
+    assert out["unpicked"] is False and out["blank"] is False
+    assert out["typed"] == [True, [False, True, ""]]
+    assert out["short"] == [False, True, ""]
+    assert out["near"] == [False, False, "3,990 of 4,000 characters"]
+    assert out["over"][:2] == [True, False] and out["over"][2].startswith("4,100 characters: ")
+    assert out["refused"] == [0, True, True]
+    assert out["sent"] == [["d-0000cccc", 1, len("The sweep I mean. " + "and so on " * 390) + 16]]
+    count, length, begins, whole = out["toast"]
+    assert (count, begins, whole) == (1, True, False) and length < 300, out["toast"]
+    assert out["page"] == [True, False]
+    assert out["row"] == [True, False]
+    assert out["changed"] == [True, True] and out["back"] is False
+    css = _text(STATIC_DIR / "css" / "app.css")
+    # What waits to be sent stays at the foot of the list; a folded row is a few lines.
+    assert re.search(r"\.dc-go\.dc-unsent \{[^}]*position: sticky; bottom: -?\d", css)
+    assert re.search(r"\.dc-unsent \.dc-wait \{ display: block", css)
+    assert re.search(r"\.dc-wait \{ display: none", css)
+    assert re.search(r"\.dc-old \.dc-oa \{[^}]*line-clamp: 3", css)
+    assert "say_chars" in _js("decisions.js") and "4000" not in _js("decisions.js")
 
 
 def test_the_client_follows_decisions_as_they_are_asked_and_answered():

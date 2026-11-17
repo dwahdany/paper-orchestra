@@ -15,6 +15,7 @@ import pytest
 from paper_orchestra.llm.base import ToolError
 from paper_orchestra.llm.fake import FakeRequest
 from paper_orchestra.research import agents, decisions, prompts
+from paper_orchestra.research.engine import read_state
 from paper_orchestra.research.model import EVENT_TYPES, NotFound, ProjectError
 from paper_orchestra.research.project import Project
 from test_research_agents import activity, context, make_project
@@ -771,6 +772,42 @@ def test_the_checkpoint_says_how_many_decisions_wait_and_the_project_goes_on(pro
     advance(project, team, backend)
     last = events(project, "checkpoint")[-1]
     assert "decisions" not in last["data"] and "decision" not in last["summary"]
+
+
+def test_a_rebuilt_checkpoint_does_not_keep_what_waited_as_what_was_done(project, backend):
+    """A state rebuilt from the events has the checkpoint's sentence and no account of its
+    own (``did``): what waited then, proposals and decisions, is cut off the sentence."""
+    from paper_orchestra import cli
+
+    team = AskingTeam()
+    advance(project, team, backend)
+    for page in project.pages(review="proposed"):
+        project.review(page.path, "accept")
+    live = advance(project, team, backend)
+    assert cli._account(live["checkpoint"]) == "The theorist proposed 2 hypotheses."
+
+    (project.root / "state.json").unlink()
+    rebuilt = read_state(project)["checkpoint"]
+
+    assert "did" not in rebuilt and "1 decision waits for your answer." in rebuilt["summary"]
+    # As a checkpoint without a decision reads once it is rebuilt: nothing is left.
+    assert cli._account(rebuilt) == ""
+    for count in (1, 2, 12):
+        said = (
+            "The theorist proposed 2 hypotheses. 2 hypotheses await your review. "
+            + decisions.waiting(count)
+        )
+        assert cli._account({"summary": said}) == "The theorist proposed 2 hypotheses."
+        assert (
+            cli._account({"summary": f"{said} Next: designing experiments."})
+            == "The theorist proposed 2 hypotheses."
+        )
+    # (the sentence of the demonstration project, which ends without what is next)
+    demo = "Round 1, analysis: 2 findings. 3 questions are waiting for you. " + decisions.waiting(1)
+    assert cli._account({"summary": demo}) == "Round 1, analysis: 2 findings."
+    # A sentence of the account that only speaks of a decision is the account's own.
+    kept = "The analyst left the decision to you. Nothing awaits your review. Next: more."
+    assert cli._account({"summary": kept}) == "The analyst left the decision to you."
 
 
 def test_a_checkpoint_without_decisions_reads_as_it_did(project, team, backend):

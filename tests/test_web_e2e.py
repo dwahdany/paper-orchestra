@@ -52,6 +52,8 @@ ADDRESS = re.compile(r"(http://127\.0\.0\.1:\d+)/\?token=")
 TOKEN_ENV = "PAPER_ORCHESTRA_UI_TOKEN"
 #: The variable that names the file whose presence switches the scripted model off.
 NO_MODEL_ENV = "PAPER_ORCHESTRA_E2E_NO_MODEL"
+#: The variable that names Modal's configuration file (``~/.modal.toml`` without it).
+MODAL_CONFIG_ENV = "MODAL_CONFIG_PATH"
 #: The option of ``paper-orchestra ui`` that ends the workers with the server.
 STOP_WORKERS = "--stop-workers-on-exit"
 #: ``dark`` runs the flows in the dark theme (``web_check.js --scheme dark``).
@@ -87,6 +89,54 @@ def _stop(process: subprocess.Popen) -> None:
             process.wait(timeout=10)
 
 
+def _server_env(tmp_path: Path, no_model: Path) -> dict[str, str]:
+    """The environment of the server of the test and of what builds its projects.
+
+    The checks look at a machine on which only the local backend can run something (the
+    demo's GPU experiment is "No backend can run this", and "run on" offers Local CPU and
+    only that).  A developer's machine may be signed in to Modal, and the server would then
+    offer Modal for them.  So Modal finds no credentials here: its token variables are left
+    out and its configuration is a file that does not exist.  Nothing of the person's is
+    read or changed.
+    """
+    return {
+        **{
+            name: value
+            for name, value in os.environ.items()
+            if name != TOKEN_ENV and not name.startswith("MODAL_")
+        },
+        "PYTHONPATH": os.pathsep.join(
+            [str(E2E_DIR), *filter(None, [os.environ.get("PYTHONPATH")])]
+        ),
+        "PAPER_ORCHESTRA_SCRIPTED_CLIENT": "scripted_model:client",
+        "PAPER_ORCHESTRA_E2E_PAUSE": "0.5",
+        NO_MODEL_ENV: str(no_model),
+        MODAL_CONFIG_ENV: str(tmp_path / "no-modal.toml"),
+        "PYTHONUNBUFFERED": "1",
+    }
+
+
+def test_the_server_of_the_test_cannot_use_modal(tmp_path, monkeypatch):
+    """The browser checks expect that nothing but this machine can run an experiment,
+    whatever the person who runs them is signed in to."""
+    pytest.importorskip("modal")
+    signed_in = tmp_path / "modal.toml"
+    signed_in.write_text('[default]\ntoken_id = "ak-test"\ntoken_secret = "as-test"\n')
+    ask = (
+        "from paper_orchestra.compute.modal_backend import modal_token_configured as c;"
+        "print('modal:', c())"
+    )
+    monkeypatch.setenv(MODAL_CONFIG_ENV, str(signed_in))
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-test")
+    # (this machine is signed in, as far as a child of this process can tell)
+    signed = _run([sys.executable, "-c", ask], env=dict(os.environ), timeout=60)
+    assert "modal: True" in signed.stdout, signed.stderr
+    env = _server_env(tmp_path, tmp_path / "no-model")
+    served = _run([sys.executable, "-c", ask], env=env, timeout=60)
+    assert "modal: False" in served.stdout, served.stderr
+
+
 @pytest.fixture
 def server(tmp_path):
     """A server on a temporary demo workspace; yields its address, its access token and
@@ -96,16 +146,7 @@ def server(tmp_path):
     token = secrets.token_urlsafe(24)
     # Not created here: the models work until the check that wants them gone writes it.
     no_model = tmp_path / "no-model"
-    env = {
-        **{name: value for name, value in os.environ.items() if name != TOKEN_ENV},
-        "PYTHONPATH": os.pathsep.join(
-            [str(E2E_DIR), *filter(None, [os.environ.get("PYTHONPATH")])]
-        ),
-        "PAPER_ORCHESTRA_SCRIPTED_CLIENT": "scripted_model:client",
-        "PAPER_ORCHESTRA_E2E_PAUSE": "0.5",
-        NO_MODEL_ENV: str(no_model),
-        "PYTHONUNBUFFERED": "1",
-    }
+    env = _server_env(tmp_path, no_model)
     # The demo project, and beside it the same project filled up to 150 pages: the checks
     # of a large project (the map folded, a large inbox decided at once, nothing typed in
     # one project turning up in another) need a second project to look at.  A third copy,

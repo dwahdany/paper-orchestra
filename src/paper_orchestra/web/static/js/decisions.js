@@ -9,6 +9,14 @@
    card then opens with the answer that holds (its option pressed, its words in the field),
    because a new answer replaces the earlier one as a whole. What is shown is what is sent.
 
+   Pressing an option chooses it and sends nothing: words may go with it. So that nobody
+   leaves with an answer that was only chosen, the card says "Not sent yet" beside the button
+   that sends, and keeps the two at the foot of the list while the card is in it (on a phone
+   the button is otherwise below the screen). An answer in the person's own words may be
+   long: the field counts towards the server's limit (`say_chars` of a decision) before
+   anything is sent, and where the answer is repeated (the toast, the folded row, the page it
+   is about) it is cut short; the field of the open card has all of it.
+
    An address of the inbox can name a decision (`#/p/<pid>/inbox/d-1a2b3c4d`): whoever
    says "answer it in the inbox" leads to that decision, opened and in sight (`main.js`).
 
@@ -27,15 +35,21 @@ export const waitingCount = (store) => store.pending().length + openDecisions(st
 /** "1 decision waits for your answer.", or nothing. */
 export const decisionsSentence = (n) => (n ? plural(n, 'decision') + (n === 1 ? ' waits' : ' wait') + ' for your answer.' : '');
 
-/** What the person answered, in a few words; empty while the decision is open. */
-export function answerWords(d) {
+/** `text` on one line, cut after `limit` characters (whole ones) with an ellipsis. */
+const clipped = (text, limit) => { const all = [...String(text || '').replace(/\s+/g, ' ').trim()]; return limit && all.length > limit ? all.slice(0, limit).join('').trimEnd() + '…' : all.join(''); };
+/** How much of the person's own words is repeated where an answer is only named. */
+const NAMED = 160;
+/** What the person answered, in a few words; empty while the decision is open. Their own
+    words are given whole, or cut after `limit` characters where the answer is only named. */
+export function answerWords(d, limit = 0) {
   const a = d && d.state !== 'open' ? d.answer : null;
   if (!a) return '';
   if (a.dismissed) return 'left to the agents: their default holds';
   const chosen = a.option ? (d.options || [])[a.option - 1] : null;
   const parts = [];
   if (chosen) parts.push('option ' + a.option + ', “' + chosen.label + '”');
-  if (a.text) parts.push(chosen ? '“' + a.text + '”' : a.text);
+  const text = limit ? clipped(a.text, limit) : a.text;
+  if (text) parts.push(chosen ? '“' + text + '”' : text);
   return parts.join('; ');
 }
 
@@ -53,6 +67,22 @@ function draftOf(id, d = find(id)) {
   const option = a && a.option >= 1 && a.option <= ((d || {}).options || []).length ? a.option : null;
   return (all[id] = { option, text: a ? a.text || '' : '', from, touched: false, sending: false, error: null });
 }
+/** Whether the card holds an answer that was not sent: an option or words the person gave
+    and that are not the answer as it stands. */
+function unsent(d, draft) {
+  const text = (draft.text || '').trim(), now = held(d);
+  if (!draft.touched || (!draft.option && !text)) return false;
+  return !now || (now.option || null) !== (draft.option || null) || (now.text || '').trim() !== text;
+}
+/** How long the words in the field are against what the server takes (`say_chars`, counted
+    as the server counts: without the blanks around them, in whole characters). Said from
+    four fifths of the limit on; `over` when the server would refuse them. */
+function length(d, draft) {
+  const limit = +(d || {}).say_chars || 0, n = [...(draft.text || '').trim()].length;
+  if (!limit || n < limit * 0.8) return { text: '', over: false };
+  if (n <= limit) return { text: n.toLocaleString('en-US') + ' of ' + limit.toLocaleString('en-US') + ' characters', over: false };
+  return { text: n.toLocaleString('en-US') + ' characters: ' + plural(n - limit, 'character') + ' more than the ' + limit.toLocaleString('en-US') + ' an answer can have. Shorten it, then send it.', over: true };
+}
 /** The address of the inbox with one decision in front. */
 export const decisionLink = (id) => link({ view: 'inbox', sel: '', sub: '', ref: id || '' });
 /** The decision an address of the inbox names, or nothing. */
@@ -69,6 +99,8 @@ function card(store, d) {
   const draft = draftOf(d.id, d), settled = d.state !== 'open', role = (d.raised_by || {}).role || 'an agent';
   const now = settled && d.answer && !d.answer.dismissed ? d.answer.option : null;
   const picked = draft.option ? (d.options || [])[draft.option - 1] : null;
+  const count = length(d, draft), waits = unsent(d, draft) && !draft.sending;
+  /* (the field opens tall enough to read a long answer in: its row has only the beginning, and a phone has no handle to pull) */
   const options = (d.options || []).map((o, i) => {
     const n = i + 1, on = draft.option === n;
     return html`<button type="button" class="dc-opt${on ? ' on' : ''}" data-act="decide-pick" data-ref="${d.id}" data-i="${n}" aria-pressed="${tf(on)}">
@@ -81,9 +113,10 @@ function card(store, d) {
     ${d.default ? html`<p class="dc-note"><b>${settled ? 'The default was' : 'Until you answer, the agents go on with'}:</b> ${d.default}</p>` : ''}
     ${held(d) ? html`<p class="dc-note dc-whole">A new answer replaces this one as a whole: the agents are shown the option that is pressed and the words in the field, and nothing else of the earlier answer.</p>` : ''}
     <label class="sr" for="dc-say-${d.id}">Your answer in your own words</label>
-    <textarea id="dc-say-${d.id}" class="dc-say" data-input="decide-text" data-ref="${d.id}" rows="2" placeholder="Or say it in your own words${(d.options || []).length ? ' (also together with an option)' : ''}">${draft.text}</textarea>
+    <textarea id="dc-say-${d.id}" class="dc-say" data-input="decide-text" data-ref="${d.id}" rows="${Math.min(8, Math.max(2, Math.ceil((draft.text || '').length / 45)))}" placeholder="Or say it in your own words${(d.options || []).length ? ' (also together with an option)' : ''}" aria-describedby="dc-count-${d.id}">${draft.text}</textarea>
+    <p class="dc-count${count.over ? ' over' : ''}" id="dc-count-${d.id}" aria-live="polite"${count.text ? '' : raw(' hidden')}>${count.text}</p>
     ${draft.error ? html`<p class="dc-err" role="alert">${draft.error}</p>` : ''}
-    <div class="dc-go"><button type="button" class="btn btn-primary" data-act="decide-send" data-ref="${d.id}"${draft.sending ? raw(' disabled') : ''}><span>${settled ? 'Change the answer' : 'Answer'}${picked ? html`: <span class="dc-pick">${picked.label}</span>` : ''}</span></button>
+    <div class="dc-go${waits ? ' dc-unsent' : ''}"><p class="dc-wait" role="status"><b>Not sent yet.</b> ${settled ? 'The earlier answer holds until you send this one.' : 'Press “Answer” to send it.'}</p><button type="button" class="btn btn-primary" data-act="decide-send" data-ref="${d.id}"${draft.sending ? raw(' disabled') : ''}><span>${settled ? 'Change the answer' : 'Answer'}${picked ? html`: <span class="dc-pick">${picked.label}</span>` : ''}</span></button>
       ${d.state === 'withdrawn' ? '' : html`<button type="button" class="btn btn-quiet" data-act="decide-dismiss" data-ref="${d.id}" data-tip="The agents go on with their default, and are told that the choice was left to them"${draft.sending ? raw(' disabled') : ''}>Not for me to decide</button>`}</div>`;
 }
 
@@ -112,7 +145,7 @@ export function decidedDecisions(store) {
 export function pageDecisions(store, path) {
   const mine = allDecisions(store).filter((d) => d.page === path);
   if (!mine.length) return '';
-  return html`<div class="dc-on-page">${mine.map((d) => html`<p class="dc-ref" data-decision-of="${d.id}">${icon(d.state === 'open' ? 'dot' : d.state === 'withdrawn' ? 'x' : 'check')}<span><b>${d.state === 'open' ? 'Waits for your decision' : d.state === 'withdrawn' ? 'Left to the agents' : 'You decided'}:</b> ${d.question}${d.state === 'open' ? '' : html` <q>${answerWords(d)}</q>`}
+  return html`<div class="dc-on-page">${mine.map((d) => html`<p class="dc-ref" data-decision-of="${d.id}">${icon(d.state === 'open' ? 'dot' : d.state === 'withdrawn' ? 'x' : 'check')}<span><b>${d.state === 'open' ? 'Waits for your decision' : d.state === 'withdrawn' ? 'Left to the agents' : 'You decided'}:</b> ${d.question}${d.state === 'open' ? '' : html` <q>${answerWords(d, NAMED)}</q>`}
     <a href="${decisionLink(d.id)}">${d.state === 'open' ? 'Answer it in the inbox' : 'Change it in the inbox'}</a></span></p>`)}</div>`;
 }
 
@@ -129,13 +162,17 @@ async function send(id, dismiss, say) {
     app.render('decide');
     return;
   }
+  /* (the server would refuse words over its limit: said here, with the words kept, before anything is sent) */
+  const long = dismiss ? { over: false } : length(d, draft);
+  if (long.over) { draft.error = 'Not sent: ' + long.text; app.render('decide'); return; }
   draft.sending = true; draft.error = null;
   app.render('decide');
   try {
     const answer = dismiss ? await api.dismissDecision(store.pid, id) : await api.answerDecision(store.pid, id, draft.option, text);
     delete app.ui.decide[id];
     await store.refreshNow();
-    const words = answerWords((answer || {}).decision || {});
+    /* (a long answer is named by its beginning: its card under "Your decisions" has all of it) */
+    const words = answerWords((answer || {}).decision || {}, NAMED);
     say(dismiss ? 'Left to the agents: they go on with their default.' : 'Answered: ' + words + '. Every later session of the agents is shown it.');
   } catch (error) {
     draft.sending = false;
@@ -152,5 +189,12 @@ export const decisionActs = (say) => ({
   'decide-send': (el) => send(el.dataset.ref, false, say),
   'decide-dismiss': (el) => send(el.dataset.ref, true, say),
 });
-/** The person typed into the field of a decision. */
-export const decisionTyped = (field) => { const draft = draftOf(field.dataset.ref); draft.text = field.value; draft.touched = true; };
+/** The person typed into the field of a decision. The card is not drawn again (the field
+    would lose its place): what depends on the words is set where it stands. */
+export const decisionTyped = (field) => {
+  const id = field.dataset.ref, d = find(id), draft = draftOf(id, d);
+  draft.text = field.value; draft.touched = true;
+  const card = field.closest ? field.closest('.dc') : null, go = card && card.querySelector('.dc-go'), counter = card && card.querySelector('.dc-count');
+  if (go) go.classList.toggle('dc-unsent', unsent(d, draft));
+  if (counter) { const count = length(d, draft); counter.textContent = count.text; counter.hidden = !count.text; counter.classList.toggle('over', count.over); }
+};

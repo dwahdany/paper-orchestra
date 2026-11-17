@@ -355,9 +355,12 @@ def same_question(first: str, second: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def answer_words(decision: Decision) -> str:
+def answer_words(decision: Decision, limit: int = 0) -> str:
     """What the person answered, in a few words: ``option 2, "A note to itself"``, with
-    their own words after it where they gave some.  Empty while the decision is open."""
+    their own words after it where they gave some.  Empty while the decision is open.
+
+    Their words are given whole (an agent is told all of them), or with ``limit`` cut
+    after that many characters, for a list in which the answer is only named."""
     answer = decision.answer
     if answer is None:
         return ""
@@ -368,9 +371,10 @@ def answer_words(decision: Decision) -> str:
     if chosen is not None:
         parts.append(f'option {answer.option}, "{chosen.label}"')
     if answer.text:
-        parts.append(
-            f'"{_one_line(answer.text)}"' if chosen is not None else _one_line(answer.text)
-        )
+        said = _one_line(answer.text)
+        if limit and len(said) > limit:
+            said = said[:limit].rstrip() + "…"
+        parts.append(f'"{said}"' if chosen is not None else said)
     return "; ".join(parts)
 
 

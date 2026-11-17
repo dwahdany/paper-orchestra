@@ -23,7 +23,12 @@ against what the server answers:
 - what an agent asks the person to choose (a decision) heads the inbox and is counted with
   what waits, on the tab, in its heading, on the overview and in the strip; on a phone every
   option, the field for the person's own words and both answers are within the screen and a
-  finger wide; an option and the words are sent in one request, an empty answer is not
+  finger wide, and once an option is touched "Not sent yet" and the button that sends are
+  on the screen together; the overview, which scrolls by itself, is no wider than the
+  phone, with the decision that waits and the lines of the feed in sight; words over the
+  server's limit (`say_chars` of a decision) are counted as too many and not sent, a long
+  answer goes out whole and is named by its beginning in the toast and on its row; an
+  option and the words are sent in one request, an empty answer is not
   sent, the answered decision is listed folded with the answer, an answer changed in
   another window arrives by itself (`decision.answered`), it can be answered again and left
   to the agents, and the page it is about says how it stands; the decision is what the
@@ -193,6 +198,14 @@ node tests/e2e/web_check.js --base http://127.0.0.1:8600        # exit status 0 
 ```
 
 To look at the app yourself meanwhile, open the link the server printed.
+
+The checks are written for a server that can run experiments on this machine and nowhere
+else, which is how `pytest tests/test_web_e2e.py` starts it: it leaves `MODAL_*` out of
+the server's environment and names a `MODAL_CONFIG_PATH` that does not exist. A server
+started by hand on a machine that is signed in to Modal can run the demo's GPU experiment
+on it; `inbox` and `experiments` then say in a `note` line that an experiment nothing can
+run was not looked at, and go on. Start the server with
+`MODAL_CONFIG_PATH="$WS/no-modal.toml"` to have them look at it.
 
 The flows change the project, so every run needs a fresh workspace. Options:
 

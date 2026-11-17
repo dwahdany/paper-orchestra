@@ -1148,6 +1148,9 @@ _SAID_NEXT = re.compile(r"(?:^|(?<=[.!?…]\s))Next: [^.]*\.\s*$")
 _SAID_WAITING = re.compile(
     r"(?:^|(?<=[.!?…]\s))[^.!?]*\b(?:(?:is|are) waiting for you|awaits? your review)\.\s*$"
 )
+#: Between the two, where an agent had asked the person to choose something: how many
+#: decisions waited (``decisions.waiting``; the demonstration project ends with it).
+_SAID_UNDECIDED = re.compile(r"(?:^|(?<=[.!?…]\s))\d+ decisions? waits? for your answer\.\s*$")
 _STAMP = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
 _AT_STAMP = re.compile(rf"\b(at )?({_STAMP})")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -1155,18 +1158,21 @@ _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
 
 def _account(checkpoint: Mapping[str, Any]) -> str:
     """What the phases did, as their checkpoint tells it, without what was true at that
-    moment only: how many things waited for the person and what was next.  Both are said
-    from the project as it is now, on lines of their own.
+    moment only: how many things waited for the person, how many decisions, and what was
+    next.  They are said from the project as it is now, on lines of their own.
 
     The engine keeps that account by itself (``did``).  A checkpoint without it (written
-    by an earlier version) has it in its summary, before those two sentences.
+    by an earlier version, or rebuilt from the events after ``state.json`` was lost) has
+    it in its summary, before those sentences.
     """
     did = checkpoint.get("did")
     if isinstance(did, str) and did.strip():
         return " ".join(did.split())
     summary = checkpoint.get("summary")
     told = " ".join(summary.split()) if isinstance(summary, str) else ""
-    return _SAID_WAITING.sub("", _SAID_NEXT.sub("", told).rstrip()).rstrip()
+    for stale in (_SAID_NEXT, _SAID_UNDECIDED, _SAID_WAITING):
+        told = stale.sub("", told).rstrip()
+    return told
 
 
 def _readable(text: str) -> str:
@@ -2206,6 +2212,11 @@ def research_request(
     _say(f"Left a request {whom}{target} ({request.id}). {when}")
 
 
+#: How much of the person's own words the list of decisions repeats; one decision, asked
+#: for by itself, is said whole.
+_ANSWER_NAMED = 160
+
+
 def _decision_lines(decision: Any, number: int | None = None) -> list[str]:
     """One decision as it is read at a terminal: the question, who asked, the options by
     number, what the agent would take, the default, and what was answered."""
@@ -2299,7 +2310,8 @@ def _what_a_new_answer_drops(before: Any, after: Any) -> str:
         gone = "your earlier words are no longer part of it"
         keep = f'give them again with the option: `--option {now.option} --say "..."`'
     return (
-        f" It replaces your earlier answer ({answer_words(before)}) as a whole: {gone}. "
+        f" It replaces your earlier answer ({answer_words(before, _ANSWER_NAMED)}) as a "
+        f"whole: {gone}. "
         f"To keep both, {keep}."
     )
 
@@ -2369,7 +2381,9 @@ def research_decide(
             _say("")
             _say("Decided:")
             for item in settled:
-                _say(f"  {numbers[item.id]}. {item.id}  {item.question}  ->  {answer_words(item)}")
+                # (named by its beginning: `research decide PROJECT N` says all of it)
+                said = answer_words(item, _ANSWER_NAMED)
+                _say(f"  {numbers[item.id]}. {item.id}  {item.question}  ->  {said}")
         if waiting:
             _say("")
             _say(

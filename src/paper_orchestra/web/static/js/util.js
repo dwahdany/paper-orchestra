@@ -99,6 +99,8 @@ export function checkpointDid(checkpoint) {
     .replace(heading, '')
     /* what comes next is said by the button, from the state as it is now */
     .replace(/(^|[.!?]\s+)Next: [^.]*\.\s*$/, '$1')
+    /* how many decisions waited, where an agent had asked for one: the page counts them as they are now */
+    .replace(/(^|[.!?]\s+)\d+ decisions? waits? for your answer\.\s*$/, '$1')
     .replace(/(^|[.!?]\s+)[^.!?]*\b(?:(?:is|are) waiting for you|awaits? your review)\.\s*$/, '$1')
     .trim());
 }

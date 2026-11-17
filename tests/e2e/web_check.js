@@ -52,6 +52,11 @@ async function api(method, url, body) {
   return { status: response.status, data };
 }
 const pagePath = (p) => p.split('/').map(encodeURIComponent).join('/');
+/** The backends the server says can run an experiment as it is planned (`options` of its
+    view). The checks are written for a server that has this machine and nothing else, as the
+    test starts it (`tests/test_web_e2e.py`); one that is started by hand may be signed in to
+    Modal, and then the demo's GPU experiment is not "No backend can run this". */
+const runnable = async (pid, id) => ((((await api('GET', '/api/projects/' + pid + '/experiments/' + id)).data || {}).options) || []).filter((o) => o.can_run).map((o) => o.backend);
 
 /** A browser context the server lets in: the link with the token is opened once, before
     anything else, as a person opens the link the server printed. The browser keeps the
@@ -199,7 +204,7 @@ CHECKS.screens = async ({ browser, pid }) => {
 CHECKS.phone = async ({ browser, pid }) => {
   const routes = ['#/library', '#/start', '#/setup', '#/p/PID/inbox', '#/p/PID/inbox/H5', '#/p/PID/inbox/E3', '#/p/PID/inbox/H5/edit', '#/p/PID/map', '#/p/PID/wiki', '#/p/PID/experiments', '#/p/PID/overview', '#/p/PID/paper'];
   const NARROW = () => { const de = document.documentElement, out = de.scrollWidth > de.clientWidth ? ['document ' + de.scrollWidth + '>' + de.clientWidth] : [];
-    ['#top', '#status', '.in-list', '.in-detail'].forEach((s) => { const el = document.querySelector(s); if (el && !el.hidden && el.scrollWidth > el.clientWidth + 1) out.push(s + ' ' + el.scrollWidth + '>' + el.clientWidth); });
+    ['#top', '#status', '.in-list', '.in-detail', '.overview', '.library', '.setup', '.start'].forEach((s) => { const el = document.querySelector(s); if (el && !el.hidden && el.scrollWidth > el.clientWidth + 1) out.push(s + ' ' + el.scrollWidth + '>' + el.clientWidth); });
     return out; };
   /* where each of these stands, the ones that are shown: [what, left, right, top, bottom, width, height] */
   const BOXES = (selectors) => { const out = [];
@@ -237,6 +242,8 @@ CHECKS.phone = async ({ browser, pid }) => {
       ok(!small.length, width + ' ' + hash + ': the phone zooms in on a field under 16 px: ' + small.join(', '));
       if (hash.endsWith('/edit')) await reach(page, width, 'the editor', ['.ed-fields input'], 40);
       if (hash.endsWith('/map') || hash.endsWith('/overview')) await reach(page, width, hash.split('/').pop(), ['.go > .btn'], 40);
+      /* the overview scrolls by itself, so the document is not wider when it is: what waits for an answer and what the feed says of it are read without a push sideways */
+      if (hash.endsWith('/overview')) await reach(page, width, 'the overview', ['.ov-decide', '.ov-col', '.feed .ev', '.rq-form select']);
       if (hash.endsWith('/inbox/E3')) ok(await page.evaluate(() => { const word = document.querySelector('.in-detail .kicker-kind > span').firstChild, r = document.createRange(); r.setStart(word, 0); r.setEnd(word, word.data.trimEnd().length); return r.getClientRects().length === 1; }), width + ': the kind of a proposal breaks in the middle of a word');
     }
     /* the row of views, scrolled to its end (the open view is then out of sight), stays there when the bar is written again */
@@ -260,11 +267,16 @@ CHECKS.phone = async ({ browser, pid }) => {
     ok(await page.evaluate(() => { const card = document.querySelector('.dc-panel .dc'); return card.scrollWidth <= card.clientWidth + 1; }), width + ': the card of a decision is wider than itself');
     await page.tap('.dc-panel .dc-opt >> nth=1');
     await until(page, () => document.querySelectorAll('.dc-panel .dc-opt[aria-pressed="true"]').length === 1 && /^Answer: /.test(document.querySelector('.dc-panel [data-act="decide-send"]').textContent.trim()), null, 4000, 'a touched option of a decision is marked and named on the button');
+    /* the touch chose and sent nothing: the card says so, and the button that sends is on the screen with it */
+    const unsent = await page.evaluate(() => { const go = document.querySelector('.dc-panel .dc-go'), said = go.querySelector('.dc-wait').getBoundingClientRect(), send = go.querySelector('[data-act="decide-send"]').getBoundingClientRect(), at = document.elementFromPoint(send.left + send.width / 2, send.top + send.height / 2);
+      return { said: said.height ? go.querySelector('.dc-wait').textContent : '', top: Math.round(Math.min(said.top, send.top)), bottom: Math.round(send.bottom), high: window.innerHeight, hit: !!at && !!at.closest('[data-act="decide-send"]') }; });
+    ok(/^Not sent yet\./.test(unsent.said) && unsent.top >= 0 && unsent.bottom <= unsent.high && unsent.hit, width + ': after an option is touched, "Not sent yet" and the button that sends are not both on the screen: ' + JSON.stringify(unsent));
     ok(!(await page.evaluate(SMALL)).length, width + ': the field of a decision is under 16 px: the phone zooms in on it');
     ok(!(await page.evaluate(NARROW)).length, width + ': with an option chosen the inbox is wider than the phone: ' + (await page.evaluate(NARROW)).join('; '));
     await page.waitForTimeout(700);        // (the second touch of a double touch is not a touch: it chooses once)
     await page.tap('.dc-panel .dc-opt >> nth=1');
     await until(page, () => !document.querySelector('.dc-panel .dc-opt[aria-pressed="true"]'), null, 4000, 'a later touch takes the choice back');
+    ok((await count(page, '.dc-panel .dc-go.dc-unsent')) === 0, width + ': with the choice taken back the card still says that something is not sent');
     /* "Answer it in the inbox", on the page the decision is about, leads to that decision and
        not to wherever the list was left: here it had been read to its end */
     const asked = (((await api('GET', '/api/projects/' + pid + '/decisions')).data || {}).decisions || []).find((x) => x.state === 'open' && x.page);
@@ -466,6 +478,34 @@ CHECKS.decisions = async ({ page, pid: demo, spare }) => {
   now = (await listed()).find((x) => x.id === d.id);
   ok(now.answers.length === 4 && now.answer.option === 2 && now.answer.text === 'Only what fits on the laptop.', 'another option keeps the words of the answer: ' + JSON.stringify(now.answers.map((a) => [a.option, a.text])));
   ok(await page.evaluate((id) => document.querySelector('.dc-old[data-decision="' + id + '"]').open, d.id), 'the row stays open when the list is drawn again');
+  /* a long answer in the person's own words: the field counts towards the server's limit, what is over it is not sent, and where the answer is repeated it is its beginning */
+  const most = now.say_chars, sentBefore = posted.length;
+  if (ok(most > 0, 'a decision says how long the person\'s own words may be (say_chars): ' + most)) {
+    await page.fill(old + '.dc-say', 'x'.repeat(most + 100));
+    await until(page, (sel) => { const c = document.querySelector(sel + '.dc-count'); return !!c && !c.hidden && c.classList.contains('over'); }, old, 4000, 'words over the limit are counted as too many while they are typed');
+    await page.click(old + '[data-act="decide-send"]');
+    await until(page, (sel) => /^Not sent: /.test((document.querySelector(sel + '.dc-err') || {}).textContent || ''), old, 4000, 'words over the limit are said to be not sent');
+    ok(posted.length === sentBefore && (await page.inputValue(old + '.dc-say')).length === most + 100, 'words over the limit are sent all the same, or lost: ' + (posted.length - sentBefore) + ' requests');
+    const long = 'The sweep I mean is this one. ' + 'and so on '.repeat(Math.floor((most - 60) / 10)) + 'to the very end.';
+    await page.fill(old + '.dc-say', long);
+    await until(page, (sel) => / of [\d,]+ characters$/.test((document.querySelector(sel + '.dc-count') || {}).textContent || ''), old, 4000, 'a long answer within the limit is counted towards it');
+    await page.click(old + '[data-act="decide-send"]');
+    await until(page, () => /^Answered: option 2/.test((document.querySelector('.toast') || {}).textContent || ''), null, 8000, 'the long answer is sent');
+    now = (await listed()).find((x) => x.id === d.id);
+    ok(now.answer.text === long, 'the server holds the long answer whole: ' + now.answer.text.length + ' of ' + long.length + ' characters');
+    const toast = await page.evaluate(() => { const t = document.querySelector('.toast'); return [Math.round(t.getBoundingClientRect().height), t.textContent.length, window.innerHeight]; });
+    ok(toast[0] <= toast[2] / 4 && toast[1] < 400 && !(await text(page, '.toast')).includes('to the very end.'), 'the toast repeats a long answer whole: ' + JSON.stringify(toast));
+    /* its row is a few lines, folded or open; the field of the open card has all of it */
+    const rowHigh = () => page.evaluate((id) => { const row = document.querySelector('.dc-old[data-decision="' + id + '"]'); return [row.open, Math.round(row.querySelector('summary').getBoundingClientRect().height)]; }, d.id);
+    const opened = await rowHigh();
+    await page.click('.dc-old[data-decision="' + d.id + '"] > summary');
+    const folded = await rowHigh();
+    ok(opened[0] && opened[1] <= 220 && !folded[0] && folded[1] <= 220, 'the row of a long answer is ' + opened[1] + ' px tall when open and ' + folded[1] + ' px when folded');
+    await page.click('.dc-old[data-decision="' + d.id + '"] > summary');
+    await page.waitForSelector('.dc-old[data-decision="' + d.id + '"][open] .dc-opt');
+    ok((await page.inputValue(old + '.dc-say')) === long, 'the field of the opened card does not have the whole answer');
+    await shot(page, 'decisions-long');
+  }
   await page.click('.dc-old[data-decision="' + d.id + '"] [data-act="decide-dismiss"]');
   await until(page, (id) => /left to the agents/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || ''), d.id, 8000, 'it can be left to the agents after all');
   ok((await listed()).find((x) => x.id === d.id).state === 'withdrawn' && (await count(page, '.dc-old[data-decision="' + d.id + '"] [data-act="decide-dismiss"]')) === 0, 'the server says withdrawn, and the row no longer offers to leave it');
@@ -826,9 +866,17 @@ CHECKS.inbox = async ({ page, pid }) => {
   /* a stale decision: the page is revised after it was read, the decision is refused and rolled back */
   await page.click('.in-row:has-text("E3") .in-main');
   await page.waitForSelector('.in-detail .page-title:has-text("small Transformer")');
-  await page.waitForSelector('.in-detail .review .note-warn');
-  ok(/No backend can run this/.test(await text(page, '.in-detail .review .note-warn')), 'an experiment that nothing here can run says so, with each backend\'s reason');
-  ok(await page.locator('.in-detail [data-act="accept-run"]').isDisabled(), 'and accept and run is not offered for it');
+  const runsE3 = await runnable(pid, 'E3');
+  if (!runsE3.length) {
+    await page.waitForSelector('.in-detail .review .note-warn');
+    ok(/No backend can run this/.test(await text(page, '.in-detail .review .note-warn')), 'an experiment that nothing here can run says so, with each backend\'s reason');
+    ok(await page.locator('.in-detail [data-act="accept-run"]').isDisabled(), 'and accept and run is not offered for it');
+  } else {
+    /* (a server that can use another backend: the rest of the check goes on all the same) */
+    notes.push('inbox: this server can run the GPU experiment of the demonstration (on ' + runsE3.join(', ') + '); what the inbox says of an experiment that nothing can run was not looked at');
+    await page.waitForSelector('.in-detail .review .runon select');
+    ok((await count(page, '.in-detail .review .note-warn:has-text("No backend can run this")')) === 0, 'an experiment that ' + runsE3.join(', ') + ' can run is said to be one that nothing can run');
+  }
   const before = await inboxCount(page);
   await page.click('.in-detail [data-act="accept"]');
   await until(page, (n) => document.querySelector('.views .count').textContent === String(n - 1), before, 3000, 'the accept shows at once');
@@ -1086,7 +1134,9 @@ CHECKS.experiments = async ({ page, pid }) => {
   if ((await api('GET', '/api/projects/' + pid + '/pages/E3')).data.page.review === 'proposed') {
     await open(page, '#/p/' + pid + '/experiments/E3', '.approve .backend');
     ok((await count(page, '.approve .backend.off')) >= 1, 'a backend that cannot run the plan is shown as such, with the reason');
-    ok(await page.locator('.approve [data-act="accept-run"]').isDisabled(), 'accept and run is not offered when nothing can run it');
+    const runsE3 = await runnable(pid, 'E3');
+    if (!runsE3.length) ok(await page.locator('.approve [data-act="accept-run"]').isDisabled(), 'accept and run is not offered when nothing can run it');
+    else notes.push('experiments: this server can run the GPU experiment of the demonstration (on ' + runsE3.join(', ') + '); whether accept and run is withheld when nothing can run it was not looked at');
     await shot(page, 'experiment-proposed');
   }
   /* an approved one runs now: live log, then metrics and a figure */
@@ -1431,7 +1481,8 @@ CHECKS.agents = async ({ page, pid }) => {
   ok(!!planned, 'the scripted experiment waits for a decision');
   await open(page, '#/p/' + pid + '/inbox/' + planned.id, '.in-detail .runon select');
   ok(/Local CPU/.test(await text(page, '.in-detail .runon select')), 'run on offers what can run it: ' + (await text(page, '.in-detail .runon select')).trim());
-  ok((await page.locator('.in-detail .runon option').count()) === 1, 'and only that');
+  const runsIt = await runnable(pid, planned.id);
+  ok((await page.locator('.in-detail .runon option').count()) === runsIt.length && runsIt.includes('local'), 'and only that: ' + (await page.locator('.in-detail .runon option').count()) + ' offered, the server says ' + runsIt.join(', '));
   await shot(page, 'inbox-run-on');
   await page.click('.in-detail [data-act="accept-run"]');
   await until(page, (id) => location.hash.endsWith('/experiments/' + id), planned.id, 10000, 'accept and run opens the experiment');

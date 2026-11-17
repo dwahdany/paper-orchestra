@@ -5676,6 +5676,8 @@ def test_decisions_are_listed_with_their_options_and_rendered_context(client, pr
     assert len(listed) == 1
     row = listed[0]
     html = row.pop("context_html")
+    # How long the person's own words may be: the field counts towards it before sending.
+    assert row.pop("say_chars") == 4000
     assert row == decision.to_dict()
     assert row["options"][0] == {"label": "Small batches only", "meaning": "Batch sizes up to 32."}
     assert (row["recommended"], row["state"], row["answer"]) == (1, "open", None)
