@@ -68,7 +68,7 @@ from paper_orchestra.memory.lock import WikiLock
 # The usage ledger is the paper pipeline's, so that usage.json has one shape and one
 # way of pricing wherever it is written.
 from paper_orchestra.pipeline import read_carried_usage, usage_report
-from paper_orchestra.research import agents, experiments
+from paper_orchestra.research import agents, decisions, experiments
 from paper_orchestra.research.agents import AgentContext, AgentReport
 from paper_orchestra.research.model import (
     FOR_ALL,
@@ -2336,9 +2336,18 @@ class Engine:
         review = (
             f"{_and(waiting)} {verb} your review." if waiting else "Nothing awaits your review."
         )
+        # What the agents asked the person to choose.  It holds nothing up: the agents go
+        # on with the default each question states, so it is said and not waited for.
+        undecided = len(self.project.decisions(state="open"))
         resumes = " (it resumes where it stopped)" if following == name and name != "run" else ""
         account = [*notes, *self._waiting_for_research(following), *self._unpriced_note()]
-        closing = [*account, *missing, review, f"Next: {_DOING[following]}{resumes}."]
+        closing = [
+            *account,
+            *missing,
+            review,
+            decisions.waiting(undecided),
+            f"Next: {_DOING[following]}{resumes}.",
+        ]
         refs = [page.path for page in self.project.pages(review="proposed")][:50]
         event = self._emit(
             "checkpoint",
@@ -2350,6 +2359,7 @@ class Engine:
                 "pending": pending["by_kind"],
                 "edits": pending["proposals"],
                 "next": following,
+                **({"decisions": undecided} if undecided else {}),
                 **recommended,
             },
         )

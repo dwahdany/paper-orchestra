@@ -64,7 +64,7 @@ from paper_orchestra.memory.harness import ContextHarness, MemoryPolicy
 from paper_orchestra.memory.tools import virtual_path
 from paper_orchestra.memory.transcript import TranscriptLog
 from paper_orchestra.memory.wiki import TRANSCRIPTS_DIR
-from paper_orchestra.research import experiments, prompts
+from paper_orchestra.research import decisions, experiments, prompts
 from paper_orchestra.research.access import (
     MAX_INPUT_BYTES,
     ProjectMemoryBackend,
@@ -762,7 +762,7 @@ def describe_event(role: str, event: Mapping[str, Any]) -> tuple[str, list[str]]
         what = named(given["path"], 80) if given.get("path") else "the top level"
         verb = "listed" if name == "repo_list" else "read"
         return f"{who} {verb} {what} in your repository.", []
-    if name in ("propose_edit", "name_project", "write_code"):
+    if name in ("propose_edit", "name_project", "write_code", "ask_decision"):
         # What came of these is told where it happens (the project's own events, the
         # tool once the file is written): a call that was refused did nothing.
         return None
@@ -801,6 +801,13 @@ class _Session:
         #: Edit proposals that were on file before this attempt: what comes after is its own.
         self._known_edits = {proposal.id for proposal in project.proposals(review=None)}
         offered = [search_tool(project), propose_edit_tool(project, role, ctx.round), *tools]
+        if role in decisions.ASKING_ROLES:
+            # Raising a decision is all a session can do with one: the person answers.
+            offered.append(
+                decisions.ask_decision_tool(
+                    project, role, round=ctx.round, phase=ctx.phase, session=ctx.session_id(role)
+                )
+            )
         index = self.backend.index()
         self._last = ""
         self._model = model_for(project, role)
@@ -951,6 +958,7 @@ def _earlier(
     on the researcher's desk.  ``rejected``: the rejected pages of those kinds.
     ``rejected_edits``: suggested edits the person turned down, with the reason.
     ``readable`` are undecided pages the session may open; they are told apart.
+    ``decisions``: what the agents asked the person to decide, with every answer.
     """
     author, own = role_author(role), ctx.session_id(role)
     kinds = creatable_kinds(role)
@@ -965,6 +973,8 @@ def _earlier(
         "pending": pending[-MAX_TOLD:],
         "rejected": rejected[-MAX_TOLD:],
         "rejected_edits": _rejected_edits(ctx.project, role),
+        # Every session is told what was asked of the person and what they answered.
+        "decisions": decisions.told(ctx.project),
     }
 
 

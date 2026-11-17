@@ -50,7 +50,9 @@ from paper_orchestra.memory.wiki import (
     slugify,
     split_front_matter,
 )
+from paper_orchestra.research import decisions as decision_records
 from paper_orchestra.research import repo as repositories
+from paper_orchestra.research.decisions import DECISIONS_DIR, Decision
 from paper_orchestra.research.model import (
     APPROVAL_FIELDS,
     EDITED_BY_PERSON,
@@ -201,6 +203,7 @@ _OWN_ENTRIES: tuple[str, ...] = (
     WIKI_DIR,
     PROPOSALS_DIR,
     REQUESTS_DIR,
+    DECISIONS_DIR,
     INPUTS_DIR,
     NOTES_DIR,
     TRANSCRIPTS_DIR,
@@ -2851,6 +2854,186 @@ class Project:
                 },
             )
 
+    # -- decisions ---------------------------------------------------------------
+
+    def _decision_path(self, decision_id: str) -> Path:
+        return self.root / DECISIONS_DIR / f"{decision_id}.json"
+
+    def decision(self, decision_id: Any) -> Decision:
+        """The decision with that id.  ``NotFound`` when there is none."""
+        data = None
+        if isinstance(decision_id, str) and re.fullmatch(r"d-[0-9a-f]+", decision_id):
+            data = self._own_json(self._decision_path(decision_id))
+        if not isinstance(data, dict):
+            raise NotFound(f"There is no decision {decision_id!r}.")
+        return Decision.from_dict(data)
+
+    def decisions(self, *, state: str | None = None) -> list[Decision]:
+        """What the agents asked the person to decide, oldest first: everything, or what
+        is in ``state`` (``open``, ``answered``, ``withdrawn``).  A project without the
+        folder has none."""
+        folder = self.root / DECISIONS_DIR
+        found = []
+        for file in sorted(folder.glob("d-*.json")) if folder.is_dir() else []:
+            data = self._own_json(file)
+            if isinstance(data, dict) and data.get("id"):
+                decision = Decision.from_dict(data)
+                if state is None or decision.state == state:
+                    found.append(decision)
+        return sorted(found, key=lambda decision: (decision.created, decision.id))
+
+    def ask_decision(
+        self,
+        question: str,
+        *,
+        options: Sequence[Any],
+        role: str,
+        context: str = "",
+        recommended: int | None = None,
+        reason: str = "",
+        default: str = "",
+        page: str | None = None,
+        blocks: Sequence[str] = (),
+        round: int | None = None,
+        phase: str = "",
+        session: str = "",
+    ) -> Decision:
+        """Put a choice in front of the person on behalf of the agent ``role``.
+
+        ``options`` are two to five ``{"label", "meaning"}``; ``recommended`` is the
+        number of the one the agent would take (from 1) and ``reason`` why;
+        ``default`` is what the agents do while nobody has answered.  ``page`` is
+        the wiki page the question belongs to and ``blocks`` the pages that wait
+        on the answer.  Nothing waits for the answer: the project goes on, and the
+        decision is shown to the person and to every later session.
+        """
+        author = role_author(role)
+        with self._lock:
+            linked = None
+            if page:
+                linked = self.resolve(page)
+                if linked is None:
+                    raise NotFound(f"No page matches {page!r}, the page the decision is about.")
+            waiting_on = []
+            for ref in blocks:
+                path = self.resolve(ref)
+                if path is None:
+                    raise NotFound(f"No page matches {ref!r}, a page that waits on the decision.")
+                waiting_on.append(path)
+            round = self.current_round() if round is None else int(round)
+            decision = decision_records.new_decision(
+                id=f"d-{secrets.token_hex(4)}",
+                question=question,
+                options=options,
+                context=context,
+                recommended=recommended,
+                reason=reason,
+                default=default,
+                page=linked,
+                blocks=list(dict.fromkeys(waiting_on)),
+                raised_by={
+                    "role": role_of(author),
+                    "round": round,
+                    "phase": str(phase or ""),
+                    "session": str(session or ""),
+                },
+                created=self._created_after(self.decisions()),
+            )
+            _check_storable("The decision", decision.to_dict())
+            (self.root / DECISIONS_DIR).mkdir(exist_ok=True)
+            write_json(self._decision_path(decision.id), decision.to_dict())
+            asks = f"The {decision.role} asks you to decide: {_clip(decision.question, 200)}"
+            self.emit(
+                decision_records.DECISION_ASKED,
+                _sentence(asks),
+                phase=str(phase or ""),
+                agent=decision.role,
+                round=round,
+                refs=[f"{DECISIONS_DIR}/{decision.id}.json", *([linked] if linked else [])],
+                data={"decision": decision.id, "page": linked, "options": len(decision.options)},
+            )
+        return decision
+
+    def _decided(self, decision: Decision, type: str, summary: str, changed: bool) -> Decision:
+        """Write what the person said to a decision and say so in the event stream.  What
+        else the file holds is kept."""
+        on_file = self._own_json(self._decision_path(decision.id))
+        extra = on_file if isinstance(on_file, dict) else {}
+        write_json(self._decision_path(decision.id), {**extra, **decision.to_dict()})
+        answer = decision.answer
+        self.emit(
+            type,
+            _sentence(summary),
+            refs=[
+                f"{DECISIONS_DIR}/{decision.id}.json",
+                *([decision.page] if decision.page else []),
+            ],
+            data={
+                "decision": decision.id,
+                "page": decision.page,
+                "option": answer.option if answer else None,
+                "state": decision.state,
+                # Whether it replaces something the person had said before.
+                "changed": changed,
+                "by": HUMAN,
+            },
+        )
+        return decision
+
+    def answer_decision(
+        self, decision_id: str, *, option: int | None = None, text: str = ""
+    ) -> Decision:
+        """The person's answer to a decision: the number of an option (from 1), their own
+        words, or both.
+
+        One that was answered or left to the agents before can be answered again:
+        the new answer is added with its time, and it is the one that holds.
+        ``NotFound`` when there is no such decision, ``ProjectError`` for an answer
+        that says nothing or names an option the decision does not have.
+        """
+        with self._lock:
+            before = self.decision(decision_id)
+            latest = before.answers[-1].at if before.answers else ""
+            decision = decision_records.with_answer(
+                before, at=stamp_after(self._clock.now(), latest), option=option, text=text
+            )
+            _check_storable("The answer", decision.answers[-1].text)
+            verb = "changed your answer" if before.state != "open" else "decided"
+            said = decision_records.answer_words(decision)
+            said = _clip(said[:1].upper() + said[1:], 200)
+            return self._decided(
+                decision,
+                decision_records.DECISION_ANSWERED,
+                f"You {verb}: {_sentence(_clip(decision.question, 120))} {said}",
+                before.state != "open",
+            )
+
+    def dismiss_decision(self, decision_id: str) -> Decision:
+        """Leave a decision to the agents: "not for me to decide, use your default".
+
+        It no longer waits for the person, and the sessions are told that the
+        default holds.  It can still be answered later (:meth:`answer_decision`).
+        Dismissing one that is dismissed already changes nothing.
+        """
+        with self._lock:
+            before = self.decision(decision_id)
+            if before.state == "withdrawn":
+                return before
+            latest = before.answers[-1].at if before.answers else ""
+            decision = decision_records.with_dismissal(
+                before, at=stamp_after(self._clock.now(), latest)
+            )
+            asked = _sentence(_clip(decision.question, 120))
+            goes_on = (
+                f" They go on with: {_clip(decision.default, 160)}" if decision.default else ""
+            )
+            return self._decided(
+                decision,
+                decision_records.DECISION_DISMISSED,
+                f"You left a decision to the agents: {asked}{goes_on}",
+                before.state != "open",
+            )
+
     # -- events ------------------------------------------------------------------
 
     def _last_seq(self, handle: Any, size: int) -> int:
@@ -3130,7 +3313,8 @@ class Project:
 
         ``{"pages": total, "by_kind": {kind: n}, "by_review": {review: n},
         "pending": {"total", "pages", "proposals", "by_kind": {kind: n}},
-        "experiments": {state: n}, "requests": {"open": n}}``.  ``by_kind``,
+        "experiments": {state: n}, "requests": {"open": n}, "decisions": {"open": n}}``.
+        ``by_kind``,
         ``by_review`` and ``experiments`` name every kind, review and state, with
         zeros; rejected experiments are not counted on the board.
         """
@@ -3156,6 +3340,7 @@ class Project:
                 for state in STATES["experiment"]
             },
             "requests": {"open": len(self.requests(state="open"))},
+            "decisions": {"open": len(self.decisions(state="open"))},
         }
 
     def search(
@@ -3221,7 +3406,7 @@ class Project:
         cutoff that cannot be read, which stops the research until it is corrected),
         an engine state that was lost, pages with missing or unknown front matter,
         ids used twice, relations that point at nothing or at the wrong kind of
-        page, proposal and request files that are not valid JSON.
+        page, proposal, request and decision files that are not valid JSON.
         """
         found = [{"path": PROJECT_FILE, "message": message} for message in self._file_problems]
         lost = self.state_lost()
@@ -3251,7 +3436,11 @@ class Project:
                             f"{name} points at: {', '.join(relation.targets)}"
                         )
             found += [{"path": page.path, "message": message} for message in messages]
-        for folder, prefix in ((PROPOSALS_DIR, "ep-"), (REQUESTS_DIR, "rq-")):
+        for folder, prefix in (
+            (PROPOSALS_DIR, "ep-"),
+            (REQUESTS_DIR, "rq-"),
+            (DECISIONS_DIR, "d-"),
+        ):
             directory = self.root / folder
             for file in sorted(directory.glob(f"{prefix}*.json")) if directory.is_dir() else []:
                 if file.is_symlink() and not _stays_inside(self.root, file):
