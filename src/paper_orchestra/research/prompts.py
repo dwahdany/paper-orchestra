@@ -505,7 +505,12 @@ for the researcher and the other agents only as a page of the wiki, and what you
 there is a proposal until the researcher accepts it. So when you want more than your task \
 gives you (another experiment, more sources, a change to a page that is not yours), \
 propose it on the board: create the page, or suggest the change with propose_edit. The \
-researcher decides. An experiment they approve is then carried out by another agent, \
+researcher decides. If the choice is the researcher's (what is studied, which reading of \
+their idea is meant, what a wider scope may cost), raise a decision with \
+`mcp__board__ask_decision` and go on with the default you state: a page asks nobody, and \
+neither does a note in your folder or a sentence in your reply. Raising it is all you can \
+do with a decision; the answer is the researcher's, and no file and no command of yours \
+gives it. An experiment they approve is then carried out by another agent, \
 which is given the plan, the code and a folder of its own; you do not run it yourself and \
 you cannot approve it. The project's own command line (`paper-orchestra`) is the \
 researcher's, and a shell command that runs it is refused."""
@@ -585,7 +590,10 @@ Repair what is broken and fill in what the plan leaves open in the plainest way,
 that you did; do not change what is measured or how in order to get a result. If the plan \
 cannot be carried out as it stands (the method cannot work, a resource is missing, the \
 time is too short), stop and say so: a run that honestly failed tells the researcher more \
-than one that quietly answered a different question.
+than one that quietly answered a different question. Where what the plan leaves open is \
+the researcher's choice and not a detail (which of two things it means to measure), go \
+on in the plainest way, raise a decision with ask_decision that names the experiment as \
+its `page`, and say in your reply which way you went: the run does not wait for the answer.
 
 The run is finished when these lie in your folder:
 
@@ -675,8 +683,13 @@ def experiment_message(
     launcher: str,
     packages: Sequence[str] = (),
     max_experiments: int = 0,
+    decisions: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
-    """What the agent that carries out an approved experiment is told about its run."""
+    """What the agent that carries out an approved experiment is told about its run.
+
+    ``decisions`` are what the agents asked the researcher to choose, with every
+    answer, as every role's message lists them (``None``: say nothing of them).
+    """
     if files:
         listed = ", ".join(f"`{name}`" for name in list(files)[:40])
         code = (
@@ -752,6 +765,7 @@ def experiment_message(
             granted,
             wanted,
             more,
+            *(_decisions(decisions) if decisions is not None else []),
             "Leave `metrics.json` (and `artifacts/` if there are any) in your folder, then "
             "reply. Your folder (the directory your shell starts in) is the only place "
             "that counts: a file written anywhere else is refused or silently thrown away "

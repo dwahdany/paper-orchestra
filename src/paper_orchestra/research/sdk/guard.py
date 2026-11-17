@@ -196,10 +196,11 @@ _WORD_BREAKS = re.compile(r"[\s;|&()<>`$\"'=,{}\[\]]+")
 _CLI_NAMES = ("paper-orchestra", "paper_orchestra")
 
 _BOARD_INSTEAD = (
-    "The project's own commands (review, approve, advance, run, cancel and the rest) are "
-    "the researcher's, and an agent does not run them. Put what you want on the board "
-    "instead: a new page with the memory tool, a change to a page with propose_edit. The "
-    "researcher decides, and an experiment they approve is carried out by another agent."
+    "The project's own commands (review, approve, decide, advance, run, cancel and the "
+    "rest) are the researcher's, and an agent does not run them. Put what you want on the "
+    "board instead: a new page with the memory tool, a change to a page with propose_edit, "
+    "a choice that is the researcher's with ask_decision. The researcher decides and "
+    "answers, and an experiment they approve is carried out by another agent."
 )
 #: Hosts no agent's shell or web tool reaches: the metadata servers of the clouds, which
 #: hand the machine's own credentials to whoever asks from the machine, and the machine

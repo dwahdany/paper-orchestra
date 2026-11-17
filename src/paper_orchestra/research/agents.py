@@ -847,13 +847,9 @@ class _Session:
         #: Edit proposals that were on file before this attempt: what comes after is its own.
         self._known_edits = {proposal.id for proposal in project.proposals(review=None)}
         offered = [search_tool(project), propose_edit_tool(project, role, ctx.round), *tools]
-        if role in decisions.ASKING_ROLES:
-            # Raising a decision is all a session can do with one: the person answers.
-            offered.append(
-                decisions.ask_decision_tool(
-                    project, role, round=ctx.round, phase=ctx.phase, session=ctx.session_id(role)
-                )
-            )
+        offered += decisions.session_tools(
+            project, role, round=ctx.round, phase=ctx.phase, session=ctx.session_id(role)
+        )
         index = self.backend.index()
         self._last = ""
         self._model = model_for(project, role)

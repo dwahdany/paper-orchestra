@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from paper_orchestra.research.project import Project
 
 __all__ = [
+    "AGENT_ASKING_ROLES",
     "ASKING_ROLES",
     "DECISIONS_DIR",
     "DECISION_STATES",
@@ -45,6 +46,7 @@ __all__ = [
     "Decision",
     "Option",
     "ask_decision_tool",
+    "session_tools",
     "told",
     "waiting",
 ]
@@ -58,6 +60,11 @@ DECISION_DISMISSED = "decision.dismissed"
 #: The roles that are given ``ask_decision``: those whose sessions write pages.  (The
 #: runner executes what was approved and writes none.)
 ASKING_ROLES: tuple[str, ...] = ("intake", "scout", "theorist", "designer", "analyst")
+#: A role there is only where the agents have a shell (the ``sdk`` runtime), and which
+#: asks as well: the agent that carries out an approved experiment.  It meets what a
+#: plan left open, and where that is the researcher's choice (what exactly is measured)
+#: it goes on in the plainest way and asks, like everyone else.
+AGENT_ASKING_ROLES: tuple[str, ...] = ("experimenter",)
 #: How many decisions one run of a phase may raise.  A resumed attempt is the same session
 #: and shares the count: three questions are what a person answers at a checkpoint.
 MAX_PER_SESSION = 3
@@ -604,3 +611,21 @@ def ask_decision_tool(
         },
         handler=handler,
     )
+
+
+def session_tools(
+    project: Project, role: str, *, round: int, phase: str, session: str
+) -> list[ToolSpec]:
+    """What a session of ``role`` is offered for decisions, in either runtime: the tool
+    that asks, for a role that may ask, and nothing else.
+
+    Both kinds of session (the tool loop and an agent with a shell) take their tools
+    from here, so that who may ask, how often, and that nobody answers is said once.
+    ``session`` is what the cap counts by: the id of the role's session, or for an
+    agent that has none of its own (one of several runs of a phase) the name of its
+    record.
+    """
+    if role not in ASKING_ROLES and role not in AGENT_ASKING_ROLES:
+        return []
+    # Raising a decision is all a session can do with one: the person answers.
+    return [ask_decision_tool(project, role, round=round, phase=phase, session=session)]

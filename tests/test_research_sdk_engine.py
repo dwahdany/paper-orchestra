@@ -685,6 +685,7 @@ def test_an_approved_experiment_is_carried_out_by_an_agent_in_a_folder_of_its_ow
         "wiki_search",
         "propose_edit",
         "fail_run",
+        "ask_decision",
     ]
     # Its temporary files were in a directory of its own, outside the run's folder
     # (nothing of them is taken for code or results), and that is gone with the agent.

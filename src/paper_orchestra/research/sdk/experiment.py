@@ -60,7 +60,7 @@ from paper_orchestra.compute.base import (
 from paper_orchestra.compute.local import collect_outputs, copy_source, job_model_env
 from paper_orchestra.errors import stops_the_run
 from paper_orchestra.llm.base import ToolError, ToolSpec
-from paper_orchestra.research import agents, experiments, prompts
+from paper_orchestra.research import agents, decisions, experiments, prompts
 from paper_orchestra.research.sdk.guard import LAUNCHER, Guard, SandboxUnavailable, launcher_text
 from paper_orchestra.research.sdk.session import AgentSession
 
@@ -312,6 +312,8 @@ class AgentBackend:
                 launcher=LAUNCHER,
                 packages=spec.packages,
                 max_experiments=int(limits.max_experiments),
+                # What the person was asked and what they answered holds for a run too.
+                decisions=decisions.told(project),
             )
             deadline = began + float(spec.timeout)
             # A command of the agent's shell may take as long as the run may: without

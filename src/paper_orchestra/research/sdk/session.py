@@ -48,7 +48,7 @@ from paper_orchestra.llm.base import (
 )
 from paper_orchestra.llm.pricing import estimate_cost_usd
 from paper_orchestra.memory.wiki import TRANSCRIPTS_DIR
-from paper_orchestra.research import agents, experiments, prompts
+from paper_orchestra.research import agents, decisions, experiments, prompts
 from paper_orchestra.research.access import propose_edit_tool, search_tool
 from paper_orchestra.research.model import EditProposal, ResearchPage
 from paper_orchestra.research.project import Project
@@ -592,6 +592,16 @@ class AgentSession:
             search_tool(project),
             propose_edit_tool(project, role, ctx.round),
             *tools,
+            # Asking the person to choose, with the caps and rules of the tool loop.  An
+            # agent whose session id is shared (the runs of one phase) is counted by
+            # the name of its record: three for each run, not three for all of them.
+            *decisions.session_tools(
+                project,
+                role,
+                round=ctx.round,
+                phase=ctx.phase,
+                session=record or self.session_id,
+            ),
         ]
         self._board = [self._board_tool(agents._stoppable(tool, ctx.heed_stop)) for tool in offered]
         self.folder = (

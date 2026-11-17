@@ -1070,7 +1070,12 @@ def test_an_agent_is_started_with_its_folder_the_board_and_the_guardrails(
     assert options.model == "claude-fable-5-2"
     assert Path(options.cwd) == project.root / "agents" / "r1-research-scout"
     assert Path(options.cwd).is_dir()
-    assert [tool.name for tool in options.board] == ["memory", "wiki_search", "propose_edit"]
+    assert [tool.name for tool in options.board] == [
+        "memory",
+        "wiki_search",
+        "propose_edit",
+        "ask_decision",
+    ]
     assert tuple(options.builtin) == (*BUILTIN_TOOLS, *HELPER_TOOLS)
     assert {"Bash", "WebSearch", "WebFetch", "Write", "Edit"} <= set(options.builtin)
     assert "Your role: scout" in options.system_prompt
@@ -1432,7 +1437,13 @@ def test_a_roles_own_tools_are_on_the_board_and_its_report_is_the_classic_one(tm
     driver = FakeDriver(script)
     ctx = sdk_context(project, driver, phase="design", compute=FakeBackend())
     report = agents.run_designer(ctx)
-    assert driver.calls() == ["memory", "wiki_search", "propose_edit", "write_code"]
+    assert driver.calls() == [
+        "memory",
+        "wiki_search",
+        "propose_edit",
+        "write_code",
+        "ask_decision",
+    ]
     page = project.page("E1")
     assert (page.review, page.state, page.author) == ("proposed", "planned", "agent:designer")
     assert report.produced == [page.path] and report.notes == []
