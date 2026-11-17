@@ -1414,7 +1414,10 @@ def test_without_the_persons_grant_no_agent_gets_the_federation_settings(
     engine = make_engine(project, team, backend)
     engine.run_experiment("E1")
     for options in engine.driver.opened:
-        assert not any(name.startswith("PAPER_ORCHESTRA_JOB_") for name in options.env)
+        # (The worker's own switch is taken away like its other variables: empty.)
+        assert not any(
+            value for name, value in options.env.items() if name.startswith("PAPER_ORCHESTRA_JOB_")
+        )
         assert all(options.env[name] == "" for name in FEDERATION_ENV)
     assert not (Path(engine.driver.opened[-1].cwd) / LAUNCHER).exists()
 

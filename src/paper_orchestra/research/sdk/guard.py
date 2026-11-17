@@ -46,8 +46,9 @@ its own:
   written out, not a script that assembles the name.  It tells an agent that
   means no harm what to do instead; what keeps the project's files from an
   agent that does is the sandbox.
-- **The environment** the agent's process starts with (:func:`agent_env`): no
-  credential of this process reaches it, except the ones its own sign-in uses.
+- **The environment** the agent's process starts with (:func:`agent_env`): only a
+  short list of this process's variables reaches it (:data:`KEPT_ENV`) and the ones
+  its own sign-in uses; every other one is taken away, whatever its name.
 
 ``settings.agents.sandbox: false`` takes the first away and the file checks of
 the third with it: the agent then works as the person's own Claude Code would,
@@ -80,7 +81,9 @@ __all__ = [
     "CLOSED_HOSTS",
     "FEDERATION_ENV",
     "JOB_ENV_PREFIX",
+    "KEPT_ENV",
     "LAUNCHER",
+    "PASS_ENV",
     "TEMP_ENV",
     "Guard",
     "SandboxUnavailable",
@@ -125,6 +128,68 @@ _SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE
 #: ``AWS_ACCESS_KEY_ID`` is half of a credential, and a name is only asked about here
 #: when it has one of the words above in it.)
 _NOT_A_SECRET_SUFFIX = ("_FILE", "_PATH", "_DIR")
+#: The variables of this process that an agent's process and its shell keep; every other
+#: one is taken away.  A list of what is let through, not of what is kept back: a name
+#: says little about what its value opens (``SSH_AUTH_SOCK`` is the person's ssh keys,
+#: ``DOCKER_HOST`` and ``KUBECONFIG`` are machines, ``DATABASE_URL`` and ``SENTRY_DSN``
+#: hold a password in the value), so no pattern of names finds them all.  Here are: who
+#: and where (the shell and its programs need them), the language, where the agent's
+#: process keeps its own files, the certificates and proxies of this network, the
+#: interpreter's environment, which devices compute, and the person's choices about
+#: what the agent's process reports home.
+KEPT_ENV: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "TZ",
+        "CLAUDE_CONFIG_DIR",
+        # The agent's process is told by its starter what started it.
+        "CLAUDE_CODE_ENTRYPOINT",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "VIRTUAL_ENV",
+        "LD_LIBRARY_PATH",
+        "CUDA_VISIBLE_DEVICES",
+        "DISABLE_TELEMETRY",
+        "DISABLE_AUTOUPDATER",
+        "DISABLE_ERROR_REPORTING",
+        "DO_NOT_TRACK",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    }
+)
+_KEPT_ENV_PREFIXES = ("LC_",)
+#: Names more variables of this process for the agents to keep, separated by commas or
+#: spaces: the person's own choice, for what their experiments need (``HF_HOME``, say).
+#: Whatever is named here reaches every agent's shell, which has the web.  A variable
+#: that changes how the agent's process signs in (``ANTHROPIC_*``, ``CLAUDE*``) is not
+#: passed on by it.
+PASS_ENV = "PAPER_ORCHESTRA_AGENT_ENV"
+_NOT_PASSED_ON = ("ANTHROPIC_", "CLAUDE")
+#: An address with a name and a password before the host (a proxy's, a database's).
+_USERINFO = re.compile(r"[a-z][a-z0-9+.-]*://[^/?#\s]*@", re.IGNORECASE)
 #: What separates the words of a shell command, for finding the programs it names.
 _WORD_BREAKS = re.compile(r"[\s;|&()<>`$\"'=,{}\[\]]+")
 _CLI_NAMES = ("paper-orchestra", "paper_orchestra")
@@ -162,6 +227,8 @@ _NOT_A_PAGE = (
     "That address is this machine's own (or a cloud's metadata server), not a page on the "
     "web: it is closed to agents."
 )
+_HTTP_SCHEME = re.compile(r"https?:", re.IGNORECASE)
+_HTTP_START = re.compile(r"https?://[^/]", re.IGNORECASE)
 _WRITING_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 _READING_TOOLS = ("Read", "Glob", "Grep", "LS", "NotebookRead")
 _PATH_KEYS = ("file_path", "notebook_path", "path")
@@ -224,15 +291,38 @@ def closed_host(url: str) -> bool:
     does not parse and a name that does not resolve are closed: nothing is
     opened that cannot be read.  (A name whose answer changes between this look
     and the connection is not caught here.)
+
+    Two readers of one address can find two hosts in it: this function reads
+    ``http://127.0.0.1\\@example.com/`` as ``example.com``, and the program that
+    connects reads a backslash as a slash and goes to ``127.0.0.1``.  So an
+    address is closed wherever readers are known to differ, before any host is
+    looked for: with a backslash, a control character or a space in it, with
+    ``http:`` not followed by exactly two slashes, with a name or password
+    before the host (``user@``), and with a ``%`` in the host.  A host in other
+    letters than ASCII is first written the way the connection writes it
+    (``１２７.０.０.１`` is ``127.0.0.1``).
     """
+    url = str(url).strip(" ")
+    if "\\" in url or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in url):
+        return True
+    if _HTTP_SCHEME.match(url) and not _HTTP_START.match(url):
+        return True
     try:
-        host = urllib.parse.urlsplit(url if "//" in url else f"//{url}").hostname
+        parts = urllib.parse.urlsplit(url if "//" in url else f"//{url}")
+        host = parts.hostname
     except ValueError:
         return True
-    if not host:
+    if not host or "@" in parts.netloc:
         return True
     host = host.rstrip(".").lower()
-    if host in CLOSED_HOSTS or host.endswith(".localhost"):
+    if "%" in host and ":" not in host:
+        return True
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii").rstrip(".").lower()
+        except UnicodeError:
+            return True
+    if not host or host in CLOSED_HOSTS or host.endswith(".localhost"):
         return True
     try:
         ipaddress.ip_address(host.split("%", 1)[0])
@@ -666,7 +756,14 @@ def agent_env(
     """The environment variables to set for an agent's process: an empty value takes a
     variable of this process away from it.
 
-    Nothing that looks like a credential reaches the agent, whose shell has the web.
+    Only what is on a short list reaches the agent (:data:`KEPT_ENV`, the ``LC_*``
+    variables, and what the person names in :data:`PASS_ENV`); every other
+    variable of this process is taken away, whatever it is called.  The agent's
+    shell has the web, and a name does not say what its value opens: the socket
+    of the person's ssh agent, a database's address with its password in it.
+    Of the list, a variable whose value holds a password (a proxy's address
+    with one) is taken away too.
+
     With the ``login`` credential no ``ANTHROPIC_*`` variable reaches it either,
     because the agent's process signs in with whichever of them it finds before
     it looks at the person's Claude Code login.  With ``federation`` the five
@@ -676,12 +773,21 @@ def agent_env(
     (:data:`JOB_ENV_PREFIX`), for the launcher in its folder to put back.
     """
     environ = os.environ if environ is None else environ
-    kept = set(FEDERATION_ENV) if credential == "federation" else set()
-    env = {
-        name: ""
-        for name in environ
-        if name not in kept and (_is_secret(name) or name.startswith("ANTHROPIC_"))
+    signs_in = set(FEDERATION_ENV) if credential == "federation" else set()
+    named = {
+        name
+        for name in re.split(r"[,\s]+", str(environ.get(PASS_ENV) or ""))
+        if name and not name.startswith(_NOT_PASSED_ON)
     }
+
+    def stays(name: str, value: str) -> bool:
+        if name in signs_in or name in named:
+            return True
+        if name not in KEPT_ENV and not name.startswith(_KEPT_ENV_PREFIXES):
+            return False
+        return not _is_secret(name) and not _USERINFO.search(str(value))
+
+    env = {name: "" for name, value in environ.items() if not stays(name, value)}
     for name, value in (job_models or {}).items():
         env[f"{JOB_ENV_PREFIX}{name}"] = value
     return env

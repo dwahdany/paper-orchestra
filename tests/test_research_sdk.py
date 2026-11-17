@@ -38,6 +38,8 @@ from paper_orchestra.research.sdk.fake import Denied, FakeAgent, FakeDriver
 from paper_orchestra.research.sdk.guard import (
     FEDERATION_ENV,
     JOB_ENV_PREFIX,
+    KEPT_ENV,
+    PASS_ENV,
     Guard,
     agent_env,
     closed_host,
@@ -589,6 +591,36 @@ def test_the_file_tools_do_not_read_processes_or_devices(tmp_path, home):
         "http://both.example/",  # one of its addresses is enough
         # A name that does not resolve is not opened either.
         "http://no-such-host.invalid/",
+        # Where two readers of an address find two hosts.  The program that connects
+        # reads a backslash as a slash, so these go to the loopback, not to example.com
+        # (which the resolver of these tests answers with an address of the web).
+        "http://127.0.0.1:8501\\@example.com/",
+        "http://127.0.0.1:8501\\\\@example.com/",
+        "http://169.254.169.254\\@example.com/",
+        "http://example.com\\@127.0.0.1:8501/",
+        "http:\\\\127.0.0.1:8501/",
+        "http://example.com/\\..\\x",  # no backslash at all: nobody needs one
+        # A name or a password before the host: read differently, and no page needs it.
+        "http://user:word@example.com/",
+        "http://127.0.0.1:8501@example.com/",
+        "http://example.com@127.0.0.1:8501/",
+        "http://127.0.0.1%2f@example.com/",
+        # `http:` without its two slashes is still an address to the one that connects.
+        "http:127.0.0.1:8501/",
+        "http:/127.0.0.1:8501/",
+        "http:///127.0.0.1:8501/",
+        "HTTPS:example.com",
+        # Characters the one that connects drops or decodes.
+        "http://127.0.0.1\t:8501/",
+        "http://exam\nple.com/",
+        "http://example.com/a b",
+        "http://%31%32%37.0.0.1:8501/",
+        "http://loc%61lhost:8501/",
+        # Other letters that are the same host to the connection.
+        "http://１２７.０.０.１:8501/",
+        "http://127。0。0。1/",
+        "http://ｌocalhost:8501/",
+        "http://①27.0.0.1/",
     ],
 )
 def test_the_web_tool_does_not_open_this_machines_own_services(tmp_path, home, url):
@@ -612,6 +644,11 @@ def test_the_web_tool_does_not_open_this_machines_own_services(tmp_path, home, u
         "example.com",
         "http://93.184.216.34/",
         "http://[2606:2800:220:1:248:1893:25c8:1946]/",
+        "https://example.com:8443/a/b?q=user@example.com#part",
+        "https://example.com/path/with%20a%20space?next=http://localhost/",
+        " https://example.com/ ",
+        "https://bücher.example/",
+        "example.com:8080/page",
     ],
 )
 def test_the_web_tool_opens_the_web(tmp_path, home, url):
@@ -879,7 +916,7 @@ def test_the_agents_process_starts_without_this_processes_credentials():
     for name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GH_TOKEN", "MODAL_TOKEN_SECRET"):
         assert login[name] == ""
     assert login["SEMANTIC_SCHOLAR_API_KEY"] == "" and login["PAPER_ORCHESTRA_UI_TOKEN"] == ""
-    assert "PATH" not in login and "HOME" not in login and "SSH_KEY_PATH" not in login
+    assert "PATH" not in login and "HOME" not in login
 
     federation = agent_env("federation", environ)
     # With federation the five settings stay, and nothing else of Anthropic's.
@@ -894,12 +931,94 @@ def test_the_agents_process_starts_without_this_processes_credentials():
 )
 def test_half_a_credential_that_is_called_an_id_does_not_reach_the_agent(name):
     """A name ending in ``_ID`` can be a credential's own (an access key's id)."""
-    environ = {name: "AKIAEXAMPLE", "AWS_ACCOUNT_ID": "1234", "TOKEN_FILE": "/x", "KEY_DIR": "/k"}
+    environ = {name: "AKIAEXAMPLE", "PATH": "/usr/bin"}
     for credential in ("login", "federation"):
         env = agent_env(credential, environ)
         assert env[name] == ""
-        # What only names an account or a place is left alone.
-        assert not {"AWS_ACCOUNT_ID", "TOKEN_FILE", "KEY_DIR"} & set(env)
+
+
+#: What a worker's environment can hold that no pattern of names finds: each opens
+#: something (the person's ssh keys, a machine, an account) or has a password in it.
+OPENS_SOMETHING = {
+    "SSH_AUTH_SOCK": "/tmp/ssh-abc/agent.1",
+    "DOCKER_HOST": "ssh://root@build-machine",
+    "KUBECONFIG": "/home/me/.kube/config",
+    "DATABASE_URL": "postgres://me:word@db.example/app",
+    "SENTRY_DSN": "https://0123abcd@o1.ingest.example/2",
+    "OP_SESSION_abc": "session-of-a-password-manager",
+    "VAULT_ADDR": "https://vault.example",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1/bus",
+    "GOOGLE_APPLICATION_CREDENTIALS": "/home/me/sa.json",
+    "AWS_PROFILE": "admin",
+    "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/claude/messaging.sock",
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "SSH_KEY_PATH": "/home/me/.ssh/id",
+    "TOKEN_FILE": "/x",
+    "SOMETHING_NOBODY_THOUGHT_OF": "x",
+}
+
+
+@pytest.mark.parametrize("credential", ["login", "federation"])
+def test_only_what_is_on_a_short_list_reaches_the_agent(credential):
+    """The agent's shell has the web.  A variable is not kept from it for how it is
+    called (a name says little about what the value opens) but passed on because it is
+    known to be needed: every other one of the worker's is taken away."""
+    needed = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/me",
+        "USER": "me",
+        "SHELL": "/bin/bash",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TERM": "xterm",
+        "CLAUDE_CONFIG_DIR": "/home/me/.claude",
+        "SSL_CERT_FILE": "/etc/ssl/cert.pem",
+        "HTTPS_PROXY": "http://proxy.example:3128",
+        "NO_PROXY": "localhost",
+    }
+    env = agent_env(credential, {**needed, **OPENS_SOMETHING})
+    for name in OPENS_SOMETHING:
+        assert env.get(name) == "", name
+    assert not set(needed) & set(env)
+    # The whole list is passed on, and nothing on it is called like a credential.
+    assert agent_env(credential, {name: "x" for name in KEPT_ENV}) == {}
+    assert not [name for name in KEPT_ENV if re.search("KEY|TOKEN|SECRET|PASS|CRED|SOCK", name)]
+    # The agent's process is told by its starter what started it: an empty value
+    # set here would replace that.
+    assert "CLAUDE_CODE_ENTRYPOINT" not in agent_env(credential, {"CLAUDE_CODE_ENTRYPOINT": "cli"})
+
+
+def test_a_proxy_with_a_password_in_its_address_does_not_reach_the_agent():
+    env = agent_env(
+        "login",
+        {
+            "HTTPS_PROXY": "http://me:word@proxy.example:3128",
+            "http_proxy": "http://word@proxy.example:3128",
+            "ALL_PROXY": "socks5://proxy.example:1080",
+            "NO_PROXY": "me@example.com",  # no address: left alone
+        },
+    )
+    assert env == {"HTTPS_PROXY": "", "http_proxy": ""}
+
+
+def test_the_person_can_name_more_variables_for_the_agents_to_keep():
+    """What an experiment needs and the list does not have (``PASS_ENV``): the person's
+    choice, by name.  Not what changes how the agent's process signs in."""
+    environ = {
+        PASS_ENV: "HF_HOME, WANDB_MODE ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN",
+        "HF_HOME": "/data/hf",
+        "WANDB_MODE": "offline",
+        "ANTHROPIC_API_KEY": "sk-secret",
+        "CLAUDE_CODE_OAUTH_TOKEN": "token",
+        "TORCH_HOME": "/data/torch",
+    }
+    for credential in ("login", "federation"):
+        assert agent_env(credential, environ) == {
+            PASS_ENV: "",
+            "ANTHROPIC_API_KEY": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "TORCH_HOME": "",
+        }
 
 
 def test_an_experiments_federation_settings_travel_under_other_names(tmp_path):
@@ -935,7 +1054,11 @@ def test_an_experiments_federation_settings_travel_under_other_names(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_an_agent_is_started_with_its_folder_the_board_and_the_guardrails(tmp_path, home):
+def test_an_agent_is_started_with_its_folder_the_board_and_the_guardrails(
+    tmp_path, home, monkeypatch
+):
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-abc/agent.1")
+    monkeypatch.setenv("DATABASE_URL", "postgres://me:word@db.example/app")
     project = sdk_project(tmp_path)
     driver = FakeDriver()
     ctx = sdk_context(project, driver)
@@ -977,6 +1100,10 @@ def test_an_agent_is_started_with_its_folder_the_board_and_the_guardrails(tmp_pa
     assert Path(options.cwd) not in temp.parents
     # `python` in its shell is the interpreter of this process, with its packages.
     assert options.env["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
+    # What this process holds besides does not go along; what was set for the agent
+    # stands over that.
+    assert options.env["SSH_AUTH_SOCK"] == "" and options.env["DATABASE_URL"] == ""
+    assert options.env["TMPDIR"] and Path(options.env["TMPDIR"]).is_relative_to(temp)
     (temp / "left-behind.txt").write_text("x", encoding="utf-8")
     session.close()
     assert driver.conversations[0].closed
