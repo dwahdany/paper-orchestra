@@ -39,7 +39,9 @@ ui = [
     "python-multipart>=0.0.9",
     "uvicorn>=0.30",
 ]
-all = ["paper-orchestra[modal,gemini,openai,ui]"]
+# The research agents as Claude Agent SDK agents (`settings.agents.runtime: sdk`).
+agents = ["claude-agent-sdk>=0.2.183,<0.3"]
+all = ["paper-orchestra[modal,gemini,openai,ui,agents]"]
 
 [project.scripts]
 paper-orchestra = "paper_orchestra.cli:main"

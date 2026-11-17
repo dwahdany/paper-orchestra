@@ -1435,6 +1435,17 @@ def research_new(
             "Default: no cutoff.",
         ),
     ] = None,
+    runtime: Annotated[
+        str | None,
+        typer.Option(
+            "--runtime",
+            metavar="classic|sdk",
+            help="How the project's agents are run: `classic` (this package's tool loop "
+            "over a model API) or `sdk` (Claude Agent SDK agents with a shell, the web and "
+            "the board). Default: classic, or what PAPER_ORCHESTRA_AGENT_RUNTIME says. "
+            "`paper-orchestra research settings` changes it later.",
+        ),
+    ] = None,
     run: Annotated[
         bool,
         typer.Option(
@@ -1448,12 +1459,19 @@ def research_new(
     The agents read what you gave, research prior work and fill the project's wiki.
     Everything they write is a suggestion until you accept it.
     """
-    from paper_orchestra.research.model import ProjectError
+    from paper_orchestra.research.model import ProjectError, settings_for_new_project
     from paper_orchestra.research.project import Project
 
     text = _brief_text(brief, brief_file)
     root = directory or _default_project_dir(title, text)
-    settings = {"research_cutoff": research_cutoff} if research_cutoff is not None else None
+    given: dict[str, Any] = {}
+    if research_cutoff is not None:
+        given["research_cutoff"] = research_cutoff
+    if runtime is not None:
+        given["agents"] = {"runtime": runtime.strip().lower()}
+    # The runtime is written into the project when it is created: what the environment
+    # says later changes nothing about a project that exists.
+    settings = settings_for_new_project(given)
     try:
         project = Project.create(
             root, title=title or "", brief=text, files=paths or (), settings=settings
@@ -2143,6 +2161,100 @@ def _settle_what_ended(project: Project) -> None:
         from paper_orchestra.research import experiments
 
         experiments.recover(project, follow=False)
+
+
+@research_app.command("settings")
+def research_settings(
+    project: ProjectArgument,
+    runtime: Annotated[
+        str | None,
+        typer.Option(
+            "--runtime",
+            metavar="classic|sdk",
+            help="How the agents are run: `classic` (the tool loop over a model API) or "
+            "`sdk` (Claude Agent SDK agents with a shell, the web and the board).",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--agent-model", metavar="MODEL", help="The model of the sdk agents."),
+    ] = None,
+    fast: Annotated[
+        bool | None,
+        typer.Option("--fast/--no-fast", help="Ask for fast mode (sdk agents)."),
+    ] = None,
+    ultracode: Annotated[
+        bool | None,
+        typer.Option(
+            "--ultracode/--no-ultracode",
+            help="Let the sdk agents start helper agents and workflows.",
+        ),
+    ] = None,
+    credential: Annotated[
+        str | None,
+        typer.Option(
+            "--credential",
+            metavar="login|federation",
+            help="Whose account the sdk agents work on: your Claude Code `login`, or the "
+            "worker's Workload Identity `federation` settings.",
+        ),
+    ] = None,
+    sandbox: Annotated[
+        bool | None,
+        typer.Option(
+            "--sandbox/--no-sandbox",
+            help="Keep the sdk agents in their own folder, away from credentials and the "
+            "project's files. Turn it off only if you accept that an agent can then reach "
+            "everything you can.",
+        ),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print the settings as JSON.")] = False,
+) -> None:
+    """Show how a project's agents are run, or change it.
+
+    Without an option this prints `settings.agents`. With options it changes the
+    values named and leaves the rest; the change holds from the next phase on.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    changes = {
+        name: value.strip().lower() if name in ("runtime", "credential") else value
+        for name, value in (
+            ("runtime", runtime),
+            ("model", model.strip() if model is not None else None),
+            ("fast", fast),
+            ("ultracode", ultracode),
+            ("credential", credential),
+            ("sandbox", sandbox),
+        )
+        if value is not None
+    }
+    if changes:
+        try:
+            opened.settings.update({"agents": changes})
+            opened.save_settings()
+        except ProjectError as exc:
+            _fail(str(exc))
+    agents = opened.settings.agents
+    if as_json:
+        typer.echo(json.dumps(agents.to_dict(), indent=2, ensure_ascii=False, default=str))
+        return
+    if changes:
+        _say(f"Changed {', '.join(changes)} for {opened.title}.")
+    if agents.runtime != "sdk":
+        _say(
+            "Agents: classic (this package's tool loop, with the models under "
+            "settings.models). `--runtime sdk` makes them Claude Agent SDK agents."
+        )
+        return
+    whose = "your Claude Code login" if agents.credential == "login" else "the worker's federation"
+    _say(
+        f"Agents: sdk (Claude Agent SDK agents on {agents.model}; fast mode "
+        f"{'asked for' if agents.fast else 'off'}; helper agents and workflows "
+        f"{'on' if agents.ultracode else 'off'}; credential: {whose}; sandbox "
+        f"{'on' if agents.sandbox else 'OFF'})."
+    )
 
 
 @research_app.command("request")

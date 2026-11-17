@@ -141,6 +141,7 @@ from paper_orchestra.research.model import (
     phase_name,
     plain_links,
     role_of,
+    settings_for_new_project,
 )
 from paper_orchestra.research.project import (
     BRIEF_FILE,
@@ -754,7 +755,7 @@ class Services:
 
     def default_settings(self) -> dict[str, Any]:
         """The settings a project starts with when nothing else is said."""
-        return ProjectSettings().to_dict()
+        return ProjectSettings.from_dict(settings_for_new_project(None)).to_dict()
 
     def doctor(self, model: str | None = None) -> dict[str, Any]:
         from paper_orchestra import doctor
@@ -2078,8 +2079,14 @@ def _create_project(
         for _ in range(20):
             directory = workspace.new_directory(name)
             try:
+                # A new project gets the runtime its form named, else the one the
+                # environment of the app asks for (PAPER_ORCHESTRA_AGENT_RUNTIME).
                 project = Project.create(
-                    directory, title=title, brief=brief, files=tops, settings=settings
+                    directory,
+                    title=title,
+                    brief=brief,
+                    files=tops,
+                    settings=settings_for_new_project(settings),
                 )
                 break
             except ProjectError:
