@@ -44,6 +44,7 @@ from paper_orchestra.compute.base import (
     human_size,
     walk_source,
 )
+from paper_orchestra.compute.local import job_model_access
 from paper_orchestra.config import DEFAULT_MODEL, default_lab_memory_dir
 from paper_orchestra.llm.base import (
     Capabilities,
@@ -1703,6 +1704,24 @@ def _compute_text(ctx: AgentContext) -> str:
         if jobs.get("network_isolation")
         else "network: cannot be blocked here, so the code itself must not use it",
     ]
+    models = (backend.name or name) == "local" and job_model_access()
+    if models:
+        features[-1] = (
+            "network: allowed for a run the researcher approves with network access "
+            "(set `network: true` on the page and say why under `## Resources`)"
+        )
+        features.append(
+            "model inference: a run approved with network access can call the Anthropic "
+            "API. The `anthropic` Python package is installed; create the client with "
+            "`anthropic.Anthropic()` and no arguments, because the credentials are already "
+            "in the job's environment (never print or store environment variables). Models "
+            "include claude-haiku-5-5, claude-sonnet-5-5, claude-opus-5-5 and "
+            "claude-fable-5-2. So a hypothesis about how models behave is tested on real "
+            "model calls, not on simulated data. Keep the number of calls small enough for "
+            "the time limit (use a thread pool, retry rate limits with backoff), write "
+            "every raw response to a file under `artifacts/`, and report how many calls "
+            "were made as a metric. There are no local model weights and no GPU"
+        )
     summary = str(jobs.get("summary") or "").strip()
     lines = [f"Backend: {backend.name or name}. {summary}".strip(), *[f"- {f}" for f in features]]
     if not jobs.get("supported", True):

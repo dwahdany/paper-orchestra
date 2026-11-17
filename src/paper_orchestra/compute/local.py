@@ -113,6 +113,39 @@ _NO_DIRECTORY = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 _MAX_CAPTURE = 200_000
 
 
+#: Set to 1 by the person who runs the worker: a local job that was approved with network
+#: access may then call the Anthropic API with the worker's keyless federation settings.
+JOB_MODEL_ACCESS_ENV = "PAPER_ORCHESTRA_JOB_MODEL_ACCESS"
+#: What Workload Identity Federation needs.  None of these is a secret by itself: four
+#: ids and the *path* of the identity token, which a local job could read anyway, since
+#: it runs as the same user.  An API key or a token is never passed on.
+_FEDERATION_ENV = (
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+)
+
+
+def job_model_access(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether local jobs approved with network access get the federation settings:
+    the person asked for it, and this process has such settings to give."""
+    environ = os.environ if environ is None else environ
+    return (
+        environ.get(JOB_MODEL_ACCESS_ENV, "").strip().lower() in ("1", "true", "yes")
+        and bool(environ.get("ANTHROPIC_FEDERATION_RULE_ID"))
+        and bool(environ.get("ANTHROPIC_IDENTITY_TOKEN_FILE"))
+    )
+
+
+def job_model_env() -> dict[str, str]:
+    """The federation settings for a job that may call the Anthropic API, or nothing."""
+    if not job_model_access():
+        return {}
+    return {key: os.environ[key] for key in _FEDERATION_ENV if os.environ.get(key)}
+
+
 def scrubbed_env(home: Path) -> dict[str, str]:
     """A minimal environment with no credentials for untrusted children."""
     env = {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ}
@@ -1294,6 +1327,8 @@ class LocalBackend(ComputeBackend):
             argv[0] = self.python
         env = scrubbed_env(home)
         env["PYTHONUNBUFFERED"] = "1"  # prints reach the person watching as they happen
+        if spec.network:
+            env.update(job_model_env())
         env.update(spec.env)
         # The mark of this job: the directory made for it, which nothing else is called.
         mark = str(work.parent)
