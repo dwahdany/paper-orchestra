@@ -1513,7 +1513,10 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
     # Under the ``sdk`` runtime an approved experiment is carried out by an agent that
     # writes and repairs code itself: what is wrong with the starting code is then
     # something the person should know when approving, not something that stops them.
-    by_agent = bool(project.settings.agents.sdk) and not in_repo
+    # (Only where an agent does: a run on a remote backend, and so every GPU run, is
+    # executed there as it is, and nobody repairs it.)
+    where = plan.backend or ("modal" if plan.mode == "gpu" else project.settings.compute)
+    by_agent = bool(project.settings.agents.sdk) and not in_repo and where == "local"
     if not files and by_agent:
         return [
             f"{WARNING}{experiment_id} has no code yet. The agent that carries out the "

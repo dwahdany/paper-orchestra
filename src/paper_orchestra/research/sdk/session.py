@@ -244,10 +244,9 @@ class AgentRuntime:
                     "settings.agents.credential to login",
                 )
             return None
-        signed_in = (home / ".claude" / ".credentials.json").is_file() or bool(
-            environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-        )
-        if not signed_in:
+        # (A token in this process's environment is no login for the agents: like every
+        # credential here it is kept from the agent's process.)
+        if not (home / ".claude" / ".credentials.json").is_file():
             return (
                 "no Claude Code login was found on this machine",
                 "run `claude` once and sign in, or set settings.agents.credential to "
@@ -299,6 +298,8 @@ class AgentSession:
         deadline: float | None = None,
         on_line: Callable[[str], None] | None = None,
         max_turns: int | None = agents.MAX_TURNS,
+        record: str | None = None,
+        resume: bool = True,
     ) -> None:
         """``tools`` are the role's own, as for the classic session; ``web_search`` is
         accepted for the same reason and not needed (every SDK agent has the web).
@@ -308,7 +309,10 @@ class AgentSession:
         ones, the federation settings its code may use (``job_models``), a further
         reason to stop (``should_stop``), the moment its time is up (``deadline``,
         on ``time.monotonic()``), and ``on_line``, which is given every line the
-        feed is given and what the agent says.
+        feed is given and what the agent says.  ``record`` names the session's
+        record and transcript where the session id does not tell this agent from
+        another (every run of a run phase has the same), and ``resume=False``
+        makes it start anew whatever is on file: a run begins in a fresh folder.
         """
         runtime = ctx.runtime
         if runtime is None:
@@ -355,8 +359,10 @@ class AgentSession:
         self._model = str(settings.model)
         self._label = f"{role}{LABEL_SUFFIX}"
         records = project.root / TRANSCRIPTS_DIR / SESSIONS_DIR
-        self._record_path = records / f"{self.session_id}.json"
-        self._transcript_path = records / f"{self.session_id}.jsonl"
+        named = record or self.session_id
+        self._record_path = records / f"{named}.json"
+        self._transcript_path = records / f"{named}.jsonl"
+        self._may_resume = resume
         self._conversation: AgentConversation | None = None
         self._resumed = False
         #: The agent's own session, as its process names it: what a later attempt resumes.
@@ -447,7 +453,7 @@ class AgentSession:
     def _open(self, *, fresh: bool = False) -> AgentConversation:
         if self._conversation is not None:
             return self._conversation
-        record = {} if fresh else self._record()
+        record = {} if fresh or not self._may_resume else self._record()
         resume = str(record.get("sdk_session") or "") or None
         self._resumed = resume is not None
         self._sdk_session = resume or ""
@@ -767,26 +773,44 @@ class AgentSession:
             # Also when the turn was cut short: what it wrote by then is in the wiki.
             self.ctx.note(self.created())
 
-    def _converse(self, text: str) -> str:
-        first = self._conversation is None
-        self._open()
-        if first and self._resumed:
-            text = (
+    def _first_exchange(self, text: str) -> Turn:
+        """The first message of this process to the agent: to the session an earlier
+        attempt left, where there is one and it can still be carried on, else to a new
+        agent, which finds on the board what the earlier one wrote."""
+        try:
+            self._open()
+            if not self._resumed:
+                self._log("prompt", text=text)
+                return self._exchange(text)
+            carried_on = (
                 "Your session was interrupted and is carried on now. What you had put on "
                 "the board is still there: look at the wiki before you write anything "
                 "again. The task, as it was given:\n\n" + text
             )
+            self._log("prompt", text=carried_on)
+            turn = self._exchange(carried_on)
+            if not turn.is_error or self._acted:
+                return turn
+        except Exception:
+            # (Not a stop and not Ctrl-C, which are no ``Exception``.)  An agent's process
+            # that cannot find the session it is asked to carry on says so in one of
+            # two ways: an error for an answer, or no start at all.
+            if not self._resumed or self._acted or self.ctx.ending():
+                raise
+        self.close()
+        self._tell(
+            f"The {self.role}'s interrupted session could not be carried on; it starts "
+            "again with what is on the board."
+        )
+        self._open(fresh=True)
         self._log("prompt", text=text)
-        turn = self._exchange(text)
-        if first and self._resumed and turn.is_error and not self._acted:
-            # The agent's own session file is gone or cannot be read: start again, with
-            # what is on the board.
-            self.close()
-            self._tell(
-                f"The {self.role}'s interrupted session could not be carried on; it starts "
-                "again with what is on the board."
-            )
-            self._open(fresh=True)
+        return self._exchange(text)
+
+    def _converse(self, text: str) -> str:
+        if self._conversation is None:
+            turn = self._first_exchange(text)
+        else:
+            self._log("prompt", text=text)
             turn = self._exchange(text)
         self._account(turn)
         self._log(

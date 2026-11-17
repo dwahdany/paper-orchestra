@@ -172,9 +172,9 @@ paper-orchestra research settings <project> --runtime sdk --credential federatio
 - A plan without code can be approved (the approval says so as a warning): the agent writes the code from the plan. In the classic runtime such a plan is refused until the designer has written its code.
 - No separate repair is made by a model afterwards: the agent is the one that repairs.
 - It can propose follow-up experiments on the board; it cannot approve or run them.
-- A run approved for Modal runs on Modal as before; an agent works on this machine.
+- A run approved for Modal (and so every GPU run) runs on Modal as before, because an agent works on this machine. Nobody repairs such a run under `sdk`: its code has to be there and sound before it can be approved, as in the classic runtime.
 - The agent's shell has the network whatever the approval says (it needs the web for its own work). "Without network access" is then an instruction to the agent about the experiment's code, not something the sandbox enforces; use Modal for code that must be cut off.
-- When a run was approved with network access and `PAPER_ORCHESTRA_JOB_MODEL_ACCESS=1` is set for the worker, the experiment's code may call the Anthropic API: the agent starts it as `./with-models python main.py`, which hands the command the worker's federation settings, and only this agent may read the identity token file. No other agent gets either.
+- When a run was approved with network access and `PAPER_ORCHESTRA_JOB_MODEL_ACCESS=1` is set for the worker, the experiment's code may call the Anthropic API: the agent starts it as `./with-models python main.py`, which hands the command the worker's federation settings, and this agent may read the identity token file. No other agent may read that file, so no other agent's shell can call the API. (With the `login` credential no other agent's shell holds the federation settings at all. With `federation` every agent's process holds the four ids and the path of the token, because it signs in with them; they are of no use without the file.)
 
 **Guardrails** (`agents.sandbox`, on by default). An agent with a shell must still not be able to decide proposals, approve runs or change the files the project is steered by, and must not get at the credentials of the machine:
 

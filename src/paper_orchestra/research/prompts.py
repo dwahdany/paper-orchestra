@@ -615,6 +615,7 @@ def experiment_message(
     plan: str,
     files: Sequence[str],
     entrypoint: str,
+    command: str,
     timeout_seconds: float,
     network: bool,
     models: bool,
@@ -627,8 +628,8 @@ def experiment_message(
         listed = ", ".join(f"`{name}`" for name in list(files)[:40])
         code = (
             f"The code the researcher approved is in your folder ({listed}); the run is "
-            f"meant to start with `python {entrypoint}`. Start from it. Change it only to "
-            "make it do what the plan says."
+            f"meant to start with `{command}`. Start from it. Change it only to make it do "
+            "what the plan says."
         )
     else:
         code = (
@@ -647,8 +648,8 @@ def experiment_message(
         granted = (
             "The researcher approved this run with network access, and its code may call "
             "the Anthropic API. The settings for that are not in your shell's environment "
-            f"under their usual names: start the code as `./{launcher} python "
-            f"{entrypoint}` and create the client in the code with `anthropic.Anthropic()` "
+            f"under their usual names: start the code as `./{launcher} {command}` and "
+            "create the client in the code with `anthropic.Anthropic()` "
             "and no arguments. Never print or store environment variables. Keep the "
             "number of calls small, write every raw response to a file under "
             "`artifacts/`, and report how many calls were made as a metric."

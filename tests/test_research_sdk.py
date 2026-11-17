@@ -1088,6 +1088,51 @@ def test_a_session_that_cannot_be_carried_on_starts_again_with_what_is_on_the_bo
     assert row["cost_usd"] == pytest.approx(0.5)  # the new session's own cost, all of it
 
 
+def test_a_process_that_does_not_start_for_the_session_to_carry_on_starts_anew(tmp_path, home):
+    project = sdk_project(tmp_path)
+
+    class Strict(FakeDriver):
+        """Refuses to start for a session it does not know, as a real process may."""
+
+        def open(self, options):
+            if options.resume in self.unresumable:
+                self.opened.append(options)
+                raise RuntimeError(f"No conversation found with session ID: {options.resume}")
+            return super().open(options)
+
+    driver = Strict(lambda agent: agent.use(cost_usd=0.5) or "Done.")
+    first = sdk_context(project, driver)
+    AgentSession(first, "scout").send("Go.")
+    first.close_sessions()
+    driver.unresumable.add("fake-1")
+    second = sdk_context(project, driver)
+    assert AgentSession(second, "scout").send("Go.") == "Done."
+    assert [options.resume for options in driver.opened] == [None, "fake-1", None]
+    assert driver.prompts == ["Go.", "Go."]
+    assert any("could not be carried on" in line for line in activity(project))
+    # A process that does not start at all, with nothing to carry on, is a failure.
+    broken = Strict()
+    broken.open = lambda options: (_ for _ in ()).throw(RuntimeError("no such program"))
+    with pytest.raises(RuntimeError, match="no such program"):
+        AgentSession(sdk_context(sdk_project(tmp_path / "other"), broken), "scout").send("Go.")
+
+
+def test_a_session_can_be_told_never_to_carry_another_on(tmp_path, home):
+    project = sdk_project(tmp_path)
+    driver = FakeDriver()
+    for number in (1, 2):
+        ctx = sdk_context(project, driver, phase="run")
+        AgentSession(ctx, "experimenter", record=f"run-{number}", resume=False).send("Go.")
+        ctx.close_sessions()
+    assert [options.resume for options in driver.opened] == [None, None]
+    assert sorted(p.name for p in (project.root / "transcripts" / "agents").iterdir()) == [
+        "run-1.json",
+        "run-1.jsonl",
+        "run-2.json",
+        "run-2.jsonl",
+    ]
+
+
 def test_a_turn_that_ends_without_a_report_is_counted_by_its_tokens_and_not_twice(tmp_path, home):
     project = sdk_project(tmp_path)
 
@@ -1290,7 +1335,11 @@ def test_the_gate_asks_for_the_package_the_command_line_and_a_credential(tmp_pat
     need = runtime.need({}, home)
     assert "no Claude Code login was found on this machine" in need["why"]
     assert "set settings.agents.credential to federation" in need["fix"]
-    assert runtime.need({"CLAUDE_CODE_OAUTH_TOKEN": "token"}, home) is None
+    # A token in the worker's environment is no login: it is kept from the agents.
+    assert runtime.need({"CLAUDE_CODE_OAUTH_TOKEN": "token"}, home) is not None
+    assert agent_env("login", {"CLAUDE_CODE_OAUTH_TOKEN": "token"}) == {
+        "CLAUDE_CODE_OAUTH_TOKEN": ""
+    }
 
 
 def test_the_gate_for_federation_looks_at_the_workers_settings(tmp_path, home):

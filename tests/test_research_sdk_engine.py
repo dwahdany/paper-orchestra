@@ -447,7 +447,12 @@ def test_the_gate_wants_the_credential_the_project_chose(project, team, backend,
         advance(project, team, backend)
 
 
-def test_the_forecast_agrees_with_the_gate(project, team, backend, home):
+def test_the_forecast_agrees_with_the_gate(project, team, backend, home, monkeypatch):
+    # (The forecast has no driver handed to it: it asks the real one, which is taken to
+    # be installed here.)
+    from paper_orchestra.research.sdk.claude import ClaudeDriver
+
+    monkeypatch.setattr(ClaudeDriver, "unavailable", lambda self: None)
     assert next_step(project, client_for=no_classic_model)["blocked"] is None
     (home / ".claude" / ".credentials.json").unlink()
     blocked = next_step(project, client_for=no_classic_model)["blocked"]
@@ -747,10 +752,71 @@ def test_a_stop_request_ends_the_agent_and_the_run_goes_back_to_the_queue(projec
     assert project.page("E1").state == "queued" and project.pages(kind="result") == []
 
     del team.during["experimenter"]
-    state = advance(project, team, backend)
+    again = make_engine(project, team, backend)
+    state = again.advance()
     assert project.page("E1").state == "succeeded"
     assert [page.title.split(":")[0] for page in project.pages(kind="result")] == ["E1 run 2"]
     assert (state["status"], state["phase"]) == ("checkpoint", "analyze")
+    # The second run is a new agent in a new folder: the stopped one's session, which
+    # worked in the first run's folder, is not carried on.
+    second = again.driver.opened[0]
+    assert second.resume is None and Path(second.cwd).parent.name == "2"
+
+
+def test_every_run_of_a_run_phase_gets_an_agent_of_its_own(project, team, backend):
+    to_approved(project, team, backend)
+    other = project.create_page(
+        "experiment",
+        "The same with another seed",
+        EXPERIMENT.format(tests="H1", mode="script").split("---\n", 2)[2],
+        author="human",
+        relations={"tests": ["H1"]},
+        fields={"mode": "script", "timeout_seconds": 300},
+    )
+    experiments.write_code(project, str(other.id), {"main.py": GOOD_CODE}, author="human")
+    approve(project, str(other.id), backend)
+
+    engine = make_engine(project, team, backend)
+    state = engine.advance()
+    assert state["status"] == "checkpoint" and team.calls.count("experimenter") == 2
+    first, second = (o for o in engine.driver.opened if Path(o.cwd).name == "work")
+    # Both runs belong to one phase and so to one session id; neither agent carries the
+    # other's session on, and each has its own folder, record and transcript.
+    assert first.resume is None and second.resume is None
+    assert Path(first.cwd).parts[-4:] == ("E1", "runs", "1", "work")
+    assert Path(second.cwd).parts[-4:] == ("E2", "runs", "1", "work")
+    kept = sorted(p.name for p in (project.root / "transcripts" / "agents").glob("*run*"))
+    assert kept == [
+        "r1-run-experimenter-E1-run1.json",
+        "r1-run-experimenter-E1-run1.jsonl",
+        "r1-run-experimenter-E2-run1.json",
+        "r1-run-experimenter-E2-run1.jsonl",
+    ]
+    assert project.page("E1").state == project.page("E2").state == "succeeded"
+
+
+def test_under_sdk_a_run_that_no_agent_carries_out_still_needs_code_that_is_sound(
+    project, team, backend
+):
+    advance(project, team, backend)
+    accept_all(project)
+    advance(project, team, backend)
+    accept_all(project)
+    for name, fields in (
+        ("On a GPU", {"mode": "gpu", "gpu": "T4"}),
+        ("On Modal", {"mode": "script", "backend": "modal"}),
+    ):
+        plan = project.create_page(
+            "experiment",
+            name,
+            "## Objective\n\nx\n",
+            author="human",
+            relations={"tests": ["H1"]},
+            fields=fields,
+        )
+        # Nobody writes or repairs code there: a plan without code is refused as ever.
+        (problem,) = experiments.check_code(project, str(plan.id))
+        assert problem.startswith(f"{plan.id} has no code yet: write its files"), problem
 
 
 def test_an_experiment_agent_proposes_a_follow_up_and_cannot_decide_or_run_it(
@@ -858,6 +924,7 @@ def test_a_run_approved_with_network_and_model_access_gets_the_launcher_and_the_
     prompt = team.prompts["experimenter"][0]
     assert "its code may call the Anthropic API" in prompt
     assert f"./{LAUNCHER} python main.py" in prompt
+    assert "meant to start with `python main.py`" in prompt
     # The settings travel under other names; the agent itself still signs in by its login.
     for name, value in values.items():
         assert options.env[name] == ""

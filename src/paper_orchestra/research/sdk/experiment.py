@@ -25,6 +25,7 @@ to the model budget, not to the run's ``cost_usd``.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import time
 from collections.abc import Callable, Sequence
@@ -145,6 +146,7 @@ class AgentBackend:
             page = project.page(self._page.path)
             limits = project.settings.limits
             entry = next((word for word in spec.command[1:] if word.endswith(".py")), "main.py")
+            command = shlex.join(spec.command)
             log.note(f"An agent carries out {page.id}; it has {round(spec.timeout)} seconds.")
             try:
                 session = AgentSession(
@@ -163,6 +165,10 @@ class AgentBackend:
                     deadline=began + float(spec.timeout),
                     on_line=log.note,
                     max_turns=None,
+                    # One agent for one run: every run of a phase has the same session
+                    # id, and a run starts in a fresh folder, so nothing is carried on.
+                    record=f"{ctx.session_id(ROLE)}-{page.id}-run{Path(run_dir).name}",
+                    resume=False,
                 )
                 session.send(
                     prompts.experiment_message(
@@ -171,6 +177,7 @@ class AgentBackend:
                         plan=page.body,
                         files=files,
                         entrypoint=entry,
+                        command=command,
                         timeout_seconds=float(spec.timeout),
                         network=bool(spec.network),
                         models=bool(models),
