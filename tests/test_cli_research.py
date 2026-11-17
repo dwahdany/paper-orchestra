@@ -416,7 +416,7 @@ def test_status_summarises_round_phase_what_is_waiting_experiments_and_cost(proj
     assert "Waiting for you: 1 question, 1 hypothesis" in out
     assert "Experiments: 1 approved" in out
     assert "1 open request" in out
-    assert "$3.21 of $25.00 on models" in out
+    assert "$3.21 of $25000.00 on models" in out
     # The time limit is a cap on one run (spec 10.9), not a budget the runs use up.
     assert "$0.00 of $5.00 on experiments, which ran for 120 s in all" in out
     assert "(one run may take up to 900 s)" in out
@@ -476,7 +476,7 @@ def test_status_of_a_demonstration_says_that_its_cost_is_the_storys(workspace):
 
     out = flat(invoke("status", str(demo.root)).stdout)
 
-    assert "Spent: $3.21 of $25.00 on models (the cost of the story this demonstration" in out
+    assert "Spent: $3.21 of $25000.00 on models (the cost of the story this demonstration" in out
     assert "no model was called" in out
     assert "no model was called" not in invoke("status", str(plain.root)).stdout
 
@@ -603,7 +603,7 @@ def test_status_as_json_is_the_whole_picture_on_stdout(project):
     }
     assert data["state"]["status"] == "checkpoint" and data["worker_alive"] is None
     assert data["counts"]["pending"]["total"] == 4
-    assert data["limits"]["model_usd"] == 25.0
+    assert data["limits"]["model_usd"] == 25000.0
     assert sorted(item["ref"] for item in data["pending"]) == ["E1", "H1", "H2", "Q1"]
 
 
@@ -1763,7 +1763,7 @@ def test_status_survives_a_state_file_with_values_of_the_wrong_type(project):
     )
     result = invoke("status", str(project.root))
     assert result.exit_code == 0, result.output
-    assert "Spent: $0.00 of $25.00 on models" in flat(result.stdout)
+    assert "Spent: $0.00 of $25000.00 on models" in flat(result.stdout)
     for spent in ("not a mapping", {"model_usd": float("nan")}):
         write_json(project.root / "state.json", checkpoint_state(spent=spent))
         result = invoke("status", str(project.root))

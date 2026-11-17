@@ -34,7 +34,7 @@ SPEC_DEFAULT_SETTINGS = {
         "lesson": "auto",
     },
     "limits": {
-        "model_usd": 25.0,
+        "model_usd": 25000.0,
         "experiment_seconds": 900,
         "experiment_usd": 5.0,
         "repair_rounds": 3,
@@ -479,14 +479,14 @@ def test_partial_settings_from_an_older_project_get_the_defaults():
 
 def test_sections_read_like_objects_and_like_mappings():
     settings = ProjectSettings()
-    assert settings.limits.model_usd == settings.limits["model_usd"] == 25.0
+    assert settings.limits.model_usd == settings.limits["model_usd"] == 25000.0
     assert settings.models["effort"] == settings.models.effort == "high"
     assert settings.limits.get("nope", 7) == 7
     # All of a mapping's read side, so code written against the JSON shape does not trip.
     limits = settings.limits
     assert dict(limits) == dict(limits.items()) == {**limits} == limits.to_dict()
     assert list(limits) == limits.keys() and len(limits) == 7 and "model_usd" in limits
-    assert limits.values()[0] == 25.0
+    assert limits.values()[0] == 25000.0
     assert [key for key in settings.models] == ["research", "reasoning", "coding", "fast", "effort"]
     assert settings.policy("hypothesis") == "review" and settings.policy("journal") == "auto"
     # Results and the idea are never held for review.
@@ -505,7 +505,7 @@ def test_invalid_settings_load_with_defaults_and_say_so():
         }
     )
     assert settings.compute == "local"
-    assert settings.limits.model_usd == 25.0 and settings.limits.repair_rounds == 3
+    assert settings.limits.model_usd == 25000.0 and settings.limits.repair_rounds == 3
     assert settings.limits.max_sources == 12
     assert settings.review["hypothesis"] == "review" and settings.review["topic"] == "auto"
     assert settings.models.effort == "high" and settings.models.fast == "claude-fable-5-2"
