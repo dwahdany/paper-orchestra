@@ -374,7 +374,11 @@ def test_phase_and_checkpoint_events_carry_the_data_the_engine_gives_them(demo):
         (2, "design", "designer", "run"),
     ]
     last = checkpoints[-1]
-    assert set(last["data"]) == {"pending", "edits", "next"}
+    # The designer's question to the person waits there as well, and is counted as the
+    # engine counts it; a checkpoint at which nothing was asked does not name the count.
+    assert set(last["data"]) == {"pending", "edits", "next", "decisions"}
+    assert last["data"]["decisions"] == 1 and "1 decision waits for your answer." in last["summary"]
+    assert all(set(e["data"]) == {"pending", "edits", "next"} for e in checkpoints[2:5])
     assert last["data"]["edits"] == 2
     assert last["data"]["pending"] == {
         "question": 1,
@@ -519,6 +523,25 @@ def test_the_analysts_verdict_on_a_hypothesis_waits_and_earlier_ones_were_decide
     }
     rejected = decided["Narrow the idea to problems with sparse gradients"]
     assert "The idea stays as I wrote it" in rejected.decision_reason
+
+
+def test_one_decision_was_answered_and_one_waits(demo):
+    answered, waiting = demo.decisions()
+    assert (answered.state, answered.role, answered.raised_by["round"]) == (
+        "answered",
+        "theorist",
+        1,
+    )
+    assert answered.chosen.label == "Plain Adam only" and answered.answer.text
+    # The agent would have taken another option: the answer is the person's own.
+    assert answered.recommended == 2 and answered.answer.option == 1
+    assert (waiting.state, waiting.role, waiting.raised_by["round"]) == ("open", "designer", 2)
+    assert waiting.page == demo.page("E3").path and len(waiting.options) == 3
+    assert demo.counts()["decisions"] == {"open": 1}
+    kinds = [e["type"] for e in demo.events() if e["type"].startswith("decision.")]
+    assert kinds == ["decision.asked", "decision.answered", "decision.asked"]
+    # The link in what the theorist wrote leads to a page of the wiki.
+    assert demo.resolve("topics/adaptive-learning-rate-variance")
 
 
 def test_requests_are_open_and_handled(demo):

@@ -2300,7 +2300,7 @@ def research_decide(
     from paper_orchestra.research.model import ProjectError
 
     opened = _open_project(project)
-    answering = option is not None or bool(say and say.strip()) or dismiss
+    answering = option is not None or say is not None or dismiss
     if decision is None:
         if answering:
             _fail(
@@ -2331,7 +2331,7 @@ def research_decide(
         return
     try:
         found = _decision_named(opened, decision)
-        if dismiss and (option is not None or (say and say.strip())):
+        if dismiss and (option is not None or say is not None):
             _fail("--dismiss leaves the decision to the agents; it goes with no answer.")
         if not answering:
             for line in _decision_lines(found):

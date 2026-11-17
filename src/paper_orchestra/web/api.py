@@ -114,6 +114,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from paper_orchestra import __version__
 from paper_orchestra.memory.wiki import slugify, split_front_matter
+from paper_orchestra.research.decisions import DECISIONS_DIR
 from paper_orchestra.research.model import (
     COMPUTE_BACKENDS,
     EFFORTS,
@@ -814,6 +815,7 @@ _OWN_PLACES = (
     WIKI_DIR,
     PROPOSALS_DIR,
     REQUESTS_DIR,
+    DECISIONS_DIR,
     INPUTS_DIR,
     NOTES_DIR,
     TRANSCRIPTS_DIR,

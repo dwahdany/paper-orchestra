@@ -2037,3 +2037,101 @@ def test_a_worker_sweeps_the_temporary_files_that_dead_writers_left(project, eng
 
     assert invoke("advance", str(project.root)).exit_code == 0
     assert not litter.exists()
+
+
+# -- decide ------------------------------------------------------------------------
+
+
+def asked(project: Project, question: str = "Which batch sizes does the idea mean?"):
+    return project.ask_decision(
+        question,
+        options=[
+            {"label": "Small batches only", "meaning": "Up to 32."},
+            {"label": "Any batch size", "meaning": "A sweep up to 1024."},
+        ],
+        role="theorist",
+        context="It decides how large the first sweep is.",
+        recommended=1,
+        reason="It is what the idea says.",
+        default="The sweep stops at 32.",
+        page="H1",
+        round=1,
+    )
+
+
+def test_decide_lists_what_waits_and_status_counts_it(project):
+    none = invoke("decide", str(project.root))
+    assert none.exit_code == 0 and "No decision is waiting for you." in none.stdout
+    assert "for your answer" not in invoke("status", str(project.root)).stdout
+
+    decision = asked(project)
+    listed = invoke("decide", str(project.root))
+
+    assert listed.exit_code == 0, listed.output
+    out = flat(listed.stdout)
+    assert "1 decision waiting for you:" in out
+    assert f"1. {decision.id} Which batch sizes does the idea mean?" in out
+    assert "asked by the theorist, round 1; about wiki/hypotheses/H1-" in out
+    assert "It decides how large the first sweep is." in out
+    assert "1 Small batches only: Up to 32. (the agent would take this: It is what the idea" in out
+    assert "2 Any batch size: A sweep up to 1024." in out
+    assert "Until you answer, the agents go on with: The sweep stops at 32." in out
+    assert "--option N" in out and "--dismiss" in out
+    status = flat(invoke("status", str(project.root)).stdout)
+    assert "1 decision waits for your answer: `paper-orchestra research decide" in status
+
+
+def test_decide_answers_with_an_option_words_or_both_and_can_change_it(project):
+    decision = asked(project)
+
+    answered = invoke("decide", str(project.root), "1", "--option", "2", "--say", "Up to 256.")
+
+    assert answered.exit_code == 0, answered.output
+    assert flat(answered.stdout) == (
+        f'Answered {decision.id}: option 2, "Any batch size"; "Up to 256.". Every later '
+        "session of the agents is shown it."
+    )
+    now = project.decision(decision.id)
+    assert (now.state, now.answer.option, now.answer.text) == ("answered", 2, "Up to 256.")
+
+    # By its id, or the beginning of it; an answered one is answered again.
+    changed = invoke("decide", str(project.root), decision.id[:6], "--say", "Small ones only.")
+    assert changed.exit_code == 0, changed.output
+    assert flat(changed.stdout).startswith(f"Changed your answer to {decision.id}: Small ones")
+    assert [a.option for a in project.decision(decision.id).answers] == [2, None]
+
+    shown = flat(invoke("decide", str(project.root), decision.id).stdout)
+    assert "Your answer on " in shown and "Small ones only." in shown
+    assert "(1 earlier answers are kept in the file.)" in shown
+    listed = flat(invoke("decide", str(project.root)).stdout)
+    assert "No decision is waiting for you." in listed
+    assert f"{decision.id} Which batch sizes does the idea mean? -> Small ones only." in listed
+
+
+def test_decide_leaves_a_decision_to_the_agents(project):
+    decision = asked(project)
+
+    left = invoke("decide", str(project.root), decision.id, "--dismiss")
+
+    assert left.exit_code == 0, left.output
+    assert flat(left.stdout) == (
+        f"Left {decision.id} to the agents. They go on with: The sweep stops at 32."
+    )
+    assert project.decision(decision.id).state == "withdrawn"
+    assert "for your answer" not in invoke("status", str(project.root)).stdout
+
+
+def test_decide_refuses_what_it_cannot_do_and_changes_nothing(project):
+    decision = asked(project)
+
+    for args, message in (
+        (("--option", "1"), "Say which decision"),
+        (("7", "--option", "1"), "There is no decision '7'"),
+        (("d-ffffffff", "--option", "1"), "There is no decision 'd-ffffffff'"),
+        (("1", "--option", "5"), "options 1 to 2"),
+        (("1", "--say", "   "), "this one is empty"),
+        (("1", "--dismiss", "--option", "1"), "it goes with no answer"),
+    ):
+        refused = invoke("decide", str(project.root), *args)
+        assert refused.exit_code == 2 and message in flat(refused.stderr), refused.output
+    assert project.decision(decision.id).state == "open"

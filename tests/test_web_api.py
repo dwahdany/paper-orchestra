@@ -361,12 +361,16 @@ def test_every_specified_endpoint_exists(client):
     }
     assert set(SPECIFIED.split("\n")) - {""} <= served
     # What was added to it: running an approved experiment now, the worker's log,
-    # forgetting a worker the server cannot verify, and the settings a project starts with.
+    # forgetting a worker the server cannot verify, the settings a project starts with,
+    # and what the agents ask the person to decide.
     assert served - set(SPECIFIED.split("\n")) == {
         "POST /api/projects/{pid}/experiments/{eid}/run",
         "GET /api/projects/{pid}/worker/log",
         "POST /api/projects/{pid}/worker/forget",
         "GET /api/defaults",
+        "GET /api/projects/{pid}/decisions",
+        "POST /api/projects/{pid}/decisions/{did}/answer",
+        "POST /api/projects/{pid}/decisions/{did}/dismiss",
     }
 
 
@@ -5635,3 +5639,126 @@ def test_a_suggested_edit_to_a_finding_is_listed_with_what_its_numbers_check_fou
         )
         decided = client.get(url(project, "/proposals?review=all")).json()["proposals"]
         assert "number_report" not in next(row for row in decided if row["id"] == proposal.id)
+
+
+# ---------------------------------------------------------------------------
+# Decisions: what the agents ask the person to choose
+# ---------------------------------------------------------------------------
+
+
+def a_decision(project: Project, question: str = "Which reading of the idea is meant?", **more):
+    more.setdefault("role", "theorist")
+    return project.ask_decision(
+        question,
+        options=[
+            {"label": "Small batches only", "meaning": "Batch sizes up to 32."},
+            {"label": "Any batch size", "meaning": "A sweep up to 1024."},
+        ],
+        context="It decides **how large** the first sweep is; see [[idea]].",
+        recommended=1,
+        reason="It is what the idea says.",
+        default="The sweep stops at 32.",
+        **more,
+    )
+
+
+def test_a_project_without_decisions_lists_none(client, project):
+    assert client.get(url(project, "/decisions")).json() == {"decisions": []}
+    assert client.get(url(project)).json()["counts"]["decisions"] == {"open": 0}
+    assert not (project.root / "decisions").exists()
+
+
+def test_decisions_are_listed_with_their_options_and_rendered_context(client, project):
+    decision = a_decision(project, page="H1", round=1, phase="hypothesize")
+
+    listed = client.get(url(project, "/decisions")).json()["decisions"]
+
+    assert len(listed) == 1
+    row = listed[0]
+    html = row.pop("context_html")
+    assert row == decision.to_dict()
+    assert row["options"][0] == {"label": "Small batches only", "meaning": "Batch sizes up to 32."}
+    assert (row["recommended"], row["state"], row["answer"]) == (1, "open", None)
+    assert row["page"] == project.page("H1").path
+    assert "<strong>how large</strong>" in html and "#/p/" in html  # the link is the app's
+    assert client.get(url(project)).json()["counts"]["decisions"] == {"open": 1}
+    assert client.get(url(project, "/decisions?state=answered")).json() == {"decisions": []}
+    assert len(client.get(url(project, "/decisions?state=open")).json()["decisions"]) == 1
+    # The library counts it on the project's row.
+    rows = client.get("/api/projects").json()["projects"]
+    assert rows[0]["counts"]["decisions"] == {"open": 1}
+
+
+def test_the_person_answers_with_an_option_their_own_words_or_both(client, project):
+    decision = a_decision(project)
+    where = url(project, f"/decisions/{decision.id}")
+
+    answered = client.post(f"{where}/answer", json={"option": 2, "text": "Up to 256 is enough."})
+
+    assert answered.status_code == 200
+    body = answered.json()["decision"]
+    assert body["state"] == "answered"
+    assert body["answer"]["option"] == 2 and body["answer"]["text"] == "Up to 256 is enough."
+    assert project.decision(decision.id).chosen.label == "Any batch size"
+    assert client.get(url(project)).json()["counts"]["decisions"] == {"open": 0}
+
+    # Changing it is a new answer: the latest one holds, the earlier one is kept.
+    changed = client.post(f"{where}/answer", json={"text": "Small batches, as I wrote."})
+    body = changed.json()["decision"]
+    assert [a["option"] for a in body["answers"]] == [2, None]
+    assert body["answer"]["text"] == "Small batches, as I wrote."
+    said = [e for e in project.events() if e["type"] == "decision.answered"]
+    assert [e["data"]["changed"] for e in said] == [False, True]
+    assert all(e["data"]["by"] == "human" for e in said)
+
+
+def test_an_answer_that_says_nothing_or_names_no_option_is_refused(client, project):
+    decision = a_decision(project)
+    where = url(project, f"/decisions/{decision.id}")
+
+    for body, said in (
+        ({}, "this one is empty"),
+        ({"text": "  "}, "this one is empty"),
+        ({"option": 3}, "options 1 to 2"),
+    ):
+        refused = client.post(f"{where}/answer", json=body)
+        assert refused.status_code == 422 and said in error_of(refused)["message"], body
+    assert client.post(f"{where}/answer", json={"option": "two"}).status_code == 422
+    assert (
+        client.post(url(project, "/decisions/d-ffffffff/answer"), json={"option": 1}).status_code
+        == 404
+    )
+    assert client.post(url(project, "/decisions/d-ffffffff/dismiss")).status_code == 404
+    assert (
+        client.post(url(project, "/decisions/..%2Fproject/answer"), json={"option": 1}).status_code
+        == 404
+    )
+    assert project.decision(decision.id).state == "open"
+
+
+def test_a_decision_can_be_left_to_the_agents(client, project):
+    decision = a_decision(project)
+
+    left = client.post(url(project, f"/decisions/{decision.id}/dismiss"))
+
+    assert left.status_code == 200
+    body = left.json()["decision"]
+    assert body["state"] == "withdrawn" and body["answer"]["dismissed"] is True
+    assert client.get(url(project)).json()["counts"]["decisions"] == {"open": 0}
+    events = [e for e in project.events() if e["type"] == "decision.dismissed"]
+    assert len(events) == 1 and events[0]["data"]["by"] == "human"
+    # It can still be answered.
+    again = client.post(url(project, f"/decisions/{decision.id}/answer"), json={"option": 1})
+    assert again.json()["decision"]["state"] == "answered"
+
+
+def test_the_events_of_a_decision_are_in_the_activity(client, project):
+    decision = a_decision(project)
+    client.post(url(project, f"/decisions/{decision.id}/answer"), json={"option": 1})
+
+    events = client.get(url(project, "/activity")).json()["events"]
+
+    kinds = [event["type"] for event in events if event["type"].startswith("decision.")]
+    assert sorted(kinds) == ["decision.answered", "decision.asked"]
+    asked = next(event for event in events if event["type"] == "decision.asked")
+    assert asked["agent"] == "theorist" and "asks you to decide" in asked["summary"]

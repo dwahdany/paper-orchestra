@@ -371,7 +371,7 @@ def test_a_session_is_opened_with_the_project_backend_and_its_role_tools(tmp_pat
     project.settings.models.reasoning = "claude-opus-5-5"
     agents.run_theorist(context(project, theorist, phase="hypothesize"))
 
-    assert seen["tools"] == ["propose_edit", "wiki_search"]
+    assert seen["tools"] == ["ask_decision", "propose_edit", "wiki_search"]
     assert seen["memory"].role == "theorist"
     assert seen["memory"].session_id == "r1-hypothesize-theorist"
     assert "# Research wiki: Warmup and variance" in seen["system"]

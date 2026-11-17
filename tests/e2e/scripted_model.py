@@ -22,7 +22,9 @@ instruction given with a press of Continue):
 * ``[scripted-more-research]`` makes the analyst write ``next: research`` into the round's
   journal page: its recommendation of another look at the literature;
 * ``[scripted-edit]`` makes the analyst suggest an edit to an accepted finding (the first
-  one in its index) that adds a sentence with a number that is on no record.
+  one in its index) that adds a sentence with a number that is on no record;
+* ``[scripted-decision]`` makes the theorist put a choice to the researcher with
+  ``ask_decision`` before it writes anything, and go on.
 
 The last two concern the analyst alone: leave them in a request for the analyst, which
 its next phase is given and closes.  Every other role ignores them.
@@ -54,6 +56,9 @@ RESEARCH_MARK = "[scripted-more-research]"
 #: In an instruction the analyst reads: it suggests an edit to an accepted finding.
 EDIT_MARK = "[scripted-edit]"
 #: What that edit adds to the finding, and the number in it that no record holds.
+#: In an instruction the theorist reads: it asks the researcher to decide something.
+DECISION_MARK = "[scripted-decision]"
+DECISION_QUESTION = "Should the scripted effect be studied at one batch size or at several?"
 EDIT_NUMBER = "73.25"
 EDIT_SENTENCE = f"With the warmup the spike is {EDIT_NUMBER} times smaller."
 EDIT_SUMMARY = "Say how much smaller the spike is with the warmup"
@@ -200,6 +205,22 @@ def theorist(request: FakeRequest) -> str:
     topic = re.search(r"(topics/[\w-]+)\.md", request.system or "")
     motivated_by = question.group(1) if question else topic.group(1) if topic else ""
     number = _round(request)
+    if DECISION_MARK in (request.text or "") and "ask_decision" in request.tools:
+        _pause()
+        request.call_tool(
+            "ask_decision",
+            {
+                "question": DECISION_QUESTION,
+                "context": "It decides how many runs the next experiment needs.",
+                "options": [
+                    {"label": "One batch size", "meaning": "A single run of a few seconds."},
+                    {"label": "Several batch sizes", "meaning": "A sweep of four runs."},
+                ],
+                "recommended": 1,
+                "reason": "One run already shows whether the effect is there.",
+                "default": "The hypotheses are written for one batch size.",
+            },
+        )
     for slug, title in (
         (f"scripted-effect-is-there-r{number}", "The scripted effect is there"),
         (f"scripted-effect-grows-r{number}", "The scripted effect grows with the batch size"),

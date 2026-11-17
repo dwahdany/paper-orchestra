@@ -243,6 +243,19 @@ CHECKS.phone = async ({ browser, pid }) => {
     await until(page, () => document.querySelectorAll('.in-row:not(.in-old)').length >= 6, null, 8000, 'the phone lists what waits');
     ok(await page.evaluate(() => getComputedStyle(document.querySelector('.in-detail')).visibility === 'hidden' && getComputedStyle(document.querySelector('.in-list')).visibility === 'visible'), width + ': the bare inbox is not the list alone');
     ok(await page.evaluate(() => !document.querySelector('.in-row [aria-current]')), width + ': a row of the list alone is marked as the proposal in front');
+    /* what an agent asks the person to choose is the first thing of the list: every option, the
+       field for their own words and both answers within the screen and a finger wide; an
+       option that is touched is marked and named on the button that answers; nothing is sent */
+    ok(await page.evaluate(() => { const card = document.querySelector('.dc-panel .dc'), row = document.querySelector('.in-row'); return !!card && !!row && card.getBoundingClientRect().top < row.getBoundingClientRect().top; }), width + ': the open decision is not the first thing in the inbox');
+    await reach(page, width, 'a decision', ['.dc-panel .dc-opt', '.dc-panel .dc-say', '.dc-panel [data-act="decide-send"]', '.dc-panel [data-act="decide-dismiss"]'], 44);
+    ok(await page.evaluate(() => { const card = document.querySelector('.dc-panel .dc'); return card.scrollWidth <= card.clientWidth + 1; }), width + ': the card of a decision is wider than itself');
+    await page.tap('.dc-panel .dc-opt >> nth=1');
+    await until(page, () => document.querySelectorAll('.dc-panel .dc-opt[aria-pressed="true"]').length === 1 && /^Answer: /.test(document.querySelector('.dc-panel [data-act="decide-send"]').textContent.trim()), null, 4000, 'a touched option of a decision is marked and named on the button');
+    ok(!(await page.evaluate(SMALL)).length, width + ': the field of a decision is under 16 px: the phone zooms in on it');
+    ok(!(await page.evaluate(NARROW)).length, width + ': with an option chosen the inbox is wider than the phone: ' + (await page.evaluate(NARROW)).join('; '));
+    await page.waitForTimeout(700);        // (the second touch of a double touch is not a touch: it chooses once)
+    await page.tap('.dc-panel .dc-opt >> nth=1');
+    await until(page, () => !document.querySelector('.dc-panel .dc-opt[aria-pressed="true"]'), null, 4000, 'a later touch takes the choice back');
     await reach(page, width, 'the list', ['.in-row:not(.in-old) [data-act="accept"]', '.in-row [data-act="reject-ask"]', '.in-check', '.in-all', '.in-old', '#status a.sb-i'], 0);
     await reach(page, width, 'the list', ['.in-row:not(.in-old) [data-act="accept"]', '.in-row [data-act="reject-ask"]', '.in-check'], 40);
     /* a row accepted in the list: the list stays in front, and the undo is there to be touched */
@@ -311,6 +324,104 @@ const tipNow = (page) => page.evaluate(() => { const t = document.querySelector(
    without credentials. What needs no model happens (the run of an approved experiment); the
    rest is something to set up, said once beside the main button in the engine's sentence,
    and never an accident. On a project of its own, which no other check touches. */
+/* what an agent asks the person to choose: the open decision heads the inbox and is counted
+   with what waits; an option and the person's own words are sent as the answer, which every
+   list then shows; an answer given in another window arrives by itself; an answered one can
+   be answered again and left to the agents; a decision an agent asks while the app is open
+   appears by itself and does not hold the phase up. On the copy of the demo project that no
+   other check decides anything in, after `nomodel` has looked at it; on the demo project
+   itself (without starting an agent) when the workspace has no such copy. */
+CHECKS.decisions = async ({ page, pid: demo, spare }) => {
+  const pid = spare || demo, project = '/api/projects/' + pid;
+  const listed = async () => (await api('GET', project + '/decisions')).data.decisions;
+  await idle(pid);
+  const open0 = (await listed()).filter((d) => d.state === 'open');
+  if (!ok(open0.length === 1, 'the demonstration has one decision that waits: ' + open0.length)) return;
+  const d = open0[0];
+  await open(page, '#/p/' + pid + '/inbox', '.in-list');
+  await until(page, () => !!document.querySelector('.dc-panel .dc'), null, 8000, 'the inbox shows the open decision');
+  const proposals = await count(page, '.in-row:not(.in-old)');
+  ok((await waitingNow(page)) === proposals + 1, 'the inbox tab counts the decision with the proposals: ' + (await waitingNow(page)) + ' for ' + proposals + ' proposals and 1 decision');
+  ok((await text(page, '.in-head h1')).trim() === (proposals + 1) + ' waiting for you', 'so does the heading of the inbox: ' + (await text(page, '.in-head h1')));
+  ok((await text(page, '.dc-panel .dc-q')).trim() === d.question, 'the card asks the question as the server has it: ' + (await text(page, '.dc-panel .dc-q')));
+  ok((await count(page, '.dc-panel .dc-opt')) === d.options.length && (await text(page, '.dc-panel .dc-opt >> nth=' + (d.recommended - 1))).includes('would take this'), 'every option is a button, and the one the agent would take is marked');
+  ok((await text(page, '.dc-panel .dc')).includes(d.default) && (await text(page, '.dc-panel .dc-by')).includes('asked by the ' + d.raised_by.role), 'the card names the default and who asked');
+  ok(await page.evaluate(() => { const card = document.querySelector('.dc-panel .dc'), row = document.querySelector('.in-row'); return !row || card.getBoundingClientRect().top < row.getBoundingClientRect().top; }), 'the decision stands above the proposals');
+  ok((await count(page, '.dc-panel .dc-by a')) === (d.page ? 1 : 0), 'and links the page it is about');
+  /* the overview and the strip say that it waits, and the main button is there all the same */
+  await open(page, '#/p/' + pid + '/overview', '.ov-head');
+  ok(/1 decision waits for your answer\./.test(await text(page, '.ov-head')) && (await count(page, '.ov-decide')) === 1, 'the overview says that a decision waits, and lists it');
+  ok((await count(page, '.ov-actions .go > .btn:not([disabled])')) >= 1, 'an open decision does not take the main button away');
+  /* nothing chosen and nothing said is no answer */
+  await open(page, '#/p/' + pid + '/inbox', '.in-list');
+  await page.click('.dc-panel [data-act="decide-send"]');
+  await until(page, () => /Choose an option/.test((document.querySelector('.dc-panel .dc-err') || {}).textContent || ''), null, 4000, 'an empty answer is not sent, and the card says why');
+  ok((await listed()).find((x) => x.id === d.id).state === 'open', 'and nothing reached the server');
+  /* an option and the person's own words, sent once */
+  const posted = [];
+  const listen = (request) => { if (request.method() === 'POST' && /\/decisions\//.test(request.url())) posted.push([request.url().split('/').pop(), JSON.parse(request.postData() || '{}')]); };
+  page.on('request', listen);
+  await page.click('.dc-panel .dc-opt >> nth=1');
+  await page.fill('.dc-panel .dc-say', 'But keep the first one as a fallback.');
+  await page.reload();
+  await page.waitForSelector('.dc-panel .dc');
+  await page.click('.dc-panel .dc-opt >> nth=1');
+  await page.fill('.dc-panel .dc-say', 'But keep the first one as a fallback.');
+  /* (typing does not lose the option that was chosen, when an event makes the page draw itself again) */
+  await api('POST', project + '/requests', { text: 'A note left while a decision is being answered.' });
+  await page.waitForTimeout(900);
+  ok((await count(page, '.dc-panel .dc-opt[aria-pressed="true"]')) === 1 && (await page.inputValue('.dc-panel .dc-say')) === 'But keep the first one as a fallback.', 'what is chosen and typed stays when the page is drawn again');
+  await page.dblclick('.dc-panel [data-act="decide-send"]');
+  await until(page, () => !document.querySelector('.dc-panel') && /Answered: option 2/.test((document.querySelector('.toast') || {}).textContent || ''), null, 8000, 'the answer is sent, the card leaves the head of the inbox, and the app says what was answered');
+  ok(posted.length === 1 && posted[0][0] === 'answer' && posted[0][1].option === 2 && posted[0][1].text === 'But keep the first one as a fallback.', 'one request carries the option and the words: ' + JSON.stringify(posted));
+  let now = (await listed()).find((x) => x.id === d.id);
+  ok(now.state === 'answered' && now.answer.option === 2 && now.answers.length === 1, 'the server holds the answer: ' + JSON.stringify(now.answer));
+  ok((await waitingNow(page)) === proposals, 'the tab counts one less: ' + (await waitingNow(page)));
+  ok((await count(page, '.dc-done .dc-old')) >= 1 && (await text(page, '.dc-done .dc-old[data-decision="' + d.id + '"] .dc-oa')).includes('option 2') , 'the answered decision is listed, folded, with the answer: ' + (await text(page, '.dc-done .dc-old[data-decision="' + d.id + '"] .dc-oa')));
+  ok(await page.evaluate((id) => !document.querySelector('.dc-old[data-decision="' + id + '"]').open, d.id), 'folded until it is opened');
+  /* the feed says it as the person's */
+  const events = (await api('GET', project + '/activity?limit=5')).data.events;
+  ok(events.some((ev) => ev.type === 'decision.answered' && ev.data.by === 'human' && /^You decided: /.test(ev.summary)), 'the activity has the answer as an event of the person: ' + JSON.stringify(events.map((ev) => ev.type)));
+  /* another window changes the answer: this one shows it without being asked */
+  await api('POST', project + '/decisions/' + d.id + '/answer', { option: 1 });
+  await until(page, (id) => /option 1/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || '') && /changed/.test(document.querySelector('.dc-old[data-decision="' + id + '"] .in-when').textContent), d.id, 8000, 'an answer changed in another window arrives by itself, and is said to be a changed one');
+  /* opened, it can be answered again, and left to the agents */
+  await page.click('.dc-old[data-decision="' + d.id + '"] > summary');
+  await page.waitForSelector('.dc-old[data-decision="' + d.id + '"][open] .dc-opt');
+  ok((await text(page, '.dc-old[data-decision="' + d.id + '"] .dc-opt >> nth=0')).includes('your answer'), 'the option that holds is marked as the answer');
+  await page.fill('.dc-old[data-decision="' + d.id + '"] .dc-say', 'Only what fits on the laptop.');
+  await page.click('.dc-old[data-decision="' + d.id + '"] [data-act="decide-send"]');
+  await until(page, (id) => /Only what fits on the laptop/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || ''), d.id, 8000, 'an answered decision is answered again from its row');
+  now = (await listed()).find((x) => x.id === d.id);
+  ok(now.answers.length === 3 && now.answer.option === null && now.answer.text === 'Only what fits on the laptop.', 'every answer is kept and the latest holds: ' + JSON.stringify(now.answers.map((a) => [a.option, a.text])));
+  ok(await page.evaluate((id) => document.querySelector('.dc-old[data-decision="' + id + '"]').open, d.id), 'the row stays open when the list is drawn again');
+  await page.click('.dc-old[data-decision="' + d.id + '"] [data-act="decide-dismiss"]');
+  await until(page, (id) => /left to the agents/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || ''), d.id, 8000, 'it can be left to the agents after all');
+  ok((await listed()).find((x) => x.id === d.id).state === 'withdrawn' && (await count(page, '.dc-old[data-decision="' + d.id + '"] [data-act="decide-dismiss"]')) === 0, 'the server says withdrawn, and the row no longer offers to leave it');
+  page.off('request', listen);
+  /* the page the decision is about says what became of it */
+  if (d.page) {
+    await open(page, '#/p/' + pid + '/wiki/' + encodeURIComponent(d.page.replace(/^wiki\//, '').replace(/\.md$/, '')), '.page-head');
+    await until(page, () => /Left to the agents/.test((document.querySelector('.dc-ref') || {}).textContent || ''), null, 6000, 'the page a decision is about says how the decision stands');
+  }
+  if (!spare) { notes.push('decisions: no agent was started to ask a decision (the workspace has no demo project in a folder named nomodel, and the demo project itself is left as the other checks expect it)'); return; }
+  /* an agent asks while the app is open: the card arrives by itself, the phase goes on to its checkpoint */
+  await open(page, '#/p/' + pid + '/inbox', '.in-list');
+  const before = await waitingNow(page);
+  const started = await api('POST', project + '/advance', { phase: 'hypothesize', instruction: 'For the browser check: [scripted-decision]' });
+  ok(started.status === 200 || started.status === 202, 'a phase is started with an instruction that makes the theorist ask: ' + started.status + ' ' + JSON.stringify(started.data).slice(0, 200));
+  await until(page, () => /at one batch size or at several/.test((document.querySelector('.dc-panel .dc-q') || {}).textContent || ''), null, 30000, 'the decision an agent asks appears at the head of the open inbox by itself');
+  ok((await waitingNow(page)) >= before + 1, 'and is counted on the tab: ' + before + ' -> ' + (await waitingNow(page)));
+  const view = await idle(pid, 90000);
+  ok(view.state.status === 'checkpoint' && view.state.phase === 'hypothesize', 'the phase did not wait for an answer: it ended at its checkpoint (' + view.state.status + ' after ' + view.state.phase + ')');
+  ok(/1 decision waits for your answer\./.test((view.checkpoint || {}).summary || ''), 'whose summary says that a decision waits: ' + ((view.checkpoint || {}).summary || '').slice(-160));
+  const asked = (await listed()).find((x) => x.state === 'open');
+  ok(!!asked && asked.raised_by.role === 'theorist' && asked.raised_by.phase === 'hypothesize' && asked.options.length === 2, 'the record says who asked and in which phase: ' + JSON.stringify(asked && asked.raised_by));
+  ok(((await api('GET', project + '/activity?limit=200')).data.events || []).some((ev) => ev.type === 'decision.asked' && ev.agent === 'theorist'), 'the activity has the question as an event of the theorist');
+  await until(page, () => /1 decision waits for your answer/.test((document.querySelector('.strip-text') || document.querySelector('#status') || {}).textContent || '') || !!document.querySelector('.dc-panel .dc'), null, 8000, 'the open app still shows it at the checkpoint');
+  await shot(page, 'decisions');
+};
+
 CHECKS.nomodel = async ({ page, spare }) => {
   if (!spare || !NO_MODEL || !fs.existsSync(path.dirname(NO_MODEL))) {
     notes.push('nomodel: a project without a usable model was not looked at (' + (!NO_MODEL ? 'PAPER_ORCHESTRA_E2E_NO_MODEL names no file for the server and the checks' : !spare ? 'the workspace has no demo project in a folder named nomodel' : 'the server is on another machine') + ')');
@@ -2597,7 +2708,7 @@ CHECKS.hostile = async ({ page, pid }) => {
   const page = await context.newPage();
   watch(page, () => current);
   /* (`nomodel` switches the scripted model off for the whole server while it looks: it comes before any check that starts agents) */
-  const order = ['screens', 'phone', 'nomodel', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
+  const order = ['screens', 'phone', 'nomodel', 'decisions', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
   const unknown = (ONLY || []).concat(SKIP).filter((name) => order.indexOf(name) < 0);
   if (unknown.length) { console.error('not a check: ' + unknown.join(', ') + ' (the checks are: ' + order.join(', ') + '; separate several with commas)'); await browser.close(); process.exit(2); }
   for (const name of order) {

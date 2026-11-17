@@ -1012,3 +1012,96 @@ def test_the_client_reads_what_the_server_now_says():
     css = _text(STATIC_DIR / "css" / "app.css")
     for selector in (".go-need", ".go-held", ".in-why", ".decided-edits", ".st-also", "#tip kbd"):
         assert selector in css, f"the stylesheet has no rule for {selector}"
+
+
+DECISIONS_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago, times } from './harness.js';
+import { app } from './js/core.js';
+import { waitingSentence, strip, statusbar } from './js/shell.js';
+import * as decisions from './js/decisions.js';
+
+const q9 = page('question', 'Q9', { title: 'The re-test channel', author: 'agent:analyst' });
+const h1 = page('hypothesis', 'H1', { review: 'proposed', author: 'agent:theorist' });
+const options = [{ label: 'Same context', meaning: 'Ask again after the talk.' }, { label: 'A <b>note</b> to itself', meaning: '' }];
+const open = { id: 'd-0000aaaa', question: 'Which channel is <i>the</i> object of study?', context: '', context_html: '<p>It decides what H1 means.</p>', options, recommended: 2, reason: 'A memory file carries it.', default: 'Record both.', page: q9.path, blocks: [], raised_by: { role: 'analyst', round: 2 }, created: ago(600), state: 'open', answer: null, answers: [] };
+const done = Object.assign({}, open, { id: 'd-0000bbbb', question: 'Adam only?', page: null, state: 'answered', answer: { option: 1, text: 'For now.', at: ago(60), dismissed: false }, answers: [{ option: 2, text: '', at: ago(120), dismissed: false }, { option: 1, text: 'For now.', at: ago(60), dismissed: false }] });
+const left = Object.assign({}, open, { id: 'd-0000cccc', question: 'Which seed?', page: null, state: 'withdrawn', answer: { option: null, text: '', at: ago(30), dismissed: true }, answers: [{ option: null, text: '', at: ago(30), dismissed: true }] });
+const project = { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['hypothesize'], then: 'design' }) };
+const store = projectStore({ pages: [q9, h1], decisions: [open, done, left], project });
+const bare = projectStore({ pages: [q9], project });
+const only = projectStore({ pages: [q9], decisions: [open], project });
+app.store = store;
+app.route = { name: 'project', pid: 'p-1', view: 'inbox', ref: '', sel: '', sub: '', q: {} };
+const panel = String(decisions.decisionsPanel(store)), old = String(decisions.decidedDecisions(store));
+const acts = decisions.decisionActs(() => {});
+acts['decide-pick']({ dataset: { ref: open.id, i: '2' } });
+decisions.decisionTyped({ dataset: { ref: open.id }, value: 'and 4 as a null' });
+const picked = String(decisions.decisionsPanel(store));
+console.log(JSON.stringify({
+  counts: [decisions.waitingCount(store), decisions.waitingCount(bare), decisions.openDecisions(store).length],
+  sentences: [waitingSentence(store), waitingSentence(bare), waitingSentence(only)],
+  words: [decisions.answerWords(open), decisions.answerWords(done), decisions.answerWords(left)],
+  panel: { cards: times(panel, 'class="dc"'), options: times(panel, 'data-act="decide-pick"'), escaped: panel.includes('A &lt;b&gt;note&lt;/b&gt; to itself') && !panel.includes('<i>the</i>'),
+    context: panel.includes('<p>It decides what H1 means.</p>'), recommended: times(panel, 'the analyst would take this'), default: panel.includes('Record both.'),
+    about: panel.includes('Q9 The re-test channel'), dismiss: times(panel, 'data-act="decide-dismiss"'), field: panel.includes('data-input="decide-text"') },
+  old: { rows: times(old, '<details'), changed: old.includes('changed'), again: times(old, 'Change the answer'), yours: times(old, 'your answer'), noDismissOfLeft: times(old, 'data-act="decide-dismiss"') },
+  picked: { pressed: times(picked, 'aria-pressed="true"'), label: picked.includes('Answer: <span class="dc-pick">A &lt;b&gt;note&lt;/b&gt; to itself</span>'), typed: picked.includes('>and 4 as a null</textarea>') },
+  none: [String(decisions.decisionsPanel(bare)), String(decisions.decidedDecisions(bare)), String(decisions.pageDecisions(bare, q9.path))],
+  onPage: String(decisions.pageDecisions(store, q9.path)).includes('Waits for your decision'),
+  shell: { bar: String(statusbar(store)).includes('<b>2</b> waiting'),
+    strip: String(strip(store)).includes('Review 2'), answer: String(strip(only)).includes('Answer 1') },
+}));
+"""
+
+
+@needs_node
+def test_decisions_are_counted_with_what_waits_and_drawn_with_their_options(tmp_path):
+    """What an agent asked the person to choose is counted with the proposals wherever
+    the app says how much waits, and drawn as a card whose options are buttons; what a
+    model wrote in it is text, and a store that has no decisions shows nothing of them."""
+    out = _client(tmp_path, DECISIONS_SCRIPT)
+    assert out["counts"] == [2, 0, 1]
+    assert out["sentences"] == [
+        "1 hypothesis is waiting for you. 1 decision waits for your answer.",
+        "Nothing is waiting for you.",
+        "1 decision waits for your answer.",
+    ]
+    assert out["words"] == [
+        "",
+        "option 1, “Same context”; “For now.”",
+        "left to the agents: their default holds",
+    ]
+    assert out["panel"] == {
+        "cards": 1,
+        "options": 2,
+        "escaped": True,
+        "context": True,
+        "recommended": 1,
+        "default": True,
+        "about": True,
+        "dismiss": 1,
+        "field": True,
+    }, out["panel"]
+    assert out["old"] == {
+        "rows": 2,
+        "changed": True,
+        "again": 2,
+        "yours": 1,
+        "noDismissOfLeft": 1,
+    }, out["old"]
+    assert out["picked"] == {"pressed": 1, "label": True, "typed": True}, out["picked"]
+    assert out["none"] == ["", "", ""]
+    assert out["onPage"] is True
+    assert out["shell"] == {"bar": True, "strip": True, "answer": True}, out["shell"]
+
+
+def test_the_client_follows_decisions_as_they_are_asked_and_answered():
+    store, api, css = _js("store.js"), _js("api.js"), _text(STATIC_DIR / "css" / "app.css")
+    # An event of a decision makes the lists be read again, in every window.
+    assert "decision\\." in store and "api.decisions(pid)" in store
+    for call in ("/decisions'", "/answer'", "/dismiss'"):
+        assert call in api, f"api.js does not call {call}"
+    # The person's own events read as theirs in the feed.
+    assert "(ev.data || {}).by === 'human'" in _js("shell.js")
+    for selector in (".dc-opt", ".dc-say", ".dc-old", ".dc-ref"):
+        assert selector in css, f"the stylesheet has no rule for {selector}"
