@@ -28,7 +28,7 @@ Shapes, for whoever writes a client:
   its place;
 * nothing of a project is read or written through a symbolic link that leads
   out of its directory: a project whose ``project.json``, wiki, proposals,
-  requests or inputs are such a link is listed as one that cannot be opened (the
+  requests, decisions or inputs are such a link is listed as one that cannot be opened (the
   store refuses it, also when the link appears while the server runs), and an
   experiment's code, a log and an earlier version of a page are refused or left
   out one by one.
@@ -70,11 +70,14 @@ Looking at a project writes nothing to it and takes none of its locks.  (The
 one exception is older than this list: a look that finds the worker of a
 phase gone records that phase as interrupted; see ``workers``.)
 
-Four endpoints go beyond the list of the specification: ``POST
+Seven endpoints go beyond the list of the specification: ``POST
 .../experiments/{eid}/run`` (run an approved experiment now), ``GET
 .../worker/log`` (what a worker wrote before it stopped), ``POST
-.../worker/forget`` (clear the name of a worker this server cannot verify) and
-``GET /api/defaults`` (the settings a new project starts with).
+.../worker/forget`` (clear the name of a worker this server cannot verify),
+``GET /api/defaults`` (the settings a new project starts with), and the three of
+the decisions the agents ask of the person: ``GET .../decisions``, ``POST
+.../decisions/{did}/answer`` and ``POST .../decisions/{did}/dismiss``.  How many
+of them wait is ``counts.decisions.open`` of the project view and of a library row.
 """
 
 from __future__ import annotations

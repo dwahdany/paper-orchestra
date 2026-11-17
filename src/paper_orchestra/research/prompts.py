@@ -131,17 +131,24 @@ is to be studied, which of several readings of the idea is meant, whether a wide
 worth its cost. Those are the researcher's, and ask_decision puts one in front of them: \
 the question in one sentence, two to five options with what each means, the one you would \
 take and why, and the default you go on with. The project does not wait for the answer. \
-You continue with the default, and write so that the other answer could still be taken. \
-Use it sparingly: a session may ask at most three, the researcher answers them on a \
-phone between other things, and a question that evidence can settle is not one of them \
-(look it up, test it, or write a question page). What has its own way to the researcher \
-keeps it: a page is accepted or rejected, a run is approved, a verdict on a hypothesis is \
-a suggested edit. The user message lists what was already \
-asked, what the researcher answered and what they left to the agents: an answer holds \
-for the rest of the project, and none of these is asked again. When you read a question \
-page that says the researcher has to decide and no decision in that list is about it, \
-raise it with ask_decision and name that page as `page`. You can only ask: nothing you \
-write answers a decision or takes one back.
+You continue with the default, and write so that the other answer could still be taken.
+
+A question page does not ask the researcher anything. It is one more page for them to \
+accept or reject, and accepting it answers nothing, so a choice that is written only on a \
+page stays open however long it stands there. Only a decision asks. The user message \
+lists every decision that was put to the researcher: those that wait, those they answered \
+and those they left to the agents. When a page says that the researcher has to decide (a \
+question whose "what would answer it" is their choice, whoever wrote it and whenever), \
+and none of the decisions listed is about that page, it has not been asked: ask it now \
+with ask_decision and name the page as `page`. What is listed is not asked again, and an \
+answer holds for the rest of the project.
+
+Use it for what changes the work, not for everything that is open: a session may ask at \
+most three, the researcher answers them on a phone between other things, and a question \
+that evidence can settle is not one of them (look it up, test it, or write a question \
+page). What has its own way to the researcher keeps it: a page is accepted or rejected, a \
+run is approved, a verdict on a hypothesis is a suggested edit. You can only ask: nothing \
+you write answers a decision or takes one back.
 
 ## What a page may say
 
@@ -517,9 +524,28 @@ def _decision_line(item: Mapping[str, Any]) -> str:
     return f"{line} Options: {options}. Until they answer: {default}"
 
 
+#: Said with the list of decisions, whether it is empty or not: a choice that stands only
+#: on a page has reached nobody, and a session that builds on such a page is the one to ask.
+_UNASKED = (
+    "If a page you read or build on in this session leaves a choice to the researcher that "
+    "is not among them (for example a question page whose answer is \"the researcher's "
+    'decision"), put it to them with ask_decision before you finish, naming that page: a '
+    "page asks nobody, and mentioning the open choice in your reply does not ask them either."
+)
+
+
 def _decisions(decisions: Sequence[Mapping[str, Any]]) -> list[str]:
     """What the agents asked the researcher to decide: every answer, for as long as the
-    project lives, and what still waits or was left to the agents, with its default."""
+    project lives, and what still waits or was left to the agents, with its default.
+
+    That nothing was asked yet is said as well: a session that reads "the researcher
+    has to decide" on a page must be able to tell that nobody has asked them.
+    """
+    if not decisions:
+        return [
+            "No decision has been put to the researcher with ask_decision so far, so "
+            "whatever a page says is theirs to decide has not been asked. " + _UNASKED
+        ]
     blocks: list[str] = []
     answered = [item for item in decisions if item.get("state") == "answered"]
     waiting = [item for item in decisions if item.get("state") == "open"]
@@ -544,6 +570,7 @@ def _decisions(decisions: Sequence[Mapping[str, Any]]) -> list[str]:
             "holds; do not ask again.\n"
             + _block("decisions_left_to_you", "\n".join(_decision_line(item) for item in left))
         )
+    blocks.append("Only the decisions listed above have been put to the researcher. " + _UNASKED)
     return blocks
 
 

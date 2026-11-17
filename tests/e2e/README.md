@@ -29,7 +29,9 @@ against what the server answers:
   to the agents, and the page it is about says how it stands; a decision the scripted
   theorist asks while the app is open (`[scripted-decision]` in the instruction) appears by
   itself and does not keep the phase from reaching its checkpoint (the check `decisions`,
-  on the copy of the demo project in the folder `nomodel`);
+  on the copy of the demo project in the folder `nomodel`). The checks that come after it
+  count proposals on the tab of the inbox, so the one decision that waits in the demo
+  project and in the large one is answered through the API before the first of them;
 - an instruction has an addressee (everyone, or one agent, from `GET /api/defaults`), an
   open one lists the phases that were given it so far, and it can be withdrawn;
 - more research is the person's choice: the list beside the main button offers "Search

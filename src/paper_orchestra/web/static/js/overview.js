@@ -122,7 +122,8 @@ function feedHTML(store) {
     const who = pause ? 'engine' : whoOf(ev), you = who === 'you';
     const ref = pause ? null : (ev.refs || []).find((r) => store.byPath.has(r));
     return html`${head}<li class="ev ev-${String(ev.type).replace(/[^a-z]/g, '-')}${you ? ' ev-you' : who === 'engine' && !pause ? ' ev-engine' : ''}"><time>${hm(ev.ts)}</time><span class="ev-who">${who}</span>
-      ${ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${plain(ev.summary)}${given}</span>`}</li>`;
+      ${/^decision\./.test(ev.type) ? html`<a href="${link({ view: 'inbox', sel: '', sub: '' })}">${plain(ev.summary)}</a>` /* (a decision is answered, and found again, in the inbox) */
+        : ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${plain(ev.summary)}${given}</span>`}</li>`;
   });
   const more = store.activity.length > app.ui.feedLimit || store.moreActivity;
   return html`<ol class="feed">${rows}</ol>${more ? html`<button class="btn btn-quiet btn-s feed-more" data-act="feed-more">Show earlier activity</button>` : ''}`;

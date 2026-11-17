@@ -2711,8 +2711,22 @@ CHECKS.hostile = async ({ page, pid }) => {
   const order = ['screens', 'phone', 'nomodel', 'decisions', 'map', 'inbox', 'wiki', 'experiments', 'agents', 'states', 'rules', 'keys', 'paper', 'large', 'composer', 'hostile'];
   const unknown = (ONLY || []).concat(SKIP).filter((name) => order.indexOf(name) < 0);
   if (unknown.length) { console.error('not a check: ' + unknown.join(', ') + ' (the checks are: ' + order.join(', ') + '; separate several with commas)'); await browser.close(); process.exit(2); }
+  /* The checks after `decisions` count the proposals on the tab of the inbox, as they did
+     before an agent could ask the person to choose something: "six wait", "accepting all
+     of them empties the inbox". So what the designer of the demonstration asks is answered
+     before the first of them, the way the person would answer it, in the demo project and
+     the large one; the checks before that look at it while it waits. */
+  const beforeAnswer = ['screens', 'phone', 'nomodel', 'decisions'];
+  let answered = false;
   for (const name of order) {
     if ((ONLY && ONLY.indexOf(name) < 0) || SKIP.indexOf(name) >= 0) continue;
+    if (!answered && beforeAnswer.indexOf(name) < 0) {
+      answered = true;
+      for (const id of [demo.id, large].filter(Boolean)) {
+        const waits = (((await api('GET', '/api/projects/' + id + '/decisions')).data || {}).decisions || []).filter((d) => d.state === 'open');
+        for (const d of waits) await api('POST', '/api/projects/' + id + '/decisions/' + d.id + '/answer', { option: d.recommended || 1 });
+      }
+    }
     current = name;
     const before = fails.length, t0 = Date.now();
     try { await CHECKS[name]({ browser, context, page, pid: demo.id, large, spare }); }

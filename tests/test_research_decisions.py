@@ -535,6 +535,7 @@ def test_every_prompt_says_when_a_decision_is_the_researchers(tmp_path):
         system = prompts.system_prompt(role, index="(empty)")
         assert "## Decisions that are the researcher's" in system
         assert "ask_decision" in system and "The project does not wait" in system
+        assert "A question page does not ask the researcher anything." in system
         assert "researcher's requests and decisions in the user message" in system
     assert "ask_decision" not in prompts.RUNNER_SYSTEM
 
@@ -580,13 +581,18 @@ def test_a_session_is_told_what_waits_what_was_answered_and_what_was_left(tmp_pa
     assert "hold for the rest of the project" in text and "Do not ask them again" in text
 
 
-def test_a_session_without_decisions_is_told_nothing_about_them(tmp_path):
+def test_a_session_is_told_when_nothing_was_asked_yet(tmp_path):
     project = make_project(tmp_path)
     seen: dict = {}
 
     agents.run_theorist(context(project, asking(seen=seen), phase="hypothesize"))
 
-    assert "decision" not in seen["text"].lower()
+    # A page that says "the researcher has to decide" has asked nobody: said in one line.
+    assert "No decision has been put to the researcher with ask_decision so far" in seen["text"]
+    assert "<decided>" not in seen["text"] and "<decisions_waiting>" not in seen["text"]
+    ask(project)
+    agents.run_theorist(context(project, asking(seen=seen), phase="hypothesize", round=2))
+    assert "No decision has been put" not in seen["text"]
 
 
 def test_what_an_agent_asked_cannot_end_the_block_it_is_listed_in(tmp_path):

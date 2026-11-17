@@ -577,7 +577,8 @@ def ask_decision_tool(
                 "default": {
                     "type": "string",
                     "description": (
-                        "What the agents do until the researcher answers, in one sentence."
+                        "What the agents do until the researcher answers, in one sentence: "
+                        'something that is done, never "wait for the answer".'
                     ),
                 },
                 "page": {

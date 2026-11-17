@@ -3,7 +3,8 @@
 A project is a directory of plain files whose root is also the root of a
 :class:`~paper_orchestra.memory.wiki.Wiki`.  :class:`Project` adds what the wiki
 layer does not know about: who may change what, review, edit proposals, the
-person's requests, the history of every page and the event stream.
+person's requests, the decisions the agents ask of the person, the history of
+every page and the event stream.
 
 Three rules hold for every method that changes something:
 
