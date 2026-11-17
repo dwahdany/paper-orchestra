@@ -123,7 +123,7 @@ export const AGENT_SAYS = {
   model: 'One model for every agent; the models of the tool loop are not used.',
   fast: 'Asks for fast mode, which answers sooner and costs considerably more per token; each agent says in the activity whether it is on.',
   ultracode: 'An agent may start helper agents and workflows of its own, under the same guardrails; every session then starts with a larger prompt.',
-  sandbox: 'An agent\'s shell writes only in the agent\'s own folder (its temporary files lie there too), and neither it nor the file tools read your home directory, the project\'s own files, the shared directory for temporary files or a credential. Where the sandbox cannot start, no agent starts.',
+  sandbox: 'An agent\'s shell writes only in the agent\'s own folder and a directory for temporary files that is made for it alone, and neither it nor the file tools read your home directory, the project\'s own files, the shared directory for temporary files or a credential. Where the sandbox cannot start, no agent starts.',
   noSandbox: 'Without the sandbox an agent\'s shell and file tools reach whatever you can reach on this machine: only the refusal of the project\'s command line, the rules about credential files and an environment without credentials remain, and a shell can get around them.',
 };
 /** What an agent with a shell did (`data.did` of an `agent.activity` event), as the feed

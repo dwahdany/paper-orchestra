@@ -456,8 +456,8 @@ notes, write and run scripts, make a virtual environment and install packages in
 download data. `python` in your shell is the interpreter the project itself runs with, \
 and the packages installed with the project are there: look at what it has (`python -c \
 "import <package>"`) before you install anything. Nothing outside the folder can be \
-written; temporary files belong in `$TMPDIR`, which is a directory of your own inside the \
-folder and is emptied when you finish. The researcher's home directory \
+written, except temporary files, which belong in `$TMPDIR`: a directory of your own that \
+is removed when you finish. The researcher's home directory \
 and every credential on the machine are closed to you; do not look for a way around that. \
 The folder is a workbench and not the record: nobody reads it for results, and what you \
 leave there is not shown to the researcher or to another agent.

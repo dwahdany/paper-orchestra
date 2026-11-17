@@ -297,6 +297,15 @@ anything it was answered, no file where none may be, credential places closed,
 `paper-orchestra` refused, and the web, its own folder and the board working. With
 `--helpers` a sub-agent tries too.
 
+Before that agent starts, on Linux, the script shows without a model call that no agent
+starts where `bwrap` and `socat` are missing from the path the agent's process gets: once
+through this package's own look for them, and once past that look, where the agent's
+process must refuse by itself. It also checks the agent's temporary files (a directory of
+its own where `mktemp` works; the shared one and another agent's closed to its shell and
+to the Read tool; gone when the agent ended), that `python` in its shell is the worker's,
+that uv's credentials are closed, and that WebFetch is refused the loopback under every
+spelling while the test server counts no connection at all.
+
 ```bash
 uv run --extra agents python tests/e2e/agent_guardrails.py --credential federation --model claude-haiku-5-5 --helpers
 ```

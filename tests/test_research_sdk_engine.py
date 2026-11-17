@@ -160,9 +160,9 @@ class AgentTeam:
 
     def experimenter(self, agent: FakeAgent) -> str:
         answers = self.experimenter_answers
-        # (Its own directory for temporary files is there besides, hidden by its name.)
-        answers["files"] = sorted(p.name for p in agent.cwd.iterdir() if p.name != ".tmp")
-        answers["temp"] = (agent.cwd / ".tmp").is_dir()
+        answers["files"] = sorted(p.name for p in agent.cwd.iterdir())
+        answers["temp"] = Path(agent.options.env["CLAUDE_CODE_TMPDIR"])
+        answers["temp_was_there"] = answers["temp"].is_dir()
         answers["code"] = agent.read("main.py") if (agent.cwd / "main.py").is_file() else None
         self._midway(agent)
         if self.metrics is not None:
@@ -686,8 +686,14 @@ def test_an_approved_experiment_is_carried_out_by_an_agent_in_a_folder_of_its_ow
         "propose_edit",
         "fail_run",
     ]
-    assert team.experimenter_answers["temp"] and not (work / ".tmp").exists()
-    assert ".tmp" not in json.dumps(record.get("code_as_run"))
+    # Its temporary files were in a directory of its own, outside the run's folder
+    # (nothing of them is taken for code or results), and that is gone with the agent.
+    temp = team.experimenter_answers["temp"]
+    assert team.experimenter_answers["temp_was_there"] and not temp.exists()
+    assert (
+        work not in temp.parents
+        and str(temp) in options.settings["sandbox"]["filesystem"]["allowWrite"]
+    )
     # The result page and the feed are those of any run.
     result = project.page("E1-run1")
     assert result.state == "succeeded" and "after" in result.body and "local backend" in result.body

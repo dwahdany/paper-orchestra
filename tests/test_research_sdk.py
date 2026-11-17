@@ -768,8 +768,11 @@ def test_the_shared_directory_for_temporary_files_is_closed_and_the_agent_has_it
     (shared / "another-session").mkdir(parents=True)
     other = shared / "another-session" / "scratch.txt"
     other.write_text("not the agent's", encoding="utf-8")
-    guard = make_guard(tmp_path, home, shared=[shared])
-    assert guard.temp() == guard.folder / ".tmp"
+    parent = tmp_path / "po-1000"
+    own_temp = parent / "mine"
+    (parent / "another-agent").mkdir(parents=True)
+    own_temp.mkdir()
+    guard = make_guard(tmp_path, home, shared=[shared], temp=own_temp)
     assert not guard.may_read(other) and not guard.may_read(shared)
     assert guard.check(ToolUse("Read", {"file_path": str(other)})) is not None
     assert guard.check(ToolUse("Write", {"file_path": str(other), "content": "x"})) is not None
@@ -777,10 +780,18 @@ def test_the_shared_directory_for_temporary_files_is_closed_and_the_agent_has_it
     files = guard.settings()["sandbox"]["filesystem"]
     assert str(shared) in files["denyRead"] and str(shared) in files["denyWrite"]
     assert str(shared) not in files["allowRead"]
-    # Its own lies in its folder, which it reads and writes.
-    own = guard.temp() / "work.txt"
+    # Its own is made for it alone: it reads and writes there, and no other agent's.
+    own = own_temp / "claude-1000" / "work.txt"
     assert guard.check(ToolUse("Write", {"file_path": str(own), "content": "x"})) is None
     assert guard.check(ToolUse("Read", {"file_path": str(own)})) is None
+    assert files["allowWrite"] == [str(own_temp)] and str(own_temp) in files["allowRead"]
+    theirs = parent / "another-agent" / "scratch.txt"
+    assert guard.check(ToolUse("Read", {"file_path": str(theirs)})) is not None
+    assert guard.check(ToolUse("Write", {"file_path": str(theirs), "content": "x"})) is not None
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": str(parent)})) is not None
+    assert str(parent) in files["denyRead"]
+    # An agent that was given none writes in its folder alone.
+    assert "allowWrite" not in make_guard(tmp_path, home).settings()["sandbox"]["filesystem"]
 
     # A project that itself lies in the shared directory keeps its agent's folder open.
     inside = Guard(
@@ -952,16 +963,49 @@ def test_an_agent_is_started_with_its_folder_the_board_and_the_guardrails(tmp_pa
     assert str(options.cwd) in settings["sandbox"]["filesystem"]["allowRead"]
     assert options.resume is None
     assert driver.prompts == ["Find the prior work."]
-    # Its temporary files lie in its own folder while it works, and go when it ends.
-    temp = Path(options.cwd) / ".tmp"
-    assert options.env["CLAUDE_CODE_TMPDIR"] == str(temp) and temp.is_dir()
-    assert oct(temp.stat().st_mode & 0o777) == "0o700"
+    # Its temporary files lie in a directory made for it alone while it works (a short
+    # path: the agent's process falls back to the shared directory for a long one),
+    # which the sandbox opens to it and to nobody else, and which goes when it ends.
+    temp = Path(options.env["CLAUDE_CODE_TMPDIR"])
+    assert temp.is_dir() and oct(temp.stat().st_mode & 0o777) == "0o700"
+    assert len(os.fsencode(temp)) + len(f"/claude-{os.getuid()}") <= 44
+    assert temp.parent.name == f"po-{os.getuid()}"
+    assert oct(temp.parent.stat().st_mode & 0o777) == "0o700"
+    files = settings["sandbox"]["filesystem"]
+    assert files["allowWrite"] == [str(temp)] and str(temp) in files["allowRead"]
+    assert str(temp.parent) in files["denyRead"]
+    assert Path(options.cwd) not in temp.parents
     # `python` in its shell is the interpreter of this process, with its packages.
     assert options.env["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
     (temp / "left-behind.txt").write_text("x", encoding="utf-8")
     session.close()
     assert driver.conversations[0].closed
     assert not temp.exists()
+
+
+def test_two_agents_have_two_directories_for_temporary_files(tmp_path, home, monkeypatch):
+    project = sdk_project(tmp_path)
+    driver = FakeDriver()
+    ctx = sdk_context(project, driver)
+    scout, theorist = AgentSession(ctx, "scout"), AgentSession(ctx, "theorist")
+    scout.send("Go.")
+    theorist.send("Go.")
+    one, other = (Path(options.env["CLAUDE_CODE_TMPDIR"]) for options in driver.opened)
+    assert one != other and one.parent == other.parent
+    (other / "theirs.txt").write_text("x", encoding="utf-8")
+    refused = scout._guard.check(ToolUse("Read", {"file_path": str(other / "theirs.txt")}))
+    assert refused is not None and "not yours to read" in refused
+    assert driver.opened[0].check(ToolUse("Read", {"file_path": str(one / "mine.txt")})) is None
+    ctx.close_sessions()
+    assert not one.exists() and not other.exists()
+
+    # A path too long for the agent's process to use is refused, not quietly replaced
+    # by the shared directory.
+    long = tmp_path / ("a-rather-long-name-for-a-directory" * 2)
+    long.mkdir()
+    monkeypatch.setenv(guard_module.TEMP_ENV, str(long))
+    with pytest.raises(OSError, match="too long a path"):
+        guard_module.make_temp()
 
 
 def test_no_agent_starts_where_the_sandbox_it_is_to_work_in_cannot_start(tmp_path, home):

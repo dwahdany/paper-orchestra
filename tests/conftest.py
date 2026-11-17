@@ -100,6 +100,24 @@ RESOLVES_TO = {
 }
 
 
+@pytest.fixture(scope="session")
+def _agent_temp_base():
+    """Where the scripted agents' own directories for temporary files are made during
+    the tests: a short path (the real thing needs one), removed with whatever a test
+    left in it."""
+    import shutil
+    import tempfile
+
+    base = tempfile.mkdtemp(prefix="", dir="/tmp" if os.path.isdir("/tmp") else None)
+    yield base
+    shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _agents_keep_temporary_files_apart(monkeypatch, _agent_temp_base):
+    monkeypatch.setenv("PAPER_ORCHESTRA_AGENT_TMPDIR", _agent_temp_base)
+
+
 @pytest.fixture(autouse=True)
 def _names_resolve_offline(monkeypatch):
     """The check of a web address an agent asks for resolves the name; in a test it is

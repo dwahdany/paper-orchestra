@@ -12,8 +12,8 @@ its own:
   token lies or the directory for temporary files that this process and the
   person's other programs share, except for what is named as readable (its own
   folder, the Python it runs code with).  Its temporary files lie in a
-  directory of its own inside its folder (:data:`TEMP_DIR`), which is removed
-  when the agent ends.  The sandbox is required, not wished for: where it
+  directory made for this agent alone (:func:`make_temp`), which no other agent
+  reads and which is removed when the agent ends.  The sandbox is required, not wished for: where it
   cannot start (on Linux it needs ``bwrap`` and ``socat``), no agent starts
   (:func:`sandbox_fault`), and the agent's process is told to refuse every
   command besides (``failIfUnavailable``), so that no command ever runs
@@ -81,13 +81,14 @@ __all__ = [
     "FEDERATION_ENV",
     "JOB_ENV_PREFIX",
     "LAUNCHER",
-    "TEMP_DIR",
+    "TEMP_ENV",
     "Guard",
     "SandboxUnavailable",
     "agent_env",
     "claude_config_dir",
     "closed_host",
     "launcher_text",
+    "make_temp",
     "runs_the_project_cli",
     "sandbox_fault",
 ]
@@ -106,9 +107,16 @@ FEDERATION_ENV: tuple[str, ...] = (
 JOB_ENV_PREFIX = "PAPER_ORCHESTRA_JOB_"
 #: The file in an experiment agent's folder that starts a command with those settings.
 LAUNCHER = "with-models"
-#: The agent's own directory for temporary files, inside its folder.  Hidden by its
-#: name, so that nothing in it is taken for code or for a result of a run.
-TEMP_DIR = ".tmp"
+#: Names where the directories for the agents' temporary files are made; without it
+#: they are made in ``/var/tmp`` (on a disk, which ``/tmp`` often is not), else in
+#: ``/tmp``.  It must be short (about 14 bytes at most): see :data:`_TEMP_BYTES`.
+TEMP_ENV = "PAPER_ORCHESTRA_AGENT_TMPDIR"
+#: The most bytes the path of an agent's directory for temporary files may have.  The
+#: agent's process keeps sockets there, whose paths are short by the system's rule: it
+#: makes ``claude-<uid>`` in the directory it is named (``CLAUDE_CODE_TMPDIR``), and
+#: when that path is longer than 44 bytes it quietly uses the shared directory instead
+#: (seen with a directory inside an experiment's run folder).
+_TEMP_BYTES = 44
 #: What the sandbox of the agent's shell is made of on Linux.
 SANDBOX_PROGRAMS: tuple[str, ...] = ("bwrap", "socat")
 
@@ -353,6 +361,9 @@ class Guard:
     #: The shared directories for temporary files, where they are not to be asked of
     #: this process (:meth:`shared_temp`).
     shared: Sequence[Path] | None = None
+    #: The agent's own directory for temporary files (:func:`make_temp`), which its
+    #: shell and its file tools read and write besides its folder.
+    temp: Path | None = None
 
     # -- the places ----------------------------------------------------------------
 
@@ -365,15 +376,20 @@ class Guard:
     def _environ(self) -> Mapping[str, str]:
         return os.environ if self.environ is None else self.environ
 
-    def temp(self) -> Path:
-        """The agent's own directory for temporary files, inside its folder."""
-        return self._folder() / TEMP_DIR
+    def _temp(self) -> Path | None:
+        return None if self.temp is None else Path(os.path.realpath(self.temp))
+
+    def _temp_parent(self) -> list[Path]:
+        """The directory the agents' own directories for temporary files are made in:
+        closed, so that no agent reads another's."""
+        own = self._temp()
+        return [] if own is None else [own.parent]
 
     def shared_temp(self) -> list[Path]:
         """Where this process, and so every agent's process before it is told otherwise,
         keeps temporary files: the person's other programs and the other agents keep
         theirs there too, so it is closed to the agent, which has a directory of its
-        own (:meth:`temp`)."""
+        own (``temp``)."""
         if self.shared is not None:
             return list(dict.fromkeys(Path(os.path.realpath(place)) for place in self.shared))
         environ = self._environ()
@@ -421,7 +437,7 @@ class Guard:
         Its own folder lies inside the project and is the exception
         (:meth:`open_places`)."""
         places = [self._home(), Path(os.path.realpath(self.project)), Path("/run/user")]
-        return list(dict.fromkeys([*places, *self.shared_temp()]))
+        return list(dict.fromkeys([*places, *self.shared_temp(), *self._temp_parent()]))
 
     def open_places(self) -> list[Path]:
         """What may be read although it lies in a hidden place."""
@@ -441,6 +457,7 @@ class Guard:
             *_package_caches(home),
             home / ".cache" / "pip",
             *(Path(os.path.realpath(path)) for path in self.readable),
+            *([self._temp()] if self.temp is not None else []),
         ]
         if self.token_file is not None:
             places.append(Path(os.path.realpath(self.token_file)))
@@ -483,8 +500,14 @@ class Guard:
         return hidden == 0 or opened >= hidden
 
     def may_write(self, path: Path) -> bool:
-        """Whether the real path ``path`` is the agent's to write: only its own folder."""
-        return not self.sandbox or _within(path, self._folder())
+        """Whether the real path ``path`` is the agent's to write: only its own folder,
+        and its own directory for temporary files."""
+        own = self._temp()
+        return (
+            not self.sandbox
+            or _within(path, self._folder())
+            or (own is not None and _within(path, own))
+        )
 
     # -- the settings of the agent's process ------------------------------------------
 
@@ -525,6 +548,8 @@ class Guard:
                     *(f"{above}**/{name}" for name in _ENV_NAMES for above in ("", "/")),
                 ],
                 "allowRead": [str(place) for place in self.open_places()],
+                # (Its folder is the shell's to write by itself; this is besides.)
+                **({"allowWrite": [str(self._temp())]} if self.temp is not None else {}),
                 # (The shared directory for temporary files besides: the agent's
                 # process opens its own for writing, and that is the agent's now.)
                 "denyWrite": [
@@ -533,6 +558,7 @@ class Guard:
                         str(place)
                         for place in self.shared_temp()
                         if not _within(self._folder(), place)
+                        and not (self.temp is not None and _within(self._temp(), place))
                     ),
                 ],
             },
@@ -586,6 +612,45 @@ class Guard:
                         "own files are in your folder."
                     )
         return None
+
+
+def make_temp(environ: Mapping[str, str] | None = None) -> Path:
+    """A new directory for one agent's temporary files, for it alone.
+
+    Not the directory this process keeps its own in, which the person's other
+    programs and the other agents share.  Not the agent's folder either: the
+    path must be short (:data:`_TEMP_BYTES`).  It is made in a directory of this
+    user's (``po-<uid>``, closed to others) under ``/var/tmp``, ``/tmp`` or what
+    :data:`TEMP_ENV` names; the guard hides that directory from every agent and
+    opens to each only its own.  Whoever made it removes it when the agent ends.
+    """
+    environ = os.environ if environ is None else environ
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    named = str(environ.get(TEMP_ENV) or "").strip()
+    failed: OSError | None = None
+    for base in [named] if named else ["/var/tmp", "/tmp"]:
+        parent = Path(os.path.realpath(os.path.expanduser(base))) / f"po-{uid}"
+        try:
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if hasattr(os, "getuid") and parent.stat().st_uid != uid:
+                raise PermissionError(f"{parent} belongs to another user")
+            made = Path(tempfile.mkdtemp(prefix="", dir=parent))
+        except OSError as exc:
+            failed = exc
+            continue
+        most = _TEMP_BYTES - len(f"/claude-{uid}")
+        if len(os.fsencode(made)) > most:
+            shutil.rmtree(made, ignore_errors=True)
+            failed = OSError(
+                f"{made} is too long a path for an agent's temporary files (at most {most} bytes)"
+            )
+            continue
+        return made
+    raise OSError(
+        "No directory for an agent's temporary files could be made"
+        + (f" under {named} ({TEMP_ENV})" if named else " under /var/tmp or /tmp")
+        + f": {failed}. Name a short directory of your own in {TEMP_ENV}."
+    )
 
 
 def _is_secret(name: str) -> bool:

@@ -23,6 +23,7 @@ interrupted is carried on where the agent's own session file allows it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -69,11 +70,11 @@ from paper_orchestra.research.sdk.driver import (
 )
 from paper_orchestra.research.sdk.guard import (
     FEDERATION_ENV,
-    TEMP_DIR,
     Guard,
     SandboxUnavailable,
     agent_env,
     claude_config_dir,
+    make_temp,
     sandbox_fault,
 )
 
@@ -202,6 +203,26 @@ def _row_of(given: Any, names: Sequence[str]) -> dict[str, float]:
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
                 row[name] = float(value)
     return row
+
+
+def _with_temp(guard: Any, temp: Path | None) -> Any:
+    """``guard`` knowing the agent's own directory for temporary files (a guard that is
+    not this package's keeps its own counsel)."""
+    if dataclasses.is_dataclass(guard) and not isinstance(guard, type):
+        return dataclasses.replace(guard, temp=temp)
+    return guard
+
+
+def _cli_reason(text: str) -> str:
+    """What the agent's process said of the sandbox it could not start, without what it
+    says around that (its advice to allow commands outside the sandbox is not ours)."""
+    said = text.split(_NO_SANDBOX, 1)[-1].lstrip(": ").split(" \u00b7 ", 1)[0].strip()
+    return (
+        "the agent's process could not start that sandbox"
+        + (f" ({said.rstrip('.')})" if said else "")
+        + ": install what it names, or set settings.agents.sandbox to false if you "
+        "accept agents whose shell reaches everything yours does"
+    )
 
 
 def _no_sandbox_sentence(role: str, why: str) -> str:
@@ -581,6 +602,8 @@ class AgentSession:
         self._guard = guard or Guard(
             folder=self.folder, project=project.root, sandbox=bool(settings.sandbox)
         )
+        #: The agent's own directory for temporary files while its process runs.
+        self._temp: Path | None = None
         self._job_models = dict(job_models or {})
         self._env = dict(env or {})
         self._should_stop = should_stop
@@ -677,16 +700,15 @@ class AgentSession:
     def _options(self, resume: str | None) -> AgentOptions:
         settings = self.runtime.settings
         helpers = bool(settings.ultracode)
-        process: dict[str, Any] = dict(self._guard.settings())
+        # (Fast mode is only on when the settings the process is started with ask for
+        # it; what came of it is said in the feed, :meth:`_announce`.)
+        left = self.ctx.budget_left()
+        temp = self._make_temp()
+        process = dict(self._guard.settings())
         if settings.fast:
-            # Fast mode is only on when the settings the process is started with ask
-            # for it; what came of it is said in the feed (:meth:`_announce`).
             process["fastMode"] = True
         if helpers:
             process.update(ultracode=True, enableWorkflows=True, skipWorkflowUsageWarning=True)
-        left = self.ctx.budget_left()
-        temp = self.folder / TEMP_DIR
-        temp.mkdir(mode=0o700, exist_ok=True)
         places = {
             # `python` in the agent's shell is the interpreter this process runs with:
             # the packages the project brings are the ones its code finds.  (The
@@ -695,11 +717,16 @@ class AgentSession:
             "PATH": os.pathsep.join(
                 [str(Path(sys.executable).parent), os.environ.get("PATH", os.defpath)]
             ),
-            # Its temporary files lie in its own folder, not in the directory that
-            # every program of the person shares: the agent's process puts its own
-            # there and names the directory to the shell as TMPDIR.
+            # Its temporary files lie in a directory made for it alone, not in the one
+            # that every program of the person shares: the agent's process puts its
+            # own there and names a directory in it to the shell as TMPDIR.
             "CLAUDE_CODE_TMPDIR": str(temp),
             "CLAUDE_TMPDIR": "",
+            # The process's own, too: it keeps there the sockets that connect a
+            # sandboxed command to the network, and the shared directory, where they
+            # would lie otherwise, is closed to the sandbox (checked live: without
+            # this the shell has no network).
+            "TMPDIR": str(temp),
         }
         return AgentOptions(
             model=self._model,
@@ -715,7 +742,8 @@ class AgentSession:
                 **places,
                 **self._env,
             },
-            check=self._guard.check,
+            # (Asked of the guard as it is when the call comes.)
+            check=lambda use: self._guard.check(use),
             resume=resume,
             max_turns=self._max_turns,
             # The agent's process counts its own cost, sub-agents and fast mode
@@ -753,7 +781,7 @@ class AgentSession:
         except Exception as exc:
             if _NO_SANDBOX in str(exc):
                 why = experiments.mask_credentials(self.ctx.project, str(exc))
-                raise SandboxUnavailable(_no_sandbox_sentence(self.role, why)) from exc
+                raise SandboxUnavailable(_no_sandbox_sentence(self.role, _cli_reason(why))) from exc
             raise
         return self._conversation
 
@@ -848,7 +876,18 @@ class AgentSession:
         if conversation is not None:
             with contextlib.suppress(Exception):
                 conversation.close()
-        shutil.rmtree(self.folder / TEMP_DIR, ignore_errors=True)
+        temp, self._temp = self._temp, None
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
+            self._guard = _with_temp(self._guard, None)
+
+    def _make_temp(self) -> Path:
+        """The agent's own directory for temporary files, made when its process is
+        started and known to its guard from then on."""
+        if self._temp is None:
+            self._temp = make_temp()
+            self._guard = _with_temp(self._guard, self._temp)
+        return self._temp
 
     # -- following the agent -------------------------------------------------------------
 
@@ -1237,7 +1276,7 @@ class AgentSession:
             self._account_unreported()
             if isinstance(exc, Exception) and _NO_SANDBOX in str(exc):
                 why = experiments.mask_credentials(self.ctx.project, str(exc))
-                raise SandboxUnavailable(_no_sandbox_sentence(self.role, why)) from exc
+                raise SandboxUnavailable(_no_sandbox_sentence(self.role, _cli_reason(why))) from exc
             raise
 
     def _last_report(self, conversation: AgentConversation) -> Turn | None:
@@ -1426,7 +1465,7 @@ class AgentSession:
             why = experiments.mask_credentials(self.ctx.project, str(turn.error or turn.ended))
             if _NO_SANDBOX in why:
                 self.close()
-                raise SandboxUnavailable(_no_sandbox_sentence(self.role, why))
+                raise SandboxUnavailable(_no_sandbox_sentence(self.role, _cli_reason(why)))
             raise AgentFailed(f"The {self.role} agent ended with an error: {why}")
         return turn.text
 
