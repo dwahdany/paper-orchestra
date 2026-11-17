@@ -425,8 +425,15 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   await page.selectOption('#opt-agent-runtime', 'classic');
   await page.waitForSelector('#opt-effort');
   ok((await count(page, '#opt-agent-model')) === 0, 'for the tool loop it does, and the fields of agents with a shell are gone');
+  ok((await count(page, '.start-agents')) === 0, 'and nothing under the box speaks of agents with a shell');
   await page.selectOption('#opt-agent-runtime', 'sdk');
   await page.waitForSelector('#opt-agent-model');
+  /* whose account pays, and that fast mode is dear, stands on the page itself: Options may be closed when Start is pressed */
+  const paid = await text(page, '.start-est .start-agents');
+  ok(paid.includes(base.model) && (base.credential === 'login' ? /billed to your own Claude account/ : /federation/).test(paid) && (!(base.fast && base.credential === 'login') || /fast mode costs several times/.test(paid)) && /Change it under Options/.test(paid), 'under the box, outside the options, the page says on which model and whose account the agents work: ' + paid);
+  await page.selectOption('#opt-agent-credential', 'federation');
+  await until(page, () => /federation/.test((document.querySelector('.start-agents') || {}).textContent || '') && !/fast mode/.test((document.querySelector('.start-agents') || {}).textContent || ''), null, 3000, 'with the federation credential it names that account, and no fast mode');
+  await page.selectOption('#opt-agent-credential', '');
   ok(/shell/.test(await says(page, 'runtime')) && (await page.getAttribute('#opt-agent-model', 'placeholder')) === base.model, 'agents with a shell: the sentence says so, and the model field shows the server\'s default: ' + (await page.getAttribute('#opt-agent-model', 'placeholder')));
   ok(JSON.stringify(await page.$$eval('#opt-agent-credential option', (options) => options.map((o) => o.value))) === JSON.stringify([''].concat(defaults.agent_credentials)), 'the credentials are the ones the server lists');
   ok((await page.isChecked('#opt-agent-fast')) === base.fast && (await page.isChecked('#opt-agent-ultracode')) === base.ultracode && (await page.isChecked('#opt-agent-sandbox')) === base.sandbox, 'the ticks start as the server\'s defaults');

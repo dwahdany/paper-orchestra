@@ -1144,7 +1144,7 @@ a.choice { text-decoration: none; }
 .net-ask .net-need { display: block; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
 .review .net-ask { background: var(--surface); }
 .net-models { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--ink-2); min-width: 0; overflow-wrap: anywhere; } .net-models svg { flex: none; margin-top: 2px; }
-.tick .net-models { flex-basis: 100%; }
+.approve > .net-models { margin-top: 8px; }
 .start-agents { display: block; margin-top: 4px; overflow-wrap: anywhere; }
 .approve-fields .tick .quiet { margin-left: 2px; }
 /* approved, and then the code or the plan changed */
