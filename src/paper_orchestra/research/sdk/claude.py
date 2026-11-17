@@ -236,9 +236,16 @@ class _Conversation:
                             error=(errors or str(message.result or message.subtype))
                             if failed
                             else None,
-                            ended=message.terminal_reason
-                            if message.terminal_reason not in (None, "completed")
-                            else (message.subtype if message.subtype != "success" else None),
+                            # How it ended when it did not simply complete: the kind of
+                            # error (``error_max_budget_usd``, ...), else why the loop
+                            # stopped (``aborted_tools`` after an interrupt).
+                            ended=message.subtype
+                            if message.subtype != "success"
+                            else (
+                                message.terminal_reason
+                                if message.terminal_reason not in (None, "completed")
+                                else None
+                            ),
                             requests=requests,
                         )
                     )
