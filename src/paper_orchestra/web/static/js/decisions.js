@@ -65,7 +65,7 @@ function card(store, d) {
     <label class="sr" for="dc-say-${d.id}">Your answer in your own words</label>
     <textarea id="dc-say-${d.id}" class="dc-say" data-input="decide-text" data-ref="${d.id}" rows="2" placeholder="Or say it in your own words${(d.options || []).length ? ' (also together with an option)' : ''}">${draft.text}</textarea>
     ${draft.error ? html`<p class="dc-err" role="alert">${draft.error}</p>` : ''}
-    <div class="dc-go"><button type="button" class="btn btn-primary" data-act="decide-send" data-ref="${d.id}"${draft.sending ? raw(' disabled') : ''}>${settled ? 'Change the answer' : 'Answer'}${picked ? html`: <span class="dc-pick">${picked.label}</span>` : ''}</button>
+    <div class="dc-go"><button type="button" class="btn btn-primary" data-act="decide-send" data-ref="${d.id}"${draft.sending ? raw(' disabled') : ''}><span>${settled ? 'Change the answer' : 'Answer'}${picked ? html`: <span class="dc-pick">${picked.label}</span>` : ''}</span></button>
       ${d.state === 'withdrawn' ? '' : html`<button type="button" class="btn btn-quiet" data-act="decide-dismiss" data-ref="${d.id}" data-tip="The agents go on with their default, and are told that the choice was left to them"${draft.sending ? raw(' disabled') : ''}>Not for me to decide</button>`}</div>`;
 }
 
