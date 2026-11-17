@@ -1012,3 +1012,53 @@ def test_the_client_reads_what_the_server_now_says():
     css = _text(STATIC_DIR / "css" / "app.css")
     for selector in (".go-need", ".go-held", ".in-why", ".decided-edits", ".st-also", "#tip kbd"):
         assert selector in css, f"the stylesheet has no rule for {selector}"
+
+
+def test_the_client_shows_agents_with_a_shell_from_what_the_server_says():
+    """How the agents are run, what they do and which runs they carried out are the
+    server's word: the form's choices and defaults come from ``GET /api/defaults``, a
+    line of the feed is set in parts only where its event carries them (``data.did``),
+    and a run is an agent's where its own record says so, not where the project's
+    runtime of today would make it one."""
+    css = _text(STATIC_DIR / "css" / "app.css")
+    for selector in (
+        ".agent-set",
+        ".agent-f",
+        ".agent-says",
+        ".agent-warn",
+        ".adv-agents",
+        ".agents-now",
+        ".agents-form",
+        ".ev-did",
+        ".ev-text",
+        ".ev-refused",
+        ".ev-work-l",
+        ".run-by",
+        ".run-agent",
+    ):
+        assert selector in css, f"the stylesheet has no rule for {selector}"
+    home = _text(STATIC_DIR / "js" / "home.js")
+    overview = _text(STATIC_DIR / "js" / "overview.js")
+    for source, name in ((home, "home.js"), (overview, "overview.js")):
+        assert "agent_runtimes" in source and "agent_credentials" in source, (
+            f"{name} offers runtimes or credentials of its own"
+        )
+    # No model's name and no default of the group is written into the client.
+    for path in _files(".js"):
+        source = _text(path)
+        assert not re.search(r"claude-(?!…)[a-z]+-\d", source), (
+            f"{path.name} names a model: the default is the server's"
+        )
+    # A runtime the composer was not told is not sent: the server chooses it then.
+    assert "if (s.runtime) agents.runtime = s.runtime;" in home
+    shell = _text(STATIC_DIR / "js" / "shell.js")
+    experiments = _text(STATIC_DIR / "js" / "experiments.js")
+    assert "d.carried_out_by === 'agent'" in shell, "the feed does not ask the run who made it"
+    assert "run.carried_out_by === 'agent'" in experiments
+    # What an agent chose is text: escaped by the template, and never a link.
+    act = shell[shell.index("export function actHTML") : shell.index("/** What a folded run says")]
+    assert "raw(" not in act and "href" not in act
+    # One sentence for each choice, and both credentials say who pays and what of fast mode.
+    vocab = _text(STATIC_DIR / "js" / "vocab.js")
+    for word in ("AGENT_SAYS", "noSandbox", "your Claude account pays", "federation rule pays"):
+        assert word in vocab, f"vocab.js does not say {word!r}"

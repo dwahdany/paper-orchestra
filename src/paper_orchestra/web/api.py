@@ -115,6 +115,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from paper_orchestra import __version__
 from paper_orchestra.memory.wiki import slugify, split_front_matter
 from paper_orchestra.research.model import (
+    AGENT_CREDENTIALS,
+    AGENT_RUNTIMES,
     COMPUTE_BACKENDS,
     EFFORTS,
     FOR_ALL,
@@ -1506,12 +1508,17 @@ def defaults(context: Ctx) -> dict[str, Any]:
     addressed to (``POST .../requests``, field ``for``).
 
     Also the values a form may offer, which are the ones the settings accept:
-    ``efforts`` (``settings.models.effort``) and ``compute_backends``
-    (``settings.compute``).  ``phase_words`` is how a sentence for the person names
-    each phase (``{"hypothesize": "the hypothesis phase"}``), as the engine's own
-    sentences and the server's refusals name it, and ``phase_names`` what a phase
-    is called by itself (``{"hypothesize": "hypotheses"}``: "checkpoint after
-    hypotheses"), as the command line says it too.
+    ``efforts`` (``settings.models.effort``), ``compute_backends``
+    (``settings.compute``), ``agent_runtimes`` (``settings.agents.runtime``) and
+    ``agent_credentials`` (``settings.agents.credential``).  The runtime in
+    ``settings.agents`` is the one a project created now would get: ``sdk`` where the
+    server's environment asks for it (``PAPER_ORCHESTRA_AGENT_RUNTIME``).
+
+    ``phase_words`` is how a sentence for the person names each phase
+    (``{"hypothesize": "the hypothesis phase"}``), as the engine's own sentences and
+    the server's refusals name it, and ``phase_names`` what a phase is called by
+    itself (``{"hypothesize": "hypotheses"}``: "checkpoint after hypotheses"), as the
+    command line says it too.
 
     ``creatable_kinds`` are the kinds of page the person can write (``kind`` of
     ``POST .../pages``), and ``kind_writers`` says for each kind which agents write
@@ -1522,6 +1529,8 @@ def defaults(context: Ctx) -> dict[str, Any]:
         "request_for": list(REQUEST_FOR),
         "efforts": list(EFFORTS),
         "compute_backends": list(COMPUTE_BACKENDS),
+        "agent_runtimes": list(AGENT_RUNTIMES),
+        "agent_credentials": list(AGENT_CREDENTIALS),
         "phase_words": context.services.phase_words(),
         "phase_names": {phase: phase_name(phase) for phase in PHASES},
         "creatable_kinds": list(_PERSON_KINDS),

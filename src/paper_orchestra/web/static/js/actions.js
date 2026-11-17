@@ -582,6 +582,7 @@ const ACT = {
   'forget-worker': () => forgetWorker(),
   'notices-seen': () => { dismissNotices(store()); app.render('ui'); },
   'show-problems': () => { if (app.route.view !== 'overview') go({ view: 'overview', sel: '', sub: '' }); setTimeout(() => { const el = $('#problems'); if (el) el.scrollIntoView({ block: 'start', behavior: glide() }); }, 60); },
+  'show-agents': () => { if (app.route.view !== 'overview') go({ view: 'overview', sel: '', sub: '' }); setTimeout(() => { const el = $('.ov-agents'); if (el) el.scrollIntoView({ block: 'start', behavior: glide() }); }, 60); },
   'cutoff-open': () => {
     if (app.ui.cutoffEdit) { app.ui.cutoffEdit = null; return; }
     const parts = cutoffParts(((store().project.settings || {}).research_cutoff));
@@ -589,6 +590,12 @@ const ACT = {
     app.render('ui');
   },
   'cutoff-none': () => saveCutoff(null),
+  'agents-open': () => {
+    if (app.ui.agentsEdit) { app.ui.agentsEdit = null; return; }
+    const a = (store().project.settings || {}).agents || {};
+    app.ui.agentsEdit = { runtime: a.runtime, model: a.model || '', fast: !!a.fast, ultracode: !!a.ultracode, credential: a.credential, sandbox: !!a.sandbox, error: null, saving: false };
+    app.render('ui');
+  },
   stop: () => stopAgents(),
   'limit-edit': () => { const limits = (store().project.settings || {}).limits || {}; app.ui.limitEdit = { value: limits.model_usd > 0 ? String(Math.ceil(limits.model_usd * 1.5)) : '' }; app.render('limit'); setTimeout(() => { const el = $('#limit-usd'); if (el) el.select(); }, 0); },
   'limit-cancel': () => { app.ui.limitEdit = null; app.render('limit'); },
@@ -710,6 +717,28 @@ async function saveCutoff(value) {
   app.render('cutoff');
 }
 
+/** Change how the project's agents are run (`settings.agents`): the runtime alone for the
+    tool loop, every field for agents with a shell. */
+async function saveAgents() {
+  const s = store(), ui = app.ui.agentsEdit;
+  if (!ui || ui.saving) return;
+  const agents = { runtime: ui.runtime };
+  if (ui.runtime === 'sdk') {
+    const model = String(ui.model || '').trim();
+    if (!model) { ui.error = 'Name the model the agents work with.'; app.render('agents'); return; }
+    Object.assign(agents, { model, fast: !!ui.fast, ultracode: !!ui.ultracode, credential: ui.credential, sandbox: !!ui.sandbox });
+  }
+  ui.saving = true; ui.error = null;
+  app.render('agents');
+  try {
+    await api.patchProject(s.pid, { settings: { agents } });
+    app.ui.agentsEdit = null;
+    await s.refreshNow();
+    say('The agents are now ' + (ui.runtime === 'sdk' ? 'Claude agents with a shell' : ui.runtime === 'classic' ? 'run in the tool loop' : ui.runtime) + ', from the next phase on.');
+  } catch (error) { ui.error = message(error); ui.saving = false; }
+  app.render('agents');
+}
+
 async function saveCode(form) {
   const s = store(), eid = form.dataset.eid, name = form.dataset.name, key = eid + '/' + name, edit = app.ui.codeEdit[key];
   if (!edit || edit.saving) return;
@@ -777,6 +806,7 @@ export function installActions() {
       if (made.error) { ui.error = made.error; app.render('cutoff'); return; }
       saveCutoff(made.value);
     }
+    else if (kind === 'agents') saveAgents();
     else if (kind === 'code') saveCode(form);
     else if (kind === 'start') startProject();
     else if (kind === 'request') {
@@ -857,6 +887,7 @@ export function installActions() {
     else if (what === 'paper-model') app.ui.paper.model = t.value;
     else if (what === 'limits' && app.ui.limits) app.ui.limits[t.dataset.name] = t.value;
     else if (what === 'cutoff' && app.ui.cutoffEdit) app.ui.cutoffEdit[t.dataset.name] = t.value;
+    else if (what === 'agents' && app.ui.agentsEdit && t.type !== 'checkbox' && t.tagName !== 'SELECT') app.ui.agentsEdit[t.dataset.name] = t.value;
     else if (what === 'limit' && app.ui.limitEdit) app.ui.limitEdit.value = t.value;
     else if (what === 'new-page-title' && app.ui.newPage) app.ui.newPage.title = t.value;
   });
@@ -874,9 +905,13 @@ export function installActions() {
     else if (what === 'ap-net-choice') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).network = t.value === 'yes'; if (app.ui.netNudge === t.dataset.eid) app.ui.netNudge = null; app.render('backend'); }
     else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.tagName === 'SELECT') app.render('start'); }
     else if (what === 'opt-review') { const s = composer(); s.auto[t.dataset.kind] = !t.checked; keepComposer(); }
+    /* a tick about the agents: what it means is said beside it, and reads otherwise once it is changed */
+    else if (what === 'opt-agent') { const s = composer(); s[t.dataset.name] = t.checked; keepComposer(); app.render('start'); }
     else if (what === 'request-about') { app.ui.request.about = t.checked; }
     else if (what === 'request-for') { app.ui.request.for = t.value; keepRequest(); app.render('request'); }
     else if (what === 'cutoff' && app.ui.cutoffEdit) { app.ui.cutoffEdit[t.dataset.name] = t.value; }
+    /* a choice about the agents: the sentence beside it, and which fields there are, follow it */
+    else if (what === 'agents' && app.ui.agentsEdit) { const ui = app.ui.agentsEdit; if (t.type === 'checkbox') ui[t.dataset.name] = t.checked; else ui[t.dataset.name] = t.value; if (t.type === 'checkbox' || t.tagName === 'SELECT') { ui.error = null; app.render('agents'); } }
     else if (what === 'map-round') { app.ui.map.round = t.value === '' ? null : +t.value; mapView.reset(); app.render('map'); }
     else if (what === 'map-lineage') { const m = app.ui.map; m.deep = t.value === 'all'; m.lineageOnly = t.value === 'only'; mapView.reset(); app.render('map'); }
     else if (what === 'paper-template') app.ui.paper.template = t.value;

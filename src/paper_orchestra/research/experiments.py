@@ -3354,6 +3354,11 @@ class _Session:
         number, directory = _new_run_dir(self.project, self.plan.id)
         record = _new_record(self.plan, number, self.backend_name, self._repairs)
         record["approval"] = _text(self.page.meta.get("approved_at")) or None
+        # Who does the job is a fact of this run, kept with it: the project's runtime
+        # can be changed afterwards, and the run stays what it was.
+        by_agent = bool(getattr(self.backend, "carried_out_by_agent", False))
+        if by_agent:
+            record["carried_out_by"] = "agent"
         attempt = _Attempt(
             number,
             directory,
@@ -3378,7 +3383,12 @@ class _Session:
             f"Run {number} of experiment {self.plan.id} started on the "
             f"{self.backend_name or 'compute'} backend.",
             refs=[self.page.path],
-            data={"experiment": self.plan.id, "run": number, "backend": self.backend_name},
+            data={
+                "experiment": self.plan.id,
+                "run": number,
+                "backend": self.backend_name,
+                **({"carried_out_by": "agent"} if by_agent else {}),
+            },
         )
         return attempt
 

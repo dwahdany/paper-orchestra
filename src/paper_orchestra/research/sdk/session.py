@@ -76,6 +76,7 @@ __all__ = [
     "AgentSession",
     "describe_tool",
     "memory_tool",
+    "tool_parts",
 ]
 
 #: Where the agents' own folders lie in a project: ``agents/<session>/``.
@@ -194,6 +195,58 @@ def describe_tool(role: str, use: ToolUse, folder: Path) -> tuple[str, list[str]
     if name == "Workflow":
         return f"{who} started a workflow of helper agents.", []
     return None
+
+
+#: What a built-in tool does, in one word, as ``data.did`` of the feed's line says it.
+_DID = {
+    "Bash": ("shell", "command"),
+    "WebSearch": ("search", "query"),
+    "WebFetch": ("fetch", "url"),
+    "Write": ("write", "file_path"),
+    "Edit": ("write", "file_path"),
+    "MultiEdit": ("write", "file_path"),
+    "NotebookEdit": ("write", "notebook_path"),
+    "Agent": ("helper", "description"),
+    "Task": ("helper", "description"),
+    "Workflow": ("workflow", ""),
+}
+
+
+def tool_parts(use: ToolUse, folder: Path, *, refused: bool = False) -> dict[str, Any]:
+    """The parts of the feed's sentence about a tool call (``data`` of the event), for a
+    reader that sets a command apart from the words around it.
+
+    ``did`` is what kind of thing the agent did (``shell``, ``search``, ``fetch``,
+    ``write``, ``helper``, ``workflow``, ``board``), ``text`` what it chose (the
+    command, the query, the address, the file), made plain and cut exactly as the
+    sentence quotes it: the parts say nothing the sentence does not.  ``helper`` is
+    set for a call of a helper agent, ``refused`` for a call that was not allowed.
+    """
+    given = use.input if isinstance(use.input, Mapping) else {}
+    if use.name.startswith(BOARD_PREFIX):
+        parts: dict[str, Any] = {"did": "board", "tool": bare_name(use.name)}
+    else:
+        did, key = _DID.get(use.name, ("", ""))
+        if not did:
+            if not refused:
+                return {}
+            did, key = "other", ""
+        chosen = given.get(key) if key else None
+        if did == "helper" and not chosen:
+            chosen = given.get("prompt")
+        if did == "write":
+            chosen = _folder_path(chosen, folder)
+        if refused and chosen is None:
+            chosen = given.get("command") or given.get("file_path") or given.get("path")
+        parts = {"did": did}
+        if chosen is not None:
+            # The words of a quotation without its marks: one line, cut, nothing hidden.
+            parts["text"] = agents.said(chosen, 160)[1:-1]
+    if use.sub:
+        parts["helper"] = True
+    if refused:
+        parts["refused"] = True
+    return parts
 
 
 class AgentRuntime:
@@ -483,12 +536,15 @@ class AgentSession:
             with self._transcript_path.open("a", encoding="utf-8") as handle:
                 handle.write(experiments.mask_credentials(self.ctx.project, line) + "\n")
 
-    def _tell(self, sentence: str, refs: Sequence[str] = ()) -> None:
-        """One line for the activity feed (and the run's log), unless it repeats the last."""
+    def _tell(
+        self, sentence: str, refs: Sequence[str] = (), data: Mapping[str, Any] | None = None
+    ) -> None:
+        """One line for the activity feed (and the run's log), unless it repeats the last.
+        ``data`` is the sentence in parts (:func:`tool_parts`)."""
         if sentence == self._last:
             return
         self._last = sentence
-        self.ctx.activity(sentence, agent=self.role, refs=refs)
+        self.ctx.activity(sentence, agent=self.role, refs=refs, data=data)
         if self._on_line is not None:
             self._on_line(sentence)
 
@@ -513,7 +569,15 @@ class AgentSession:
             said += f"; fast mode was asked for and is not on{why}."
         if self._resumed:
             said += " It carries on the session that was interrupted."
-        self._tell(said)
+        self._tell(
+            said,
+            data={
+                "did": "start",
+                "model": model,
+                "fast": "on" if state == "on" else "off",
+                "fast_asked": bool(self.runtime.settings.fast),
+            },
+        )
         self._log(
             "started",
             model=data.get("model"),
@@ -556,7 +620,7 @@ class AgentSession:
             if not self._ending():
                 described = self._described(event)
                 if described is not None:
-                    self._tell(described[0], described[1])
+                    self._tell(*described)
         elif isinstance(event, Answered):
             # Kept for whoever reads the transcript; long answers are cut.
             self._log(
@@ -581,16 +645,19 @@ class AgentSession:
             ):
                 raise _Unresponsive()
 
-    def _described(self, use: ToolUse) -> tuple[str, list[str]] | None:
-        """The feed's sentence about a tool call the agent announced.  A call the guard
-        refuses is told as refused: the person should see what was tried, and that it
-        did not happen."""
+    def _described(self, use: ToolUse) -> tuple[str, list[str], dict[str, Any]] | None:
+        """The feed's sentence about a tool call the agent announced, with what it
+        refers to and its parts.  A call the guard refuses is told as refused: the
+        person should see what was tried, and that it did not happen."""
         try:
             refused = self._guard.check(use)
         except Exception:
             refused = "refused"
         if refused is None:
-            return describe_tool(self.role, use, self.folder)
+            described = describe_tool(self.role, use, self.folder)
+            if described is None:
+                return None
+            return described[0], described[1], tool_parts(use, self.folder)
         who = f"A helper of the {self.role}" if use.sub else f"The {self.role}"
         given = use.input if isinstance(use.input, Mapping) else {}
         tried = given.get("command") or given.get("file_path") or given.get("path") or use.name
@@ -598,6 +665,7 @@ class AgentSession:
             f"{who} tried {agents.said(tried, 140)} with {agents.named(use.name, 40)}; "
             "that is not an agent's to do, and it was refused.",
             [],
+            tool_parts(use, self.folder, refused=True),
         )
 
     def _count(self, event: Used) -> None:

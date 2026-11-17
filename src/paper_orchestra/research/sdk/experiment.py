@@ -63,6 +63,10 @@ class AgentBackend:
     to act on (the run itself is then recorded as cancelled and queued again).
     """
 
+    #: Read by ``experiments.run`` for the run's record and its ``run.started`` event:
+    #: the run says of itself that an agent carried it out.
+    carried_out_by_agent = True
+
     def __init__(self, ctx: agents.AgentContext, inner: Any, page: Any) -> None:
         self._ctx = ctx
         self._inner = inner

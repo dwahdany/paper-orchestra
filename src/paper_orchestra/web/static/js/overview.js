@@ -3,9 +3,9 @@
 
 import { app, defaults, link } from './core.js';
 import { MONTH_NAMES, ago, checkpointDid, clock, cutoffParts, cutoffWords, dayOf, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, setHTML, whyNot } from './util.js';
-import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, icon, lapsed, pageGlyph, phaseName, roleName, shownState } from './vocab.js';
+import { AGENT_SAYS, CHECKPOINT_AFTER, KIND, PHASES, RUNTIME, ROLE, STAGES, TONE, agentName, credentialName, glyph, icon, lapsed, pageGlyph, phaseName, roleName, runtimeName, shownState } from './vocab.js';
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
-import { DEMO_COST, UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
+import { DEMO_COST, UNVERIFIED, actHTML, agentFields, agentsSentence, continueControl, continueNotes, crashText, engineView, foldRuns, foldSteps, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, runWho, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
@@ -99,7 +99,7 @@ function argumentHTML(store) {
 }
 
 function feedHTML(store) {
-  const events = foldRuns(store.activity.filter((ev) => ev.type !== 'run.log')).slice(-app.ui.feedLimit).reverse();
+  const events = foldSteps(foldRuns(store.activity.filter((ev) => ev.type !== 'run.log'))).slice(-app.ui.feedLimit).reverse();
   if (!events.length) return html`<p class="quiet">Nothing has happened yet.</p>`;
   let day = '';
   const rows = events.map((ev) => {
@@ -108,9 +108,15 @@ function feedHTML(store) {
     day = d;
     if (ev.run) {
       const path = (store.expById.get(ev.eid) || {}).path;
-      return html`${head}<li class="ev ev-run ev-${ev.status}"><time>${hm(ev.ts)}</time><span class="ev-who">runner</span>
+      return html`${head}<li class="ev ev-run ev-${ev.status}"><time>${hm(ev.ts)}</time><span class="ev-who">${runWho(ev)}</span>
         <span class="ev-run-l">${path ? html`<a href="${link({ view: 'experiments', sel: path, sub: '' })}">${runSentence(ev)}</a>` : runSentence(ev)}
-          <details class="ev-steps" data-keep="run:${ev.key}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${plain(p.summary)}</span></li>`)}</ol></details></span></li>`;
+          <details class="ev-steps" data-keep="run:${ev.key}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${actHTML(p)}</span></li>`)}</ol></details></span></li>`;
+    }
+    /* an agent with a shell that did much in a row: its latest step, and all of them behind it */
+    if (ev.work) {
+      return html`${head}<li class="ev ev-agent-activity ev-work"><time>${hm(ev.ts)}</time><span class="ev-who">${whoOf(ev.last)}</span>
+        <span class="ev-work-l">${actHTML(ev.last)}
+          <details class="ev-steps" data-keep="work:${ev.seq}"><summary>${plural(ev.parts.length, 'step')}</summary><ol>${ev.parts.map((p) => html`<li><time>${hm(p.ts)}</time><span>${actHTML(p)}</span></li>`)}</ol></details></span></li>`;
     }
     /* a phase that starts says which of the person's instructions it was given */
     const told = ev.type === 'phase.started' ? ((ev.data || {}).requests || []).map((id) => store.requests.find((r) => r.id === id)).filter(Boolean) : [];
@@ -121,7 +127,7 @@ function feedHTML(store) {
     const who = pause ? 'engine' : whoOf(ev), you = who === 'you';
     const ref = pause ? null : (ev.refs || []).find((r) => store.byPath.has(r));
     return html`${head}<li class="ev ev-${String(ev.type).replace(/[^a-z]/g, '-')}${you ? ' ev-you' : who === 'engine' && !pause ? ' ev-engine' : ''}"><time>${hm(ev.ts)}</time><span class="ev-who">${who}</span>
-      ${ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${plain(ev.summary)}${given}</span>`}</li>`;
+      ${ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${actHTML(ev)}${given}</span>`}</li>`;
   });
   const more = store.activity.length > app.ui.feedLimit || store.moreActivity;
   return html`<ol class="feed">${rows}</ol>${more ? html`<button class="btn btn-quiet btn-s feed-more" data-act="feed-more">Show earlier activity</button>` : ''}`;
@@ -204,6 +210,25 @@ function cutoffHTML(store) {
       <button class="btn btn-s" type="submit"${ui.saving ? raw(' disabled') : ''}>Save the cutoff</button>
       ${parts ? html`<button class="btn btn-quiet btn-s" type="button" data-act="cutoff-none"${ui.saving ? raw(' disabled') : ''}>No cutoff</button>` : ''}
       ${ui.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span>${ui.error}</span></p>` : ''}</form>` : ''}</details>`;
+}
+
+/** How the project's agents are run (`settings.agents`), said in a sentence and changed in
+    place: the runtime, and for agents with a shell their model, fast mode, helpers, the
+    credential and the sandbox, each with what it means. A change holds from the next phase
+    on: what is at work goes on as it was started. */
+function agentsHTML(store, e) {
+  const a = (store.project.settings || {}).agents;
+  if (!a || typeof a !== 'object') return '';
+  const ui = app.ui.agentsEdit, d = defaults();
+  const list = (name, kept, words) => { const l = d && Array.isArray(d[name]) ? d[name].filter((x) => typeof x === 'string' && x) : []; return (l.indexOf(kept) < 0 ? l.concat([kept]) : l).map((v) => [v, words(v)]); };
+  return html`<section class="ov-sec ov-agents"><h2>How the agents work</h2>
+    <p class="agents-now" data-agents="${a.runtime}"><b>${agentsSentence(a)}</b> ${(RUNTIME[a.runtime] || ['', ''])[1]}</p>
+    ${a.runtime === 'sdk' && !a.sandbox ? html`<p class="note note-warn agents-open-box">${icon('warn')}<span><b>The sandbox is off.</b> ${AGENT_SAYS.noSandbox}</span></p>` : ''}
+    <details class="spend-more agents-more"${ui ? raw(' open') : ''}><summary data-act="agents-open">Change how the agents work</summary>
+    ${ui ? html`<form class="agents-form" data-form="agents">${agentFields(ui, { id: 'ag', input: 'agents', tick: 'agents', runtimes: list('agent_runtimes', ui.runtime, runtimeName), credentials: list('agent_credentials', ui.credential, credentialName), picked: ui, modelHint: '' })}
+      <p class="quiet agents-when">${e.working ? 'The agents at work now go on as they were started; the change holds from the next phase on.' : 'The change holds from the next phase on.'}</p>
+      ${ui.error ? html`<p class="note note-neg" role="alert">${icon('warn')}<span><b>Not changed.</b> ${ui.error}</span></p>` : ''}
+      <button class="btn btn-s" type="submit"${ui.saving ? raw(' disabled') : ''}>Save how the agents work</button></form>` : ''}</details></section>`;
 }
 
 function spendHTML(store) {
@@ -290,6 +315,7 @@ export const overviewView = {
       </div><div class="ov-col">
         <section class="ov-sec"><h2>Activity</h2>${feedHTML(store)}</section>
         <section class="ov-sec"><h2>Spend</h2>${spendHTML(store)}</section>
+        ${agentsHTML(store, e)}
         <section class="ov-sec"><h2>Write it up <span>optional</span></h2><p class="ov-paper">When the wiki says what you want to say, it can be written up as a paper with one of the bundled templates. <a class="linkish" href="${link({ view: 'paper', sel: '', sub: '' })}">Open the paper step</a></p></section>
       </div></div></div></div>`);
     afterRender(root);

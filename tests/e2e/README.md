@@ -14,8 +14,9 @@ and cancelling a run, a run that succeeds only after the runner repaired the cod
 an instruction, starting a phase on a scripted model, watching its activity arrive, stopping
 and resuming it, a worker that dies, a phase that fails, a budget stop, the server going
 away and coming back, the keyboard keeping its place, the command palette, a project of
-150 pages, a new project from the composer with two uploaded files, and titles and text
-with markup, scripts, odd Unicode and words longer than any column.
+150 pages, a new project from the composer with two uploaded files, titles and text
+with markup, scripts, odd Unicode and words longer than any column, and a project whose
+agents have a shell (below).
 
 It also checks that the interface follows the rules of the engine and the store, each
 against what the server answers:
@@ -113,6 +114,30 @@ against what the server answers:
   takes the browser offline, puts another value into its cookie and brings it back, which
   is what a restart is to a browser.)
 
+- agents with a shell (the `sdk` runtime), on a fourth copy of the demo project which no
+  other check touches. The composer offers the runtimes and credentials the server lists
+  (`agent_runtimes`, `agent_credentials` and `settings.agents` of `GET /api/defaults`), names
+  the server's default as the default, says in one sentence what each choice means (the
+  login and federation: who pays and what becomes of fast mode; the sandbox switched off:
+  what the agents can then reach), and sends only what the person chose, so that a composer
+  left alone leaves the runtime to the server's environment. The overview says how the
+  project's agents work and changes it (`PATCH` with `settings.agents`); a model without a
+  name is not sent, and a change the server refuses is shown in the server's words with
+  the form unchanged. Where the agents cannot start, the engine's sentence stands beside
+  the main button with the way to those settings, not to Setup. An approval for this
+  machine says that an agent carries the run out; one for Modal says what it always said.
+  The feed sets what an agent chose apart from the words around it (a shell command, a web
+  search, an address, which is text and never a link, a file, a helper and what the helper
+  did, a call that was refused), tells a board tool in the project's sentence, folds what
+  one agent did in a row into one line that opens to its steps and grows while it is open,
+  and tells a run an agent carried out as one line from the agent with the agent's steps in
+  it; a run the runner made reads as before. The experiment shows such a run with its log,
+  its metrics and the word that an agent carried it out (`carried_out_by` of the run's
+  record), also where it failed. At 320 and 390 px nothing of this is wider than the
+  phone, a long command wraps under when and who, and every field is a finger high and
+  16 px. No agent can be started on the scripted model, so the check writes what agents
+  leave behind (events with `data.did`, a run's record) into the project's files;
+
 And a few things a reload, another window or the keyboard must not break:
 
 - whom an instruction is for is kept with the text that is being typed, across a reload; an
@@ -158,6 +183,7 @@ WS=$(mktemp -d)
 uv run paper-orchestra research demo --dir "$WS/demo"                # about 6 s: its runs are real
 uv run paper-orchestra research demo --dir "$WS/large" --pages 150   # for the `large` check
 uv run paper-orchestra research demo --dir "$WS/nomodel"             # for the `nomodel` check
+uv run paper-orchestra research demo --dir "$WS/shell"               # for the `shell` check
 
 # The server's access token, for the server and for the checks (16 characters or more).
 export PAPER_ORCHESTRA_UI_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
@@ -177,7 +203,7 @@ To look at the app yourself meanwhile, open the link the server printed.
 
 The flows change the project, so every run needs a fresh workspace. Options:
 
-- `--only map,inbox` / `--skip composer`: the checks are `screens`, `phone`, `nomodel`, `map`,
+- `--only map,inbox` / `--skip composer`: the checks are `screens`, `phone`, `shell`, `nomodel`, `map`,
   `inbox`, `wiki`, `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`,
   `composer`, `hostile`. They are written to run in that order on one fresh demo project; a
   single one also runs alone.
@@ -187,6 +213,10 @@ The flows change the project, so every run needs a fresh workspace. Options:
   such project, when `PAPER_ORCHESTRA_E2E_NO_MODEL` is not set, or when the server is on
   another machine (the file is the switch). It comes before every check that starts
   agents: the switch is the server's, not one project's.
+- `shell` looks at the project in the folder `shell` (a fourth copy of the demo project),
+  whose agents it gives a shell and into whose files it writes; it says in a `note` line
+  that it was skipped when the workspace has no such project, and which parts it left out
+  when the server is on another machine or when such agents can start here.
 - `--shots DIR`: photographs of the moving states (a running phase, a live log, a failure)
   as the checks pass them.
 - `--scheme dark`: the flows in the dark theme. The checks are meant to pass in both

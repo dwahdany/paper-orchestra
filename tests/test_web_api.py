@@ -5635,3 +5635,164 @@ def test_a_suggested_edit_to_a_finding_is_listed_with_what_its_numbers_check_fou
         )
         decided = client.get(url(project, "/proposals?review=all")).json()["proposals"]
         assert "number_report" not in next(row for row in decided if row["id"] == proposal.id)
+
+
+# ---------------------------------------------------------------------------
+# How the agents are run (settings.agents), their lines in the feed, their runs
+# ---------------------------------------------------------------------------
+
+AGENT_RUNTIME_ENV = "PAPER_ORCHESTRA_AGENT_RUNTIME"
+
+
+def test_the_defaults_offer_the_runtimes_and_credentials_the_settings_accept(client, monkeypatch):
+    from paper_orchestra.research.model import ProjectSettings
+
+    monkeypatch.delenv(AGENT_RUNTIME_ENV, raising=False)
+    body = client.get("/api/defaults").json()
+    assert body["agent_runtimes"] == ["classic", "sdk"]
+    assert body["agent_credentials"] == ["login", "federation"]
+    for runtime in body["agent_runtimes"]:
+        for credential in body["agent_credentials"]:
+            given = {"agents": {"runtime": runtime, "credential": credential}}
+            agents = ProjectSettings.from_dict(given, strict=True).agents
+            assert (agents.runtime, agents.credential) == (runtime, credential)
+    # Every field a form shows has its default here: a client carries none of its own.
+    assert body["settings"]["agents"] == {
+        "runtime": "classic",
+        "model": "claude-fable-5-2",
+        "fast": True,
+        "ultracode": True,
+        "credential": "login",
+        "sandbox": True,
+    }
+
+
+def test_a_new_project_gets_the_runtime_the_servers_environment_names(
+    client, workspace, monkeypatch
+):
+    def created(settings: dict[str, Any] | None) -> dict[str, Any]:
+        data = {"brief": "An idea."}
+        if settings is not None:
+            data["settings"] = json.dumps(settings)
+        response = client.post("/api/projects", data=data)
+        assert response.status_code == 201, response.text
+        pid = response.json()["id"]
+        shown = client.get(f"/api/projects/{pid}").json()["settings"]["agents"]
+        # ... and it is written into the project: the environment of whoever opens it
+        # later changes nothing.
+        on_file = json.loads((workspace / response.json()["dir"] / "project.json").read_text())
+        assert on_file["settings"]["agents"] == shown
+        return shown
+
+    monkeypatch.delenv(AGENT_RUNTIME_ENV, raising=False)
+    assert created(None)["runtime"] == "classic"
+
+    monkeypatch.setenv(AGENT_RUNTIME_ENV, "sdk")
+    assert client.get("/api/defaults").json()["settings"]["agents"]["runtime"] == "sdk"
+    assert created(None)["runtime"] == "sdk"
+    # A form that says something else about the agents, and nothing about the runtime,
+    # still gets the environment's.
+    partly = created({"agents": {"fast": False, "credential": "federation"}})
+    assert (partly["runtime"], partly["fast"], partly["credential"]) == ("sdk", False, "federation")
+    # What the form names wins.
+    assert created({"agents": {"runtime": "classic"}})["runtime"] == "classic"
+    refused = client.post(
+        "/api/projects",
+        data={"brief": "x", "settings": json.dumps({"agents": {"runtime": "abacus"}})},
+    )
+    assert refused.status_code == 422 and "runtime" in error_of(refused)["message"]
+
+    monkeypatch.setenv(AGENT_RUNTIME_ENV, "nonsense")
+    assert created(None)["runtime"] == "classic"
+
+
+def test_how_the_agents_are_run_can_be_changed_and_a_refused_change_changes_nothing(
+    client, project, monkeypatch
+):
+    monkeypatch.delenv(AGENT_RUNTIME_ENV, raising=False)
+    assert client.get(url(project)).json()["settings"]["agents"]["runtime"] == "classic"
+    changed = client.patch(
+        url(project),
+        json={
+            "settings": {
+                "agents": {
+                    "runtime": "sdk",
+                    "model": "claude-haiku-5-5",
+                    "fast": False,
+                    "ultracode": False,
+                    "credential": "federation",
+                    "sandbox": False,
+                }
+            }
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    wanted = {
+        "runtime": "sdk",
+        "model": "claude-haiku-5-5",
+        "fast": False,
+        "ultracode": False,
+        "credential": "federation",
+        "sandbox": False,
+    }
+    assert changed.json()["settings"]["agents"] == wanted
+    assert Project.open(project.root).settings.agents.sdk
+    # One field alone: the others stay.
+    one = client.patch(url(project), json={"settings": {"agents": {"sandbox": True}}})
+    assert one.json()["settings"]["agents"] == {**wanted, "sandbox": True}
+
+    before = (project.root / "project.json").read_text()
+    for wrong, named in (
+        ({"runtime": "abacus"}, "runtime"),
+        ({"credential": "password"}, "credential"),
+        ({"fast": "yes"}, "fast"),
+        ({"model": " "}, "model"),
+        ({"sandbox": True, "ultracode": 1}, "ultracode"),
+    ):
+        refused = client.patch(url(project), json={"settings": {"agents": wrong}})
+        assert refused.status_code == 422, (wrong, refused.text)
+        assert named in error_of(refused)["message"]
+        assert (project.root / "project.json").read_text() == before
+        assert client.get(url(project)).json()["settings"]["agents"] == {**wanted, "sandbox": True}
+
+
+def test_the_feed_carries_the_parts_of_an_agents_line(client, project):
+    """What an agent with a shell did reaches the app as the sentence and as its parts
+    (``data``), over the listing and over the stream alike; a credential is in neither."""
+    project.emit(
+        "agent.activity",
+        "The scout ran “ls -la && cat main.py” in its shell.",
+        phase="research",
+        agent="scout",
+        round=1,
+        data={"did": "shell", "text": "ls -la && cat main.py"},
+    )
+    project.emit(
+        "agent.activity",
+        "The scout read wiki/idea.md.",
+        phase="research",
+        agent="scout",
+        round=1,
+    )
+    told, plain = client.get(url(project, "/activity?limit=2")).json()["events"]
+    assert told["agent"] == "scout" and told["summary"].startswith("The scout ran")
+    assert told["data"] == {"did": "shell", "text": "ls -la && cat main.py"}
+    # A line of the tool loop, and one written before lines had parts, has none.
+    assert not plain["data"]
+
+
+def test_a_run_an_agent_carried_out_says_so_wherever_the_run_is_shown(client, project):
+    run_dir = add_run(project)
+    record = json.loads((run_dir / "run.json").read_text())
+    by_hand = client.get(url(project, "/experiments/E1")).json()["runs"][0]
+    assert "carried_out_by" not in by_hand  # a run of the runner's says nothing of the kind
+
+    (run_dir / "run.json").write_text(json.dumps({**record, "carried_out_by": "agent"}))
+    view = client.get(url(project, "/experiments/E1")).json()
+    assert view["runs"][0]["carried_out_by"] == "agent"
+    # ... with its log and what it left, like any run.
+    assert view["runs"][0]["log_url"] and view["runs"][0]["artifact_urls"]
+    log = client.get(url(project, "/experiments/E1/runs/1/log")).json()
+    assert "done" in log["text"]
+    (row,) = client.get(url(project, "/experiments")).json()["experiments"]
+    assert row["last_run"]["carried_out_by"] == "agent"

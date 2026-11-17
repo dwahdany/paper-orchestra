@@ -657,6 +657,13 @@ def test_an_approved_experiment_is_carried_out_by_an_agent_in_a_folder_of_its_ow
     assert "[paper-orchestra] The run measured both variances." in log
     assert [event["data"]["status"] for event in events(project, "run.finished")] == ["succeeded"]
     assert "The experimenter ran “python main.py” in its shell." in activity(project)
+    # The run says of itself who did the job, in its record and where it starts: whoever
+    # shows it (the app) must not ask the project's settings, which can change afterwards.
+    assert record["carried_out_by"] == "agent"
+    assert json.loads((run_dir / "run.json").read_text())["carried_out_by"] == "agent"
+    assert [event["data"].get("carried_out_by") for event in events(project, "run.started")] == [
+        "agent"
+    ]
     assert engine.driver.conversations[-1].closed
     assert "experimenter.agent" in [row["label"] for row in usage(project)["by_label"]]
 
@@ -982,6 +989,9 @@ def test_a_run_approved_for_a_remote_backend_is_not_an_agents(project, team, bac
     record = engine.run_experiment("E1")
     assert (record["status"], record["backend"]) == ("succeeded", "modal")
     assert len(remote.jobs) == 1 and team.calls.count("experimenter") == 0
+    # ... and neither its record nor its start says that one did.
+    assert "carried_out_by" not in record
+    assert "carried_out_by" not in events(project, "run.started")[-1]["data"]
 
 
 # ---------------------------------------------------------------------------

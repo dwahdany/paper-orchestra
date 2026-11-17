@@ -321,10 +321,24 @@ class AgentContext:
         """Remember pages this run of the phase created."""
         self.produced += [path for path in paths if path not in self.produced]
 
-    def activity(self, summary: str, *, agent: str, refs: Iterable[str] = ()) -> None:
-        """One line for the activity feed about what an agent is doing."""
+    def activity(
+        self,
+        summary: str,
+        *,
+        agent: str,
+        refs: Iterable[str] = (),
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """One line for the activity feed about what an agent is doing.  ``data`` says
+        the same in parts, for a reader that sets a command apart from the sentence."""
         self.project.emit(
-            "agent.activity", summary, phase=self.phase, agent=agent, refs=refs, round=self.round
+            "agent.activity",
+            summary,
+            phase=self.phase,
+            agent=agent,
+            refs=refs,
+            data=dict(data) if data else None,
+            round=self.round,
         )
 
     def backend(self, plan: Any = None) -> ComputeBackend | None:

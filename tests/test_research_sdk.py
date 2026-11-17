@@ -50,6 +50,7 @@ from paper_orchestra.research.sdk.session import (
     AgentRuntime,
     AgentSession,
     describe_tool,
+    tool_parts,
 )
 from test_research_agents import activity, make_harness, make_project
 
@@ -939,6 +940,61 @@ def test_the_feed_gets_one_line_for_each_meaningful_tool_call(tmp_path, home):
     kinds = [line["type"] for line in transcript(project, "r1-research-scout")]
     assert kinds[:2] == ["prompt", "started"] and kinds[-1] == "result"
     assert kinds.count("tool") == 9 and "said" in kinds
+    # Each line also says the same in parts, for a reader that sets a command apart from
+    # the sentence (the app's feed): what was done, and what the agent chose.
+    parts = [event["data"] for event in project.events() if event["type"] == "agent.activity"]
+    assert parts == [
+        {"did": "start", "model": "claude-fable-5-2", "fast": "on", "fast_asked": True},
+        {"did": "search", "text": "warmup variance adaptive optimizers"},
+        {"did": "fetch", "text": "https://arxiv.org/abs/1908.03265"},
+        {"did": "shell", "text": "pip install numpy && python probe.py"},
+        {"did": "write", "text": "probe.py"},
+        {"did": "board", "tool": "wiki_search"},
+        {"did": "board", "tool": "memory"},
+        {"did": "helper", "text": "Read three papers"},
+        {"did": "shell", "text": "ls papers/", "helper": True},
+    ]
+
+
+def test_the_parts_of_a_feed_line_say_no_more_than_its_sentence(tmp_path, home, monkeypatch):
+    """The parts are cut and made plain exactly as the sentence quotes them, a credential is
+    blanked in them as in the sentence, and a refused call says that it was refused."""
+    monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "s2k-a-very-secret-value-1234")
+    project = sdk_project(tmp_path)
+    long = "echo " + "x" * 400
+
+    def script(agent: FakeAgent) -> None:
+        agent.bash(long)
+        agent.bash('echo "a"\nprintenv s2k-a-very-secret-value-1234')
+        agent.bash("paper-orchestra research approve . E1")
+
+    run_scripted(project, "scout", script)
+    events = [event for event in project.events() if event["type"] == "agent.activity"][1:]
+    cut, masked, refused = events
+    assert cut["data"]["did"] == "shell" and len(cut["data"]["text"]) == 160
+    assert f"“{cut['data']['text']}”" in cut["summary"]
+    assert "\n" not in masked["data"]["text"] and "s2k-a-very" not in masked["data"]["text"]
+    assert f"“{masked['data']['text']}”" in masked["summary"]
+    assert refused["data"] == {
+        "did": "shell",
+        "text": "paper-orchestra research approve . E1",
+        "refused": True,
+    }
+    assert "it was refused" in refused["summary"]
+
+
+def test_tool_parts_has_nothing_to_say_where_the_feed_says_nothing(tmp_path):
+    for name in ("Read", "Glob", "Grep", "TodoWrite"):
+        assert tool_parts(ToolUse(name, {"file_path": "x"}), tmp_path) == {}
+    inside = ToolUse("Write", {"file_path": str(tmp_path / "notes" / "a.md"), "content": "x"})
+    assert tool_parts(inside, tmp_path) == {"did": "write", "text": "notes/a.md"}
+    assert tool_parts(ToolUse("Workflow", {}), tmp_path) == {"did": "workflow"}
+    odd = ToolUse("Read", {"file_path": "/etc/shadow"})
+    assert tool_parts(odd, tmp_path, refused=True) == {
+        "did": "other",
+        "text": "/etc/shadow",
+        "refused": True,
+    }
 
 
 def test_what_the_agent_chose_stands_in_the_feed_as_a_quotation_and_secrets_are_masked(

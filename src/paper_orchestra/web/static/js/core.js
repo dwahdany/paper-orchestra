@@ -36,6 +36,7 @@ export const app = {
     request: { text: '', about: true, for: 'all' },
     goMenu: null,           // which Continue control has its list of phases open: 'strip', 'overview' or null
     cutoffEdit: null,       // the research cutoff being changed on the overview
+    agentsEdit: null,       // how the agents are run, being changed on the overview
     starting: {},           // experiment id -> a run is being started (the server may settle an unfinished one first)
     cancelling: {},         // experiment id -> its approval is being taken back, or its run cancelled
     defaults: null,         // GET /api/defaults, as last fetched
@@ -98,7 +99,7 @@ export function openProjectUi(pid) {
   ui.approve = {}; ui.codeTab = {}; ui.codeEdit = {}; ui.runOpen = {}; ui.asDiff = {}; ui.histVersion = {};
   ui.newPage = null; ui.limitEdit = null; ui.limits = null; ui.limitsOpen = false;
   ui.editProposal = {}; ui.reapprove = null; ui.netNudge = null; ui.showLessons = false; ui.focusEditor = '';
-  ui.goMenu = null; ui.cutoffEdit = null; ui.starting = {}; ui.cancelling = {}; ui.decidedAll = false;
+  ui.goMenu = null; ui.cutoffEdit = null; ui.agentsEdit = null; ui.starting = {}; ui.cancelling = {}; ui.decidedAll = false;
   /* (an earlier version kept on this device what rests on a rejected experiment; the server says it now) */
   storage.remove('po-rested:' + pid);
   ui.paper = { templates: ui.paper.templates, template: ui.paper.template };

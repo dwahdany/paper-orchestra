@@ -104,6 +104,32 @@ export const effortName = (effort) => EFFORT_NAME[effort] || String(effort || ''
 export const COMPUTE_NAME = { local: ['This machine (local CPU)', 'this machine'], modal: ['Modal sandboxes', 'Modal sandboxes'] };
 export const computeName = (backend, short) => (COMPUTE_NAME[backend] ? COMPUTE_NAME[backend][short ? 1 : 0] : String(backend || ''));
 
+/** How the project's agents are run (`settings.agents`). The runtimes and the credentials a
+    form offers come from the server (`agent_runtimes` and `agent_credentials` of
+    /api/defaults); these are the words for the ones this interface knows, each with the one
+    sentence that says what it means. A value it does not know is offered under its own name. */
+export const RUNTIME = {
+  classic: ['The tool loop', 'The agents work through the project\'s own tools over a model API: they read and write the wiki and search the literature, and have no shell.'],
+  sdk: ['Claude agents with a shell', 'Each agent is a Claude Agent SDK agent with a shell in a folder of its own and the web; what counts still reaches the wiki as a proposal for you, and an experiment you approve for this machine is carried out by another agent.'],
+};
+export const runtimeName = (runtime) => (RUNTIME[runtime] ? RUNTIME[runtime][0] : String(runtime || ''));
+export const CREDENTIAL = {
+  login: ['Your Claude Code login', 'The agents sign in with the Claude Code login of this machine: your Claude account pays, and fast mode works where your account has it.'],
+  federation: ['The server\'s federation settings', 'The agents sign in with the server\'s Workload Identity Federation settings: the organization of the federation rule pays, and fast mode is refused where that organization has not enabled it.'],
+};
+export const credentialName = (credential) => (CREDENTIAL[credential] ? CREDENTIAL[credential][0] : String(credential || ''));
+/** What the other settings of the agents mean, one sentence each; the sandbox has one for on and one for off. */
+export const AGENT_SAYS = {
+  model: 'One model for every agent; the models of the tool loop are not used.',
+  fast: 'Asks for fast mode, which answers sooner and costs considerably more per token; each agent says in the activity whether it is on.',
+  ultracode: 'An agent may start helper agents and workflows of its own, under the same guardrails; every session then starts with a larger prompt.',
+  sandbox: 'An agent\'s shell writes only in the agent\'s own folder, and neither it nor the file tools read your home directory, the project\'s own files or a credential.',
+  noSandbox: 'Without the sandbox an agent\'s shell and file tools reach whatever you can reach on this machine: only the refusal of the project\'s command line, the rules about credential files and an environment without credentials remain, and a shell can get around them.',
+};
+/** What an agent with a shell did (`data.did` of an `agent.activity` event), as the feed
+    says it before what the agent chose: "ran `ls -la`", "searched the web for …". */
+export const DID = { shell: 'ran', search: 'searched the web for', fetch: 'opened', write: 'wrote', helper: 'started a helper agent:', workflow: 'started a workflow of helper agents' };
+
 export const agentName = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : String(author || '').replace(/^agent:/, '') || 'engine');
 
 /* ---------- glyphs ---------- */
