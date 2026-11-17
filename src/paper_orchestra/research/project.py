@@ -2996,7 +2996,10 @@ class Project:
         words, or both.
 
         One that was answered or left to the agents before can be answered again:
-        the new answer is added with its time, and it is the one that holds.
+        the new answer is added with its time, and it is the one that holds, as a
+        whole.  Nothing of the earlier answer is carried into it: whoever lets the
+        person change an answer shows them the one that holds (the app) or says
+        what the new one dropped (the command line).
         ``NotFound`` when there is no such decision, ``ProjectError`` for an answer
         that says nothing or names an option the decision does not have.
         """

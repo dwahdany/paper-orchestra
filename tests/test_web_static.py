@@ -1095,6 +1095,89 @@ def test_decisions_are_counted_with_what_waits_and_drawn_with_their_options(tmp_
     assert out["shell"] == {"bar": True, "strip": True, "answer": True}, out["shell"]
 
 
+CHANGE_ANSWER_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago } from './harness.js';
+import { app, parseHash } from './js/core.js';
+import { api } from './js/api.js';
+import * as decisions from './js/decisions.js';
+
+const q9 = page('question', 'Q9', { title: 'The re-test channel', author: 'agent:analyst' });
+const options = [{ label: 'Cheap', meaning: '' }, { label: 'Wide', meaning: '' }];
+const base = { id: 'd-0000bbbb', question: 'How wide?', context: '', context_html: '', options, recommended: null, reason: '', default: 'Cheap.', page: q9.path, blocks: [], raised_by: { role: 'analyst', round: 1 }, created: ago(600) };
+const answered = (option, text, at) => Object.assign({}, base, { state: 'answered', answer: { option, text, at, dismissed: false }, answers: [{ option, text, at, dismissed: false }] });
+const store = projectStore({ pages: [q9], decisions: [answered(1, 'Keep it cheap for now.', ago(120))], project: { state: checkpoint('analyze', 'hypothesize'), next_step: said({ will_run: ['hypothesize'], then: 'design' }) } });
+app.route = { name: 'project', pid: 'p-1', view: 'inbox', ref: '', sel: '', sub: '', q: {} };
+app.render = () => {};
+const sent = [];
+api.answerDecision = async (pid, id, option, text) => { sent.push([id, option, text]); return { decision: answered(option, text, ago(1)) }; };
+store.refreshNow = async () => {};
+const acts = decisions.decisionActs(() => {});
+const el = { dataset: { ref: base.id } };
+const look = () => {
+  const old = String(decisions.decidedDecisions(store));
+  return { pressed: Array.from(old.matchAll(/data-i="(\d)" aria-pressed="true"/g)).map((m) => +m[1]), field: (old.match(/>([^<]*)<\/textarea>/) || [])[1],
+    whole: old.includes('replaces this one as a whole'), refused: old.includes('This is the answer you gave') };
+};
+const out = {};
+/* the card of an answered decision opens as the answer that holds */
+out.first = look();
+/* another window changes the answer while this card was not touched: the card follows */
+store.decisions = [answered(2, '', ago(60))];
+out.followed = look();
+/* the answer as it stands is not sent again */
+await acts['decide-send'](el);
+out.unchanged = [sent.length, look().refused];
+/* words are added: the option that holds goes with them */
+decisions.decisionTyped({ dataset: { ref: base.id }, value: 'Also record wall-clock time.' });
+store.decisions = [answered(1, 'From another window.', ago(30))];     // (a card the person is writing in is theirs)
+out.touched = look();
+await acts['decide-send'](el);
+out.withWords = sent.slice();
+/* another option is pressed: the words that hold go with it */
+sent.length = 0;
+store.decisions = [answered(1, 'Keep it cheap for now.', ago(10))];
+out.again = look();
+acts['decide-pick']({ dataset: { ref: base.id, i: '2' } });
+await acts['decide-send'](el);
+out.withOption = sent.slice();
+/* whoever says "in the inbox" names the decision */
+const named = (hash) => decisions.decisionNamed(parseHash(hash));
+out.links = [decisions.decisionLink(base.id), String(decisions.pageDecisions(store, q9.path)).includes('href="#/p/p-1/inbox/d-0000bbbb"'),
+  named('#/p/p-1/inbox/d-0000bbbb'), named('#/p/p-1/inbox/Q9'), named('#/p/p-1/inbox'), named('#/p/p-1/wiki/d-0000bbbb')];
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_changing_an_answer_starts_from_the_answer_that_holds(tmp_path):
+    """A new answer replaces the earlier one as a whole.  The card of an answered
+    decision therefore opens with that answer in it (its option pressed, its words in
+    the field) and says so: words added to an option are sent with the option, another
+    option with the words.  An untouched card follows an answer changed elsewhere, the
+    answer as it stands is not sent again, and a link "in the inbox" names its decision."""
+    out = _client(tmp_path, CHANGE_ANSWER_SCRIPT)
+    assert out["first"] == {
+        "pressed": [1],
+        "field": "Keep it cheap for now.",
+        "whole": True,
+        "refused": False,
+    }
+    assert (out["followed"]["pressed"], out["followed"]["field"]) == ([2], "")
+    assert out["unchanged"] == [0, True]
+    assert (out["touched"]["pressed"], out["touched"]["field"]) == (
+        [2],
+        "Also record wall-clock time.",
+    )
+    assert out["withWords"] == [["d-0000bbbb", 2, "Also record wall-clock time."]]
+    assert (out["again"]["pressed"], out["again"]["field"]) == ([1], "Keep it cheap for now.")
+    assert out["withOption"] == [["d-0000bbbb", 2, "Keep it cheap for now."]]
+    assert out["links"] == ["#/p/p-1/inbox/d-0000bbbb", True, "d-0000bbbb", "", "", ""]
+    main = _js("main.js")
+    # A row that is in front only by default does not move the list off the decisions.
+    assert "(route.sel ? ', .in-scroll .in-row.cur' : '')" in main
+    assert "decisionLink(d.id)" in _js("overview.js")
+
+
 def test_the_client_follows_decisions_as_they_are_asked_and_answered():
     store, api, css = _js("store.js"), _js("api.js"), _text(STATIC_DIR / "css" / "app.css")
     # An event of a decision makes the lists be read again, in every window.

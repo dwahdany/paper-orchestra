@@ -17,6 +17,14 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from paper_orchestra.research.decisions import (
+    LABEL_CHARS,
+    LINE_CHARS,
+    MEANING_CHARS,
+    QUESTION_CHARS,
+    SAY_CHARS,
+)
+
 __all__ = [
     "COMMON",
     "ROLE_PROMPTS",
@@ -503,25 +511,41 @@ def _request_lines(requests: Sequence[Mapping[str, Any]]) -> str:
 
 def _decision_line(item: Mapping[str, Any]) -> str:
     """One decision as a line of a list.  The question and the options are an agent's
-    words and the answer is the researcher's: all of it stays an entry of the list."""
+    words and the answer is the researcher's: all of it stays an entry of the list.
+
+    The options stand on the line whatever its state: the researcher may have answered
+    "the second one, but only for the pairs", which says nothing without them.  Each
+    piece is cut only where the record itself would have refused it
+    (``research.decisions``): what the person said reaches every session whole.
+    """
     about = f" (about {inert_line(item['page'], 160)})" if item.get("page") else ""
-    line = f"- {item.get('id')}: {inert_line(item.get('question'), 300)}{about}"
+    line = f"- {item.get('id')}: {inert_line(item.get('question'), QUESTION_CHARS)}{about}"
+    options = "; ".join(
+        f"{number}. {inert_line(label, LABEL_CHARS)}"
+        for number, label in enumerate(item.get("options") or [], start=1)
+    )
+    if options:
+        line += f" Options: {options}."
     answer = item.get("answer")
     if answer:
         chose = (
-            f'option {answer["option"]}, "{inert_line(answer.get("label"), 120)}"'
-            + (f" ({inert_line(answer['meaning'], 300)})" if answer.get("meaning") else "")
+            f'option {answer["option"]}, "{inert_line(answer.get("label"), LABEL_CHARS)}"'
+            + (
+                f" ({inert_line(answer['meaning'], MEANING_CHARS)})"
+                if answer.get("meaning")
+                else ""
+            )
             if answer.get("option")
             else ""
         )
-        said = f'in their words: "{inert_line(answer["text"], 1200)}"' if answer.get("text") else ""
+        said = (
+            f'in their words: "{inert_line(answer["text"], SAY_CHARS)}"'
+            if answer.get("text")
+            else ""
+        )
         return f"{line} They answered: {'; '.join(part for part in (chose, said) if part)}"
-    options = "; ".join(
-        f"{number}. {inert_line(label, 120)}"
-        for number, label in enumerate(item.get("options") or [], start=1)
-    )
-    default = inert_line(item.get("default"), 300) or "what the agent that asked would have done"
-    return f"{line} Options: {options}. Until they answer: {default}"
+    default = inert_line(item.get("default"), LINE_CHARS)
+    return f"{line} Until they answer: {default or 'what the agent that asked would have done'}"
 
 
 #: Said with the list of decisions, whether it is empty or not: a choice that stands only

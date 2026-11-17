@@ -2088,8 +2088,8 @@ def test_decide_answers_with_an_option_words_or_both_and_can_change_it(project):
 
     assert answered.exit_code == 0, answered.output
     assert flat(answered.stdout) == (
-        f'Answered {decision.id}: option 2, "Any batch size"; "Up to 256.". Every later '
-        "session of the agents is shown it."
+        f'Answered {decision.id}, "Which batch sizes does the idea mean?": option 2, "Any '
+        'batch size"; "Up to 256.". Every later session of the agents is shown it.'
     )
     now = project.decision(decision.id)
     assert (now.state, now.answer.option, now.answer.text) == ("answered", 2, "Up to 256.")
@@ -2097,7 +2097,9 @@ def test_decide_answers_with_an_option_words_or_both_and_can_change_it(project):
     # By its id, or the beginning of it; an answered one is answered again.
     changed = invoke("decide", str(project.root), decision.id[:6], "--say", "Small ones only.")
     assert changed.exit_code == 0, changed.output
-    assert flat(changed.stdout).startswith(f"Changed your answer to {decision.id}: Small ones")
+    assert flat(changed.stdout).startswith(
+        f'Changed your answer to {decision.id}, "Which batch sizes does the idea mean?": Small'
+    )
     assert [a.option for a in project.decision(decision.id).answers] == [2, None]
 
     shown = flat(invoke("decide", str(project.root), decision.id).stdout)
@@ -2105,7 +2107,69 @@ def test_decide_answers_with_an_option_words_or_both_and_can_change_it(project):
     assert "(1 earlier answers are kept in the file.)" in shown
     listed = flat(invoke("decide", str(project.root)).stdout)
     assert "No decision is waiting for you." in listed
-    assert f"{decision.id} Which batch sizes does the idea mean? -> Small ones only." in listed
+    assert f"1. {decision.id} Which batch sizes does the idea mean? -> Small ones only." in listed
+
+
+def test_a_decision_keeps_its_number_when_another_is_answered(project):
+    """Answering 1 and then 2 from one listing answers the first and the second: the
+    numbers are not places among what still waits."""
+    first = asked(project, "First of the list?")
+    second = asked(project, "Second of the list?")
+    third = asked(project, "Third of the list?")
+    listed = flat(invoke("decide", str(project.root)).stdout)
+    for number, decision in enumerate((first, second, third), start=1):
+        assert f"{number}. {decision.id} {decision.question}" in listed
+
+    one = invoke("decide", str(project.root), "1", "--option", "1")
+    two = invoke("decide", str(project.root), "2", "--option", "1")
+
+    assert f'Answered {first.id}, "First of the list?": option 1' in flat(one.stdout)
+    assert f'Answered {second.id}, "Second of the list?": option 1' in flat(two.stdout)
+    states = [project.decision(d.id).state for d in (first, second, third)]
+    assert states == ["answered", "answered", "open"]
+    # What waits keeps its number, the hint names one that waits, and an answered one
+    # is found again by the number it had.
+    after = flat(invoke("decide", str(project.root)).stdout)
+    assert "1 decision waiting for you:" in after
+    assert f"3. {third.id} Third of the list?" in after
+    assert f"1. {first.id} First of the list? -> option 1" in after
+    assert f"2. {second.id} Second of the list? -> option 1" in after
+    assert " 3 --option N`" in after and "keeps its number" in after
+    again = flat(invoke("decide", str(project.root), "1").stdout)
+    assert f"{first.id} First of the list?" in again and "Your answer on " in again
+    changed = invoke("decide", str(project.root), "1", "--option", "2")
+    assert f"Changed your answer to {first.id}" in flat(changed.stdout)
+    assert project.decision(first.id).answer.option == 2
+
+
+def test_a_new_answer_says_what_it_dropped_of_the_earlier_one(project):
+    """A new answer is the whole answer.  When the earlier one had an option or words
+    that the new one does not repeat, the terminal says that they no longer hold and
+    how to keep both."""
+    decision = asked(project)
+    root = str(project.root)
+    assert invoke("decide", root, "1", "--option", "2", "--say", "Up to 256.").exit_code == 0
+
+    words = flat(invoke("decide", root, "1", "--say", "Only words now.").stdout)
+
+    assert f"Changed your answer to {decision.id}" in words and ": Only words now." in words
+    assert (
+        'It replaces your earlier answer (option 2, "Any batch size"; "Up to 256.") as a '
+        "whole: option 2 no longer holds. To keep both, give it with the words: "
+        '`--option 2 --say "..."`.'
+    ) in words
+    assert project.decision(decision.id).answer.option is None
+
+    both = flat(invoke("decide", root, "1", "--option", "2", "--say", "Up to 256.").stdout)
+    assert "It replaces" not in both  # new words in place of the old ones: nothing went unsaid
+    option = flat(invoke("decide", root, "1", "--option", "1").stdout)
+    assert (
+        'It replaces your earlier answer (option 2, "Any batch size"; "Up to 256.") as a '
+        "whole: your earlier words are no longer part of it. To keep both, give them again "
+        'with the option: `--option 1 --say "..."`.'
+    ) in option
+    # An answer that holds as much as the one before says nothing more.
+    assert "It replaces" not in flat(invoke("decide", root, "1", "--option", "2").stdout)
 
 
 def test_decide_leaves_a_decision_to_the_agents(project):
@@ -2115,7 +2179,8 @@ def test_decide_leaves_a_decision_to_the_agents(project):
 
     assert left.exit_code == 0, left.output
     assert flat(left.stdout) == (
-        f"Left {decision.id} to the agents. They go on with: The sweep stops at 32."
+        f'Left {decision.id}, "Which batch sizes does the idea mean?", to the agents. They '
+        "go on with: The sweep stops at 32."
     )
     assert project.decision(decision.id).state == "withdrawn"
     assert "for your answer" not in invoke("status", str(project.root)).stdout
@@ -2123,6 +2188,12 @@ def test_decide_leaves_a_decision_to_the_agents(project):
 
 def test_decide_refuses_what_it_cannot_do_and_changes_nothing(project):
     decision = asked(project)
+    # An id that begins with a digit: a number that names no decision must not find it.
+    folder = project.root / "decisions"
+    record = json.loads((folder / f"{decision.id}.json").read_text())
+    (folder / f"{decision.id}.json").unlink()
+    (folder / "d-7c41e0aa.json").write_text(json.dumps({**record, "id": "d-7c41e0aa"}))
+    decision = project.decision("d-7c41e0aa")
 
     for args, message in (
         (("--option", "1"), "Say which decision"),

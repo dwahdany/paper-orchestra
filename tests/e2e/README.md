@@ -26,7 +26,13 @@ against what the server answers:
   finger wide; an option and the words are sent in one request, an empty answer is not
   sent, the answered decision is listed folded with the answer, an answer changed in
   another window arrives by itself (`decision.answered`), it can be answered again and left
-  to the agents, and the page it is about says how it stands; a decision the scripted
+  to the agents, and the page it is about says how it stands; the decision is what the
+  person sees when they arrive by the tab of the inbox, by its row on the overview
+  (`#/p/<pid>/inbox/<decision>`) and by "Answer it in the inbox" or "Change it in the
+  inbox" on its page, on a wide sheet and on a phone, and a later render leaves the list
+  where it was scrolled to; the card of an answered decision opens as the answer that
+  holds, so that words added to it go out with its option and another option with its
+  words, and the answer as it stands is not sent a second time; a decision the scripted
   theorist asks while the app is open (`[scripted-decision]` in the instruction) appears by
   itself and does not keep the phase from reaching its checkpoint (the check `decisions`,
   on the copy of the demo project in the folder `nomodel`). The checks that come after it

@@ -7,7 +7,7 @@ import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, i
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
 import { DEMO_COST, UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
-import { openDecisions } from './decisions.js';
+import { decisionLink, openDecisions } from './decisions.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
 export function stripMap(store) {
@@ -122,7 +122,7 @@ function feedHTML(store) {
     const who = pause ? 'engine' : whoOf(ev), you = who === 'you';
     const ref = pause ? null : (ev.refs || []).find((r) => store.byPath.has(r));
     return html`${head}<li class="ev ev-${String(ev.type).replace(/[^a-z]/g, '-')}${you ? ' ev-you' : who === 'engine' && !pause ? ' ev-engine' : ''}"><time>${hm(ev.ts)}</time><span class="ev-who">${who}</span>
-      ${/^decision\./.test(ev.type) ? html`<a href="${link({ view: 'inbox', sel: '', sub: '' })}">${plain(ev.summary)}</a>` /* (a decision is answered, and found again, in the inbox) */
+      ${/^decision\./.test(ev.type) ? html`<a href="${decisionLink((ev.data || {}).decision)}">${plain(ev.summary)}</a>` /* (a decision is answered, and found again, in the inbox) */
         : ref ? html`<a href="${link({ view: 'wiki', sel: ref, sub: '' })}" data-sel="${ref}">${plain(ev.summary)}</a>` : html`<span>${plain(ev.summary)}${given}</span>`}</li>`;
   });
   const more = store.activity.length > app.ui.feedLimit || store.moreActivity;
@@ -258,7 +258,7 @@ export const overviewView = {
         <span class="in-quick on"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="${acceptTip(it)}" aria-label="${acceptTip(it)}">${icon('check')}</button><button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-view="inbox" data-tip="Reject, with a reason" aria-label="Reject">${icon('x')}</button></span></div>`; })
       : html`<p class="quiet ov-none">${asked.length ? 'No proposal is waiting for you.' : 'Nothing is waiting for you.'}</p>`;
     /* what the agents asked the person to choose: each leads to the inbox, where it is answered */
-    const decide = asked.map((d) => html`<a class="ov-run ov-decide" href="${link({ view: 'inbox', sel: '', sub: '' })}" data-decision="${d.id}">${icon('dot')}<span class="in-name"><span class="pn-t">${d.question}</span></span><span class="in-what"><span class="in-kind">Decision</span>${(d.raised_by || {}).role || 'agent'} · ${ago(d.created)} · answer it in the inbox</span></a>`);
+    const decide = asked.map((d) => html`<a class="ov-run ov-decide" href="${decisionLink(d.id)}" data-decision="${d.id}">${icon('dot')}<span class="in-name"><span class="pn-t">${d.question}</span></span><span class="in-what"><span class="in-kind">Decision</span>${(d.raised_by || {}).role || 'agent'} · ${ago(d.created)} · answer it in the inbox</span></a>`);
     const watch = html`${running.map((x) => { const run = x.last_run && x.last_run.status === 'running' ? x.last_run : null; const est = (x.meta || {}).est_minutes; return html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span>
         <span class="in-what">${run ? html`run ${run.number} · <span data-since="${run.started}">${clock((Date.now() - (parseStamp(run.started) || Date.now())) / 1000)}</span>${est ? ' of about ' + est + ' min' : ''}` : 'queued'}</span>
         ${run && est ? html`<progress class="meter-p" max="1" value="0" data-since="${run.started}" data-total="${est * 60}" aria-label="Elapsed, of the estimate"></progress>` : ''}<code class="ov-tail" data-tail="${x.id}">${store.tails[x.id] || ''}</code></a>`; })}

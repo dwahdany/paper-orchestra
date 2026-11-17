@@ -3252,8 +3252,9 @@ def answer_decision(
     did: str, body: DecisionAnswerBody, project: Proj, context: Ctx
 ) -> dict[str, Any]:
     """The person's answer: ``{"option": 2}``, ``{"text": "..."}`` or both.  An answered
-    decision can be answered again; the new answer holds and the earlier ones are kept.
-    An empty answer or an option the decision does not have is refused (422), an
+    decision can be answered again; the new answer holds, as a whole (an option or words
+    of the earlier one that it does not repeat are not part of it), and the earlier ones
+    are kept.  An empty answer or an option the decision does not have is refused (422), an
     unknown decision is 404.  The answer is the ``decision`` as it now stands."""
     decision = project.answer_decision(did, option=body.option, text=body.text)
     return {"decision": _decision_view(context, project, decision)}

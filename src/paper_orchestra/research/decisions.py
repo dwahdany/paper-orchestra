@@ -71,8 +71,9 @@ CONTEXT_CHARS = 1200
 LABEL_CHARS = 120
 MEANING_CHARS = 500
 LINE_CHARS = 500
-#: The person's own words: long enough for a paragraph, short enough to be shown to
-#: every later session.
+#: The person's own words: long enough for a paragraph, short enough to be shown whole
+#: to every later session.  The sessions' message cuts nothing shorter than these limits
+#: (``prompts._decision_line``): what is accepted here is what the agents read.
 SAY_CHARS = 4000
 
 

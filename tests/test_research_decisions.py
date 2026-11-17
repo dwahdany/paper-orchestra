@@ -583,26 +583,77 @@ def test_a_session_is_told_what_waits_what_was_answered_and_what_was_left(tmp_pa
     agents.run_theorist(context(project, theorist, phase="hypothesize"))
 
     text = seen["text"]
+    listed = "Options: 1. Same context; 2. A note to itself; 3. Nothing carried over."
     assert (
         "<decided>\n"
-        f'- {answered.id}: Is the claim about Adam only? They answered: option 2, "A note to '
-        'itself" (A new context gets only the note.); in their words: "RAdam can wait."\n'
-        f"- {worded.id}: How far may the scope grow? They answered: in their words: "
+        f"- {answered.id}: Is the claim about Adam only? {listed} They answered: option 2, "
+        '"A note to itself" (A new context gets only the note.); in their words: '
+        '"RAdam can wait."\n'
+        f"- {worded.id}: How far may the scope grow? {listed} They answered: in their words: "
         '"One more optimiser, no more."\n'
         "</decided>"
     ) in text
     assert (
         "<decisions_waiting>\n"
-        f"- {waiting.id}: {QUESTION} (about {page.path}) Options: 1. Same context; 2. A note "
-        "to itself; 3. Nothing carried over. Until they answer: Record all three side by "
-        "side.\n</decisions_waiting>"
+        f"- {waiting.id}: {QUESTION} (about {page.path}) {listed} Until they answer: Record "
+        "all three side by side.\n</decisions_waiting>"
     ) in text
     assert (
-        f"<decisions_left_to_you>\n- {left.id}: Which seed first? Options: 1. Same context; "
-        "2. A note to itself; 3. Nothing carried over. Until they answer: Seed 0.\n"
-        "</decisions_left_to_you>"
+        f"<decisions_left_to_you>\n- {left.id}: Which seed first? {listed} Until they "
+        "answer: Seed 0.\n</decisions_left_to_you>"
     ) in text
     assert "hold for the rest of the project" in text and "Do not ask them again" in text
+
+
+def test_an_answer_in_the_persons_words_is_read_beside_the_options(tmp_path):
+    """An answer such as "The second one, but only for the pairs" names an option by
+    its place: the session that reads it has the numbered options on the same line."""
+    project = make_project(tmp_path)
+    decision = ask(project)
+    project.answer_decision(decision.id, text="The second one, but only for haiku pairs.")
+    seen: dict = {}
+
+    agents.run_theorist(context(project, asking(seen=seen), phase="hypothesize"))
+
+    line = next(row for row in seen["text"].splitlines() if row.startswith(f"- {decision.id}:"))
+    assert line == (
+        f"- {decision.id}: {QUESTION} Options: 1. Same context; 2. A note to itself; "
+        '3. Nothing carried over. They answered: in their words: "The second one, but only '
+        'for haiku pairs."'
+    )
+
+
+def test_everything_a_decision_may_hold_reaches_the_sessions_whole(tmp_path):
+    """The longest answer, meaning and default the record accepts are not cut in the
+    message: nothing told the person or the agent that less would be read."""
+    project = make_project(tmp_path)
+
+    def filled(length: int, last: str) -> str:
+        words = " ".join(f"w{n}" for n in range(length))[: length - len(last) - 1]
+        return f"{words} {last}"
+
+    meaning = filled(decisions.MEANING_CHARS, "meaning-ends")
+    default = filled(decisions.LINE_CHARS, "default-ends")
+    said = filled(decisions.SAY_CHARS, "answer-ends")
+    assert (len(meaning), len(default), len(said)) == (500, 500, 4000)
+    chosen = ask(project, options=[{"label": "Wide", "meaning": meaning}, {"label": "Narrow"}])
+    project.answer_decision(chosen.id, option=1, text=said)
+    ask(project, "Which seed first?", default=default)
+    seen: dict = {}
+
+    agents.run_theorist(context(project, asking(seen=seen), phase="hypothesize"))
+
+    text = seen["text"]
+    assert f'option 1, "Wide" ({meaning}); in their words: "{said}"\n' in text
+    assert f"Until they answer: {default}\n" in text
+    # A file written by hand may hold more than the record accepts: that is still cut.
+    path = project.root / "decisions" / f"{chosen.id}.json"
+    data = json.loads(path.read_text())
+    data["answers"][-1]["text"] = said + " and-more" * 20
+    data["answer"] = data["answers"][-1]
+    path.write_text(json.dumps(data))
+    agents.run_theorist(context(project, asking(seen=seen), phase="hypothesize", round=2))
+    assert 'answer-end…"\n' in seen["text"] and "and-more" not in seen["text"]
 
 
 def test_a_session_is_told_when_nothing_was_asked_yet(tmp_path):

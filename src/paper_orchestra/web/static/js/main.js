@@ -4,7 +4,8 @@
    the open route into the page, keeping scroll positions and the caret. A render caused by
    the event stream waits while the person is in the middle of typing. */
 
-import { app, askHealth, link, listAlone, openProjectUi, parseHash, phone } from './core.js';
+import { app, askHealth, link, openProjectUi, parseHash, phone } from './core.js';
+import { decisionNamed } from './decisions.js';
 import { api, connection, Unreachable } from './api.js';
 import { $, $$, clock, html, parseStamp, plain, setHTML } from './util.js';
 import { Store } from './store.js';
@@ -63,14 +64,34 @@ function refocus(key) {
 /** The row that is selected stays in sight in its list. A page reached by a link, a key or
     the map must not be left below the edge of the index (the list's own scroll position is
     kept across a render, so nothing else would bring it up). */
-function showCurrent(main) {
-  $$('.idx-scroll .idx.cur, .exp-rail .idx.cur, .in-scroll .in-row.cur', main).forEach((el) => {
+function showCurrent(main, route) {
+  /* (a row of the inbox that is in front only because it is the first, with no page named by
+     the address, was chosen by nobody: the list stays at its head, where the decisions are) */
+  $$('.idx-scroll .idx.cur, .exp-rail .idx.cur' + (route.sel ? ', .in-scroll .in-row.cur' : ''), main).forEach((el) => {
     const box = el.closest('.idx-scroll, .exp-rail, .in-scroll');
     if (!box) return;
     const a = el.getBoundingClientRect(), b = box.getBoundingClientRect(), pad = Math.min(40, b.height / 4);
     if (a.top < b.top + pad) box.scrollTop -= b.top + pad - a.top;
     else if (a.bottom > b.bottom - pad) box.scrollTop += a.bottom - (b.bottom - pad);
   });
+}
+
+/** The decision an address of the inbox names is what the person finds when they arrive:
+    unfolded where it was answered before, and at the head of the list. Once per arrival
+    (`arriving` is set when the address changes and kept until the list is there to show
+    it): a later render leaves the list where the person has scrolled it, and a row they
+    folded stays folded. */
+let arriving = '';
+function showDecision(main, store) {
+  if (!arriving || !store || !store.loaded) return;
+  const el = $('.in-scroll [data-decision="' + CSS.escape(arriving) + '"]', main), box = el && el.closest('.in-scroll');
+  arriving = '';
+  if (!box) return;
+  if (el.tagName === 'DETAILS') el.open = true;
+  /* (the first of the open ones is shown with the heading of its group) */
+  const first = el.matches('.dc-panel .dc') && !(el.previousElementSibling && el.previousElementSibling.matches('.dc'));
+  const top = first ? el.closest('.dc-panel') : el;
+  box.scrollTop += top.getBoundingClientRect().top - box.getBoundingClientRect().top - 6;
 }
 
 /** A press that started nothing because its phase needs a model, and none can be used: the
@@ -181,9 +202,11 @@ function render(reason, background) {
   document.body.classList.toggle('in-project', route.name === 'project' && !!store && store.loaded);
 
   Object.keys(saved).forEach((sel) => { const el = $(sel, main); if (el) el.scrollTop = saved[sel]; });
-  if (!same && !listAlone(route)) showCurrent(main);      // (the list of a phone has no current row: it stays where it was read)
+  if (!same) showCurrent(main, route);
   logs.forEach((log) => { const el = $('.log-body[data-log="' + CSS.escape(log.key || '') + '"]', main); if (el && !log.stuck) el.scrollTop = log.top; });
   opened.forEach((keep) => { const el = $('details[data-keep="' + CSS.escape(keep) + '"]', main); if (el) el.open = true; });
+  if (!same) arriving = decisionNamed(route);
+  showDecision(main, store);
   renderToast();
   const ban = $('#banner');
   ban.hidden = connection.ok;

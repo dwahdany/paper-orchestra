@@ -96,6 +96,15 @@ async function refused(page, fn) {
   return out;
 }
 async function shot(page, name) { if (SHOTS) { fs.mkdirSync(SHOTS, { recursive: true }); await page.screenshot({ path: path.join(SHOTS, name + '.png') }); } }
+/** Whether the decision `id` is what the person sees in the list of the inbox: its question
+    (the row of an answered one) lies within the list's box. Empty when it does, else why not. */
+const decisionInSight = (page, id) => page.evaluate((id) => {
+  const el = document.querySelector('.in-scroll [data-decision="' + id + '"]'), box = document.querySelector('.in-scroll');
+  if (!el || !box) return 'it is not in the list';
+  if (getComputedStyle(box).visibility === 'hidden') return 'the list is not shown';
+  const a = (el.querySelector('.dc-q, summary') || el).getBoundingClientRect(), b = box.getBoundingClientRect();
+  return a.top >= b.top - 1 && a.bottom <= b.bottom + 1 ? '' : 'its question is at ' + Math.round(a.top) + '..' + Math.round(a.bottom) + ', the list shows ' + Math.round(b.top) + '..' + Math.round(b.bottom) + ' (scrolled by ' + Math.round(box.scrollTop) + ')';
+}, id);
 async function open(page, hash, ready) {
   await page.goto(BASE + '/' + hash);
   await page.waitForSelector(ready || '#view > *:not(.boot):not(.loading)', { timeout: 10000 * SLOW });
@@ -256,6 +265,20 @@ CHECKS.phone = async ({ browser, pid }) => {
     await page.waitForTimeout(700);        // (the second touch of a double touch is not a touch: it chooses once)
     await page.tap('.dc-panel .dc-opt >> nth=1');
     await until(page, () => !document.querySelector('.dc-panel .dc-opt[aria-pressed="true"]'), null, 4000, 'a later touch takes the choice back');
+    /* "Answer it in the inbox", on the page the decision is about, leads to that decision and
+       not to wherever the list was left: here it had been read to its end */
+    const asked = (((await api('GET', '/api/projects/' + pid + '/decisions')).data || {}).decisions || []).find((x) => x.state === 'open' && x.page);
+    const about = asked && (((await api('GET', '/api/projects/' + pid + '/pages')).data || {}).pages || []).find((x) => x.path === asked.page);
+    if (ok(!!about && !!about.id, width + ': the open decision of the demonstration is about a page')) {
+      await page.evaluate(() => { const box = document.querySelector('.in-scroll'); box.scrollTop = box.scrollHeight; });
+      await page.evaluate((href) => { location.hash = href; }, '#/p/' + pid + '/inbox/' + about.id);
+      await page.waitForSelector('.in-detail .dc-ref a');
+      await page.tap('.in-detail .dc-ref a');
+      await until(page, (id) => location.hash.endsWith('/inbox/' + id), asked.id, 4000, 'the link on the page names the decision in the address');
+      await page.waitForTimeout(250);
+      ok(!(await decisionInSight(page, asked.id)), width + ': "Answer it in the inbox" does not show the decision: ' + (await decisionInSight(page, asked.id)));
+      await open(page, hash = '#/p/' + pid + '/inbox');
+    }
     await reach(page, width, 'the list', ['.in-row:not(.in-old) [data-act="accept"]', '.in-row [data-act="reject-ask"]', '.in-check', '.in-all', '.in-old', '#status a.sb-i'], 0);
     await reach(page, width, 'the list', ['.in-row:not(.in-old) [data-act="accept"]', '.in-row [data-act="reject-ask"]', '.in-check'], 40);
     /* a row accepted in the list: the list stays in front, and the undo is there to be touched */
@@ -352,6 +375,40 @@ CHECKS.decisions = async ({ page, pid: demo, spare }) => {
   await open(page, '#/p/' + pid + '/overview', '.ov-head');
   ok(/1 decision waits for your answer\./.test(await text(page, '.ov-head')) && (await count(page, '.ov-decide')) === 1, 'the overview says that a decision waits, and lists it');
   ok((await count(page, '.ov-actions .go > .btn:not([disabled])')) >= 1, 'an open decision does not take the main button away');
+  /* the decision is what the person sees when they arrive, however they come: by the tab
+     (on a sheet so low that the first proposal, which is in front, lies below the card), by
+     its row on the overview, and by the link on the page it is about, from a list that was
+     read to its end. A press, not an address typed in: the list is drawn anew on the way. */
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await open(page, '#/p/' + pid + '/overview', '.ov-head');
+  await page.click('#top .views a[href$="/inbox"]');
+  await page.waitForSelector('.dc-panel .dc');
+  await page.waitForTimeout(250);
+  ok(!(await decisionInSight(page, d.id)) && (await page.evaluate(() => document.querySelector('.in-scroll').scrollTop)) === 0, 'by the tab of the inbox the list does not begin with the decision: ' + (await decisionInSight(page, d.id)));
+  await open(page, '#/p/' + pid + '/overview', '.ov-head');
+  await page.click('.ov-decide');
+  await page.waitForSelector('.dc-panel .dc');
+  await page.waitForTimeout(250);
+  ok((await page.evaluate(() => location.hash)).endsWith('/inbox/' + d.id) && !(await decisionInSight(page, d.id)), 'the row of the overview does not lead to the decision: ' + (await page.evaluate(() => location.hash)) + ' ' + (await decisionInSight(page, d.id)));
+  ok((await count(page, '.in-detail .page-head, .in-detail .in-none')) >= 1 && (await count(page, '.blank')) === 0, 'an address that names a decision still shows the inbox');
+  if (d.page) {
+    const about = (await api('GET', project + '/pages')).data.pages.find((x) => x.path === d.page);
+    await page.evaluate(() => { const box = document.querySelector('.in-scroll'); box.scrollTop = box.scrollHeight; });
+    await page.click('.in-row a.in-main[href$="/inbox/' + about.id + '"]');
+    await page.waitForSelector('.in-detail .dc-ref a');
+    ok(/Answer it in the inbox/.test(await text(page, '.in-detail .dc-ref a')), 'the page a decision is about offers to answer it');
+    await page.evaluate(() => { const box = document.querySelector('.in-scroll'); box.scrollTop = box.scrollHeight; });
+    await page.click('.in-detail .dc-ref a');
+    await until(page, (id) => location.hash.endsWith('/inbox/' + id), d.id, 4000, 'the link on the page names the decision in the address');
+    await page.waitForTimeout(250);
+    ok(!(await decisionInSight(page, d.id)), '"Answer it in the inbox" does not show the decision: ' + (await decisionInSight(page, d.id)));
+    /* (once: a list the person then scrolls stays where they put it when it is drawn again) */
+    const left = await page.evaluate(() => { const box = document.querySelector('.in-scroll'); box.scrollTop = box.scrollHeight; return box.scrollTop; });
+    await api('POST', project + '/requests', { text: 'A note left while the list of the inbox is being read.' });
+    await page.waitForTimeout(900);
+    ok(left > 0 && (await page.evaluate(() => document.querySelector('.in-scroll').scrollTop)) === left, 'a render moved the list back to the decision the address names');
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
   /* nothing chosen and nothing said is no answer */
   await open(page, '#/p/' + pid + '/inbox', '.in-list');
   await page.click('.dc-panel [data-act="decide-send"]');
@@ -389,11 +446,25 @@ CHECKS.decisions = async ({ page, pid: demo, spare }) => {
   await page.click('.dc-old[data-decision="' + d.id + '"] > summary');
   await page.waitForSelector('.dc-old[data-decision="' + d.id + '"][open] .dc-opt');
   ok((await text(page, '.dc-old[data-decision="' + d.id + '"] .dc-opt >> nth=0')).includes('your answer'), 'the option that holds is marked as the answer');
-  await page.fill('.dc-old[data-decision="' + d.id + '"] .dc-say', 'Only what fits on the laptop.');
-  await page.click('.dc-old[data-decision="' + d.id + '"] [data-act="decide-send"]');
+  /* a new answer replaces the earlier one as a whole, so the card starts as the answer that
+     holds, and says so: words that are added go out with the option, another option with the words */
+  const old = '.dc-old[data-decision="' + d.id + '"] ';
+  const pressed = () => page.evaluate((sel) => Array.from(document.querySelectorAll(sel + '.dc-opt[aria-pressed="true"]')).map((el) => +el.dataset.i), old);
+  ok(JSON.stringify(await pressed()) === '[1]' && (await page.inputValue(old + '.dc-say')) === '' && /replaces this one as a whole/.test(await text(page, old + '.dc-whole')), 'the card of an answered decision does not open as the answer that holds: pressed ' + JSON.stringify(await pressed()));
+  await page.click(old + '[data-act="decide-send"]');
+  await until(page, (sel) => /This is the answer you gave/.test((document.querySelector(sel + '.dc-err') || {}).textContent || ''), old, 4000, 'the answer as it stands is not sent a second time');
+  ok((await listed()).find((x) => x.id === d.id).answers.length === 2, 'and nothing reached the server');
+  await page.fill(old + '.dc-say', 'Only what fits on the laptop.');
+  await page.click(old + '[data-act="decide-send"]');
   await until(page, (id) => /Only what fits on the laptop/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || ''), d.id, 8000, 'an answered decision is answered again from its row');
   now = (await listed()).find((x) => x.id === d.id);
-  ok(now.answers.length === 3 && now.answer.option === null && now.answer.text === 'Only what fits on the laptop.', 'every answer is kept and the latest holds: ' + JSON.stringify(now.answers.map((a) => [a.option, a.text])));
+  ok(now.answers.length === 3 && now.answer.option === 1 && now.answer.text === 'Only what fits on the laptop.', 'every answer is kept, and words added to an answer keep its option: ' + JSON.stringify(now.answers.map((a) => [a.option, a.text])));
+  ok(JSON.stringify(await pressed()) === '[1]' && (await page.inputValue(old + '.dc-say')) === 'Only what fits on the laptop.', 'after it is sent the card holds the new answer');
+  await page.click(old + '.dc-opt >> nth=1');
+  await page.click(old + '[data-act="decide-send"]');
+  await until(page, (id) => /option 2/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || ''), d.id, 8000, 'another option is chosen from the row');
+  now = (await listed()).find((x) => x.id === d.id);
+  ok(now.answers.length === 4 && now.answer.option === 2 && now.answer.text === 'Only what fits on the laptop.', 'another option keeps the words of the answer: ' + JSON.stringify(now.answers.map((a) => [a.option, a.text])));
   ok(await page.evaluate((id) => document.querySelector('.dc-old[data-decision="' + id + '"]').open, d.id), 'the row stays open when the list is drawn again');
   await page.click('.dc-old[data-decision="' + d.id + '"] [data-act="decide-dismiss"]');
   await until(page, (id) => /left to the agents/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || ''), d.id, 8000, 'it can be left to the agents after all');
@@ -403,6 +474,11 @@ CHECKS.decisions = async ({ page, pid: demo, spare }) => {
   if (d.page) {
     await open(page, '#/p/' + pid + '/wiki/' + encodeURIComponent(d.page.replace(/^wiki\//, '').replace(/\.md$/, '')), '.page-head');
     await until(page, () => /Left to the agents/.test((document.querySelector('.dc-ref') || {}).textContent || ''), null, 6000, 'the page a decision is about says how the decision stands');
+    /* "Change it in the inbox" leads to that decision, unfolded, among the many rows below the proposals */
+    await page.click('.dc-ref a');
+    await until(page, (id) => location.hash.endsWith('/inbox/' + id) && !!document.querySelector('.dc-old[data-decision="' + id + '"]'), d.id, 6000, 'the link on the page names the decision in the address');
+    await page.waitForTimeout(250);
+    ok(await page.evaluate((id) => document.querySelector('.dc-old[data-decision="' + id + '"]').open, d.id) && !(await decisionInSight(page, d.id)), '"Change it in the inbox" does not show the decision unfolded: ' + (await decisionInSight(page, d.id)));
   }
   if (!spare) { notes.push('decisions: no agent was started to ask a decision (the workspace has no demo project in a folder named nomodel, and the demo project itself is left as the other checks expect it)'); return; }
   /* an agent asks while the app is open: the card arrives by itself, the phase goes on to its checkpoint */

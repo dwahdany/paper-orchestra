@@ -2237,26 +2237,71 @@ def _decision_lines(decision: Any, number: int | None = None) -> list[str]:
     return lines
 
 
+def _decision_numbers(project: Project) -> dict[str, int]:
+    """The number each decision has at the terminal: its place among all the project's
+    decisions, the oldest first.
+
+    It is not the place among what still waits: that would move with every answer,
+    and a person who answers 1 and then 2 from one listing would answer the third.
+    A decision keeps its number once it is answered, so the number also finds it
+    again, to look at the answer or to change it.
+    """
+    return {decision.id: number for number, decision in enumerate(project.decisions(), start=1)}
+
+
 def _decision_named(project: Project, ref: str) -> Any:
-    """The decision ``ref`` names: its id (or the beginning of it), or the number it has in
-    the list of what waits."""
+    """The decision ``ref`` names: its number (:func:`_decision_numbers`), or its id or
+    the beginning of it (``d-7c4``, ``7c41``)."""
     from paper_orchestra.research.model import NotFound
 
     known = project.decisions()
-    waiting = [decision for decision in known if decision.state == "open"]
     text = ref.strip().lower()
-    if text.isdigit() and 1 <= int(text) <= len(waiting):
-        return waiting[int(text) - 1]
+    if text.isdigit() and 1 <= int(text) <= len(known):
+        return known[int(text) - 1]
+    # A few digits are a number and nothing else: "7" must not find d-7c41e0aa when
+    # the list has no seventh decision.
+    numbered = text.isdigit() and len(text) <= 3
     matches = [d for d in known if d.id == text] or [
-        d for d in known if text and d.id.startswith(text if text.startswith("d-") else f"d-{text}")
+        d
+        for d in known
+        if text and not numbered and d.id.startswith(text if text.startswith("d-") else f"d-{text}")
     ]
-    if len(matches) != 1:
+    if len(matches) > 1:
         raise NotFound(
-            f"There is no decision {ref!r}."
-            if not matches
-            else f"{ref!r} is the beginning of {len(matches)} decisions; give more of the id."
+            f"{ref!r} is the beginning of {len(matches)} decisions; give more of the id."
+        )
+    if not matches:
+        count = f"the project has {_plural(len(known), 'decision')}, numbered from 1"
+        raise NotFound(
+            f"There is no decision {ref!r}"
+            + (f": {count if known else 'the agents have asked none'}." if numbered else ".")
         )
     return matches[0]
+
+
+def _what_a_new_answer_drops(before: Any, after: Any) -> str:
+    """What to say when an answer replaced one that held more: a new answer is the whole
+    answer, so the option or the words of the earlier one that it does not repeat no
+    longer hold.  Empty when nothing was dropped."""
+    from paper_orchestra.research.decisions import answer_words
+
+    was, now = before.answer, after.answer
+    if was is None or was.dismissed or now is None:
+        return ""
+    had_option = before.chosen is not None and now.option is None
+    had_words = bool(was.text) and not now.text
+    if not had_option and not had_words:
+        return ""
+    if had_option:
+        gone = f"option {was.option} no longer holds"
+        keep = f'give it with the words: `--option {was.option} --say "..."`'
+    else:
+        gone = "your earlier words are no longer part of it"
+        keep = f'give them again with the option: `--option {now.option} --say "..."`'
+    return (
+        f" It replaces your earlier answer ({answer_words(before)}) as a whole: {gone}. "
+        f"To keep both, {keep}."
+    )
 
 
 @research_app.command("decide")
@@ -2266,8 +2311,8 @@ def research_decide(
         str | None,
         typer.Argument(
             metavar="D",
-            help="The decision: its id (d-1a2b3c4d), or its number in the list of what "
-            "waits. Without it, what waits is listed.",
+            help="The decision: its number in the list, or its id (d-1a2b3c4d). A decision "
+            "keeps its number when it is answered. Without it, what waits is listed.",
             show_default=False,
         ),
     ] = None,
@@ -2294,7 +2339,9 @@ def research_decide(
     it: what to study, which reading of your idea is meant, a trade-off of cost or
     scope.  The project does not wait for you: the agents go on with the default the
     question states, and every later session is shown your answer.  An answer can be
-    changed: the new one holds and the earlier ones are kept.
+    changed: the new one holds, as a whole (an option or words of the earlier answer
+    that it does not repeat are dropped, and said to be), and the earlier ones are
+    kept in the file.
     """
     from paper_orchestra.research.decisions import answer_words
     from paper_orchestra.research.model import ProjectError
@@ -2307,26 +2354,28 @@ def research_decide(
                 "Say which decision: its id or its number in the list (`research decide PROJECT`)."
             )
         known = opened.decisions()
+        numbers = _decision_numbers(opened)
         waiting = [item for item in known if item.state == "open"]
         if not waiting:
             _say("No decision is waiting for you.")
         else:
             _say(f"{_plural(len(waiting), 'decision')} waiting for you:")
-        for number, item in enumerate(waiting, start=1):
+        for item in waiting:
             _say("")
-            for line in _decision_lines(item, number):
+            for line in _decision_lines(item, numbers[item.id]):
                 _say(line)
         settled = [item for item in known if item.state != "open"]
         if settled:
             _say("")
             _say("Decided:")
             for item in settled:
-                _say(f"  {item.id}  {item.question}  ->  {answer_words(item)}")
+                _say(f"  {numbers[item.id]}. {item.id}  {item.question}  ->  {answer_words(item)}")
         if waiting:
             _say("")
             _say(
-                f"Answer with `paper-orchestra research decide {_quoted(opened.root)} 1 "
-                '--option N`, `--say "..."` or `--dismiss`.'
+                f"Answer with `paper-orchestra research decide {_quoted(opened.root)} "
+                f'{numbers[waiting[0].id]} --option N`, `--say "..."` or `--dismiss`. A '
+                "decision keeps its number when it is answered."
             )
         return
     try:
@@ -2340,7 +2389,7 @@ def research_decide(
         if dismiss:
             done = opened.dismiss_decision(found.id)
             _say(
-                f"Left {done.id} to the agents. They go on with: "
+                f'Left {done.id}, "{done.question}", to the agents. They go on with: '
                 f"{done.default or 'what they would have done'}"
             )
             return
@@ -2348,8 +2397,12 @@ def research_decide(
     except ProjectError as exc:
         _fail(str(exc))
     changed = "Changed your answer to" if found.state != "open" else "Answered"
+    # The question is said with the id: an id alone does not tell which one was answered.
     _say(
-        f"{changed} {done.id}: {answer_words(done)}. Every later session of the agents is shown it."
+        _readable(
+            f'{changed} {done.id}, "{done.question}": {answer_words(done)}. Every later '
+            f"session of the agents is shown it.{_what_a_new_answer_drops(found, done)}"
+        )
     )
 
 
