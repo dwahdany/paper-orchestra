@@ -380,6 +380,10 @@ def make_guard(tmp_path: Path, home: Path, **options) -> Guard:
     project = tmp_path / "p"
     folder = project / "agents" / "r1-research-scout"
     folder.mkdir(parents=True, exist_ok=True)
+    # (The tests' own directory lies in the directory for temporary files, which is
+    # closed to an agent: left out here, and tested by itself.)
+    options.setdefault("shared", ())
+    options.setdefault("environ", {})
     return Guard(folder=folder, project=project, home=home, **options)
 
 
@@ -479,11 +483,11 @@ def test_a_search_does_not_start_above_what_is_closed(tmp_path, home):
     """Grep and Glob walk down from where they start, in the agent's process and not in
     the shell's sandbox: started at ``/`` or ``/home`` they would read the project's
     files and the person's.  A directory with a closed place beneath it is closed."""
-    import tempfile
-
     guard = make_guard(tmp_path, home)
     project = guard.project
-    above = [Path("/"), tmp_path, home.parent, project.parent, Path(tempfile.gettempdir())]
+    # (Not the directory for temporary files: whether the test's own directory lies
+    # beneath it depends on how the tests were started.)
+    above = [Path("/"), tmp_path, home.parent, project.parent]
     for place in dict.fromkeys(above):
         assert not guard.may_read(Path(os.path.realpath(place))), place
         for tool in ("Grep", "Glob"):
@@ -565,6 +569,26 @@ def test_the_file_tools_do_not_read_processes_or_devices(tmp_path, home):
         "http://[::]:8501/",
         "http://[bad",
         "",
+        # Other ways to write the loopback and the metadata server: as one number, in
+        # hexadecimal, in octal, with parts left out, inside an IPv6 address.
+        "http://2130706433:8501/",
+        "http://0x7f000001/",
+        "http://0x7f.0.0.1/",
+        "http://127.1:8501/",
+        "http://0177.0.0.1/",
+        "http://017700000001/",
+        "http://[::ffff:127.0.0.1]:8501/",
+        "http://[::ffff:169.254.169.254]/",
+        "http://2852039166/",  # 169.254.169.254 as one number
+        "http://0xa9fea9fe/",
+        # Names that resolve to them (answered from conftest.RESOLVES_TO).
+        "http://127.0.0.1.nip.io:8501/",
+        "http://169.254.169.254.nip.io/",
+        "http://localtest.me:8501/",
+        "http://mapped.example/",
+        "http://both.example/",  # one of its addresses is enough
+        # A name that does not resolve is not opened either.
+        "http://no-such-host.invalid/",
     ],
 )
 def test_the_web_tool_does_not_open_this_machines_own_services(tmp_path, home, url):
@@ -581,7 +605,14 @@ def test_the_web_tool_does_not_open_this_machines_own_services(tmp_path, home, u
 
 @pytest.mark.parametrize(
     "url",
-    ["https://example.com/", "https://arxiv.org/abs/1706.03762", "http://10.0.0.5/", "example.com"],
+    [
+        "https://example.com/",
+        "https://arxiv.org/abs/1706.03762",
+        "http://10.0.0.5/",
+        "example.com",
+        "http://93.184.216.34/",
+        "http://[2606:2800:220:1:248:1893:25c8:1946]/",
+    ],
 )
 def test_the_web_tool_opens_the_web(tmp_path, home, url):
     assert not closed_host(url)
@@ -642,6 +673,135 @@ def test_without_the_sandbox_files_are_open_but_credentials_and_the_gate_are_not
     settings = guard.settings()
     assert "sandbox" not in settings
     assert f"Read(/{home}/.ssh/**)" in settings["permissions"]["deny"]
+
+
+def test_the_identity_token_is_a_credential_wherever_it_lies(tmp_path, home):
+    """The worker's identity token is hidden under /run/user only by where it happens to
+    lie.  Named elsewhere (a projected token of a cluster, a file under /var), it is
+    closed all the same: to the shell, to the file tools, with and without the sandbox."""
+    token = tmp_path / "var" / "secrets" / "identity.jwt"
+    token.parent.mkdir(parents=True)
+    token.write_text("jwt", encoding="utf-8")
+    link = tmp_path / "token-link.jwt"
+    link.symlink_to(token)
+    environ = {"ANTHROPIC_IDENTITY_TOKEN_FILE": str(link)}
+    # Without the setting the file is like any other outside the hidden places.
+    assert make_guard(tmp_path, home).may_read(token)
+    guard = make_guard(tmp_path, home, environ=environ)
+    assert token in guard.credential_places() and link in guard.credential_places()
+    for path in (token, link):
+        assert guard.check(ToolUse("Read", {"file_path": str(path)})) is not None
+        assert f"Read(/{path})" in guard.settings()["permissions"]["deny"]
+    files = guard.settings()["sandbox"]["filesystem"]
+    assert str(token) in files["denyRead"] and str(token) in files["denyWrite"]
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": str(token.parent.parent)}))
+    # The rule about credential files stays without the sandbox.
+    opened = make_guard(tmp_path, home, environ=environ, sandbox=False)
+    assert opened.check(ToolUse("Read", {"file_path": str(token)})) is not None
+    assert f"Read(/{token})" in opened.settings()["permissions"]["deny"]
+    # The experiment agent the person granted model access may read it, and only it.
+    granted = make_guard(tmp_path, home, environ=environ, token_file=link)
+    assert granted.check(ToolUse("Read", {"file_path": str(token)})) is None
+    assert str(token) in granted.settings()["sandbox"]["filesystem"]["allowRead"]
+    assert str(token) not in granted.settings()["sandbox"]["filesystem"]["denyRead"]
+
+
+def test_uvs_credentials_and_its_private_checkouts_are_not_opened(tmp_path, home):
+    """`uv auth login` keeps what it is given in ``~/.local/share/uv/credentials``, and
+    uv's cache holds checkouts of git dependencies, private ones among them.  What is
+    opened of uv is what running Python needs."""
+    share = home / ".local" / "share" / "uv"
+    cache = home / ".cache" / "uv"
+    for place in (share / "credentials", share / "python", cache / "git-v0", cache / "wheels-v5"):
+        place.mkdir(parents=True)
+    guard = make_guard(tmp_path, home)
+    opened = guard.settings()["sandbox"]["filesystem"]["allowRead"]
+    assert str(share) not in opened and str(cache) not in opened
+    assert str(share / "python") in opened and str(cache / "wheels-v5") in opened
+    assert str(cache / "git-v0") not in opened
+    assert str(share / "credentials") not in opened
+    secret = share / "credentials" / "credentials.toml"
+    assert guard.check(ToolUse("Read", {"file_path": str(secret)})) is not None
+    assert f"Read(/{share}/credentials/**)" in guard.settings()["permissions"]["deny"]
+    assert guard.check(ToolUse("Read", {"file_path": str(cache / "git-v0" / "x" / "a.py")}))
+    python = share / "python" / "bin" / "python"
+    assert guard.check(ToolUse("Read", {"file_path": str(python)})) is None
+    assert make_guard(tmp_path, home, sandbox=False).check(
+        ToolUse("Read", {"file_path": str(secret)})
+    )
+
+
+def test_the_sandbox_is_required_and_not_only_asked_for(tmp_path, home):
+    """Without ``failIfUnavailable`` the agent's process warns that the sandbox cannot
+    start and runs every command of the agent outside any sandbox."""
+    sandbox = make_guard(tmp_path, home).settings()["sandbox"]
+    assert sandbox["enabled"] is True and sandbox["failIfUnavailable"] is True
+    assert sandbox["allowUnsandboxedCommands"] is False
+
+
+def test_what_the_sandbox_is_made_of_is_looked_for_on_the_path_the_agent_gets(tmp_path):
+    bare = tmp_path / "bare"
+    full = tmp_path / "full"
+    for place, programs in ((bare, ("ls",)), (full, ("ls", "bwrap", "socat"))):
+        place.mkdir()
+        for name in programs:
+            (place / name).write_text("#!/bin/sh\n", encoding="utf-8")
+            (place / name).chmod(0o755)
+    fault = guard_module.sandbox_fault(str(bare), platform="linux")
+    assert fault is not None
+    assert "bwrap and socat are not installed" in fault[0] and "cannot start" in fault[0]
+    assert "apt install bubblewrap socat" in fault[1]
+    assert "settings.agents.sandbox to false" in fault[1]
+    assert guard_module.sandbox_fault(str(full), platform="linux") is None
+    (full / "socat").unlink()
+    assert "socat is not installed" in guard_module.sandbox_fault(str(full), platform="linux")[0]
+    # Elsewhere the system brings its own.
+    assert guard_module.sandbox_fault(str(bare), platform="darwin") is None
+
+
+def test_the_shared_directory_for_temporary_files_is_closed_and_the_agent_has_its_own(
+    tmp_path, home
+):
+    """An agent's shell used to keep its temporary files where every program of the
+    person keeps theirs, and could read and change what lay there."""
+    shared = tmp_path / "tmp" / "claude-1000"
+    (shared / "another-session").mkdir(parents=True)
+    other = shared / "another-session" / "scratch.txt"
+    other.write_text("not the agent's", encoding="utf-8")
+    guard = make_guard(tmp_path, home, shared=[shared])
+    assert guard.temp() == guard.folder / ".tmp"
+    assert not guard.may_read(other) and not guard.may_read(shared)
+    assert guard.check(ToolUse("Read", {"file_path": str(other)})) is not None
+    assert guard.check(ToolUse("Write", {"file_path": str(other), "content": "x"})) is not None
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": str(shared)})) is not None
+    files = guard.settings()["sandbox"]["filesystem"]
+    assert str(shared) in files["denyRead"] and str(shared) in files["denyWrite"]
+    assert str(shared) not in files["allowRead"]
+    # Its own lies in its folder, which it reads and writes.
+    own = guard.temp() / "work.txt"
+    assert guard.check(ToolUse("Write", {"file_path": str(own), "content": "x"})) is None
+    assert guard.check(ToolUse("Read", {"file_path": str(own)})) is None
+
+    # A project that itself lies in the shared directory keeps its agent's folder open.
+    inside = Guard(
+        folder=shared / "p" / "agents" / "a", project=shared / "p", home=home, shared=[shared]
+    )
+    inside.folder.mkdir(parents=True)
+    assert inside.may_read(inside.folder / "notes.txt") and not inside.may_read(other)
+    assert str(shared) not in inside.settings()["sandbox"]["filesystem"]["denyWrite"]
+
+    # What is shared is asked of this process where nobody names it.
+    import tempfile
+
+    found = Guard(
+        folder=guard.folder,
+        project=guard.project,
+        home=home,
+        environ={"TMPDIR": str(tmp_path / "t"), "CLAUDE_CODE_TMPDIR": str(tmp_path / "c")},
+    ).shared_temp()
+    assert Path(os.path.realpath(tempfile.gettempdir())) in found
+    assert tmp_path / "t" in found and tmp_path / "c" in found
+    assert Path(f"/tmp/claude-{os.getuid()}") in found
 
 
 def test_the_settings_put_the_shell_in_the_sandbox_and_hide_what_is_closed(tmp_path, home):
@@ -792,8 +952,106 @@ def test_an_agent_is_started_with_its_folder_the_board_and_the_guardrails(tmp_pa
     assert str(options.cwd) in settings["sandbox"]["filesystem"]["allowRead"]
     assert options.resume is None
     assert driver.prompts == ["Find the prior work."]
+    # Its temporary files lie in its own folder while it works, and go when it ends.
+    temp = Path(options.cwd) / ".tmp"
+    assert options.env["CLAUDE_CODE_TMPDIR"] == str(temp) and temp.is_dir()
+    assert oct(temp.stat().st_mode & 0o777) == "0o700"
+    # `python` in its shell is the interpreter of this process, with its packages.
+    assert options.env["PATH"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
+    (temp / "left-behind.txt").write_text("x", encoding="utf-8")
     session.close()
     assert driver.conversations[0].closed
+    assert not temp.exists()
+
+
+def test_no_agent_starts_where_the_sandbox_it_is_to_work_in_cannot_start(tmp_path, home):
+    """With ``sandbox: true`` and nothing to make a sandbox of, the agent's process ran
+    every command unsandboxed and said nothing.  Now no agent is started: the gate
+    says so before a phase, and a session that is started all the same fails with a
+    plain sentence."""
+    project = sdk_project(tmp_path)
+    driver = FakeDriver()
+    driver.no_sandbox = guard_module.sandbox_fault("/nowhere", platform="linux")
+    runtime = AgentRuntime(project, driver)
+    need = runtime.need({"PATH": "/nowhere"}, home)
+    assert need is not None and "bwrap and socat are not installed" in need["why"]
+    assert "install bubblewrap and socat" in need["fix"]
+    assert driver.sandbox_asked == ["/nowhere"]
+
+    ctx = sdk_context(project, driver)
+    session = AgentSession(ctx, "scout", env={"PATH": "/only/this"})
+    with pytest.raises(guard_module.SandboxUnavailable) as caught:
+        session.send("Go.")
+    assert driver.opened == [] and driver.prompts == []
+    # Asked of the path the agent's process would have been started with.
+    assert driver.sandbox_asked[-1] == "/only/this"
+    said = str(caught.value)
+    assert said.startswith("The scout agent was not started: the project's agents work with")
+    assert "bwrap and socat are not installed" in said
+    assert said.endswith("Nothing was run outside the sandbox.")
+    from paper_orchestra.errors import stops_the_run
+
+    assert stops_the_run(caught.value)  # nobody tries it once more
+
+    # A project that asks for no sandbox is not asked about one.
+    open_project = sdk_project(tmp_path / "open", sandbox=False)
+    open_driver = FakeDriver()
+    open_driver.no_sandbox = driver.no_sandbox
+    assert AgentRuntime(open_project, open_driver).need({}, home) is None
+    AgentSession(sdk_context(open_project, open_driver), "scout").send("Go.")
+    assert len(open_driver.opened) == 1 and open_driver.sandbox_asked == []
+
+
+@pytest.mark.parametrize("how", ["answer", "failure", "start"])
+def test_an_agents_process_that_refuses_for_want_of_the_sandbox_is_said_in_a_sentence(
+    tmp_path, home, how
+):
+    """Where the look for the sandbox's programs finds them and the sandbox still cannot
+    start, the agent's process refuses (it is told to: ``failIfUnavailable``).  That is
+    the same failure, said the same way, and no second agent is tried."""
+    project = sdk_project(tmp_path)
+    refusal = (
+        "Claude Code returned an error result: Sandbox required but unavailable: sandbox is "
+        "enabled but dependencies are missing: bubblewrap (bwrap) not installed"
+    )
+
+    class Refusing(FakeDriver):
+        def open(self, options):
+            if how == "start":
+                self.opened.append(options)
+                raise RuntimeError(refusal)
+            conversation = super().open(options)
+
+            def send(text, sink):
+                if how == "failure":
+                    raise RuntimeError(refusal)
+                from paper_orchestra.research.sdk.driver import Turn
+
+                return Turn(is_error=True, error=refusal, ended="error_during_execution")
+
+            conversation.send = send
+            return conversation
+
+    # Also for a session that is carried on: it is not taken for one that is gone.
+    first = FakeDriver(lambda agent: agent.use(cost_usd=0.1))
+    AgentSession(sdk_context(project, first), "scout").send("Go.")
+    driver = Refusing()
+    driver.sessions.update(first.sessions)
+    with pytest.raises(guard_module.SandboxUnavailable, match="was not started") as caught:
+        AgentSession(sdk_context(project, driver), "scout").send("Go.")
+    assert "bubblewrap (bwrap) not installed" in str(caught.value)
+    assert len(driver.opened) == 1
+    assert not any("could not be carried on" in line for line in activity(project))
+
+
+def test_the_real_driver_looks_for_the_sandbox_on_the_path_it_is_given(tmp_path, monkeypatch):
+    from paper_orchestra.research.sdk.claude import ClaudeDriver
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    fault = ClaudeDriver().sandbox_unavailable(str(tmp_path))
+    assert fault is not None and "bwrap and socat are not installed" in fault[0]
+    report = machine_report({"PATH": str(tmp_path)}, tmp_path)
+    assert report["sandbox"] is False and "bwrap and socat" in report["sandbox_missing"]
 
 
 def test_the_settings_of_the_project_decide_fast_mode_helpers_and_the_sandbox(tmp_path, home):
@@ -1397,6 +1655,185 @@ def test_a_process_that_does_not_start_for_the_session_to_carry_on_starts_anew(t
     broken.open = lambda options: (_ for _ in ()).throw(RuntimeError("no such program"))
     with pytest.raises(RuntimeError, match="no such program"):
         AgentSession(sdk_context(sdk_project(tmp_path / "other"), broken), "scout").send("Go.")
+
+
+def test_a_carried_on_turn_that_reaches_the_budget_is_counted_and_no_other_agent_starts(
+    tmp_path, home
+):
+    """A turn of a session that is carried on which ended at the sum the process was
+    told, without a tool call, was taken for a session that is gone: its cost was
+    dropped, and a fresh agent was started past the limit."""
+    project = sdk_project(tmp_path)
+    driver = FakeDriver(lambda agent: agent.use(cost_usd=0.4, input_tokens=4000, output_tokens=400))
+    first = sdk_context(project, driver)
+    AgentSession(first, "scout").send("Go.")
+    first.close_sessions()
+
+    driver.ends_at_budget = True
+    driver.script = lambda agent: (
+        agent.use(cost_usd=0.3, input_tokens=3000, output_tokens=300) or "thinking only"
+    )
+    second = sdk_context(project, driver, left=lambda: 0.05)
+    with pytest.raises(SessionStopped, match="reached the model budget"):
+        AgentSession(second, "scout").send("Go.")
+    assert [options.resume for options in driver.opened] == [None, "fake-1"]
+    assert not any("could not be carried on" in line for line in activity(project))
+    assert sum(row["cost_usd"] for row in ledger(first) + ledger(second)) == pytest.approx(0.7)
+    # (What the processes themselves counted: nothing is missing from the ledger.)
+    assert sum(row["cost_usd"] for row in driver.sessions["fake-1"].values()) == pytest.approx(0.7)
+
+
+def test_a_carried_on_process_that_fails_after_it_worked_is_not_given_a_third_start(tmp_path, home):
+    """A session that is carried on and then fails (an API error) did find its session.
+    The failure is the phase's, which whoever runs the phase tries once more: no fresh
+    agent is started on top of that, and what the failed turn used is counted."""
+    project = sdk_project(tmp_path)
+    driver = FakeDriver(lambda agent: agent.use(cost_usd=0.3, input_tokens=3000))
+    first = sdk_context(project, driver)
+    AgentSession(first, "scout").send("Go.")
+    first.close_sessions()
+
+    def failing(agent: FakeAgent) -> None:
+        agent.use(cost_usd=0.3, input_tokens=300_000, output_tokens=3000)
+        raise RuntimeError("API Error: 500 internal error")
+
+    driver.script = failing
+    second = sdk_context(project, driver)
+    with pytest.raises(RuntimeError, match="API Error: 500"):
+        AgentSession(second, "scout").send("Go.")
+    assert [options.resume for options in driver.opened] == [None, "fake-1"]
+    (row,) = ledger(second)
+    assert row["label"] == "scout.agent.unreported" and row["cost_usd"] > 0
+
+    # One that fails before any model request (its session is not there) starts anew.
+    def gone(agent: FakeAgent) -> str:
+        if agent.options.resume:
+            raise RuntimeError("the agent's process ended without a result")
+        return "Done."
+
+    driver.script = gone
+    third = sdk_context(project, driver)
+    assert AgentSession(third, "scout").send("Go.") == "Done."
+    assert [options.resume for options in driver.opened][2:] == ["fake-1", None]
+
+
+def test_a_killed_turn_on_a_model_without_a_list_price_is_not_recorded_as_free(tmp_path, home):
+    """Recorded with a cost of nothing, such a turn hid from the list of models the
+    ledger cannot price, and the spend read as exact.  A form of a known model (its
+    context size, a date) is priced as that model; a model nobody knows is recorded
+    without a cost and named as unpriced."""
+
+    def killed(agent: FakeAgent) -> None:
+        agent.use(cost_usd=3.0, input_tokens=400_000, output_tokens=40_000)
+        raise KeyboardInterrupt
+
+    def rows_of(model: str, where: Path) -> tuple[list[dict], dict]:
+        project = sdk_project(where, model=model)
+        driver = FakeDriver(killed)
+        ctx = sdk_context(project, driver)
+        with pytest.raises(KeyboardInterrupt):
+            AgentSession(ctx, "intake").send("Go.")
+        return ledger(ctx), usage_report(ctx.harness.usage, [])
+
+    (row,), report = rows_of("claude-fable-5-2[1m]", tmp_path / "long")
+    (plain,), _ = rows_of("claude-fable-5-2", tmp_path / "plain")
+    assert row["label"] == "intake.agent.unreported" and row["input_tokens"] == 400_000
+    assert row["cost_usd"] == pytest.approx(plain["cost_usd"]) and row["cost_usd"] > 1
+    assert report["unpriced_models"] == []
+
+    (row,), report = rows_of("mystery-model-9", tmp_path / "unknown")
+    assert row["label"] == "intake.agent.unreported" and row["input_tokens"] == 400_000
+    assert "cost_usd" not in row
+    assert report["unpriced_models"] == ["mystery-model-9"]
+
+
+def test_a_process_that_names_its_model_with_a_date_is_not_counted_twice(tmp_path, home):
+    """The estimate of a killed turn is filed under the project's name for the model; a
+    process that reports its totals under a longer name had them looked up under that
+    one, found nothing, and the estimate was counted on top of the turn's real cost."""
+    project = sdk_project(tmp_path)
+    dated = "claude-fable-5-2-20260101"
+
+    def work(agent: FakeAgent) -> None:
+        agent.use(cost_usd=1.0, input_tokens=1000, output_tokens=100, model=dated)
+        if not agent.options.resume:
+            raise KeyboardInterrupt
+
+    driver = FakeDriver(work)
+    first = sdk_context(project, driver)
+    with pytest.raises(KeyboardInterrupt):
+        AgentSession(first, "intake").send("Go.")
+    first.close_sessions()
+    second = sdk_context(project, driver)
+    AgentSession(second, "intake").send("Go.")
+    rows = ledger(first) + ledger(second)
+    assert {row["model"] for row in rows} == {"claude-fable-5-2"}
+    # The process's own total is $2.00: the ledger holds that, not that and the estimate.
+    assert sum(row["cost_usd"] for row in rows) == pytest.approx(2.0)
+    assert sum(row["requests"] for row in rows if row["label"] == "intake.agent") == 1
+
+
+def test_what_agents_were_seen_to_cost_raises_the_count_and_guards_the_next_start(tmp_path, home):
+    """In fast mode an agent costs several times the list price of its tokens, and its
+    first request alone most of a dollar.  The count during a turn knows the list
+    price: it is raised by what was seen, and an agent is not started with less left
+    than a start was seen to cost."""
+    project = sdk_project(tmp_path)
+    listed = 30_000 * 5 / 1_000_000  # looked up below, not assumed
+    from paper_orchestra.llm.pricing import estimate_cost_usd
+
+    listed = estimate_cost_usd("claude-fable-5-2", Usage(input_tokens=30_000))
+    driver = FakeDriver(lambda agent: agent.use(cost_usd=3 * listed, input_tokens=30_000))
+    first = sdk_context(project, driver)
+    AgentSession(first, "intake").send("Go.")
+    first.close_sessions()
+    observed = json.loads(
+        (project.root / "transcripts" / "agents" / "observed.json").read_text(encoding="utf-8")
+    )
+    assert observed == {
+        "claude-fable-5-2+fast": {
+            "ratio": pytest.approx(3.0),
+            "start_usd": pytest.approx(3 * listed, abs=1e-4),
+        }
+    }
+
+    # The next agent's turn in flight is counted at three times the list price.
+    counted = []
+
+    def over_budget(model, usage, *, more_usd=0.0):
+        counted.append((estimate_cost_usd(model, usage) or 0.0) + more_usd)
+
+    second = sdk_context(project, driver, phase="hypothesize", over_budget=over_budget)
+    AgentSession(second, "theorist").send("Go.")
+    second.close_sessions()
+    assert counted[-1] == pytest.approx(3 * listed)
+
+    # And none is started with less left than the start was seen to cost.
+    asked = []
+
+    def short_of(needed: float):
+        asked.append(needed)
+        return RuntimeError("What is left does not cover the start.")
+
+    third = sdk_context(project, driver, phase="design", short_of=short_of)
+    opened = len(driver.opened)
+    with pytest.raises(SessionStopped, match="does not cover the start") as stopped:
+        AgentSession(third, "designer").send("Go.")
+    assert len(driver.opened) == opened and asked == [pytest.approx(3 * listed, abs=1e-4)]
+    assert isinstance(stopped.value.reason, RuntimeError)
+
+    # Outside fast mode nothing is raised: the process's figure is the list price there.
+    slow = sdk_project(tmp_path / "slow", fast=False)
+    slow_driver = FakeDriver(
+        lambda agent: agent.use(cost_usd=3 * listed, input_tokens=30_000),
+        started={"fast_mode_state": "off"},
+    )
+    AgentSession(sdk_context(slow, slow_driver), "intake").send("Go.")
+    counted.clear()
+    AgentSession(
+        sdk_context(slow, slow_driver, phase="hypothesize", over_budget=over_budget), "theorist"
+    ).send("Go.")
+    assert counted[-1] == pytest.approx(listed)
 
 
 def test_a_session_can_be_told_never_to_carry_another_on(tmp_path, home):

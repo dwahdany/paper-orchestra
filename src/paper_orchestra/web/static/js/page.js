@@ -136,7 +136,12 @@ export function approvalChoice(eid, data) {
 /** A plan that asks for network access is never given it by default, and never refused it
     by default either: the person answers, one way or the other, before a run is approved.
     The answer is kept in `app.ui.approve[eid].network` (true or false; undefined = not yet). */
-export function networkAsk(eid, plan) {
+/** Said beside the choice of network access where model access for jobs is on (the
+    experiment view's `model_access`) and the run is for this machine: granting the network
+    then grants the Anthropic API on the server's account, which nothing here counts. */
+export const MODEL_ACCESS_SAID = 'With network access this run\'s code can call the Anthropic API on the server\'s federation account; those calls are billed to that account and counted against no limit of the project.';
+export const modelAccessNote = (on) => (on ? html`<span class="net-models" data-models="1">${icon('warn')}${MODEL_ACCESS_SAID}</span>` : '');
+export function networkAsk(eid, plan, models) {
   if (!plan || !plan.network) return '';
   const answer = (app.ui.approve[eid] || {}).network;
   const answered = answer === true || answer === false;
@@ -146,6 +151,7 @@ export function networkAsk(eid, plan) {
     <div class="net-opts">
       <label><input type="radio" name="net-${eid}" value="yes" data-input="ap-net-choice" data-eid="${eid}"${answer === true ? raw(' checked') : ''}> Allow network access</label>
       <label><input type="radio" name="net-${eid}" value="no" data-input="ap-net-choice" data-eid="${eid}"${answer === false ? raw(' checked') : ''}> Run it without network access</label></div>
+    ${modelAccessNote(models)}
     ${answered ? '' : html`<span class="net-need"${nudge ? raw(' role="alert"') : ''}>Choose one of the two before you approve the run.</span>`}</fieldset>`;
 }
 function runOn(store, page, entry) {
@@ -159,7 +165,7 @@ function runOn(store, page, entry) {
   }
   const chosen = approvalChoice(page.id, data);
   return html`<label class="runon"><span>Run on</span><select data-input="runon" data-eid="${page.id}" id="runon-${page.id}">
-    ${runnable.map((o) => html`<option value="${o.backend}"${o.backend === chosen.backend ? raw(' selected') : ''}>${optionLabel(o, data.plan)}</option>`)}</select></label>${networkAsk(page.id, data.plan)}`;
+    ${runnable.map((o) => html`<option value="${o.backend}"${o.backend === chosen.backend ? raw(' selected') : ''}>${optionLabel(o, data.plan)}</option>`)}</select></label>${networkAsk(page.id, data.plan, !!data.model_access && chosen.backend === 'local')}`;
 }
 
 /* ---------- what stops a plan from being approved ---------- */

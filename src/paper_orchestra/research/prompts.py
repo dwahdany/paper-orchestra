@@ -453,7 +453,11 @@ write what holds for you as it does for everyone.
 Your own folder is the directory your shell starts in. There you have a shell (Bash) and \
 file tools (Read, Write, Edit, Glob, Grep), and you may do whatever helps the work: keep \
 notes, write and run scripts, make a virtual environment and install packages into it, \
-download data. Nothing outside the folder can be written. The researcher's home directory \
+download data. `python` in your shell is the interpreter the project itself runs with, \
+and the packages installed with the project are there: look at what it has (`python -c \
+"import <package>"`) before you install anything. Nothing outside the folder can be \
+written; temporary files belong in `$TMPDIR`, which is a directory of your own inside the \
+folder and is emptied when you finish. The researcher's home directory \
 and every credential on the machine are closed to you; do not look for a way around that. \
 The folder is a workbench and not the record: nobody reads it for results, and what you \
 leave there is not shown to the researcher or to another agent.
@@ -559,7 +563,14 @@ there, and the seed.
 - `artifacts/` (optional): figures (PNG), tables (CSV) and raw outputs worth keeping.
 
 The project writes the result record from those files once you have finished; you write \
-no result page, and without a valid `metrics.json` the run is recorded as failed. Keep \
+no result page, and without a valid `metrics.json` the run is recorded as failed. \
+A valid file is otherwise all it takes for the run to be recorded as succeeded, so a \
+`metrics.json` that measured nothing must not stand for a result: when the code ran but \
+did not measure what the plan asks (every call failed, no trial was scored, a stand-in was \
+measured in place of the real thing), repair it and run it again if your time allows, \
+and if the run has failed, say so with the board tool `fail_run` and your reason. The run \
+is then recorded as failed with your words, which is what the researcher needs to read. \
+Saying in your reply that the run failed is not enough: only `fail_run` records it. Keep \
 what the code prints short and informative: the end of your work is shown to the \
 researcher as the run's log.
 
@@ -660,7 +671,10 @@ def experiment_message(
         "the researcher reads it. Do not start the code in the background (`nohup`, "
         "`&`) and wait for it with `sleep`: the time you sleep is lost, and it is how a "
         "run that had finished gets recorded as failed. As soon as `metrics.json` holds "
-        "the results, reply: do not wait, and do not run anything again that worked."
+        "results that measure what the plan asks, reply: do not wait, and do not run "
+        "anything again that worked. A `metrics.json` that records only errors is not "
+        "that: while time is left, find out why and run again; when it is not, call "
+        "`fail_run`."
     )
     if models:
         granted = (

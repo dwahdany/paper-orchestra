@@ -33,6 +33,16 @@ function accepted(name, kept) {
 const agentDefaults = () => { const d = defaults(); const a = d && d.settings && d.settings.agents; return a && typeof a === 'object' ? a : null; };
 /** What the composer's choices about the agents come to: the person's where one was made, the
     server's default otherwise; `null` until the defaults are known. */
+/** What a person should know before they press Start when the agents are Claude agents
+    with a shell: on which model, on whose account, and that fast mode costs more. Said on
+    the page itself, not only inside the closed Options. */
+function agentsWord(a) {
+  const fast = a.fast && a.credential === 'login';
+  return 'The agents are Claude agents with a shell on ' + a.model + (fast ? ' in fast mode' : '') + ', billed to '
+    + (a.credential === 'login' ? 'your own Claude account' : 'the account of the server\'s federation settings')
+    + (fast ? '; fast mode costs several times the usual price, and the start of each agent alone can cost about a dollar' : '')
+    + '. Change it under Options.';
+}
 function agentChoice(s) {
   const a = agentDefaults();
   if (!a) return null;
@@ -136,7 +146,7 @@ export const startView = {
           <span class="composer-go">${s.text || n ? '' : html`<button class="btn btn-quiet" type="button" data-act="start-example">Use an example</button>`}
             <button class="btn btn-primary btn-l" type="submit"${ready ? '' : raw(' disabled')}>Start research ${icon('right')}</button></span></div>
         <div class="drop-veil" aria-hidden="true">Drop to attach</div></form>
-      <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}</p>
+      <p class="start-est">${ready ? 'First it reads ' + (n ? 'your ' + plural(n, 'file') + ' and ' : '') + 'the idea, then looks for prior work, and pauses at the first checkpoint.' + (limit ? ' It stops when ' + limit + ' has been spent on models.' : ' It stops at the project\'s limit for model spend.') : 'A few sentences are enough. You can edit the idea later; it stays yours and no agent changes it.'}${agents && agents.runtime === 'sdk' ? html`<span class="start-agents" data-agents-say="${agents.credential}">${agentsWord(agents)}</span>` : ''}</p>
       <details class="adv"${s.adv ? raw(' open') : ''}><summary data-act="adv">Options <span class="quiet">title, model effort, a research cutoff, limits, what needs your review, how the agents work</span></summary><div class="adv-grid">
         <label><span>Title</span><input id="opt-title" data-input="opt" data-name="title" value="${s.title}" placeholder="Named from the idea" autocomplete="off"></label>
 ${agents && agents.runtime === 'sdk' ? '' : html`        <label><span>Model effort</span><select id="opt-effort" data-input="opt" data-name="effort">${[['', models.effort ? 'Default (' + effortName(models.effort) + ')' : 'As the project default']].concat(accepted('efforts', s.effort).map((v) => [v, effortName(v)])).map(([v, t]) => html`<option value="${v}"${s.effort === v ? raw(' selected') : ''}>${t}</option>`)}</select></label>`}

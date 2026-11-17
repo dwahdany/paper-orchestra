@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -68,9 +69,12 @@ from paper_orchestra.research.sdk.driver import (
 )
 from paper_orchestra.research.sdk.guard import (
     FEDERATION_ENV,
+    TEMP_DIR,
     Guard,
+    SandboxUnavailable,
     agent_env,
     claude_config_dir,
+    sandbox_fault,
 )
 
 __all__ = [
@@ -127,6 +131,16 @@ _USAGE_NAMES = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
+#: The file under ``transcripts/agents/`` that holds what the project's agents were
+#: seen to cost (:meth:`AgentSession._observe`).
+OBSERVED_FILE = "observed.json"
+#: The most an agent's cost in fast mode is taken to be above the list price of its tokens.
+_MAX_RATIO = 6.0
+#: What the agent's process says when it was told to require the sandbox and cannot
+#: start it.
+_NO_SANDBOX = "Sandbox required but unavailable"
+#: What it says of a session it is asked to carry on and does not have.
+_NO_SESSION = "No conversation found"
 #: What a row of a session's totals holds, per model.
 _ROW_NAMES = (*_USAGE_NAMES, "web_searches", "cost_usd")
 #: The counters of a row by which the point a process counts from is told: what went
@@ -162,6 +176,46 @@ def output_tail(text: str) -> str:
     if left_out > 0:
         lines = [f"({left_out} earlier lines of this output are not shown)", *lines[-OUTPUT_LINES:]]
     return "\n".join(lines) + "\n"
+
+
+def _listed(model: str, usage: Usage) -> float | None:
+    """What ``usage`` costs on ``model`` at the list price; ``None`` where there is none.
+
+    A model can be named with more than the price list knows: the size of its
+    context (``claude-fable-5-2[1m]``) or a date.  It is then priced as the model
+    it is a form of, which is nearer the truth than counting it as nothing.
+    """
+    bare = re.sub(r"\[[^\]]*\]$", "", model)
+    for name in dict.fromkeys((model, bare, re.sub(r"-\d{8}$", "", bare))):
+        cost = estimate_cost_usd(name, usage)
+        if cost is not None:
+            return cost
+    return None
+
+
+def _row_of(given: Any, names: Sequence[str]) -> dict[str, float]:
+    """The numbers ``names`` of a mapping read from a file; what is no number is left out."""
+    row: dict[str, float] = {}
+    if isinstance(given, Mapping):
+        for name in names:
+            value = given.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                row[name] = float(value)
+    return row
+
+
+def _no_sandbox_sentence(role: str, why: str) -> str:
+    """What the person is told when an agent was not started, or was ended, for want of
+    the sandbox the project asks for."""
+    return (
+        f"The {role} agent was not started: the project's agents work with their shell in "
+        f"a sandbox (settings.agents.sandbox), and {_lower_first(why.rstrip('.'))}. Nothing "
+        "was run outside the sandbox."
+    )
+
+
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:]
 
 
 class AgentFailed(RuntimeError):
@@ -336,10 +390,15 @@ def machine_report(
     found = availability()
     missing = [name for name in FEDERATION_ENV if not environ.get(name)]
     token = environ.get("ANTHROPIC_IDENTITY_TOKEN_FILE") or ""
+    no_sandbox = sandbox_fault(environ.get("PATH"))
     return {
         "package": found["package"],
         "command_line": found["command_line"],
         "install": INSTALL,
+        # Whether the sandbox of an agent's shell can start here, and if not, why and
+        # what to do: a project with ``agents.sandbox`` on starts no agent without it.
+        "sandbox": no_sandbox is None,
+        "sandbox_missing": f"{no_sandbox[0]}: {no_sandbox[1]}" if no_sandbox else "",
         # true, false, or null where a file does not tell (macOS)
         "login": login_found(environ, home),
         "login_file": str(login_file(environ, home)),
@@ -380,6 +439,15 @@ class AgentRuntime:
 
     # -- the model gate ------------------------------------------------------------
 
+    def sandbox_fault(self, path: str | None = None) -> tuple[str, str] | None:
+        """Why the sandbox the project asks for cannot start for an agent whose process
+        is started with ``path``; ``None`` when it can, and for a project that asks
+        for none.  The driver answers: it knows what its agents run in."""
+        if not self.settings.sandbox:
+            return None
+        asked = getattr(self.driver, "sandbox_unavailable", None)
+        return asked(path) if asked is not None else None
+
     def _credential_fault(self, environ: Mapping[str, str], home: Path) -> tuple[str, str] | None:
         if self.settings.credential == "federation":
             missing = [name for name in FEDERATION_ENV if not environ.get(name)]
@@ -413,12 +481,16 @@ class AgentRuntime:
         """What keeps the project's SDK agents from starting, in the shape of
         ``agents.model_need`` (for ``agents.need_sentence``); ``None`` when they can.
 
-        Three things are looked at, and nothing is contacted: the package can be
-        imported, there is a command line for the agents to run in, and there is a
+        Four things are looked at, and nothing is contacted: the package can be
+        imported, there is a command line for the agents to run in, the sandbox
+        of their shell can start where the project asks for one, and there is a
         credential of the kind the project chose.
         """
-        fault = self.driver.unavailable() or self._credential_fault(
-            os.environ if environ is None else environ, home or Path.home()
+        environ = os.environ if environ is None else environ
+        fault = (
+            self.driver.unavailable()
+            or self.sandbox_fault(environ.get("PATH"))
+            or self._credential_fault(environ, home or Path.home())
         )
         if fault is None:
             return None
@@ -548,6 +620,15 @@ class AgentSession:
         #: Whether this conversation has said what it works as (:meth:`_announce`).
         self._announced = False
         self._acted = False
+        #: Whether the process has reported a model request since the last message.
+        self._heard = False
+        #: What the first model request of the process that runs now used.
+        self._first: Usage | None = None
+        #: How many times the list price this project's agents were seen to cost in fast
+        #: mode (the least that was seen: the count during a turn must not run ahead of
+        #: the truth), and whether the process that runs now says fast mode is on.
+        self._ratio = max(1.0, self._observed().get("ratio") or 1.0)
+        self._fast_on = False
         #: Set when the agent was asked to end its turn, and why.
         self._asked_at: float | None = None
         self._stopped: BaseException | None = None
@@ -604,6 +685,22 @@ class AgentSession:
         if helpers:
             process.update(ultracode=True, enableWorkflows=True, skipWorkflowUsageWarning=True)
         left = self.ctx.budget_left()
+        temp = self.folder / TEMP_DIR
+        temp.mkdir(mode=0o700, exist_ok=True)
+        places = {
+            # `python` in the agent's shell is the interpreter this process runs with:
+            # the packages the project brings are the ones its code finds.  (The
+            # directory as it is named, not where it leads: a virtual environment is
+            # told by where its `python` lies.)
+            "PATH": os.pathsep.join(
+                [str(Path(sys.executable).parent), os.environ.get("PATH", os.defpath)]
+            ),
+            # Its temporary files lie in its own folder, not in the directory that
+            # every program of the person shares: the agent's process puts its own
+            # there and names the directory to the shell as TMPDIR.
+            "CLAUDE_CODE_TMPDIR": str(temp),
+            "CLAUDE_TMPDIR": "",
+        }
         return AgentOptions(
             model=self._model,
             cwd=self.folder,
@@ -615,6 +712,7 @@ class AgentSession:
             settings=process,
             env={
                 **agent_env(str(settings.credential), job_models=self._job_models),
+                **places,
                 **self._env,
             },
             check=self._guard.check,
@@ -641,8 +739,85 @@ class AgentSession:
         self._last_total = float(record.get("cost_usd") or 0.0) if resume else 0.0
         self._seen, self._seen_total = {}, None
         self._announced = False
-        self._conversation = self.runtime.driver.open(self._options(resume))
+        self._first = None
+        options = self._options(resume)
+        # With the sandbox asked for, no agent starts where it cannot: its process would
+        # run the agent's commands outside any sandbox.  (Asked of the path the
+        # process is started with; the process is told to refuse besides.)
+        missing = self.runtime.sandbox_fault(options.env.get("PATH"))
+        if missing is not None:
+            raise SandboxUnavailable(_no_sandbox_sentence(self.role, f"{missing[0]}: {missing[1]}"))
+        self._short_of_a_start()
+        try:
+            self._conversation = self.runtime.driver.open(options)
+        except Exception as exc:
+            if _NO_SANDBOX in str(exc):
+                why = experiments.mask_credentials(self.ctx.project, str(exc))
+                raise SandboxUnavailable(_no_sandbox_sentence(self.role, why)) from exc
+            raise
         return self._conversation
+
+    # -- what the project's agents were seen to cost ----------------------------------
+
+    def _observed_key(self) -> str:
+        return f"{self._model}{'+fast' if self.runtime.settings.fast else ''}"
+
+    def _observed(self) -> dict[str, float]:
+        """What agents of this project on this model were last seen to cost: how many
+        times the list price of their tokens (``ratio``), and what the first model
+        request of an agent came to (``start_usd``).  Empty before any was seen."""
+        path = self._record_path.parent / OBSERVED_FILE
+        try:
+            found = json.loads(path.read_text(encoding="utf-8")).get(self._observed_key())
+        except (OSError, ValueError, AttributeError):
+            return {}
+        return _row_of(found, ("ratio", "start_usd"))
+
+    def _observe(self, cost_usd: float, turn: Mapping[str, Usage], first: Usage | None) -> None:
+        """Take note of what a turn that has just been accounted for cost against the
+        list price of its tokens.  Fast mode costs several times the list price,
+        and the count during a turn knows only the list price: the next count is
+        raised by what was seen here, and the next agent is not started with less
+        left than a start was seen to cost."""
+        used = turn.get(self._model)
+        listed = _listed(self._model, used) if used is not None else None
+        if not listed or cost_usd <= 0:
+            return
+        seen: dict[str, float] = {}
+        before = self._observed()
+        if self._fast_on:
+            ratio = min(_MAX_RATIO, max(1.0, cost_usd / listed))
+            seen["ratio"] = round(min(ratio, before.get("ratio") or ratio), 4)
+        start = _listed(self._model, first) if first is not None else None
+        if start:
+            seen["start_usd"] = round(cost_usd * min(1.0, start / listed), 4)
+        if not seen:
+            return
+        path = self._record_path.parent / OBSERVED_FILE
+        with contextlib.suppress(OSError, ValueError):
+            try:
+                everything = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                everything = {}
+            if not isinstance(everything, dict):
+                everything = {}
+            kept = everything.get(self._observed_key())
+            everything[self._observed_key()] = {**(kept if isinstance(kept, dict) else {}), **seen}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_record(path, everything)
+        self._ratio = seen.get("ratio", self._ratio)
+
+    def _short_of_a_start(self) -> None:
+        """End the session before its agent starts when what is left of the model budget
+        is less than the first request of an agent was seen to cost here: started all
+        the same, it would pass the limit with its first request (in fast mode, by
+        most of a dollar within seconds)."""
+        start = self._observed().get("start_usd") or 0.0
+        if start <= 0:
+            return
+        why = self.ctx.short_of(start)
+        if why is not None:
+            raise agents.SessionStopped(str(why), reason=why)
 
     @staticmethod
     def _history_of(record: Mapping[str, Any]) -> dict[str, list[dict[str, float]]]:
@@ -668,11 +843,12 @@ class AgentSession:
 
     def close(self) -> None:
         """End the agent's process.  What it wrote on the board stays; its session can be
-        carried on by a later attempt at the phase."""
+        carried on by a later attempt at the phase.  Its temporary files go with it."""
         conversation, self._conversation = self._conversation, None
         if conversation is not None:
             with contextlib.suppress(Exception):
                 conversation.close()
+        shutil.rmtree(self.folder / TEMP_DIR, ignore_errors=True)
 
     # -- following the agent -------------------------------------------------------------
 
@@ -713,6 +889,7 @@ class AgentSession:
         self._announced = True
         model = agents.named(data.get("model") or self._model, 60)
         state = str(data.get("fast_mode_state") or "off")
+        self._fast_on = state == "on" and bool(self.runtime.settings.fast)
         said = f"The {self.role} works as a Claude agent on {model}"
         if not self.runtime.settings.fast:
             said += "."
@@ -843,10 +1020,28 @@ class AgentSession:
     def _model_of(self, event: Used) -> str:
         """The model a message was written by, under the name the session's totals use:
         the agent's own model is named there as the project names it."""
-        model = str(event.model or "")
+        return self._named(str(event.model or ""))
+
+    def _named(self, model: str) -> str:
+        """``model`` under the name the session's totals use: the agent's own model is
+        named as the project names it, whatever the process adds to the name (a
+        date) or leaves out."""
         if not model or model.startswith(self._model) or self._model.startswith(model):
             return self._model
         return model
+
+    def _by_name(self, usage: Mapping[str, Any]) -> dict[str, dict[str, float]]:
+        """The totals a process reported, by the names the session uses.  A process
+        that names the agent's model otherwise than the project does would have its
+        totals looked up under one name and filed under another, and what a
+        killed turn was estimated at would be counted on top of its real cost."""
+        named: dict[str, dict[str, float]] = {}
+        for model, given in usage.items():
+            row = _row(given)
+            into = named.setdefault(self._named(str(model)), _row({}))
+            for name in _ROW_NAMES:
+                into[name] += row[name]
+        return named
 
     def _count(self, event: Used) -> None:
         """Take note of what one model request used, and let the budget see the turn so
@@ -860,20 +1055,31 @@ class AgentSession:
         kept apart and priced at that model's own list price.
         """
         usage = event.usage
-        self._by_message[event.message_id] = (
-            self._model_of(event),
-            Usage(**{name: agents._whole(usage.get(name)) for name in _USAGE_NAMES}, requests=1),
+        self._heard = True
+        named = self._model_of(event)
+        used_now = Usage(
+            **{name: agents._whole(usage.get(name)) for name in _USAGE_NAMES}, requests=1
         )
+        if self._first is None and named == self._model and not event.sub:
+            self._first = used_now
+        self._by_message[event.message_id] = (named, used_now)
         turn: dict[str, Usage] = {self._model: Usage(web_searches=self._searches)}
         for model, used in self._by_message.values():
             turn.setdefault(model, Usage()).add(used)
         self._turn = turn
         others = sum(
-            estimate_cost_usd(model, used) or 0.0
-            for model, used in turn.items()
-            if model != self._model
+            _listed(model, used) or 0.0 for model, used in turn.items() if model != self._model
         )
-        self.ctx.used(self._model, turn[self._model], more_usd=others)
+        # Whoever is asked prices the agent's own model by its name at the list price.
+        # What it was seen to cost above that (fast mode) is added, and all of it where
+        # the name has no price of its own: the budget must not learn of either only
+        # when the turn has ended.
+        own = turn[self._model]
+        ratio = self._ratio if self._fast_on else 1.0
+        above = ratio * (_listed(self._model, own) or 0.0) - (
+            estimate_cost_usd(self._model, own) or 0.0
+        )
+        self.ctx.used(self._model, own, more_usd=others + max(0.0, above))
 
     def _counts_from(self, model: str, row: Mapping[str, float]) -> dict[str, float]:
         """The totals the process that runs now started its count of ``model`` from, told
@@ -920,14 +1126,15 @@ class AgentSession:
         count from (:meth:`_counts_from`).
         """
         ledger = self.ctx.harness.usage
-        for model, given in turn.model_usage.items():
-            row = _row(given)
+        for model, row in self._by_name(turn.model_usage).items():
             before = self._seen.get(model) or self._counts_from(model, row)
             new = {name: max(0.0, row[name] - before[name]) for name in _ROW_NAMES}
             self._seen[model] = row
             self._remember(model, row)
             if not any(new.values()):
                 continue
+            if model == self._model:
+                self._observe(new["cost_usd"], self._turn, self._first)
             ledger.record(
                 self._label,
                 model,
@@ -953,6 +1160,8 @@ class AgentSession:
         self._turn = {}
         self._by_message = {}
         self._searches = 0
+        # (Only the first turn of a process tells what a start costs.)
+        self._first = Usage()
         if turn.session_id:
             self._sdk_session = turn.session_id
         self._save_record()
@@ -1021,11 +1230,14 @@ class AgentSession:
                 session=turn.session_id if turn is not None else self._sdk_session,
             )
             raise
-        except BaseException:
+        except BaseException as exc:
             # A failure of the agent's process: it is ended, and what it used is counted
             # from what its messages said.
             self.close()
             self._account_unreported()
+            if isinstance(exc, Exception) and _NO_SANDBOX in str(exc):
+                why = experiments.mask_credentials(self.ctx.project, str(exc))
+                raise SandboxUnavailable(_no_sandbox_sentence(self.role, why)) from exc
             raise
 
     def _last_report(self, conversation: AgentConversation) -> Turn | None:
@@ -1065,8 +1277,12 @@ class AgentSession:
         for model, used in self._turn.items():
             if not any(used.to_dict().values()):
                 continue
-            estimate = estimate_cost_usd(model, used) or 0.0
-            ledger.record(f"{self._label}{UNREPORTED_SUFFIX}", model, used, cost_usd=estimate)
+            priced = _listed(model, used)
+            estimate = priced or 0.0
+            # A model without a list price is recorded without a cost, not with a cost
+            # of nothing: the ledger then names it among the models it cannot price,
+            # and whoever shows the spend says that the sum leaves it out.
+            ledger.record(f"{self._label}{UNREPORTED_SUFFIX}", model, used, cost_usd=priced)
             rows = self._history.get(model) or []
             base = self._seen.get(model) or (rows[-1] if rows else _row({}))
             would = dict(base)
@@ -1113,11 +1329,26 @@ class AgentSession:
         self._searches = 0
         self._asked_at = None
         self._acted = False
+        self._heard = False
         try:
             return self._converse(text)
         finally:
             # Also when the turn was cut short: what it wrote by then is in the wiki.
             self.ctx.note(self.created())
+
+    def _gone(self, turn: Turn) -> bool:
+        """Whether ``turn``, the answer to the first message of a process that was to
+        carry a session on, says that the session is not there any more: the process
+        says so in words, or it answers with an error without having made one model
+        request.  An error after the agent had worked (a failing API, a budget it
+        reached) is none of that: its cost counts, and it ends the turn as any error
+        does."""
+        if not turn.is_error or self._acted or turn.ended == "error_max_budget_usd":
+            return False
+        said = str(turn.error or "")
+        if _NO_SANDBOX in said:
+            return False  # no other agent would fare better
+        return _NO_SESSION in said or not (self._heard or turn.requests)
 
     def _first_exchange(self, text: str) -> Turn:
         """The first message of this process to the agent: to the session an earlier
@@ -1135,13 +1366,24 @@ class AgentSession:
             )
             self._log("prompt", text=carried_on)
             turn = self._exchange(carried_on)
-            if not turn.is_error or self._acted:
+            if not self._gone(turn):
                 return turn
-        except Exception:
+            # Let go of, and counted all the same where it says that it cost something.
+            self._account(turn)
+        except SandboxUnavailable:
+            raise
+        except Exception as exc:
             # (Not a stop and not Ctrl-C, which are no ``Exception``.)  An agent's process
             # that cannot find the session it is asked to carry on says so in one of
-            # two ways: an error for an answer, or no start at all.
-            if not self._resumed or self._acted or self.ctx.ending():
+            # two ways: an error for an answer, or no start at all.  A process that
+            # had made a model request before it failed did find its session: that
+            # failure is the phase's, and whoever runs the phase tries again.
+            if (
+                not self._resumed
+                or self._acted
+                or self.ctx.ending()
+                or (self._heard and _NO_SESSION not in str(exc))
+            ):
                 raise
         self.close()
         self._tell(
@@ -1182,6 +1424,9 @@ class AgentSession:
             raise agents.SessionStopped("the agent's session reached the model budget")
         if turn.is_error:
             why = experiments.mask_credentials(self.ctx.project, str(turn.error or turn.ended))
+            if _NO_SANDBOX in why:
+                self.close()
+                raise SandboxUnavailable(_no_sandbox_sentence(self.role, why))
             raise AgentFailed(f"The {self.role} agent ended with an error: {why}")
         return turn.text
 

@@ -132,7 +132,8 @@ class _Conversation:
             sub=bool(given.get("agent_id")),
         )
         try:
-            reason = self._options.check(use)
+            # Off the loop: the check of a web address resolves its name.
+            reason = await asyncio.to_thread(self._options.check, use)
         except Exception as exc:  # a check that fails refuses: the gate fails closed
             reason = f"The check of this call failed ({type(exc).__name__}), so it was refused."
         if reason is None:
@@ -336,6 +337,13 @@ class ClaudeDriver:
                 "install Claude Code, or reinstall claude-agent-sdk, which brings its own",
             )
         return None
+
+    def sandbox_unavailable(self, path: str | None = None) -> tuple[str, str] | None:
+        """Why the sandbox of an agent's shell cannot start for a process started with
+        ``path`` (this process's without); ``None`` when nothing is known to be missing."""
+        from paper_orchestra.research.sdk.guard import sandbox_fault
+
+        return sandbox_fault(path)
 
     def open(self, options: AgentOptions) -> _Conversation:
         missing = self.unavailable()

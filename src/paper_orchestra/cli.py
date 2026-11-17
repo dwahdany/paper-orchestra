@@ -1038,14 +1038,17 @@ def _needs_a_model(exc: BaseException) -> bool:
     return isinstance(refusal, type) and isinstance(exc, refusal)
 
 
-def _unreported_spend(project: Project) -> float:
+def _unreported_spend(project: Project) -> tuple[float, list[str]]:
     """What of the model spend is a count from tokens for agents that never reported
-    their cost (``unreported_usd`` of the usage ledger); nothing when there is none."""
+    their cost (``unreported_usd`` of the usage ledger), and the models of such agents
+    that have no list price and are in the sum with nothing (``unreported_unpriced``);
+    nothing and none when there are none."""
     try:
         ledger = read_json(project.root / "usage.json")
-        return max(0.0, float(ledger.get("unreported_usd") or 0.0))
+        unpriced = [str(model) for model in ledger.get("unreported_unpriced") or []]
+        return max(0.0, float(ledger.get("unreported_usd") or 0.0)), unpriced
     except (OSError, ValueError, TypeError, AttributeError, RecursionError):
-        return 0.0
+        return 0.0, []
 
 
 def _sweep(project: Project) -> None:
@@ -1266,12 +1269,19 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         f"{_amount(spent.get('experiment_seconds')):.0f} s in all (one run may take up to "
         f"{limits.experiment_seconds:.0f} s)"
     )
-    unreported = _unreported_spend(project)
+    unreported, unpriced = _unreported_spend(project)
     if unreported:
         lines.append(
             f"  The model spend is at least that: ${unreported:.2f} of it stands for agents "
             "that were stopped before they reported their cost, counted from their tokens "
             "at the list price"
+        )
+    if unpriced:
+        lines.append(
+            "  The model spend is at least that: an agent on "
+            f"{', '.join(repr(model) for model in unpriced)} was stopped before it "
+            "reported its cost, and that model has no list price here, so its tokens are "
+            "in usage.json and its cost is not in the sum"
         )
     lines += _problem_lines(project)
     lines.append(_next_steps(project, state, counts))
@@ -2113,6 +2123,8 @@ def research_approve(
         f"{root} {name}` runs it now; `paper-orchestra research advance {root}` runs "
         "everything approved and analyses the results."
     )
+    if _grants_model_access(page):
+        _say(MODEL_ACCESS_SAID)
     for line in _what_was_approved(opened, page):
         _say(line)
 
@@ -2241,6 +2253,24 @@ def _asks_for_network(page: ResearchPage) -> bool:
     return value is True or str(value).strip().lower() in _TRUE
 
 
+#: Said when a run is approved whose code will be able to call the Anthropic API: the
+#: person learns of a spend that nothing here counts before they grant it, not after.
+MODEL_ACCESS_SAID = (
+    "With network access this run's code can call the Anthropic API with the worker's "
+    "federation settings (PAPER_ORCHESTRA_JOB_MODEL_ACCESS is on): those calls are billed "
+    "to that account and are counted against no limit of the project."
+)
+
+
+def _grants_model_access(page: ResearchPage) -> bool:
+    """Whether the approval on ``page`` lets the run's code call the Anthropic API: a
+    local run with network access while model access for jobs is on."""
+    from paper_orchestra.compute.local import job_model_access
+
+    local = str(page.meta.get("backend") or "local") == "local"
+    return local and _asks_for_network(page) and job_model_access()
+
+
 def _approved_as(page: ResearchPage) -> str:
     """What the approval recorded on the page: where the run goes, with what, for how
     long at most, and whether it may reach the network."""
@@ -2351,9 +2381,10 @@ def research_run(
             changed = _mapping(record.get("code_as_run"))
             if any(changed.get(verb) for verb in ("changed", "added", "removed")):
                 # The result comes from other code than was approved: said where the
-                # result is, with what makes that code the experiment's.
+                # result is, with what makes that code the experiment's.  A plan that
+                # came without code was given none to change: the agent wrote it.
                 _say(
-                    "  The agent that carried it out changed the code it was given "
+                    f"  The agent that carried it out {_did_to_the_code(changed)} "
                     f"(kept in runs/{record.get('number')}/code-as-run). `paper-orchestra "
                     f"research adopt-code {root} {record.get('experiment')}` makes it the "
                     "experiment's code; without that, a new run starts from the approved code."
@@ -2368,6 +2399,14 @@ def research_run(
         )
     if any(outcome != "succeeded" for outcome in outcomes):
         raise typer.Exit(1)
+
+
+def _did_to_the_code(as_run: Mapping[str, Any]) -> str:
+    """What the agent that carried a run out did to the code, from the record's
+    ``code_as_run``: it wrote the code where the plan came with none (``approved`` is
+    the number of files that were approved), and changed what it was given otherwise."""
+    wrote = "approved" in as_run and not as_run.get("approved") and not as_run.get("changed")
+    return "wrote the code for this run" if wrote else "changed the code it was given"
 
 
 def _settle_what_ended(project: Project) -> None:

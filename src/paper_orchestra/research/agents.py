@@ -276,6 +276,9 @@ class AgentContext:
     #: What is left of the model budget, in dollars, for a session that can be told a
     #: sum it must not pass; ``None`` when nobody says.
     left: Callable[[], float | None] = _no_guard
+    #: Asked before an agent is started with what a start was seen to cost, in dollars:
+    #: why it must not start (what is left of the model budget is less), or ``None``.
+    short_of: Callable[[float], BaseException | None] = lambda needed: None
     #: The sessions this run of the phase opened that hold something to close (an SDK
     #: agent's process); whoever runs the phase closes them when it ends.
     sessions: list[Any] = field(default_factory=list, repr=False)

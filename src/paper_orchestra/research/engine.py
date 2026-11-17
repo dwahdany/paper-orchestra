@@ -832,6 +832,15 @@ def _money(amount: float) -> str:
     return f"${amount:.2f}"
 
 
+def _limit_money(limit: float) -> str:
+    """A limit the person set, with the digits they gave it: ``$0.145`` and not
+    ``$0.14``, beside which "$0.15 is spent" would read as an error of arithmetic.
+    A limit in whole cents reads as any amount does."""
+    if limit >= 0.01 and abs(limit * 100 - round(limit * 100)) > 1e-6:
+        return "$" + f"{limit:.4f}".rstrip("0")
+    return _money(limit)
+
+
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
@@ -1030,8 +1039,10 @@ class Engine:
                     "research approve` or in the app, then run it again."
                 )
             self._tidy_hypotheses(release=False)
-            if self._sdk():
+            named = backend if isinstance(backend, str) else getattr(backend, "name", None)
+            if self._sdk() and self._agent_carries_out(page, named):
                 # An agent carries the experiment out: it needs what every agent needs.
+                # (A run approved for a remote backend runs there, without an agent.)
                 need = self._agents_need()
                 if need is not None:
                     sentence = agents.need_sentence(need, f"Carrying out {page.id}")
@@ -1271,6 +1282,19 @@ class Engine:
             )
             if unreported:
                 report["unreported_usd"] = round(unreported, 4)
+            # Such an agent on a model without a list price is in the sum with nothing:
+            # named here, so that the sum is still shown as the lower bound it is.
+            unpriced = sorted(
+                {
+                    str(row.get("model"))
+                    for row in report.get("by_label") or []
+                    if str(row.get("label") or "").endswith(UNREPORTED_LABEL)
+                    and "cost_usd" not in row
+                    and str(row.get("model")) in self._unpriced
+                }
+            )
+            if unpriced:
+                report["unreported_unpriced"] = unpriced
             write_json(self.project.root / USAGE_FILE, report)
             self._state["spent"]["model_usd"] = round(spent, 4)
             return spent
@@ -1323,8 +1347,31 @@ class Engine:
         whose design then cannot be done is refused before anything is spent.
         """
         if self._sdk():
+            if name == "run" and not self._runs_need_agents():
+                return None
             return self._agents_need()
         return None if name == "run" else self._models_need()
+
+    @staticmethod
+    def _agent_carries_out(page: ResearchPage, backend: Any = None) -> bool:
+        """Whether a run of ``page`` under the sdk runtime is an agent's work: one that
+        was approved for this machine.  A run approved for a remote backend runs there
+        as it always did, and waits for nothing the agents need."""
+        named = str(backend or page.meta.get("backend") or "local")
+        return named == "local"
+
+    def _runs_need_agents(self) -> bool:
+        """Whether the run phase would start an agent: some approved run is for this
+        machine (or nothing tells, and the gate then asks as for every phase)."""
+        try:
+            waiting = [
+                page
+                for page in self.project.pages(kind="experiment")
+                if page.review == "accepted" and page.state in ("approved", "queued")
+            ]
+        except Exception:
+            return True
+        return not waiting or any(self._agent_carries_out(page) for page in waiting)
 
     def _sdk(self) -> bool:
         """Whether the project's agents are Claude Agent SDK agents (``settings.agents``)."""
@@ -1415,7 +1462,7 @@ class Engine:
         if spent >= limit:
             raise _BudgetSpent(
                 "model_usd",
-                f"The model budget is used up: {_money(spent)} of {_money(limit)} is spent. "
+                f"The model budget is used up: {_money(spent)} of {_limit_money(limit)} is spent. "
                 "Raise settings.limits.model_usd in the project's settings to go on; the "
                 "phase then resumes where it stopped.",
                 spent=spent,
@@ -1462,7 +1509,8 @@ class Engine:
         def say(spent: float) -> str:
             return (
                 f"The model budget ran out in the middle of {work}: {_money(spent)} of "
-                f"{_money(limit)} is spent, so its session was ended at its next model call. "
+                f"{_limit_money(limit)} is spent, so its session was ended at its next model "
+                "call. "
                 "What it had written until then is kept. Raise settings.limits.model_usd in "
                 f"the project's settings to go on; {then}"
             )
@@ -1470,6 +1518,40 @@ class Engine:
         exc = _BudgetSpent("model_usd", say(spent), spent=spent, allowed=limit)
         exc.say = say
         return exc
+
+    def _short_of(
+        self, needed: float, *, phase: str | None = None, experiment: str | None = None
+    ) -> _BudgetSpent | None:
+        """Asked before an agent is started (sdk runtime) with what the start of an agent
+        was seen to cost in this project: is less than that left of the model budget?
+
+        An agent's first request sends everything it is given, and in fast mode that
+        alone was seen to cost most of a dollar.  Started with less than that left,
+        the agent passes the limit within seconds, before any count can end it: it is
+        not started, and the work stops at a checkpoint as for a budget that is spent.
+        """
+        limit = float(self.project.settings.limits.model_usd)
+        with self._lock:
+            spent = self._ledger_usd()
+        if limit - spent >= needed:
+            return None
+        if experiment:
+            who = f"the agent that carries out {experiment}"
+            then = f"{experiment} keeps its approval and is run when the work goes on."
+        else:
+            role = _ROLE.get(str(phase or self._state.get("phase")), "agent")
+            who = f"the {role}"
+            then = "the phase then starts where it stopped."
+        return _BudgetSpent(
+            "model_usd",
+            f"What is left of the model budget does not cover the start of {who}: "
+            f"{_money(spent)} of {_limit_money(limit)} is spent, and the first request of an "
+            f"agent was last seen to cost about {_money(needed)} here, so it was not "
+            "started. Raise settings.limits.model_usd in the project's settings to go on; "
+            f"{then}",
+            spent=spent,
+            allowed=limit,
+        )
 
     def _as_spent(self, exc: _BudgetSpent) -> _BudgetSpent:
         """``exc`` with the amount the ledger holds now.
@@ -1907,6 +1989,7 @@ class Engine:
             handover=self._handover(name, round),
             runtime=self._runtime() if self._sdk() else None,
             left=self._budget_left,
+            short_of=functools.partial(self._short_of, phase=name),
         )
 
     def _handover(self, name: str, round: int) -> tuple[str, ...]:
@@ -2173,7 +2256,9 @@ class Engine:
         # What is written of an error is read by the app, the command line and later
         # sessions: no credential a library quoted in it gets that far.
         told = self._clean(exc)
-        error = f"{type(exc).__name__}: {_one_line(told, 1000)}"
+        # (An error that is a whole sentence to the person stands without its class.)
+        named = "" if getattr(exc, "whole_sentence", False) is True else f"{type(exc).__name__}: "
+        error = f"{named}{_one_line(told, 1000)}"
         log.error("The %s phase failed.", name, exc_info=exc)
         self._settle(record, clock, ctx, "failed", error)
         with self._lock:
@@ -2547,7 +2632,7 @@ class Engine:
             return []
         exc = _BudgetSpent(
             "model_usd",
-            f"The model budget is used up: {_money(spent)} of {_money(limit)} is spent. No "
+            f"The model budget is used up: {_money(spent)} of {_limit_money(limit)} is spent. No "
             "agent starts again until settings.limits.model_usd is raised in the project's "
             "settings; what awaits your review can be decided all the same.",
             spent=spent,
@@ -2714,6 +2799,7 @@ class Engine:
             # spend is the model budget's, which is looked at before it starts.
             ctx.runtime = self._runtime()
             ctx.over_budget = functools.partial(self._over_budget, experiment=experiment)
+            ctx.short_of = functools.partial(self._short_of, experiment=experiment)
             self._guard()
             chosen = self._agent_backend(page, ctx, chosen, carried_out)
         try:

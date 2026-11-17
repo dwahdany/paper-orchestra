@@ -160,7 +160,9 @@ class AgentTeam:
 
     def experimenter(self, agent: FakeAgent) -> str:
         answers = self.experimenter_answers
-        answers["files"] = sorted(p.name for p in agent.cwd.iterdir())
+        # (Its own directory for temporary files is there besides, hidden by its name.)
+        answers["files"] = sorted(p.name for p in agent.cwd.iterdir() if p.name != ".tmp")
+        answers["temp"] = (agent.cwd / ".tmp").is_dir()
         answers["code"] = agent.read("main.py") if (agent.cwd / "main.py").is_file() else None
         self._midway(agent)
         if self.metrics is not None:
@@ -592,6 +594,8 @@ def test_the_model_budget_ends_an_agents_turn_in_the_middle_and_stops_at_a_check
 
     team.during["scout"] = expensive
     engine = make_engine(project, team, backend)
+    # (Not in fast mode: the count during the turn is then the list price alone.)
+    engine.driver.started["fast_mode_state"] = "off"
     state = engine.advance()
 
     assert len(reached) < 40 and engine.driver.interrupts == 1
@@ -680,7 +684,10 @@ def test_an_approved_experiment_is_carried_out_by_an_agent_in_a_folder_of_its_ow
         "memory",
         "wiki_search",
         "propose_edit",
+        "fail_run",
     ]
+    assert team.experimenter_answers["temp"] and not (work / ".tmp").exists()
+    assert ".tmp" not in json.dumps(record.get("code_as_run"))
     # The result page and the feed are those of any run.
     result = project.page("E1-run1")
     assert result.state == "succeeded" and "after" in result.body and "local backend" in result.body
@@ -1602,3 +1609,239 @@ def test_the_web_app_gives_a_new_project_the_runtime_the_environment_names(monke
     assert Services.default_settings(None)["agents"]["runtime"] == "classic"
     monkeypatch.setenv(AGENT_RUNTIME_ENV, "sdk")
     assert Services.default_settings(None)["agents"]["runtime"] == "sdk"
+
+
+# ---------------------------------------------------------------------------
+# What the third review found
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_the_agent_says_failed_is_recorded_as_failed_with_its_words(project, team, backend):
+    """A valid metrics.json was all a run needed to be recorded as succeeded: code that
+    caught its own errors wrote one that measured nothing, the agent said in its reply
+    that the run had failed, and the board showed a green "succeeded"."""
+    to_approved(project, team, backend)
+    team.metrics = {"direct_trials": 0, "api_calls": 10, "api_errors": 10}
+    why = "Every one of the 10 API calls failed, so no trial was scored and nothing was measured."
+
+    def says_so(agent: FakeAgent) -> None:
+        assert "fail_run" in agent.options.system_prompt and "fail_run" in agent.prompt
+        short = agent.board("fail_run", reason="it failed")
+        assert agent.failed and "Give the reason" in short
+        said = agent.board("fail_run", reason=why)
+        assert not agent.failed and "recorded as failed" in said
+
+    team.during["experimenter"] = says_so
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert (record["status"], record["error_kind"], record["requeued"]) == (
+        "failed",
+        "declared",
+        False,
+    )
+    assert record["error"] == f'The agent that carried out the run says that it failed: "{why}".'
+    assert record["metrics"] == {} and record["repairs"] == []
+    assert project.page("E1").state == "failed"
+    result = project.page("E1-run1")
+    assert result.state == "failed" and why in result.body
+    # What the code wrote is kept as a file, and counts as no result.
+    assert (project.root / "experiments" / "E1" / "runs" / "1" / "metrics.json").is_file()
+    log = (project.root / "experiments" / "E1" / "runs" / "1" / "log.txt").read_text()
+    assert f"The agent says that the run failed: {why}" in log
+    assert team.calls.count("experimenter") == 1
+
+
+def test_an_agent_that_got_the_run_to_work_after_all_takes_its_statement_back(
+    project, team, backend
+):
+    to_approved(project, team, backend)
+
+    def changed_its_mind(agent: FakeAgent) -> None:
+        agent.board("fail_run", reason="The first attempt measured nothing at all, it seemed.")
+        agent.board("fail_run", withdraw=True)
+
+    team.during["experimenter"] = changed_its_mind
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert (record["status"], record["metrics"]) == ("succeeded", METRICS)
+
+
+def test_a_statement_that_the_run_failed_stands_when_the_time_runs_out(
+    project, team, backend, monkeypatch
+):
+    """Time that is up with a valid metrics.json in place records the run with those
+    metrics.  Not when the agent had said that they are no result."""
+    to_approved(project, team, backend)
+    from paper_orchestra.research.sdk import experiment as experiment_module
+
+    def late(agent: FakeAgent) -> None:
+        (agent.cwd / "metrics.json").write_text(json.dumps({"trials": 0}), encoding="utf-8")
+        agent.board("fail_run", reason="No trial ran: the data could not be downloaded in time.")
+        # The time is up while it is still at work.
+        monkeypatch.setattr(experiment_module.time, "monotonic", lambda: 10**9)
+        agent.tick(3)
+
+    team.metrics = None
+    team.during["experimenter"] = late
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert (record["status"], record["error_kind"]) == ("failed", "declared")
+    assert "No trial ran" in record["error"]
+
+
+def test_under_sdk_a_run_for_a_remote_backend_does_not_wait_for_the_agents(
+    project, team, backend, home
+):
+    """Such a run is carried out where it was approved for, without an agent.  It waited
+    all the same for the agents' login, with a sentence about a model it does not use."""
+    to_approved(project, team, backend)
+
+    class Remote(FakeBackend):
+        name = "modal"
+
+    remote = Remote()
+    experiments.withdraw(project, "E1")
+    experiments.approve(project, "E1", backend="modal", backends={"modal": remote})
+    (home / ".claude" / ".credentials.json").unlink()
+    engine = Engine(
+        project,
+        compute=remote,
+        client_for=no_classic_model,
+        scholar=make_scholar(),
+        driver=FakeDriver(team),
+    )
+    assert engine._model_need("run") is None
+    assert engine._model_need("analyze") is not None  # the analyst is an agent
+    record = engine.run_experiment("E1")
+    assert (record["status"], record["backend"]) == ("succeeded", "modal")
+    assert team.calls.count("experimenter") == 0
+
+    # A run for this machine is an agent's, and waits for what the agents need.
+    experiments.approve(project, "E1", backend="local", backends={"local": backend})
+    local = make_engine(project, team, backend)
+    assert local._model_need("run") is not None
+    with pytest.raises(ModelNeeded, match="no Claude Code login"):
+        local.run_experiment("E1")
+
+
+def test_an_agent_that_could_not_work_is_not_called_a_compute_backend(project, team, backend):
+    to_approved(project, team, backend)
+
+    def overloaded(agent: FakeAgent) -> None:
+        raise RuntimeError("API Error: 529 Overloaded")
+
+    team.during["experimenter"] = overloaded
+    state = advance(project, team, backend)
+    (run,) = experiments.runs(project, "E1")
+    assert run["error"].startswith("The agent that was to carry out E1 could not work (")
+    assert "compute backend" not in run["error"] and run["requeued"] is True
+    # The phase's record says it as a sentence, without the name of a class.
+    assert state["phases"][-1]["error"].startswith("The agent that was to carry out E1")
+    # The feed says that a second agent took the run up, as the log does.
+    assert any(
+        "another agent takes the run up once more" in line and "529" in line
+        for line in activity(project)
+    )
+
+
+def test_without_the_sandbox_it_asks_for_no_experiment_agent_runs_and_the_approval_stays(
+    project, team, backend
+):
+    to_approved(project, team, backend)
+    from paper_orchestra.research.sdk.guard import sandbox_fault
+
+    # The gate refuses before anything starts, in a sentence.
+    gated = make_engine(project, team, backend)
+    gated.driver.no_sandbox = sandbox_fault("/nowhere", platform="linux")
+    with pytest.raises(ModelNeeded) as refused:
+        gated.advance()
+    assert "bwrap and socat are not installed" in str(refused.value)
+    assert team.calls.count("experimenter") == 0 and project.page("E1").state == "approved"
+
+    # Where the gate found nothing and the agent's own start does, the run is not
+    # carried out, is not tried by a second agent, and keeps its approval.
+    engine = make_engine(project, team, backend)
+    engine._agents_need = lambda: None
+    engine.driver.no_sandbox = gated.driver.no_sandbox
+    from paper_orchestra.compute.base import BackendUnusable
+
+    with pytest.raises(BackendUnusable, match="Nothing was run outside the sandbox"):
+        engine.run_experiment("E1")
+    assert team.calls.count("experimenter") == 0 and engine.driver.opened == gated.driver.opened
+    (run,) = experiments.runs(project, "E1")
+    assert run["requeued"] is True and project.page("E1").state == "queued"
+    assert run["error"].startswith("The experimenter agent was not started:")
+    assert "compute backend" not in run["error"]
+
+
+def test_no_agent_is_started_with_less_left_than_a_start_was_seen_to_cost(project, team, backend):
+    """In fast mode the first request of an agent was seen to cost most of a dollar: an
+    agent started with fifty cents left took the project to $1.91 of $1.50 within
+    seconds.  It is not started; the work stops at the checkpoint with the reason."""
+    project.settings.update({"limits": {"model_usd": 1.5}})
+    project.save_settings()
+    team.cost = 0.976  # what the one request of each agent costs, as its process says
+    engine = make_engine(project, team, backend)
+    state = engine.advance()
+    assert team.calls == ["intake"] and len(engine.driver.opened) == 1
+    assert (state["status"], state["next_phase"]) == ("checkpoint", "research")
+    said = state["phases"][-1]["error"]
+    assert said.startswith("What is left of the model budget does not cover the start of the scout")
+    assert "$0.98 of $1.50 is spent" in said and "so it was not started" in said
+    assert state["spent"]["model_usd"] == pytest.approx(0.976)
+    (warning,) = events(project, "budget.warning")
+    assert warning["data"]["limit"] == "model_usd"
+    # With the limit raised the phase starts.
+    project.settings.update({"limits": {"model_usd": 5.0}})
+    project.save_settings()
+    again = advance(project, team, backend)
+    assert "scout" in team.calls and again["phases"][-1]["status"] == "completed"
+
+
+def test_a_limit_is_shown_with_the_digits_the_person_gave_it(project, team, backend):
+    """A limit of $0.145 read "$0.15 of $0.14 is spent"."""
+    from paper_orchestra.research.engine import _limit_money
+
+    assert _limit_money(0.145) == "$0.145" and _limit_money(0.14) == "$0.14"
+    assert _limit_money(25) == "$25.00" and _limit_money(0.004) == "$0.004"
+    project.settings.update({"limits": {"model_usd": 0.145}})
+    project.save_settings()
+    team.cost = 0.15
+    engine = make_engine(project, team, backend)
+    engine.driver.started["fast_mode_state"] = "off"
+    state = engine.advance()
+    assert "$0.15 of $0.145 is spent" in json.dumps(state["checkpoint"])
+
+
+def test_an_agent_on_an_unpriced_model_that_was_killed_makes_the_spend_a_lower_bound(
+    project, team, backend
+):
+    """Such a turn was recorded as costing $0.00: status showed the spend as exact, and
+    the ledger did not list the model among those it cannot price."""
+    project.settings.update({"agents": {"model": "mystery-model-9"}})
+    project.save_settings()
+
+    def killed(agent: FakeAgent) -> None:
+        agent.use(cost_usd=3.0, input_tokens=400_000, output_tokens=40_000)
+        raise KeyboardInterrupt
+
+    team.during["intake"] = killed
+    with pytest.raises(KeyboardInterrupt):
+        make_engine(project, team, backend).advance()
+    report = usage(project)
+    assert report["unpriced_models"] == ["mystery-model-9"]
+    assert report["unreported_unpriced"] == ["mystery-model-9"]
+    (row,) = [row for row in report["by_label"] if row["label"] == "intake.agent.unreported"]
+    assert "cost_usd" not in row and row["input_tokens"] >= 400_000
+    status = " ".join(
+        runner.invoke(cli.app, ["research", "status", str(project.root)]).output.split()
+    )
+    assert "The model spend is at least that: an agent on 'mystery-model-9' was stopped" in status
+    assert "has no list price here" in status
+
+
+def test_the_command_line_says_that_the_agent_wrote_the_code_of_a_plan_without_code():
+    """It said "changed the code it was given" of a plan that came with none."""
+    wrote = {"approved": 0, "changed": [], "added": ["main.py"], "removed": []}
+    assert cli._did_to_the_code(wrote) == "wrote the code for this run"
+    changed = {"approved": 1, "changed": ["main.py"], "added": ["helper.py"], "removed": []}
+    assert cli._did_to_the_code(changed) == "changed the code it was given"
+    # A record from before the count of approved files was kept says what it always said.
+    assert cli._did_to_the_code({"added": ["main.py"]}) == "changed the code it was given"

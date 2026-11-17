@@ -219,5 +219,10 @@ class AgentDriver(Protocol):
         """Why no agent can be started here and what to do about it (two clauses, as the
         rest of "..., and <why>: <fix>"), or ``None`` when one can.  Contacts nothing."""
 
+    def sandbox_unavailable(self, path: str | None = None) -> tuple[str, str] | None:
+        """Why the sandbox of an agent's shell cannot start for an agent whose process is
+        started with ``path`` (in the same two clauses), or ``None`` when it can.  Asked
+        only for a project whose agents are to work in the sandbox."""
+
     def open(self, options: AgentOptions) -> AgentConversation:
         """Start an agent.  Its first event is :class:`Started`."""

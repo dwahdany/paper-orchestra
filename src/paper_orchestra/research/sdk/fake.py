@@ -309,6 +309,10 @@ class FakeDriver:
         self.started: dict[str, Any] = {"fast_mode_state": "on", **(started or {})}
         #: Why no agent can be started (``(why, fix)``), for tests of the gate.
         self.missing: tuple[str, str] | None = None
+        #: Why the sandbox of an agent's shell cannot start (``(why, fix)``), and the
+        #: path each agent's process would have been started with when that was asked.
+        self.no_sandbox: tuple[str, str] | None = None
+        self.sandbox_asked: list[str | None] = []
         #: Whether an agent whose turn is broken off from outside still says what its
         #: session cost (a real one does unless the interrupt ended it too).
         self.reports_when_interrupted = False
@@ -333,6 +337,10 @@ class FakeDriver:
 
     def unavailable(self) -> tuple[str, str] | None:
         return self.missing
+
+    def sandbox_unavailable(self, path: str | None = None) -> tuple[str, str] | None:
+        self.sandbox_asked.append(path)
+        return self.no_sandbox
 
     def open(self, options: AgentOptions) -> _FakeConversation:
         self.opened.append(options)

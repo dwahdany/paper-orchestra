@@ -2054,6 +2054,22 @@ def test_a_request_for_everyone_is_shown_to_every_phase_until_the_rounds_analysi
     assert handled(project, request) == [(1, "hypothesize"), (1, "design"), (1, "analyze")]
 
 
+def test_the_record_and_the_result_page_of_a_classic_run_are_what_they_were(project, team, backend):
+    """The sdk runtime added a row to the result page and a field to the run's record
+    (the digest of the approval, beside the digest of the code as an agent left it).
+    They are for a run an agent carried out: a classic run's are unchanged."""
+    to_analysis_checkpoint(project, team, backend)
+    (run,) = experiments.runs(project, "E1")
+    assert run["status"] == "succeeded"
+    assert "approved_digest" not in run and "carried_out_by" not in run
+    assert "code_as_run" not in run and "model_access" not in run
+    body = project.page("E1-run1").body
+    rows = [line.split("|")[1].strip() for line in body.splitlines() if line.startswith("| ")]
+    assert "Approval" not in rows and "Command of the plan" not in rows
+    assert "Command" in rows and "Code" in rows
+    assert "agent" not in body.split("## Log")[0]
+
+
 def test_a_request_for_everyone_left_after_the_rounds_analysis_waits_for_the_next_round(
     project, team, backend
 ):

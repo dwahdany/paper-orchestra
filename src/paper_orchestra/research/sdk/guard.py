@@ -8,11 +8,18 @@ its own:
 
 - **The shell's sandbox** (the agent's process applies it to every command):
   the shell can write only inside the agent's own folder, and cannot read the
-  person's home directory, the project's directory or the place the identity
-  token lies, except for what is named as readable (its own folder, the Python
-  it runs code with).  A file of settings with secrets (``.env``, ``.envrc``,
+  person's home directory, the project's directory, the place the identity
+  token lies or the directory for temporary files that this process and the
+  person's other programs share, except for what is named as readable (its own
+  folder, the Python it runs code with).  Its temporary files lie in a
+  directory of its own inside its folder (:data:`TEMP_DIR`), which is removed
+  when the agent ends.  The sandbox is required, not wished for: where it
+  cannot start (on Linux it needs ``bwrap`` and ``socat``), no agent starts
+  (:func:`sandbox_fault`), and the agent's process is told to refuse every
+  command besides (``failIfUnavailable``), so that no command ever runs
+  outside it.  A file of settings with secrets (``.env``, ``.envrc``,
   ``*.env``) is named to it as well, which on Linux only holds in the agent's
-  folder and its directory for temporary files: one that lies outside every
+  folder: one that lies outside every
   hidden place (``/srv/app/.env``) can be read by the shell, though not by the
   file tools.  A write outside the folder does not always fail with an
   error: the sandbox may take it and throw it away, so that the command seems
@@ -29,8 +36,10 @@ its own:
   starts): built-in tools that write stay inside the agent's folder, the ones
   that read stay out of what the sandbox hides and out of the trees of the
   system that show processes and devices, and the ones that search (Grep, Glob)
-  do not start at a directory that has any of that beneath it (``/``, ``/home``), the tool that opens a web page does
-  not open this machine's own services, and a shell command that runs the
+  do not start at a directory that has any of that beneath it (``/``,
+  ``/home``), the tool that opens a web page does not open this machine's own
+  services under any spelling of their address (:func:`closed_host` resolves
+  the name as the connection would), and a shell command that runs the
   project's own command line is refused, with the way that is open instead:
   propose it on the board.  That last refusal reads the text of the command:
   it catches the command line and an import of the package where they are
@@ -44,8 +53,10 @@ its own:
 the third with it: the agent then works as the person's own Claude Code would,
 and its shell reaches whatever the person's does: the project's files, this
 machine's services, and on a cloud machine the metadata server and so the
-machine's own account.  The refusal of the project's command line and the rules
-about credentials stay, and without the sandbox they can be got around.
+machine's own account.  The refusal of the project's command line stays, and
+so do the rules that keep the file tools from the places where credentials lie
+(the identity token among them); the shell is under none of them then, and
+reads whatever the person's own shell reads.
 """
 
 from __future__ import annotations
@@ -53,6 +64,8 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import shutil
+import socket
 import sys
 import tempfile
 import urllib.parse
@@ -68,12 +81,15 @@ __all__ = [
     "FEDERATION_ENV",
     "JOB_ENV_PREFIX",
     "LAUNCHER",
+    "TEMP_DIR",
     "Guard",
+    "SandboxUnavailable",
     "agent_env",
     "claude_config_dir",
     "closed_host",
     "launcher_text",
     "runs_the_project_cli",
+    "sandbox_fault",
 ]
 
 #: What Workload Identity Federation needs (four ids and the path of the identity token).
@@ -90,6 +106,11 @@ FEDERATION_ENV: tuple[str, ...] = (
 JOB_ENV_PREFIX = "PAPER_ORCHESTRA_JOB_"
 #: The file in an experiment agent's folder that starts a command with those settings.
 LAUNCHER = "with-models"
+#: The agent's own directory for temporary files, inside its folder.  Hidden by its
+#: name, so that nothing in it is taken for code or for a result of a run.
+TEMP_DIR = ".tmp"
+#: What the sandbox of the agent's shell is made of on Linux.
+SANDBOX_PROGRAMS: tuple[str, ...] = ("bwrap", "socat")
 
 _SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
 #: A name that says where something lies is no credential.  (``_ID`` is not among these:
@@ -159,10 +180,43 @@ def runs_the_project_cli(command: str) -> bool:
     return False
 
 
+def _addresses(host: str) -> list[str]:
+    """The addresses the name ``host`` resolves to, as a connection to it would find them."""
+    found = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(str(entry[4][0]) for entry in found))
+
+
+def _closed_address(text: str) -> bool:
+    """Whether the address ``text`` is one of :data:`CLOSED_HOSTS`, the loopback, a
+    link-local address or the unspecified one; also when it is written as an IPv4
+    address inside an IPv6 one.  What is no address is closed."""
+    try:
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return (
+        str(address) in CLOSED_HOSTS
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_unspecified
+    )
+
+
 def closed_host(url: str) -> bool:
     """Whether ``url`` names a host that is closed to agents (:data:`CLOSED_HOSTS`), or
-    any other address of the loopback or the link-local range.  An address that does
-    not parse is closed: nothing is opened that cannot be read."""
+    any other address of the loopback or the link-local range, however it is spelled.
+
+    An address can be written in more ways than one (``127.1``, ``2130706433``,
+    ``0x7f000001``, ``0177.0.0.1``), and any name can resolve to one
+    (``127.0.0.1.nip.io``): the host is read the way a connection reads it, and a
+    name is resolved, and closed when one of its addresses is.  An address that
+    does not parse and a name that does not resolve are closed: nothing is
+    opened that cannot be read.  (A name whose answer changes between this look
+    and the connection is not caught here.)
+    """
     try:
         host = urllib.parse.urlsplit(url if "//" in url else f"//{url}").hostname
     except ValueError:
@@ -173,10 +227,59 @@ def closed_host(url: str) -> bool:
     if host in CLOSED_HOSTS or host.endswith(".localhost"):
         return True
     try:
-        address = ipaddress.ip_address(host)
+        ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
-        return False
-    return address.is_loopback or address.is_link_local or address.is_unspecified
+        pass
+    else:
+        return _closed_address(host)
+    try:
+        # The short, the decimal, the octal and the hexadecimal ways to write an address.
+        return _closed_address(socket.inet_ntoa(socket.inet_aton(host)))
+    except (OSError, UnicodeError):
+        pass
+    try:
+        addresses = _addresses(host)
+    except (OSError, UnicodeError):
+        return True
+    return not addresses or any(_closed_address(address) for address in addresses)
+
+
+def sandbox_fault(path: str | None = None, platform: str | None = None) -> tuple[str, str] | None:
+    """Why the sandbox of an agent's shell cannot start on this machine, as ``(why, what
+    to do)``; ``None`` when nothing is known to be missing.
+
+    On Linux the sandbox is made of two programs (:data:`SANDBOX_PROGRAMS`), which
+    must be on the path the agent's process is started with (``path``; this
+    process's without).  Elsewhere the system brings what is needed.  Without them
+    the agent's process would run every command of the agent outside any sandbox,
+    so no agent is started.
+    """
+    if not (platform or sys.platform).startswith("linux"):
+        return None
+    where = os.environ.get("PATH", os.defpath) if path is None else path
+    missing = [name for name in SANDBOX_PROGRAMS if shutil.which(name, path=where) is None]
+    if not missing:
+        return None
+    return (
+        "the sandbox that an agent's shell runs in cannot start on this machine: "
+        f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} not installed",
+        "install bubblewrap and socat (`apt install bubblewrap socat`), or set "
+        "settings.agents.sandbox to false if you accept agents whose shell reaches "
+        "everything yours does",
+    )
+
+
+class SandboxUnavailable(RuntimeError):
+    """The project asks for agents in a sandbox, and the sandbox cannot start.
+
+    No agent works then: a shell outside the sandbox is what the setting forbids.
+    Its message is a whole sentence to the person, and trying again changes nothing.
+    """
+
+    plain = True
+    whole_sentence = True
+    #: Read by ``errors.stops_the_run``: nobody tries this again by itself.
+    unusable = True
 
 
 def claude_config_dir(environ: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
@@ -198,10 +301,14 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _temporary_places() -> list[str]:
-    """Where this process, and so the agent's, keeps temporary files."""
-    named = [os.environ.get(name) for name in ("TMPDIR", "CLAUDE_CODE_TMPDIR")]
-    return list(dict.fromkeys([tempfile.gettempdir(), *(path for path in named if path)]))
+def _package_caches(home: Path) -> list[Path]:
+    """What of uv's cache is opened for reading: the packages it has unpacked, not the
+    checkouts of git repositories it keeps there (``git-v0``), which can be private."""
+    try:
+        found = sorted((home / ".cache" / "uv").iterdir())
+    except OSError:
+        return []
+    return [place for place in found if place.is_dir() and not place.name.startswith("git-")]
 
 
 #: The names such a file usually has, as patterns for the agent's process and its
@@ -240,6 +347,12 @@ class Guard:
     #: The identity token file, for an experiment agent whose run the person approved
     #: with network access while model access for jobs is on; ``None`` for everyone else.
     token_file: Path | None = None
+    #: The environment of this process (``os.environ`` without): where it names its
+    #: identity token and its directory for temporary files.
+    environ: Mapping[str, str] | None = None
+    #: The shared directories for temporary files, where they are not to be asked of
+    #: this process (:meth:`shared_temp`).
+    shared: Sequence[Path] | None = None
 
     # -- the places ----------------------------------------------------------------
 
@@ -248,6 +361,37 @@ class Guard:
 
     def _folder(self) -> Path:
         return Path(os.path.realpath(self.folder))
+
+    def _environ(self) -> Mapping[str, str]:
+        return os.environ if self.environ is None else self.environ
+
+    def temp(self) -> Path:
+        """The agent's own directory for temporary files, inside its folder."""
+        return self._folder() / TEMP_DIR
+
+    def shared_temp(self) -> list[Path]:
+        """Where this process, and so every agent's process before it is told otherwise,
+        keeps temporary files: the person's other programs and the other agents keep
+        theirs there too, so it is closed to the agent, which has a directory of its
+        own (:meth:`temp`)."""
+        if self.shared is not None:
+            return list(dict.fromkeys(Path(os.path.realpath(place)) for place in self.shared))
+        environ = self._environ()
+        named = [environ.get(name) for name in ("TMPDIR", "CLAUDE_CODE_TMPDIR", "CLAUDE_TMPDIR")]
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        # (The last is where a Claude Code process keeps them when nothing is named.)
+        places = [tempfile.gettempdir(), *named, f"/tmp/claude-{uid}"]
+        return list(dict.fromkeys(Path(os.path.realpath(place)) for place in places if place))
+
+    def _token_places(self) -> list[Path]:
+        """The identity token file this process signs in with, as it is named and where
+        that leads: a credential wherever it lies, unless it is this agent's to read."""
+        named = str(self._environ().get("ANTHROPIC_IDENTITY_TOKEN_FILE") or "").strip()
+        if not named:
+            return []
+        places = [Path(os.path.abspath(os.path.expanduser(named))), Path(os.path.realpath(named))]
+        granted = self.token_file is not None and Path(os.path.realpath(self.token_file))
+        return [place for place in dict.fromkeys(places) if place != granted]
 
     def credential_places(self) -> list[Path]:
         """Where credentials lie on this machine, whatever else is readable."""
@@ -266,14 +410,18 @@ class Guard:
             home / ".netrc",
             home / ".aws",
             home / ".config" / "gcloud",
+            # Where `uv auth login` keeps what it is given, in plain text.
+            home / ".local" / "share" / "uv" / "credentials",
+            *self._token_places(),
         ]
 
     def hidden(self) -> list[Path]:
-        """What the agent may not read: the person's home directory, the project and
-        the place of the identity token.  Its own folder lies inside the project and
-        is the exception (:meth:`open_places`)."""
+        """What the agent may not read: the person's home directory, the project, the
+        place of the identity token and the shared directory for temporary files.
+        Its own folder lies inside the project and is the exception
+        (:meth:`open_places`)."""
         places = [self._home(), Path(os.path.realpath(self.project)), Path("/run/user")]
-        return list(dict.fromkeys(places))
+        return list(dict.fromkeys([*places, *self.shared_temp()]))
 
     def open_places(self) -> list[Path]:
         """What may be read although it lies in a hidden place."""
@@ -284,14 +432,15 @@ class Guard:
             # an experiment imports are there.
             Path(os.path.realpath(sys.prefix)),
             Path(os.path.realpath(sys.base_prefix)),
+            # Programs the person installed for themselves (`uv` is usually one).
             home / ".local" / "bin",
-            home / ".local" / "share" / "uv",
-            home / ".cache" / "uv",
+            # The interpreters and tools `uv` installed: a virtual environment's Python
+            # is a link into them.  Not all of uv's directory: its credentials lie there.
+            home / ".local" / "share" / "uv" / "python",
+            home / ".local" / "share" / "uv" / "tools",
+            *_package_caches(home),
             home / ".cache" / "pip",
             *(Path(os.path.realpath(path)) for path in self.readable),
-            # The directory for temporary files, where it lies in a hidden place: the
-            # sandbox keeps there what connects a command to the network.
-            *(Path(os.path.realpath(path)) for path in _temporary_places()),
         ]
         if self.token_file is not None:
             places.append(Path(os.path.realpath(self.token_file)))
@@ -323,8 +472,8 @@ class Guard:
             # process has refusals of its own for these; this one does not rest on them.
             return False
         if _holds(path, [*_SYSTEM_TREES, *self.hidden()]):
-            # No exception for a place that is open: the directory for temporary files
-            # is, and a project that lies beneath it is hidden all the same.
+            # No exception for a place that is open: a search walks down into
+            # whatever lies beneath.
             return False
         # The closest place decides: the agent's folder is open inside the hidden
         # project, the project is hidden wherever it lies, and what is named as
@@ -352,6 +501,9 @@ class Guard:
             return settings
         settings["sandbox"] = {
             "enabled": True,
+            # Where the sandbox cannot start, the agent's process refuses to work.
+            # Without this it warns and runs every command outside any sandbox.
+            "failIfUnavailable": True,
             # A command that runs in the sandbox needs nobody's leave; none runs outside it.
             "autoAllowBashIfSandboxed": True,
             "allowUnsandboxedCommands": False,
@@ -367,14 +519,22 @@ class Guard:
                     ),
                     # A file of settings with secrets outside of that.  On Linux the
                     # sandbox applies a pattern only where it looks for matches when a
-                    # command starts, which is the agent's folder and its directory for
-                    # temporary files (checked live: `cat` of one there is refused, of
-                    # one in /var/tmp it is not).  Elsewhere the shell can read such a
+                    # command starts, which is the agent's folder (checked live: `cat`
+                    # of one there is refused, of one in /var/tmp it is not).  Elsewhere the shell can read such a
                     # file; the file tools cannot, wherever it lies.
                     *(f"{above}**/{name}" for name in _ENV_NAMES for above in ("", "/")),
                 ],
                 "allowRead": [str(place) for place in self.open_places()],
-                "denyWrite": [str(place) for place in credentials],
+                # (The shared directory for temporary files besides: the agent's
+                # process opens its own for writing, and that is the agent's now.)
+                "denyWrite": [
+                    *(str(place) for place in credentials),
+                    *(
+                        str(place)
+                        for place in self.shared_temp()
+                        if not _within(self._folder(), place)
+                    ),
+                ],
             },
             # The shell has the web.  It does not have this machine's own services.
             # The sandbox refused link-local addresses before these names were here

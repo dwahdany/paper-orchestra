@@ -271,6 +271,17 @@ def _agents_rows(agents: Mapping[str, Any]) -> list[tuple[str, str, str]]:
         rows.append(
             ("agents: sdk runtime (optional)", "ok", "claude-agent-sdk and its command line")
         )
+    if "sandbox" in agents:
+        rows.append(
+            (
+                "agents: sandbox of the shell",
+                "ok" if agents.get("sandbox") else "missing",
+                "what the sandbox of an agent's shell needs is here"
+                if agents.get("sandbox")
+                else f"{agents.get('sandbox_missing')}. A project with agents.sandbox on "
+                "starts no agent until then",
+            )
+        )
     login = agents.get("login")
     rows.append(
         (

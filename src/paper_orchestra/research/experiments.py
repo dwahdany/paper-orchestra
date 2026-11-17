@@ -2604,7 +2604,7 @@ def _facts(record: Mapping[str, Any]) -> list[str]:
         rows.append(("Remote job", f"`{record['handle']}`"))
     if record.get("code_digest") or record.get("code_as_run"):
         rows.append(("Code", _code_cell(record)))
-    if record.get("approved_digest"):
+    if by_agent and record.get("approved_digest"):
         rows.append(
             (
                 "Approval",
@@ -3009,6 +3009,15 @@ def _judge(
         limit = plan.timeout_seconds
         return _Outcome(
             "failed", f"The run was stopped after its time limit of {limit:g} s.", kind="timeout"
+        )
+    if result.declared_failed:
+        # An agent carried the run out and says that it failed.  Its words are a
+        # quotation; the files it left are kept, and count as no result.
+        said = quotable(result.declared_failed, 600)
+        return _Outcome(
+            "failed",
+            f'The agent that carried out the run says that it failed: "{said}".',
+            kind="declared",
         )
     if result.returncode is None:
         lost = "The backend lost track of the job: it reported no exit status."
@@ -3614,10 +3623,6 @@ class _Session:
         number, directory = _new_run_dir(self.project, self.plan.id)
         record = _new_record(self.plan, number, self.backend_name, self._repairs)
         record["approval"] = _text(self.page.meta.get("approved_at")) or None
-        # The digest of that approval (plan and code together), for the result page to
-        # name beside the digest of the code alone: two digests with one name read as
-        # a contradiction.
-        record["approved_digest"] = _text(self.page.meta.get("approved_digest")) or None
         adopted = _adoption_before(self.project, self.plan.id)
         if adopted:
             record["code_adopted"] = adopted
@@ -3626,6 +3631,11 @@ class _Session:
         by_agent = bool(getattr(self.backend, "carried_out_by_agent", False))
         if by_agent:
             record["carried_out_by"] = "agent"
+            # The digest of the approval (plan and code together), for the result page
+            # to name beside the digest of the code as the agent left it: two digests
+            # with one name read as a contradiction.  Only for a run by an agent: the
+            # record and the result page of a classic run are what they always were.
+            record["approved_digest"] = _text(self.page.meta.get("approved_digest")) or None
         if self.plan.network and self.backend_name == "local" and job_model_access():
             # The run's code can call the Anthropic API with the worker's federation
             # settings.  Nothing here counts those calls: the record says so.
@@ -4032,9 +4042,11 @@ class _Session:
     @staticmethod
     def _abandoned(exc: BaseException, requeue: bool, said: str) -> _Outcome:
         if getattr(exc, "unusable", False) is True:
-            return _Outcome(
-                "failed", f"The compute backend cannot be used: {exc}", "backend", requeued=True
-            )
+            # (An agent that could not work says so in a sentence of its own: the
+            # compute backend is not what failed then.)
+            whole = getattr(exc, "whole_sentence", False) is True
+            said = str(exc) if whole else f"The compute backend cannot be used: {exc}"
+            return _Outcome("failed", said, "backend", requeued=True)
         if requeue:
             return _Outcome(
                 "cancelled",

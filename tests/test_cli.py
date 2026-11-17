@@ -627,9 +627,14 @@ def test_doctor_says_what_agents_with_a_shell_need_on_this_machine(monkeypatch, 
     }
     assert set(rows) == {
         "agents: sdk runtime (optional)",
+        "agents: sandbox of the shell",
         "agents: credential login",
         "agents: credential federation",
     }
+    # Whether the sandbox of an agent's shell can start: without it no agent starts.
+    assert rows["agents: sandbox of the shell"][0] in ("ok", "missing")
+    bare = doctor._agents_rows({**report["agents"], "sandbox": False, "sandbox_missing": "why"})
+    assert ("agents: sandbox of the shell", "missing") in [(c, s) for c, s, _ in bare]
     assert rows["agents: credential federation"][0] == "not configured"
     assert "ANTHROPIC_FEDERATION_RULE_ID" in rows["agents: credential federation"][1]
     if sys.platform != "darwin":

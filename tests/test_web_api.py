@@ -1360,6 +1360,33 @@ def test_experiments_are_listed_with_their_runs(client, project):
     assert "body" not in row
 
 
+def test_the_experiment_view_says_whether_network_access_grants_the_model_api(
+    client, project, monkeypatch, tmp_path
+):
+    """With model access for jobs on, approving a local run with network access lets its
+    code call the Anthropic API on the worker's account, counted nowhere.  The form says
+    so where the approval is given, which needs the view to say whether it is on."""
+    from paper_orchestra import cli
+
+    assert client.get(url(project, "/experiments/E1")).json()["model_access"] is False
+    token = tmp_path / "identity.jwt"
+    token.write_text("jwt", encoding="utf-8")
+    monkeypatch.setenv("PAPER_ORCHESTRA_JOB_MODEL_ACCESS", "1")
+    monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "rule")
+    monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN_FILE", str(token))
+    assert client.get(url(project, "/experiments/E1")).json()["model_access"] is True
+
+    # The command line says the same when the approval is given.
+    page = project.page("E1")
+    page.meta.update(backend="local", network=True)
+    assert cli._grants_model_access(page)
+    assert "counted against no limit of the project" in cli.MODEL_ACCESS_SAID
+    page.meta.update(network=False)
+    assert not cli._grants_model_access(page)
+    page.meta.update(backend="modal", network=True)
+    assert not cli._grants_model_access(page)
+
+
 def test_an_experiment_comes_with_plan_code_runs_and_options(client, project):
     add_run(project)
     view = client.get(url(project, "/experiments/E1")).json()

@@ -58,11 +58,12 @@ from paper_orchestra.compute.base import (
 )
 from paper_orchestra.compute.local import collect_outputs, copy_source, job_model_env
 from paper_orchestra.errors import stops_the_run
+from paper_orchestra.llm.base import ToolError, ToolSpec
 from paper_orchestra.research import agents, experiments, prompts
-from paper_orchestra.research.sdk.guard import LAUNCHER, Guard, launcher_text
+from paper_orchestra.research.sdk.guard import LAUNCHER, Guard, SandboxUnavailable, launcher_text
 from paper_orchestra.research.sdk.session import AgentSession
 
-__all__ = ["ROLE", "WORK_DIR", "AgentBackend", "AgentUnusable"]
+__all__ = ["FAIL_TOOL", "ROLE", "WORK_DIR", "AgentBackend", "AgentUnusable", "fail_run_tool"]
 
 #: The role an experiment agent works as, and writes its proposals as.
 ROLE = "experimenter"
@@ -73,6 +74,10 @@ WORK_DIR = "work"
 RETRY_NEEDS_SECONDS = 30.0
 
 
+#: The board tool with which the agent says that the run failed.
+FAIL_TOOL = "fail_run"
+
+
 class AgentUnusable(BackendUnusable):
     """The agent that was to carry a run out could not work: its process failed, twice.
 
@@ -80,6 +85,63 @@ class AgentUnusable(BackendUnusable):
     goes back to the queue and keeps its approval, and the work stops with the
     reason for the person to act on.
     """
+
+    #: Its message says all of it ("The agent that was to carry out E1 could not
+    #: work ..."): whoever records it puts no "the compute backend cannot be used"
+    #: before it, and no name of a class.
+    whole_sentence = True
+    plain = True
+
+
+def fail_run_tool(said: list[str]) -> ToolSpec:
+    """The board tool with which an experiment agent says that the run failed.
+
+    A valid ``metrics.json`` is otherwise all a run needs to be recorded as
+    succeeded, and code that caught its own errors writes one that measured
+    nothing (zero trials, ten failed calls).  The agent sees that; with this tool
+    it says so, and the run is recorded as failed with its words.  ``said`` is
+    where the reason is kept: the last call stands, and ``withdraw`` takes it back
+    for an agent that got the run to work after all.
+    """
+
+    def handler(given: dict[str, Any]) -> str:
+        if given.get("withdraw"):
+            said.clear()
+            return "Taken back: the run is judged by what it leaves in your folder."
+        reason = " ".join(str(given.get("reason") or "").split())
+        if len(reason) < 20:
+            raise ToolError(
+                "Give the reason in a sentence or two: what was tried and why nothing "
+                "that the plan asks for was measured."
+            )
+        said[:] = [reason]
+        return (
+            "Noted: this run will be recorded as failed, with your reason, whatever "
+            "metrics.json holds. If you still get the experiment to work in your time, "
+            "call this tool again with withdraw set to true."
+        )
+
+    return ToolSpec(
+        name=FAIL_TOOL,
+        description=(
+            "Say that this run failed: the plan could not be carried out, or what the "
+            "code wrote into metrics.json is no measurement of what the plan asks "
+            "(nothing ran, every call failed, no trial was scored). The run is then "
+            "recorded as failed with your reason, not as succeeded. Call it with "
+            "withdraw: true to take that back."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the run failed, in a sentence or two.",
+                },
+                "withdraw": {"type": "boolean", "description": "Take the statement back."},
+            },
+        },
+        handler=handler,
+    )
 
 
 class AgentBackend:
@@ -238,11 +300,15 @@ class AgentBackend:
             # this the agent's process moves a command to the background after two
             # minutes, and the agent is left to wait for it with `sleep`.
             command_ms = str(max(1, round(float(spec.timeout) * 1000)))
+            #: Why the agent says the run failed, when it does (``fail_run``).
+            declared: list[str] = []
             for attempt in (1, 2):
                 try:
+                    declared.clear()
                     session = AgentSession(
                         ctx,
                         ROLE,
+                        tools=[fail_run_tool(declared)],
                         caps={"experiment": int(limits.max_experiments)},
                         folder=work,
                         guard=Guard(
@@ -284,15 +350,30 @@ class AgentBackend:
                     # The agent's process failed.  That says nothing about the
                     # experiment: a second agent takes the run up, and when that one
                     # fails too the run goes back to the queue with its approval.
-                    why = experiments.mask_credentials(project, f"{type(exc).__name__}: {exc}")
+                    # (An error that is a sentence to the person is said as it is.)
+                    named = "" if getattr(exc, "plain", False) else f"{type(exc).__name__}: "
+                    why = experiments.mask_credentials(project, f"{named}{exc}")
                     left = deadline - time.monotonic()
                     if attempt == 1 and not stops_the_run(exc) and left > RETRY_NEEDS_SECONDS:
-                        log.note(
+                        again = (
                             f"The agent's process failed ({why}); another agent takes the "
                             "run up once more."
                         )
+                        log.note(again)
+                        # In the feed too: two agents announce themselves there.
+                        ctx.activity(
+                            f"The agent that carried out {page.id} failed "
+                            f"({agents.said(why, 200)}); another agent takes the run up "
+                            "once more.",
+                            agent=ROLE,
+                        )
                         continue
                     log.note(f"The agent could not carry out the run: {why}")
+                    if isinstance(exc, SandboxUnavailable):
+                        raise AgentUnusable(
+                            f"{exc} {page.id} keeps its approval and is in the queue "
+                            "again; it is run when the work goes on."
+                        ) from exc
                     raise AgentUnusable(
                         f"The agent that was to carry out {page.id} could not work ({why}). "
                         f"{page.id} keeps its approval and is in the queue again; it is run "
@@ -315,6 +396,11 @@ class AgentBackend:
             if session.cancelled:
                 log.note("The run was cancelled while the agent was at work.")
                 return result(cancelled=True, notes=notes)
+            if declared:
+                # Before the clock and before the metrics: an agent that says the run
+                # failed is believed, whatever its code wrote.
+                log.note(f"The agent says that the run failed: {declared[0]}")
+                return result(returncode=0, declared_failed=declared[0], notes=notes)
             if session.timed_out and results_stand:
                 said = (
                     f"The agent's time ({round(spec.timeout)} seconds) was up before it had "

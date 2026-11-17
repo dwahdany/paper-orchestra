@@ -3481,7 +3481,16 @@ def _experiment_view(context: Context, project: Project, page: ResearchPage) -> 
         ],
         "options": options,
         "options_error": options_error,
+        # Whether a run approved for this machine with network access can call the
+        # Anthropic API with the worker's settings: said where the approval is given.
+        "model_access": _job_model_access(),
     }
+
+
+def _job_model_access() -> bool:
+    from paper_orchestra.compute.local import job_model_access
+
+    return job_model_access()
 
 
 @router.get("/projects/{pid}/experiments/{eid}")

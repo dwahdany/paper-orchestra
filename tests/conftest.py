@@ -89,6 +89,33 @@ def _offline(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", refuse)
 
 
+#: What the names resolve to that the tests of the sdk agents' guard ask about: no test
+#: asks a name server.  A name that is not here resolves to an address of the web.
+RESOLVES_TO = {
+    "127.0.0.1.nip.io": ["127.0.0.1"],
+    "169.254.169.254.nip.io": ["169.254.169.254"],
+    "localtest.me": ["127.0.0.1", "::1"],
+    "mapped.example": ["::ffff:127.0.0.1"],
+    "both.example": ["93.184.216.34", "127.0.0.1"],
+}
+
+
+@pytest.fixture(autouse=True)
+def _names_resolve_offline(monkeypatch):
+    """The check of a web address an agent asks for resolves the name; in a test it is
+    answered from :data:`RESOLVES_TO`, and a name ending in ``.invalid`` does not resolve."""
+    import socket
+
+    from paper_orchestra.research.sdk import guard
+
+    def addresses(host: str) -> list[str]:
+        if host.endswith(".invalid"):
+            raise socket.gaierror("Name or service not known")
+        return RESOLVES_TO.get(host, ["93.184.216.34"])
+
+    monkeypatch.setattr(guard, "_addresses", addresses, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _no_provider_credentials(monkeypatch, tmp_path_factory):
     """Tests never see real credentials, on-disk profiles or a custom API endpoint."""

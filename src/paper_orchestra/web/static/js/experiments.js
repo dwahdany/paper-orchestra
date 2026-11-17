@@ -6,7 +6,7 @@ import { app, link } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $$, ago, cap, clock, dateTime, duration, html, join, minutes, money, parseStamp, plain, plural, raw, setHTML, tf, whyNot } from './util.js';
 import { TONE, agentName, glyph, icon, lapsed, pageGlyph, shownState, successWords } from './vocab.js';
-import { afterRender, approvalChoice, backendName, label, networkAsk, pageName, pageTip, planProblemsHTML, proposedAt, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
+import { afterRender, approvalChoice, backendName, label, modelAccessNote, networkAsk, pageName, pageTip, planProblemsHTML, proposedAt, reviewBar, reviewTag, stateTag, unacceptForm, unacceptLink, who } from './page.js';
 
 const GROUPS = [
   /* (also one that reads approved and is no longer what was approved: it will not run until it is approved again) */
@@ -198,9 +198,9 @@ function approveHTML(store, page, data) {
     <div class="approve-fields">
       <label><span>Time limit</span><input type="number" id="ap-min-${eid}" min="1" max="${capMin}" step="1" value="${limitMin}" data-input="ap-minutes" data-eid="${eid}" inputmode="numeric"><span class="quiet">${agentWould(store, chosen.backend) ? 'minutes for all of the agent\'s work (reading, running and repairing the code, not one execution of it), then it is stopped' : 'minutes, then it is stopped'} (at most ${capMin} in this project)</span></label>
       ${chosen.backend === 'modal' || plan.mode === 'gpu' ? html`<label><span>GPU</span><input id="ap-gpu-${eid}" value="${gpu}" placeholder="none (CPU)" data-input="ap-gpu" data-eid="${eid}" size="8" autocomplete="off"><span class="quiet">for example T4, L4, A10G</span></label>` : ''}
-      ${plan.network ? '' : html`<label class="tick"><input type="checkbox" id="ap-net-${eid}" data-input="ap-network" data-eid="${eid}"${network ? raw(' checked') : ''}> Allow network access<span class="quiet">${chosen.backend === 'local' ? 'off unless you tick this; this machine cannot block it either way' : 'off unless you tick this'}</span></label>`}
+      ${plan.network ? '' : html`<label class="tick"><input type="checkbox" id="ap-net-${eid}" data-input="ap-network" data-eid="${eid}"${network ? raw(' checked') : ''}> Allow network access<span class="quiet">${chosen.backend === 'local' ? 'off unless you tick this; this machine cannot block it either way' : 'off unless you tick this'}</span>${modelAccessNote(!!data.model_access && chosen.backend === 'local')}</label>`}
     </div>
-    ${networkAsk(eid, plan)}
+    ${networkAsk(eid, plan, !!data.model_access && chosen.backend === 'local')}
     <div class="approve-opts"><span><b>Mode</b> ${plan.mode || 'script'}</span>${(plan.packages || []).length ? html`<span><b>Packages</b> ${plan.packages.join(', ')}</span>` : ''}${plan.repo ? html`<span><b>Repository</b> ${plan.repo}</span>` : ''}
       <span><b>Left for experiments</b> ${money(Math.max(0, (limits.experiment_usd || 0) - (((store.project.state || {}).spent || {}).experiment_usd || 0)))}</span></div>
     ${app.ui.rejecting === page.path ? html`<form class="reject-form" data-form="reject" data-ref="${page.path}"><label class="sr" for="why-x-${eid}">Reason</label><input id="why-x-${eid}" name="reason" data-input="reason" data-ref="${page.path}" value="${app.ui.reasons[page.path] || ''}" placeholder="Why? The agents read this reason." autocomplete="off"><button class="btn btn-neg" type="submit">Reject</button><button class="btn btn-quiet" type="button" data-act="reject-cancel">Cancel</button></form>`
@@ -240,7 +240,7 @@ export function failureKind(run) {
   if (run.timed_out || k === 'timeout') return 'timeout';
   if (k === 'budget') return 'budget';
   if (['backend', 'setup', 'worker', 'internal'].indexOf(k) >= 0) return 'backend';
-  if (['exit', 'metrics', 'code', 'patch', 'command'].indexOf(k) >= 0) return 'program';
+  if (['exit', 'metrics', 'code', 'patch', 'command', 'declared'].indexOf(k) >= 0) return 'program';
   return run.error && run.exit_code == null ? 'backend' : 'program';
 }
 const choice = (act, attrs, title, sub, primary) => html`<button class="choice${primary ? ' choice-primary' : ''}" data-act="${act}"${raw(Object.entries(attrs).map(([k, v]) => ' data-' + k + '="' + String(v).replace(/[^\w.-]/g, '') + '"').join(''))}><b>${title}</b><span>${sub}</span></button>`;
