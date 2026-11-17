@@ -16,7 +16,7 @@ import { askHealth } from './core.js';
 import { STAGES, relOf } from './vocab.js';
 
 const VERDICT = { supports: 1, refutes: 1, answers: 1 };
-const STRUCTURAL = /^(page\.|review\.decided|proposal\.created|experiment\.state|run\.started|run\.finished|request\.(created|withdrawn)|phase\.|checkpoint|budget\.warning|error|paper\.|project\.)/;
+const STRUCTURAL = /^(page\.|review\.decided|proposal\.created|experiment\.state|run\.started|run\.finished|request\.(created|withdrawn)|decision\.|phase\.|checkpoint|budget\.warning|error|paper\.|project\.)/;
 const MAX_ACTIVITY = 600;
 /** How long nothing is heard of a project with a worker before the page asks whether the worker is still there. */
 const SILENCE_MS = 4000;
@@ -35,6 +35,7 @@ export class Store {
     this.edges = [];
     this.proposals = [];                 // pending edit proposals (after the overlay)
     this.requests = [];
+    this.decisions = [];                 // what the agents asked the person to decide, with the answers
     this.experiments = [];
     this.expById = new Map();
     this.activity = [];                  // oldest first
@@ -71,10 +72,10 @@ export class Store {
   /* ---------- loading ---------- */
   async fetchLists() {
     const pid = this.pid;
-    const [project, pages, graph, proposals, requests, experiments] = await Promise.all([
-      api.project(pid), api.pages(pid), api.graph(pid), api.proposals(pid, 'proposed'), api.requests(pid), api.experiments(pid),
+    const [project, pages, graph, proposals, requests, experiments, decisions] = await Promise.all([
+      api.project(pid), api.pages(pid), api.graph(pid), api.proposals(pid, 'proposed'), api.requests(pid), api.experiments(pid), api.decisions(pid),
     ]);
-    return { project, pages: pages.pages, edges: graph.edges, dangling: graph.dangling || [], proposals: proposals.proposals, requests: requests.requests, experiments: experiments.experiments };
+    return { project, pages: pages.pages, edges: graph.edges, dangling: graph.dangling || [], proposals: proposals.proposals, requests: requests.requests, experiments: experiments.experiments, decisions: decisions.decisions || [] };
   }
 
   async load() {
@@ -196,6 +197,7 @@ export class Store {
     });
     this.expById = new Map(this.experiments.map((row) => [row.id, row]));
     this.requests = s.requests;
+    this.decisions = s.decisions || [];
   }
 
   /** The path of the page a reference names: a path, an id (`H2`), or a link target. */

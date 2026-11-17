@@ -7,6 +7,7 @@ import { CHECKPOINT_AFTER, KIND, PHASES, ROLE, STAGES, TONE, agentName, glyph, i
 import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
 import { DEMO_COST, UNVERIFIED, continueControl, continueNotes, crashText, engineView, foldRuns, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
+import { openDecisions } from './decisions.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
 export function stripMap(store) {
@@ -223,7 +224,7 @@ function spendHTML(store) {
 
 export const overviewView = {
   render(root) {
-    const store = app.store, p = store.project, e = engineView(store), items = store.pending();
+    const store = app.store, p = store.project, e = engineView(store), items = store.pending(), asked = openDecisions(store);
     const running = store.experiments.filter((x) => (x.state === 'running' && !x.interrupted) || x.state === 'queued');
     /* the page says "running" and nothing is running it: its worker is gone */
     const interrupted = store.experiments.filter((x) => x.state === 'running' && x.interrupted && x.review !== 'rejected');
@@ -254,7 +255,9 @@ export const overviewView = {
     const waiting = items.length ? items.map((it) => { const sum = summaryOf(it); return html`<div class="ov-item" data-ref="${it.ref}"><a class="ov-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', shownState(it.page), 18)}
         <span class="in-name">${pageName(it.page)}</span>${sum ? html`<span class="in-sum">${sum}</span>` : ''}<span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)} · ${ago(it.when)}</span>${checkMark(it)}</a>
         <span class="in-quick on"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="${acceptTip(it)}" aria-label="${acceptTip(it)}">${icon('check')}</button><button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-view="inbox" data-tip="Reject, with a reason" aria-label="Reject">${icon('x')}</button></span></div>`; })
-      : html`<p class="quiet ov-none">Nothing is waiting for you.</p>`;
+      : html`<p class="quiet ov-none">${asked.length ? 'No proposal is waiting for you.' : 'Nothing is waiting for you.'}</p>`;
+    /* what the agents asked the person to choose: each leads to the inbox, where it is answered */
+    const decide = asked.map((d) => html`<a class="ov-run ov-decide" href="${link({ view: 'inbox', sel: '', sub: '' })}" data-decision="${d.id}">${icon('dot')}<span class="in-name"><span class="pn-t">${d.question}</span></span><span class="in-what"><span class="in-kind">Decision</span>${(d.raised_by || {}).role || 'agent'} · ${ago(d.created)} · answer it in the inbox</span></a>`);
     const watch = html`${running.map((x) => { const run = x.last_run && x.last_run.status === 'running' ? x.last_run : null; const est = (x.meta || {}).est_minutes; return html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span>
         <span class="in-what">${run ? html`run ${run.number} · <span data-since="${run.started}">${clock((Date.now() - (parseStamp(run.started) || Date.now())) / 1000)}</span>${est ? ' of about ' + est + ' min' : ''}` : 'queued'}</span>
         ${run && est ? html`<progress class="meter-p" max="1" value="0" data-since="${run.started}" data-total="${est * 60}" aria-label="Elapsed, of the estimate"></progress>` : ''}<code class="ov-tail" data-tail="${x.id}">${store.tails[x.id] || ''}</code></a>`; })}
@@ -283,7 +286,7 @@ export const overviewView = {
       ${problemsHTML(store)}
       <section class="ov-map" aria-label="Where things stand"><a class="ov-maplink" href="${link({ view: 'map', sel: '', sub: '' })}">Open the map <kbd>1</kbd></a>${stripMap(store)}${roundsLine(store, e)}</section>
       <div class="ov-cols"><div class="ov-col">
-        <section class="ov-sec"><h2>Waiting for you<span>${items.length}</span></h2>${waiting}</section>
+        <section class="ov-sec"><h2>Waiting for you<span>${items.length + asked.length}</span></h2>${decide}${waiting}</section>
         ${anyWatch ? html`<section class="ov-sec"><h2>Experiments that need watching</h2>${watch}</section>` : ''}
         <section class="ov-sec ov-arg"><h2>The argument so far<a class="ov-more" href="${link({ view: 'map', sel: '', sub: '' })}">see it as the map</a></h2>${argumentHTML(store)}</section>
         <section class="ov-sec"><h2>Instructions for the agents</h2>${requestsHTML(store, e)}</section>

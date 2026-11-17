@@ -38,6 +38,7 @@ from typing import Any
 
 from paper_orchestra.llm.base import Usage, UsageTracker
 from paper_orchestra.llm.pricing import estimate_cost_usd, price_for
+from paper_orchestra.research import decisions
 from paper_orchestra.research.model import (
     IDEA_PATH,
     KINDS,
@@ -636,6 +637,64 @@ H4_REJECTION = (
     "Ma and Yarats (2021) already compare RAdam with untuned warmup. I want to stay with "
     "plain Adam until the batch-size question is settled."
 )
+
+#: What the theorist asked the person to choose in round 1, and what they answered: the
+#: answer is why the hypothesis about RAdam was turned down, and round 2 works by it.
+SCOPE_DECISION = {
+    "question": "Is the idea about plain Adam only, or about adaptive optimisers in general?",
+    "context": (
+        'The idea says "Adam". [[topics/adaptive-learning-rate-variance|The topic on the variance of the adaptive learning rate]] also covers '
+        "optimisers that correct the early variance themselves. Which ones the hypotheses "
+        "cover decides what the first experiments have to compare."
+    ),
+    "options": [
+        {
+            "label": "Plain Adam only",
+            "meaning": "Every hypothesis and experiment uses Adam as published; the other "
+            "optimisers are left for later.",
+        },
+        {
+            "label": "Adam and RAdam",
+            "meaning": "One hypothesis compares warmup with RAdam's rectification, which "
+            "adds an arm to every experiment.",
+        },
+        {
+            "label": "Any adaptive optimiser",
+            "meaning": "The claim is made for the family; the experiments grow by an "
+            "optimiser sweep.",
+        },
+    ],
+    "recommended": 2,
+    "reason": "Ma and Yarats (2021) suggest the two are close, and one extra arm is cheap.",
+    "default": "The hypotheses cover Adam and RAdam (H4 is the one about RAdam).",
+}
+SCOPE_ANSWER = "Stay with plain Adam until the batch-size question is settled."
+#: What the designer asks in round 2 and nobody has answered: it is what waits in the app.
+MODEL_DECISION = {
+    "question": 'What counts as "closer to a real model" for the next experiment?',
+    "context": (
+        "You asked to try the result on something closer to a real model than the toy. "
+        "How close decides what the experiment costs and whether it needs the network."
+    ),
+    "options": [
+        {
+            "label": "A two-layer Transformer on a synthetic task",
+            "meaning": "About 20 minutes on one T4, no network. This is E3 as it is planned.",
+        },
+        {
+            "label": "A small ResNet on CIFAR-10",
+            "meaning": "About an hour on one T4, and network access to download the data.",
+        },
+        {
+            "label": "Fine-tuning a small pretrained language model",
+            "meaning": "Closest to practice: several GPU hours, network access, and a "
+            "result that depends on the checkpoint chosen.",
+        },
+    ],
+    "recommended": 1,
+    "reason": "It shows whether the spike is a property of the toy at a fiftieth of the cost.",
+    "default": "E3 stays the two-layer Transformer; the other two are not designed.",
+}
 
 HYPOTHESIS_NEXT = (
     "Starting Adam's second-moment estimate from a large first batch removes the spike "
@@ -1422,6 +1481,11 @@ class _Story:
             parts.append(f"{edits} suggested edit{'s' if edits != 1 else ''}")
         waiting = f"{_and(parts)} {'is' if counts['total'] == 1 else 'are'} waiting for you."
         summary = f"{lead} {waiting[0].upper()}{waiting[1:]}" if parts else lead
+        # As the engine says it: what the agents asked the person to choose, which waits
+        # for nobody.
+        undecided = len(self.project.decisions(state="open"))
+        if undecided:
+            summary = f"{summary} {decisions.waiting(undecided)}"
         self._save(
             status="checkpoint",
             next_phase=following,
@@ -1447,6 +1511,7 @@ class _Story:
                 "pending": dict(counts["by_kind"]),
                 "edits": counts["proposals"],
                 "next": following,
+                **({"decisions": undecided} if undecided else {}),
             },
         )
 
@@ -1602,13 +1667,21 @@ def _hypothesize(story: _Story) -> None:
                 "hypothesis", title, body, author="agent:theorist", summary=summary,
                 relations=relations,
             )  # fmt: skip
+        story.wait(seconds=50)
+        # A choice no source settles: what the idea is about.  The theorist asks, and goes on.
+        scope = project.ask_decision(
+            **SCOPE_DECISION, role="theorist", round=1, phase="hypothesize",
+            session="demo-r1-hypothesize-theorist",
+        )  # fmt: skip
     story.checkpoint("design", "Round 1, hypotheses: 4 proposed.")
 
     story.wait(minutes=11)
     for ref in ("H1", "H2", "H3"):
         story.wait(seconds=45)
         project.review(ref, "accept")
-    story.wait(seconds=90)
+    story.wait(seconds=60)
+    project.answer_decision(scope.id, option=1, text=SCOPE_ANSWER)
+    story.wait(seconds=30)
     project.review("H4", "reject", reason=H4_REJECTION)
     story.wait(minutes=2)
     project.create_page(
@@ -1920,6 +1993,10 @@ def _second_round(story: _Story, experiments: Any, pages: int | None) -> None:
         story.wait(seconds=120)
         experiments.write_code(project, "E3", {"main.py": E3_CODE}, author="agent:designer")
         story.say("designer", "E3: main.py is written and parses; it needs a GPU to run.", after=15)
+        project.ask_decision(
+            **MODEL_DECISION, role="designer", round=2, phase="design", page="E3",
+            session="demo-r2-design-designer",
+        )  # fmt: skip
         story.say("designer", "The person asked for a sweep of the warmup length (H2).")
         project.create_page(
             "experiment", E4_TITLE, E4_BODY, author="agent:designer",

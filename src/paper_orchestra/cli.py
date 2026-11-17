@@ -1210,6 +1210,13 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         lines += _experiment_notes(project)
     if counts["requests"]["open"]:
         lines.append(f"  {_plural(counts['requests']['open'], 'open request')} for the agents")
+    undecided = counts["decisions"]["open"]
+    if undecided:
+        lines.append(
+            f"  {_plural(undecided, 'decision')} "
+            f"{'waits' if undecided == 1 else 'wait'} for your answer: "
+            f"`paper-orchestra research decide {_quoted(project.root)}`"
+        )
     spent, limits = _mapping(state.get("spent")), project.settings.limits
     # The two budgets are totals; the time limit is per run, so the time used is only told.
     # A demonstration's model cost is part of what was written for it, not a bill.
@@ -1534,11 +1541,16 @@ def _workspace_status(as_json: bool) -> None:
         )
     else:
         for project in projects:
-            waiting = project.counts()["pending"]["total"]
+            counts = project.counts()
+            waiting, undecided = counts["pending"]["total"], counts["decisions"]["open"]
+            waits = [
+                *([f"{waiting} waiting for you"] if waiting else []),
+                *([f"{_plural(undecided, 'decision')} to answer"] if undecided else []),
+            ]
             where = _where_it_stands(_state_as_it_is(project)).rstrip(".")
             _say(
                 f'{project.root}  "{project.title}"  {where}'
-                + (f"  ({waiting} waiting for you)" if waiting else "")
+                + (f"  ({', '.join(waits)})" if waits else "")
             )
     for problem in unreadable:
         _say(f"Error: {problem}", fg=typer.colors.RED, err=True)
@@ -2192,6 +2204,153 @@ def research_request(
         )
     target = f", about {request.target}" if request.target else ""
     _say(f"Left a request {whom}{target} ({request.id}). {when}")
+
+
+def _decision_lines(decision: Any, number: int | None = None) -> list[str]:
+    """One decision as it is read at a terminal: the question, who asked, the options by
+    number, what the agent would take, the default, and what was answered."""
+    from paper_orchestra.research.decisions import answer_words
+
+    asked = f"asked by the {decision.role}" if decision.role else "asked"
+    where = f", round {decision.raised_by.get('round')}" if decision.raised_by.get("round") else ""
+    lead = f"{number}. " if number is not None else ""
+    lines = [f"{lead}{decision.id}  {decision.question}", f"   {asked}{where}"]
+    if decision.page:
+        lines[-1] += f"; about {decision.page}"
+    for line in decision.context.splitlines():
+        if line.strip():
+            lines.append(f"   {line.strip()}")
+    for index, option in enumerate(decision.options, start=1):
+        mark = "  (the agent would take this" if index == decision.recommended else ""
+        if mark:
+            mark += f": {decision.reason})" if decision.reason else ")"
+        meaning = f": {option.meaning}" if option.meaning else ""
+        lines.append(f"     {index}  {option.label}{meaning}{mark}")
+    if decision.default:
+        lines.append(f"   Until you answer, the agents go on with: {decision.default}")
+    said = answer_words(decision)
+    if said:
+        answer = decision.answer
+        lines.append(_readable(f"   Your answer at {answer.at}: {said}"))
+        if len(decision.answers) > 1:
+            lines.append(f"   ({len(decision.answers) - 1} earlier answers are kept in the file.)")
+    return lines
+
+
+def _decision_named(project: Project, ref: str) -> Any:
+    """The decision ``ref`` names: its id (or the beginning of it), or the number it has in
+    the list of what waits."""
+    from paper_orchestra.research.model import NotFound
+
+    known = project.decisions()
+    waiting = [decision for decision in known if decision.state == "open"]
+    text = ref.strip().lower()
+    if text.isdigit() and 1 <= int(text) <= len(waiting):
+        return waiting[int(text) - 1]
+    matches = [d for d in known if d.id == text] or [
+        d for d in known if text and d.id.startswith(text if text.startswith("d-") else f"d-{text}")
+    ]
+    if len(matches) != 1:
+        raise NotFound(
+            f"There is no decision {ref!r}."
+            if not matches
+            else f"{ref!r} is the beginning of {len(matches)} decisions; give more of the id."
+        )
+    return matches[0]
+
+
+@research_app.command("decide")
+def research_decide(
+    project: ProjectArgument,
+    decision: Annotated[
+        str | None,
+        typer.Argument(
+            metavar="D",
+            help="The decision: its id (d-1a2b3c4d), or its number in the list of what "
+            "waits. Without it, what waits is listed.",
+            show_default=False,
+        ),
+    ] = None,
+    option: Annotated[
+        int | None,
+        typer.Option("--option", metavar="N", help="Choose option N of the decision."),
+    ] = None,
+    say: Annotated[
+        str | None,
+        typer.Option(
+            "--say",
+            metavar="TEXT",
+            help="Answer in your own words; alone, or together with --option.",
+        ),
+    ] = None,
+    dismiss: Annotated[
+        bool,
+        typer.Option("--dismiss", help="Not for you to decide: the agents use their default."),
+    ] = False,
+) -> None:
+    """Answer what the agents asked you to decide.
+
+    An agent raises a decision when the answer is your choice and no evidence settles
+    it: what to study, which reading of your idea is meant, a trade-off of cost or
+    scope.  The project does not wait for you: the agents go on with the default the
+    question states, and every later session is shown your answer.  An answer can be
+    changed: the new one holds and the earlier ones are kept.
+    """
+    from paper_orchestra.research.decisions import answer_words
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    answering = option is not None or bool(say and say.strip()) or dismiss
+    if decision is None:
+        if answering:
+            _fail(
+                "Say which decision: its id or its number in the list (`research decide PROJECT`)."
+            )
+        known = opened.decisions()
+        waiting = [item for item in known if item.state == "open"]
+        if not waiting:
+            _say("No decision is waiting for you.")
+        else:
+            _say(f"{_plural(len(waiting), 'decision')} waiting for you:")
+        for number, item in enumerate(waiting, start=1):
+            _say("")
+            for line in _decision_lines(item, number):
+                _say(line)
+        settled = [item for item in known if item.state != "open"]
+        if settled:
+            _say("")
+            _say("Decided:")
+            for item in settled:
+                _say(f"  {item.id}  {item.question}  ->  {answer_words(item)}")
+        if waiting:
+            _say("")
+            _say(
+                f"Answer with `paper-orchestra research decide {_quoted(opened.root)} 1 "
+                '--option N`, `--say "..."` or `--dismiss`.'
+            )
+        return
+    try:
+        found = _decision_named(opened, decision)
+        if dismiss and (option is not None or (say and say.strip())):
+            _fail("--dismiss leaves the decision to the agents; it goes with no answer.")
+        if not answering:
+            for line in _decision_lines(found):
+                _say(line)
+            return
+        if dismiss:
+            done = opened.dismiss_decision(found.id)
+            _say(
+                f"Left {done.id} to the agents. They go on with: "
+                f"{done.default or 'what they would have done'}"
+            )
+            return
+        done = opened.answer_decision(found.id, option=option, text=say or "")
+    except ProjectError as exc:
+        _fail(str(exc))
+    changed = "Changed your answer to" if found.state != "open" else "Answered"
+    _say(
+        f"{changed} {done.id}: {answer_words(done)}. Every later session of the agents is shown it."
+    )
 
 
 @research_app.command("cancel")

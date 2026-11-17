@@ -5,6 +5,7 @@
 import { app, link } from './core.js';
 import { api } from './api.js';
 import { $, $$, ago, bytes, cap, dateTime, debounce, html, join, lineDiff, listOf, minutes, money, parseStamp, plain, plural, raw, storage, tf } from './util.js';
+import { pageDecisions } from './decisions.js';
 import { STATES, TONE, agentName, earlierSuccess, glyph, icon, kindName, lapsed, pageGlyph, shownState, successWords } from './vocab.js';
 
 /* ---------- naming a page ---------- */
@@ -571,6 +572,7 @@ export function panelHTML(store, page, opt) {
     ${page.kind === 'experiment' && page.meta && page.meta.state_reason && (page.state === 'failed' || page.state === 'planned') ? html`<p class="page-reason${page.state === 'planned' ? ' page-reason-back' : ''}">${icon('warn')}${plain(page.meta.state_reason)}</p>` : ''}
     ${app.ui.confirmDelete === page.path ? html`<div class="note note-neg confirm" role="alertdialog" aria-label="Delete this page"><span><b>Delete this page?</b> Its last version stays under <code>history/</code>; pages that link to it keep the link as text.</span>
       <span class="row"><button class="btn btn-neg" data-act="delete" data-ref="${page.path}">Delete</button><button class="btn btn-quiet" data-act="delete-cancel">Cancel</button></span></div>` : ''}
+    ${pageDecisions(store, page.path)}
   </header>`;
   let body;
   if (!view) {

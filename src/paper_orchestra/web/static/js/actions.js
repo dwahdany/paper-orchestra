@@ -11,6 +11,7 @@ import { currentItem, editCheck } from './inbox.js';
 import { EXAMPLE, clearComposer, composer, composerReady, composerSettings, keepComposer, loadDoctor, loadLibrary, totalSize } from './home.js';
 import { clearToast, closeOverlay, openHelp, openNewPage, openPalette, overlayOpen, renderToast, say, sayError, trapTab } from './overlays.js';
 import { dismissNotices, theme } from './shell.js';
+import { decisionActs, decisionTyped } from './decisions.js';
 
 const GRACE_MS = 5000;
 /** How the page moves to something: at once for a person who asked for less motion. */
@@ -626,6 +627,7 @@ const ACT = {
   'feed-more': async () => { const s = store(); app.ui.feedLimit += 60; if (s.activity.length < app.ui.feedLimit && s.moreActivity) { try { await s.loadEarlierActivity(); } catch (error) { sayError(message(error)); } } app.render('ui'); },
   'new-page': () => openNewPage(),
   'decided-more': () => { app.ui.decidedAll = true; app.render('ui'); },
+  ...decisionActs((text) => say(text)),
   'show-lessons': () => { app.ui.showLessons = true; app.render('ui'); },
   'bulk-accept': () => bulk('accept'),
   'bulk-reject': () => { app.ui.rejecting = app.ui.rejecting === 'bulk' ? null : 'bulk'; app.render('ui'); },
@@ -849,6 +851,7 @@ export function installActions() {
     } else if (what === 'opt') { const s = composer(); s[t.dataset.name] = t.value; keepComposer(); if (t.dataset.name === 'model_usd' || t.dataset.name === 'cutoffYear' || s.error) { s.error = null; app.render('start'); } }
     else if (what === 'reason') { app.ui.reasons[t.dataset.ref] = t.value; keepReasons(); }
     else if (what === 'request') { app.ui.request.text = t.value; keepRequest(); }
+    else if (what === 'decide-text') decisionTyped(t);
     else if (what === 'code') { const edit = app.ui.codeEdit[t.dataset.key]; if (edit) { edit.text = t.value; edit.restored = false; if (store()) storage.set(codeKey(store().pid, t.dataset.key), t.value); } }
     /* drawn again while typing, never on blur: a render between the press and the release of a
        button would swallow the click that follows the typing */

@@ -120,6 +120,10 @@ export const api = {
   /** `role` is whom the instruction is for: `all`, or one of the roles of `/api/defaults`. */
   addRequest: (pid, text, target, role) => request('POST', project(pid) + '/requests', Object.assign({ text, target: target || null }, role ? { for: role } : {})),
   deleteRequest: (pid, rid) => request('DELETE', project(pid) + '/requests/' + encodeURIComponent(rid)),
+  /** What the agents asked the person to decide, with every answer (options count from 1). */
+  decisions: (pid) => request('GET', project(pid) + '/decisions'),
+  answerDecision: (pid, did, option, text) => request('POST', project(pid) + '/decisions/' + encodeURIComponent(did) + '/answer', { option: option || null, text: text || '' }),
+  dismissDecision: (pid, did) => request('POST', project(pid) + '/decisions/' + encodeURIComponent(did) + '/dismiss'),
   search: (pid, q, signal) => request('GET', project(pid) + '/search' + query({ q, limit: 12 }), undefined, { signal }),
 
   experiments: (pid) => request('GET', project(pid) + '/experiments'),

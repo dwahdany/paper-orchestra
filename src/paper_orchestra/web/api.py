@@ -3215,6 +3215,52 @@ def delete_request(rid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     return {"deleted": rid}
 
 
+def _decision_view(context: Context, project: Project, decision: Any) -> dict[str, Any]:
+    """A decision as the panel shows it: the record, with its context rendered."""
+    pid = context.workspace.key_of(project)
+    text = _blank(decision.context, context.services.secrets(project))
+    html = render_markdown(text, project=project, pid=pid, page_path=decision.page)
+    return {**decision.to_dict(), "context_html": html if decision.context.strip() else ""}
+
+
+@router.get("/projects/{pid}/decisions")
+def list_decisions(project: Proj, context: Ctx, state: str = "all") -> dict[str, Any]:
+    """What the agents asked the person to decide, oldest first (``state=open``,
+    ``answered`` or ``withdrawn`` to narrow).  Each is its record
+    (``research.decisions.Decision.to_dict``: ``options`` with ``label`` and
+    ``meaning``, ``recommended`` as a number from 1, ``default``, ``page``,
+    ``raised_by``, ``state``, the ``answer`` that holds and every one in ``answers``)
+    with ``context_html``."""
+    wanted = None if state == "all" else state
+    found = project.decisions(state=wanted)
+    return {"decisions": [_decision_view(context, project, decision) for decision in found]}
+
+
+class DecisionAnswerBody(_Body):
+    #: The number of the chosen option, from 1; and, or instead, the person's own words.
+    option: int | None = None
+    text: str = ""
+
+
+@router.post("/projects/{pid}/decisions/{did}/answer")
+def answer_decision(
+    did: str, body: DecisionAnswerBody, project: Proj, context: Ctx
+) -> dict[str, Any]:
+    """The person's answer: ``{"option": 2}``, ``{"text": "..."}`` or both.  An answered
+    decision can be answered again; the new answer holds and the earlier ones are kept.
+    An empty answer or an option the decision does not have is refused (422), an
+    unknown decision is 404.  The answer is the ``decision`` as it now stands."""
+    decision = project.answer_decision(did, option=body.option, text=body.text)
+    return {"decision": _decision_view(context, project, decision)}
+
+
+@router.post("/projects/{pid}/decisions/{did}/dismiss")
+def dismiss_decision(did: str, project: Proj, context: Ctx) -> dict[str, Any]:
+    """ "Not for me to decide": the decision is left to the agents, who go on with the
+    default it states.  It can still be answered afterwards."""
+    return {"decision": _decision_view(context, project, project.dismiss_decision(did))}
+
+
 _MARKDOWN_LINK = re.compile(r"!?\[([^\]\n]*)\]\([^)\n]*\)")
 _EMPHASIS = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
 _LINE_MARK = re.compile(r"^\s*(?:#{1,6}|>+|[-*+]|\d+[.)])\s+")

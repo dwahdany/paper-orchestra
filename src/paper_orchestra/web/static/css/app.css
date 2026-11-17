@@ -1459,3 +1459,45 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
   .strip-actions { flex: 1 1 auto; min-width: 0; } .go { flex: 0 1 auto; min-width: 0; }
   .go > .btn { height: auto; min-height: 44px; } .go > .btn:first-child { flex: 0 1 auto; min-width: 0; padding-top: 5px; padding-bottom: 5px; white-space: normal; text-align: left; } .go:not(.go-pick) > .go-more { flex: none; width: 44px; }
 }
+
+/* ---------- decisions: what an agent asks the person to choose ----------
+   A card per open decision, at the head of the inbox. The options are the largest things on
+   it: each one a button as wide as the card, tall enough for a finger. Ochre marks it as
+   something that waits, as it does a proposal. */
+.dc-panel { margin-bottom: 18px; } .dc-panel h3 { color: var(--prop); }
+.dc-lead { margin: 0 10px 8px; font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }
+.dc { margin: 0 4px 12px; padding: 14px 14px 12px; border: 1px solid var(--prop-line); border-left-width: 3px; border-radius: 8px; background: var(--surface); min-width: 0; overflow-wrap: anywhere; }
+.dc .dc-q { margin: 0; font: 600 17px/1.32 var(--serif); color: var(--ink); letter-spacing: 0; text-transform: none; text-wrap: pretty; }
+.dc-by { margin-top: 4px; font-size: 12px; line-height: 1.45; color: var(--ink-3); } .dc-by a, .dc-old .in-when a, .dc-ref a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.dc .dc-ctx { margin-top: 10px; max-width: none; font-size: 14.5px; line-height: 1.5; color: var(--ink-2); }
+.dc-opts { display: grid; gap: 6px; margin-top: 12px; }
+.dc-opt { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 1px 8px; align-items: start; width: 100%; min-height: 48px; padding: 10px 12px 10px 10px; border: 1px solid var(--rule-2); border-radius: 7px; background: var(--ground); text-align: left; cursor: pointer; }
+.dc-opt:hover { background: var(--hover); }
+.dc-opt.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-wash); }
+.dc-n { display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--rule-2); border-radius: 50%; font: 600 12.5px/1 var(--sans); color: var(--ink-2); background: var(--surface); }
+.dc-opt.on .dc-n { border-color: var(--accent); background: var(--accent); color: var(--on-btn); }
+.dc-l { font: 600 14.5px/1.35 var(--sans); padding-top: 2px; color: var(--ink); }
+.dc-rec, .dc-cur { display: inline-block; margin-left: 4px; padding: 1px 7px; border-radius: 9px; font: italic 400 11.5px/1.5 var(--sans); white-space: nowrap; }
+.dc-rec { background: var(--prop-wash); color: var(--prop); } .dc-cur { background: var(--pos-wash); color: var(--pos); }
+.dc-m { grid-column: 2; font-size: 13px; line-height: 1.45; color: var(--ink-2); }
+.dc-note { margin-top: 9px; font-size: 13px; line-height: 1.45; color: var(--ink-2); } .dc-note b { font-weight: 600; color: var(--ink); }
+.dc-say { display: block; width: 100%; min-height: 44px; margin-top: 12px; padding: 9px 12px; resize: vertical; font: 15px/1.45 var(--serif); }
+.dc-err { margin-top: 8px; font-size: 13px; color: var(--neg); }
+.dc-go { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; } .dc-go .btn { height: auto; min-height: 36px; white-space: normal; text-align: left; } .dc-pick { font-weight: 400; }
+.dc-done { margin-top: 22px; padding-top: 6px; border-top: 1px solid var(--rule); }
+.dc-old { border-radius: 6px; } .dc-old[open] { margin-bottom: 8px; }
+.dc-old > summary { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 1px 8px; align-items: start; min-height: 36px; padding: 6px 10px; border-radius: 6px; cursor: pointer; list-style: none; } .dc-old > summary::-webkit-details-marker { display: none; }
+.dc-old > summary:hover { background: var(--hover); }
+.dc-oq { font: 13.5px/1.4 var(--serif); color: var(--ink-2); } .dc-oa { grid-column: 2; font-size: 12.5px; line-height: 1.4; color: var(--ink); overflow-wrap: anywhere; } .dc-old .in-when { grid-column: 2; white-space: normal; }
+.dc-in { margin: 4px 4px 0 30px; border-color: var(--rule-2); border-left-width: 1px; }
+.dc-on-page { margin-top: 12px; }
+.dc-ref { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; padding: 9px 12px; border: 1px solid var(--prop-line); border-radius: 6px; font-size: 13px; line-height: 1.5; background: var(--prop-wash); overflow-wrap: anywhere; } .dc-ref .ic { flex: none; margin-top: 3px; color: var(--prop); } .dc-ref q { font-family: var(--serif); font-style: italic; }
+.ov-decide .ic { color: var(--prop); } .ov-decide .pn-t { white-space: normal; font-family: var(--serif); font-size: 15px; }
+@media (max-width: 700px), (max-height: 480px) and (pointer: coarse) {
+  .dc-lead { margin: 0 8px 8px; font-size: 13.5px; }
+  .dc { margin: 0 2px 12px; padding: 14px 12px 12px; } .dc .dc-q { font-size: 19px; } .dc-by { font-size: 13px; } .dc-by a { display: inline-block; padding: 6px 0; }
+  .dc-opt { min-height: 56px; padding: 12px 12px 12px 10px; } .dc-l { font-size: 16px; } .dc-m { font-size: 14px; } .dc-note { font-size: 14px; }
+  .dc-go .btn { flex: 1 1 100%; min-height: 48px; justify-content: center; text-align: center; }
+  .dc-old > summary { min-height: 48px; padding: 8px 10px; } .dc-oq { font-size: 15px; } .dc-oa { font-size: 14px; } .dc-in { margin-left: 2px; }
+  .dc-ref { font-size: 14px; } .dc-ref a { display: inline-block; padding: 6px 0; }
+}

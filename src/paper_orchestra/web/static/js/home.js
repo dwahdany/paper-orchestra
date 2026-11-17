@@ -159,10 +159,13 @@ export function countsLine(by) {
 /** How many proposals wait in a project, in words: the live number the row carries. */
 function waitingWords(row) {
   const n = row.pending || 0;
-  if (!n) return '';
+  /* (what the agents asked the person to choose is counted apart: it holds nothing up) */
+  const asked = ((row.counts || {}).decisions || {}).open || 0;
+  const decide = asked ? asked + (asked === 1 ? ' decision' : ' decisions') + ' to answer' : '';
+  if (!n) return decide;
   const pending = (row.counts || {}).pending;
   /* while the pages of a project that changed are still to be counted, the number is the last checkpoint's */
-  return n + ' waiting for you' + (pending ? '' : ' at the last checkpoint');
+  return n + ' waiting for you' + (pending ? '' : ' at the last checkpoint') + (decide ? ' · ' + decide : '');
 }
 /** Where a row says the project stands. The row carries the engine's reading and where it
     came from (`state_source`): a project whose state.json is lost is listed where its events

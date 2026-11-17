@@ -34,6 +34,7 @@ export const app = {
     confirmDelete: null,    // the path of the page about to be deleted
     trail: {},              // project id -> the pages opened on the way
     request: { text: '', about: true, for: 'all' },
+    decide: {},             // decision id -> the answer being given: the option tapped, the words typed
     goMenu: null,           // which Continue control has its list of phases open: 'strip', 'overview' or null
     cutoffEdit: null,       // the research cutoff being changed on the overview
     starting: {},           // experiment id -> a run is being started (the server may settle an unfinished one first)

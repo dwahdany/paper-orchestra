@@ -5,6 +5,7 @@ import { VIEWS, app, hrefOf, link } from './core.js';
 import { connection, RESTARTED } from './api.js';
 import { clock, codeSpans, dateTime, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, storage, tf, whyNot } from './util.js';
 import { KIND, PHASE_DO, STAGES, icon, lapsed, phaseName } from './vocab.js';
+import { decisionsSentence, openDecisions, waitingCount } from './decisions.js';
 
 const MARK = raw('<svg class="brand-mark" width="18" height="18" viewBox="-10 -10 20 20" aria-hidden="true"><circle r="8"/><circle class="core" r="3"/></svg>');
 
@@ -93,14 +94,14 @@ export function crashText(store, exit) {
 }
 
 export function waitingSentence(store) {
-  const items = store.pending();
-  if (!items.length) return 'Nothing is waiting for you.';
+  const items = store.pending(), asked = decisionsSentence(openDecisions(store).length);
+  if (!items.length) return asked || 'Nothing is waiting for you.';
   const by = {};
   let edits = 0;
   items.forEach((it) => { if (it.type === 'edit') edits++; else by[it.kind] = (by[it.kind] || 0) + 1; });
   const parts = Object.keys(by).sort((a, b) => STAGES.indexOf(a) - STAGES.indexOf(b)).map((k) => by[k] + ' ' + (by[k] === 1 ? (KIND[k] || { one: k }).one : (KIND[k] || { many: k + 's' }).many).toLowerCase());
   if (edits) parts.push(plural(edits, 'suggested edit'));
-  return listOf(parts) + (items.length === 1 ? ' is' : ' are') + ' waiting for you.';
+  return listOf(parts) + (items.length === 1 ? ' is' : ' are') + ' waiting for you.' + (asked ? ' ' + asked : '');
 }
 /* ---------- what happens next ---------- */
 /** What pressing the main button does, in words. The answer itself is the server's:
@@ -368,7 +369,7 @@ export function topbar(route) {
     return html`<a class="brand" href="#/library">${MARK}<span>PaperOrchestra</span></a><nav class="views" aria-label="Sections">
       ${nav.map((n) => html`<a href="#/${n[0]}"${here === n[0] ? raw(' aria-current="page"') : ''}>${n[1]}</a>`)}</nav><div class="top-r">${right}</div>`;
   }
-  const p = store.project, e = engineView(store), n = store.pending().length;
+  const p = store.project, e = engineView(store), n = waitingCount(store);
   const round = html`<span class="ts-long">Round ${e.round || 1} · </span>`;
   /* the words are one piece: the bar's gap belongs between the mark and the words, not inside them */
   const status = e.unverified ? html`${icon('warn')}Worker not verified`
@@ -490,7 +491,7 @@ function workerLogHTML(store) {
   return html`<pre class="strip-pre" data-follow>${log.text.split('\n').slice(-60).join('\n')}</pre>`;
 }
 export function strip(store) {
-  const e = engineView(store), n = store.pending().length;
+  const e = engineView(store), n = waitingCount(store);
   const open = app.ui.activityOpen;
   const toggle = (what) => html`<button class="btn btn-quiet" data-act="toggle-activity" aria-expanded="${tf(open)}">${open ? 'Hide' : 'Show'} ${what} ${icon(open ? 'down' : 'right')}</button>`;
   /* what a press does where the button cannot say all of it, the reasons for more research,
@@ -540,7 +541,7 @@ export function strip(store) {
   if (e.mode === 'stopped') {
     return html`<div class="strip s-checkpoint"><span class="strip-mark">${PAUSE}</span><span class="strip-kicker">Stopped · round ${e.round || 1}, during ${phaseName(e.next || e.phase)}</span>
       <span class="strip-text">You stopped the agents. What they had written is kept; the phase resumes where it stopped.</span>
-      <span class="strip-actions">${n ? html`<a class="btn" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${n}</a>` : ''}${continueControl(store, e, 'strip')}</span></div>${sub}`;
+      <span class="strip-actions">${n ? html`<a class="btn" href="${link({ view: 'inbox', sel: '', sub: '' })}">${store.pending().length ? 'Review' : 'Answer'} ${n}</a>` : ''}${continueControl(store, e, 'strip')}</span></div>${sub}`;
   }
   if (e.budget) {
     const editing = app.ui.limitEdit;
@@ -551,13 +552,13 @@ export function strip(store) {
   }
   return html`<div class="strip s-checkpoint"><span class="strip-mark">${PAUSE}</span>
     <span class="strip-kicker">Checkpoint · round ${e.round || 1}${e.phase ? (e.lifted ? ', during ' : ', after ') + phaseName(e.phase) : ''}</span><span class="strip-text">${e.lifted ? 'The limit for models is raised. ' + cap1(phaseName(e.next || e.phase)) + ' stopped at the old one and can go on where it stopped. ' : ''}${waitingSentence(store)}</span>
-    <span class="strip-actions">${n ? html`<a class="btn" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${n}</a>` : ''}
+    <span class="strip-actions">${n ? html`<a class="btn" href="${link({ view: 'inbox', sel: '', sub: '' })}">${store.pending().length ? 'Review' : 'Answer'} ${n}</a>` : ''}
       ${continueControl(store, e, 'strip')}</span></div>${sub}`;
 }
 
 /* ---------- the status bar ---------- */
 export function statusbar(store) {
-  const p = store.project, e = engineView(store), n = store.pending().length;
+  const p = store.project, e = engineView(store), n = waitingCount(store);
   const limits = (p.settings || {}).limits || {}, spent = (p.state || {}).spent || {};
   const running = store.experiments.find((x) => x.state === 'running' && !x.interrupted);
   const run = running && running.last_run && running.last_run.status === 'running' ? running.last_run : null;
