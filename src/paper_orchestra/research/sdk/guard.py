@@ -10,30 +10,47 @@ its own:
   the shell can write only inside the agent's own folder, and cannot read the
   person's home directory, the project's directory or the place the identity
   token lies, except for what is named as readable (its own folder, the Python
-  it runs code with).  Whether the sandbox holds is checked against a real
+  it runs code with).  A write outside the folder does not always fail with an
+  error: the sandbox may take it and throw it away, so that the command seems
+  to succeed and nothing is changed.  The shell has the web, but not this
+  machine's own services: the sandbox refuses link-local addresses (where a
+  cloud's metadata server hands out the machine's credentials) and the
+  loopback, and the settings name those hosts as denied besides
+  (:data:`CLOSED_HOSTS`).  Whether the sandbox holds is checked against a real
   agent by ``tests/e2e/agent_guardrails.py``.
 - **Permission rules** for the built-in file tools: reading the places where
   credentials lie is denied by the agent's process itself.
 - **The check before every tool call** (:meth:`Guard.check`, run in this
   process as the agent's ``PreToolUse`` hook, also for helpers the agent
   starts): built-in tools that write stay inside the agent's folder, the ones
-  that read stay out of what the sandbox hides, and a shell command that runs
-  the project's own command line is refused, with the way that is open
-  instead: propose it on the board.
+  that read stay out of what the sandbox hides and out of the trees of the
+  system that show processes and devices, the tool that opens a web page does
+  not open this machine's own services, and a shell command that runs the
+  project's own command line is refused, with the way that is open instead:
+  propose it on the board.  That last refusal reads the text of the command:
+  it catches the command line and an import of the package where they are
+  written out, not a script that assembles the name.  It tells an agent that
+  means no harm what to do instead; what keeps the project's files from an
+  agent that does is the sandbox.
 - **The environment** the agent's process starts with (:func:`agent_env`): no
   credential of this process reaches it, except the ones its own sign-in uses.
 
 ``settings.agents.sandbox: false`` takes the first away and the file checks of
-the third with it: the agent then works as the person's own Claude Code would.
-The refusal of the project's command line and the rules about credentials stay.
+the third with it: the agent then works as the person's own Claude Code would,
+and its shell reaches whatever the person's does: the project's files, this
+machine's services, and on a cloud machine the metadata server and so the
+machine's own account.  The refusal of the project's command line and the rules
+about credentials stay, and without the sandbox they can be got around.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import sys
 import tempfile
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,11 +59,14 @@ from typing import Any
 from paper_orchestra.research.sdk.driver import ToolUse
 
 __all__ = [
+    "CLOSED_HOSTS",
     "FEDERATION_ENV",
     "JOB_ENV_PREFIX",
     "LAUNCHER",
     "Guard",
     "agent_env",
+    "claude_config_dir",
+    "closed_host",
     "launcher_text",
     "runs_the_project_cli",
 ]
@@ -78,6 +98,28 @@ _BOARD_INSTEAD = (
     "instead: a new page with the memory tool, a change to a page with propose_edit. The "
     "researcher decides, and an experiment they approve is carried out by another agent."
 )
+#: Hosts no agent's shell or web tool reaches: the metadata servers of the clouds, which
+#: hand the machine's own credentials to whoever asks from the machine, and the machine
+#: itself, where the app that decides proposals may be listening.
+CLOSED_HOSTS: tuple[str, ...] = (
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+    "instance-data",
+    "instance-data.ec2.internal",
+    "169.254.169.254",
+    "100.100.100.200",
+    "168.63.129.16",
+    "localhost",
+    "127.0.0.1",
+)
+#: Trees of the system that show processes and devices, not files: closed to the file
+#: tools whatever else is readable (the shell's sandbox has its own view of them).
+_SYSTEM_TREES = (Path("/proc"), Path("/sys"))
+_NOT_A_PAGE = (
+    "That address is this machine's own (or a cloud's metadata server), not a page on the "
+    "web: it is closed to agents."
+)
 _WRITING_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 _READING_TOOLS = ("Read", "Glob", "Grep", "LS", "NotebookRead")
 _PATH_KEYS = ("file_path", "notebook_path", "path")
@@ -90,12 +132,46 @@ def runs_the_project_cli(command: str) -> bool:
     path), the module (``python -m paper_orchestra``) or an import of it
     (``python -c "from paper_orchestra..."``).  A directory that merely has the
     name in it (``paper-orchestra-notes/``) is not one.
+
+    This reads the command's text and no more: ``python run.py`` with the import
+    inside the file, or a name put together from pieces, is not seen.  It is a
+    signpost for an agent that means no harm, not the boundary: under the
+    sandbox such code cannot change the project's files whatever it imports,
+    and without the sandbox nothing here keeps a determined agent out.
     """
     for word in _WORD_BREAKS.split(str(command or "")):
         last = word.rstrip("/").rsplit("/", 1)[-1]
         if last in _CLI_NAMES or last.startswith("paper_orchestra."):
             return True
     return False
+
+
+def closed_host(url: str) -> bool:
+    """Whether ``url`` names a host that is closed to agents (:data:`CLOSED_HOSTS`), or
+    any other address of the loopback or the link-local range.  An address that does
+    not parse is closed: nothing is opened that cannot be read."""
+    try:
+        host = urllib.parse.urlsplit(url if "//" in url else f"//{url}").hostname
+    except ValueError:
+        return True
+    if not host:
+        return True
+    host = host.rstrip(".").lower()
+    if host in CLOSED_HOSTS or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_link_local or address.is_unspecified
+
+
+def claude_config_dir(environ: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
+    """Claude Code's configuration directory: ``CLAUDE_CONFIG_DIR`` where it is set,
+    else ``.claude`` in the home directory.  The person's login lies there."""
+    environ = os.environ if environ is None else environ
+    named = str(environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    return Path(os.path.expanduser(named)) if named else (home or Path.home()) / ".claude"
 
 
 def _real(path: str | os.PathLike[str], base: Path) -> Path:
@@ -146,6 +222,8 @@ class Guard:
     def credential_places(self) -> list[Path]:
         """Where credentials lie on this machine, whatever else is readable."""
         home = self._home()
+        # Where Claude Code keeps the login, also when its directory is named elsewhere.
+        login = Path(os.path.realpath(claude_config_dir(home=home))) / ".credentials.json"
         return [
             home / ".anthropic",
             home / ".config" / "anthropic",
@@ -153,6 +231,7 @@ class Guard:
             home / ".config" / "op",
             home / ".ssh",
             home / ".claude" / ".credentials.json",
+            *([login] if login != home / ".claude" / ".credentials.json" else []),
             home / ".claude.json",
             home / ".netrc",
             home / ".aws",
@@ -201,6 +280,10 @@ class Guard:
             return False
         if not self.sandbox:
             return True
+        if any(_within(path, tree) for tree in _SYSTEM_TREES):
+            # Processes (their environment, their memory) and devices.  The agent's
+            # process has refusals of its own for these; this one does not rest on them.
+            return False
         # The closest place decides: the agent's folder is open inside the hidden
         # project, the project is hidden wherever it lies, and what is named as
         # readable is open inside a hidden home directory.
@@ -216,8 +299,9 @@ class Guard:
 
     def settings(self) -> dict[str, Any]:
         """The permission rules and the sandbox, as the agent's process takes them."""
-        denied = [f"Read(/{place}/**)" for place in self.credential_places() if place.suffix == ""]
-        denied += [f"Read(/{place})" for place in self.credential_places()]
+        credentials = self.credential_places()
+        denied = [f"Read(/{place}/**)" for place in credentials if place.suffix == ""]
+        denied += [f"Read(/{place})" for place in credentials]
         denied += ["Read(**/.env)", "Read(**/.env.local)"]
         settings: dict[str, Any] = {"permissions": {"deny": list(dict.fromkeys(denied))}}
         if not self.sandbox:
@@ -228,10 +312,23 @@ class Guard:
             "autoAllowBashIfSandboxed": True,
             "allowUnsandboxedCommands": False,
             "filesystem": {
-                "denyRead": [str(place) for place in self.hidden()],
+                # What is hidden, and a credential that lies outside of it (a login
+                # whose directory ``CLAUDE_CONFIG_DIR`` names somewhere else).
+                "denyRead": [
+                    *(str(place) for place in self.hidden()),
+                    *(
+                        str(place)
+                        for place in credentials
+                        if not any(_within(place, hidden) for hidden in self.hidden())
+                    ),
+                ],
                 "allowRead": [str(place) for place in self.open_places()],
-                "denyWrite": [str(place) for place in self.credential_places()],
+                "denyWrite": [str(place) for place in credentials],
             },
+            # The shell has the web.  It does not have this machine's own services:
+            # the sandbox refuses the loopback and link-local addresses by itself
+            # (checked live); these names say so whatever a later version does.
+            "network": {"deniedDomains": list(CLOSED_HOSTS)},
         }
         return settings
 
@@ -244,6 +341,9 @@ class Guard:
         command = given.get("command")
         if isinstance(command, str) and runs_the_project_cli(command):
             return _BOARD_INSTEAD
+        if use.name == "WebFetch" and isinstance(given.get("url"), str):
+            # This tool runs in the agent's process, outside the shell's sandbox.
+            return _NOT_A_PAGE if closed_host(given["url"]) else None
         folder = self._folder()
         if use.name in _WRITING_TOOLS:
             target = next((given[key] for key in _PATH_KEYS if isinstance(given.get(key), str)), "")

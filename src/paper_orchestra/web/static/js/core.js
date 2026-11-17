@@ -37,6 +37,7 @@ export const app = {
     goMenu: null,           // which Continue control has its list of phases open: 'strip', 'overview' or null
     cutoffEdit: null,       // the research cutoff being changed on the overview
     agentsEdit: null,       // how the agents are run, being changed on the overview
+    adopting: null,         // experiment id + '/' + run -> the code an agent left is being taken over
     starting: {},           // experiment id -> a run is being started (the server may settle an unfinished one first)
     cancelling: {},         // experiment id -> its approval is being taken back, or its run cancelled
     defaults: null,         // GET /api/defaults, as last fetched

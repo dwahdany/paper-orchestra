@@ -233,11 +233,12 @@ function agentsHTML(store, e) {
 
 function spendHTML(store) {
   const p = store.project, limits = (p.settings || {}).limits || {}, spent = (p.state || {}).spent || {};
+  const unreported = Number((p.usage || {}).unreported_usd) || 0;
   const frac = (a, b) => (b > 0 ? Math.max(0, Math.min(1, a / b)) : 0);
   const phases = ((p.state || {}).phases || []).filter((ph) => ph.seconds != null);
   const agentSeconds = phases.reduce((a, ph) => a + (ph.seconds || 0), 0);
   return html`${p.demonstration ? html`<p class="quiet spend-demo" data-demonstration>${DEMO_COST}</p>` : ''}<div class="spend-big">
-    <div><b>${money(spent.model_usd || 0)}</b><span>of ${money(limits.model_usd)} for models${p.demonstration ? ', in the story' : ''}</span><progress class="meter-p${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend, of the limit"></progress></div>
+    <div><b>${money(spent.model_usd || 0)}</b><span>of ${money(limits.model_usd)} for models${p.demonstration ? ', in the story' : ''}${unreported > 0 ? html` <span class="quiet spend-least" title="An agent that was stopped before it reported its cost is counted from its tokens at the list price, which is a lower bound.">· at least: ${money(unreported)} of it is counted from the tokens of agents that were stopped</span>` : ''}</span><progress class="meter-p${frac(spent.model_usd || 0, limits.model_usd) > 0.85 ? ' hot' : ''}" max="1" value="${frac(spent.model_usd || 0, limits.model_usd)}" aria-label="Model spend, of the limit"></progress></div>
     <div><b>${money(spent.experiment_usd || 0)}</b><span>of ${money(limits.experiment_usd)} for experiments</span><progress class="meter-p" max="1" value="${frac(spent.experiment_usd || 0, limits.experiment_usd)}" aria-label="Experiment spend, of the limit"></progress></div>
     <div><b>${duration(agentSeconds) || '0 s'}</b><span>of agent time · ${duration(spent.experiment_seconds || 0) || '0 s'} of runs</span></div></div>
     ${phases.length ? html`<details class="spend-more"><summary>Time by phase</summary><table class="metrics"><tbody>${phases.map((ph) => html`<tr><td>Round ${ph.round} · ${phaseName(ph.phase)}${ph.status !== 'completed' ? ' (' + ph.status + ')' : ''}</td><td class="n">${duration(ph.seconds)}</td><td class="n">${plural((ph.produced || []).length, 'page')}</td></tr>`)}</tbody></table></details>` : ''}
@@ -275,7 +276,7 @@ export const overviewView = {
       : !idle ? html`<a class="btn btn-l" href="${link({ view: 'map', sel: '', sub: '' })}">Watch on the map</a><button class="btn btn-l" data-act="stop"${e.stopping ? raw(' disabled') : ''}>${icon('stop')}${e.stopping ? 'Stopping…' : 'Stop'}</button>`
       : html`${items.length ? html`<a class="btn btn-l" href="${link({ view: 'inbox', sel: '', sub: '' })}">Review ${items.length}</a>` : ''}
         ${continueControl(store, e, 'overview', true)}
-        ${e.mode === 'failed' || e.died || e.crashed ? html`<a class="btn btn-l" href="#/setup">Open Setup</a>` : ''}`;
+        ${e.mode === 'failed' || e.died || e.crashed ? html`${((p.settings || {}).agents || {}).runtime === 'sdk' ? html`<button class="btn btn-l" data-act="agents-show">How the agents work</button>` : ''}<a class="btn btn-l" href="#/setup">Open Setup</a>` : ''}`;
     const waiting = items.length ? items.map((it) => { const sum = summaryOf(it); return html`<div class="ov-item" data-ref="${it.ref}"><a class="ov-main" href="${link({ view: 'inbox', sel: it.page.path, sub: '' })}">${glyph(it.kind, it.type === 'page' ? 'proposed' : 'accepted', shownState(it.page), 18)}
         <span class="in-name">${pageName(it.page)}</span>${sum ? html`<span class="in-sum">${sum}</span>` : ''}<span class="in-what"><span class="in-kind">${whatOf(it)}</span>${agentName(it.author)} · ${ago(it.when)}</span>${checkMark(it)}</a>
         <span class="in-quick on"><button class="ibtn ibtn-yes" data-act="accept" data-ref="${it.ref}" data-tip="${acceptTip(it)}" aria-label="${acceptTip(it)}">${icon('check')}</button><button class="ibtn ibtn-no" data-act="reject-ask" data-ref="${it.ref}" data-key="${it.page.path}" data-view="inbox" data-tip="Reject, with a reason" aria-label="Reject">${icon('x')}</button></span></div>`; })

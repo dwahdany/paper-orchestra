@@ -16,6 +16,12 @@ The agent's folder is ``experiments/E<n>/runs/<k>/work``, not the run directory
 itself: the run's record, its log and the snapshot of the approved code lie
 beside it, out of the agent's reach.
 
+What the record says of such a run is what was observed and no more.  The agent
+may run the code many times, change it, or never run it: the record therefore
+names no exit status, calls the plan's command the plan's, and names the code as
+the agent left it (``runs/<k>/code-as-run``, with the files it changed) beside
+the code that was approved.
+
 The plan's ``timeout_seconds`` bounds the agent's whole work (writing, running,
 repairing), not one execution of the code.  The seconds of the run are the
 agent's wall time, accounted as for any run.  What the agent's model costs goes
@@ -24,6 +30,7 @@ to the model budget, not to the run's ``cost_usd``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import shutil
@@ -206,6 +213,15 @@ class AgentBackend:
                 return result(error=f"The agent could not carry out the run: {why}", notes=notes)
             finally:
                 ctx.close_sessions()
+            # The agent has ended.  What it made of the approved code is kept beside
+            # it, for the record to name the code that was there with the results.
+            with contextlib.suppress(OSError):
+                experiments.keep_code_as_run(
+                    work,
+                    Path(run_dir),
+                    whole=Path(source_dir) == Path(run_dir) / experiments.CODE_DIR,
+                    skip=(LAUNCHER,),
+                )
             notes += collect_outputs(work, spec.outputs, Path(run_dir))
             if session.cancelled:
                 log.note("The run was cancelled while the agent was at work.")
@@ -218,4 +234,7 @@ class AgentBackend:
                 return result(timed_out=True, notes=notes)
             if not os.path.isfile(os.path.join(run_dir, "metrics.json")):
                 log.note("The agent finished without leaving metrics.json in its folder.")
+            # Zero says to whoever judges the job that the agent ended its work by
+            # itself.  It is no exit status of the experiment's code, which nobody
+            # measured: the run's record names none (``experiments._finish``).
             return result(returncode=0, notes=notes)

@@ -20,8 +20,9 @@ at its checkpoint as well.
 What ``advance()`` does when no phase is named: it first runs what the person
 approved and analyses results that have no analysis yet, pauses after that
 analysis when anything ran, and otherwise goes on with the phase that was next.
-A run needs no model and never waits for one.  Every other phase does: where the
-project's models cannot be used, ``advance()`` stops before the first such phase,
+Under the classic runtime a run needs no model and never waits for one (under
+``sdk`` an agent carries it out, and it waits like the rest).  Every other phase
+does: where the project's models cannot be used, ``advance()`` stops before the first such phase,
 at a checkpoint when something was done before it and with :class:`ModelNeeded`
 (one sentence, nothing recorded) when nothing was.
 Which phase is next is never changed by what an agent or a request says: more
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import json
 import logging
 import os
@@ -184,6 +186,12 @@ class EngineError(ProjectError):
 
 class WorkerBusy(EngineError):
     """Another worker is running this project."""
+
+
+#: How the ledger rows end that hold spend an SDK agent never reported
+#: (``research.sdk.session.UNREPORTED_SUFFIX`` after its label; not imported from
+#: there, so that reading a ledger needs nothing of the sdk runtime).
+UNREPORTED_LABEL = ".agent.unreported"
 
 
 class ModelNeeded(EngineError):
@@ -941,7 +949,8 @@ class Engine:
         failed twice, or cannot run as the project is set; ``error`` says why).
 
         Nothing that needs no model waits for one.  Every phase but the run needs
-        the project's models; where they cannot be used (no credential, a model
+        the project's models (under the ``sdk`` runtime the run does too: an agent
+        carries it out); where they cannot be used (no credential, a model
         without tools), the call stops before the first phase that needs them.
         When a phase completed before that (the run of what was approved), it
         pauses at that phase's checkpoint, which says in one sentence what is
@@ -1243,6 +1252,16 @@ class Engine:
                 # was lost.  On file, so that the next worker carries it too.
                 report["carried_usd"] = self._carried_usd
                 report["estimated_cost_usd"] = round(spent, 4)
+            # What agents that were stopped or killed never reported, counted from their
+            # tokens at the list price: part of the sum, and a lower bound of what it
+            # stands for.  Said beside the sum by whoever shows it.
+            unreported = sum(
+                _number(row.get("cost_usd"))
+                for row in report.get("by_label") or []
+                if str(row.get("label") or "").endswith(UNREPORTED_LABEL)
+            )
+            if unreported:
+                report["unreported_usd"] = round(unreported, 4)
             write_json(self.project.root / USAGE_FILE, report)
             self._state["spent"]["model_usd"] = round(spent, 4)
             return spent
@@ -1394,8 +1413,14 @@ class Engine:
                 allowed=limit,
             )
 
-    def _over_budget(self, model: str, usage: Usage) -> _BudgetSpent | None:
+    def _over_budget(
+        self, model: str, usage: Usage, *, phase: str | None = None, experiment: str | None = None
+    ) -> _BudgetSpent | None:
         """Asked after every model request of a session's turn: is the model budget spent?
+
+        ``phase`` is the phase whose agent is at work, and ``experiment`` the one an
+        agent carries out where it is that agent: the sentence names who was
+        stopped, and what happens to the work when the limit is raised.
 
         ``usage`` is what the turn has used so far on ``model``.  The ledger does not
         hold it yet, so it is priced here and added to what the ledger holds.  A turn
@@ -1410,13 +1435,19 @@ class Engine:
             spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0)
         if spent < limit:
             return None
-        role = _ROLE.get(str(self._state.get("phase")), "agent")
+        if experiment:
+            work = f"the work of the agent that carries out {experiment}"
+            then = f"{experiment} is in the queue again and is run when the work goes on."
+        else:
+            role = _ROLE.get(str(phase or self._state.get("phase")), "agent")
+            work = f"the {role}'s work"
+            then = "the phase then resumes where it stopped."
         return _BudgetSpent(
             "model_usd",
-            f"The model budget ran out in the middle of the {role}'s work: {_money(spent)} of "
+            f"The model budget ran out in the middle of {work}: {_money(spent)} of "
             f"{_money(limit)} is spent, so its session was ended at its next model call. What "
             "it had written until then is kept. Raise settings.limits.model_usd in the "
-            "project's settings to go on; the phase then resumes where it stopped.",
+            f"project's settings to go on; {then}",
             spent=spent,
             allowed=limit,
         )
@@ -1829,7 +1860,9 @@ class Engine:
             instruction=instruction,
             guard=self._guard,
             stopping=self._stopping,
-            over_budget=self._over_budget,
+            # (Named here: the state's phase is the last one that ran, which is another
+            # one while a run is started by itself.)
+            over_budget=functools.partial(self._over_budget, phase=name),
             scholar=self._scholar,
             compute=self._compute,
             handover=self._handover(name, round),
@@ -1919,7 +1952,13 @@ class Engine:
                 # (A setting that cannot be read is no better read a second time.)
                 if attempt == 2 or stops_the_run(exc) or isinstance(exc, CutoffError):
                     return self._failed(record, clock, ctx, exc)
-                log.warning("The %s phase failed; trying once more.", name, exc_info=True)
+                # (An agent's own account of why it ended is a sentence for the person,
+                # said in the feed below: a traceback of this process adds nothing to it.)
+                log.warning(
+                    "The %s phase failed; trying once more.",
+                    name,
+                    exc_info=not getattr(exc, "plain", False),
+                )
                 # An error can carry text a model wrote: it stands there as a quotation.
                 self._emit(
                     "agent.activity",
@@ -2634,6 +2673,7 @@ class Engine:
             # The seam of the sdk runtime: the job of the run is an agent's.  Its model
             # spend is the model budget's, which is looked at before it starts.
             ctx.runtime = self._runtime()
+            ctx.over_budget = functools.partial(self._over_budget, experiment=experiment)
             self._guard()
             chosen = self._agent_backend(page, ctx, chosen, carried_out)
         try:
@@ -2684,19 +2724,34 @@ class Engine:
 
         return choose
 
-    def _repairer(self, ctx: AgentContext) -> tuple[Callable[..., Any] | None, str | None]:
+    def _repairer(
+        self, ctx: AgentContext
+    ) -> tuple[Callable[..., Any] | None, str | Callable[[Mapping[str, Any]], str] | None]:
         """The callback that repairs a failed run, or ``None`` and why there is none.
 
-        A run needs no model and never waits for one.  The repair of a run that
-        failed for a programming error does, the runner's: where that model cannot
-        be used, the run happens all the same, a failure stands, and its record
-        says why nothing was tried (``experiments.run(..., unrepaired=...)``).
+        Under the classic runtime a run needs no model and never waits for one.  The
+        repair of a run that failed for a programming error does, the runner's:
+        where that model cannot be used, the run happens all the same, a failure
+        stands, and its record says why nothing was tried
+        (``experiments.run(..., unrepaired=...)``).  Under ``sdk`` nobody repairs
+        afterwards, and why is said of the run that failed: an agent carried it
+        out and repaired while it worked, or it ran where no agent works.
         """
         if self._sdk():
-            return None, (
-                "under the sdk runtime the agent that carries out an experiment repairs "
-                "its code itself, so no separate repair is made."
-            )
+
+            def unrepaired(record: Mapping[str, Any]) -> str:
+                if record.get("carried_out_by") == "agent":
+                    return (
+                        "under the sdk runtime the agent that carries out an experiment "
+                        "repairs its code itself, so no separate repair is made."
+                    )
+                return (
+                    f"this run was on the {record.get('backend') or 'remote'} backend, where "
+                    "no agent works, and under the sdk runtime no separate repair is made "
+                    "afterwards. Correct the code and approve the experiment again."
+                )
+
+            return None, unrepaired
         setting = agents.MODEL_ROLES["runner"]
         try:
             need = self._models_need((setting,))

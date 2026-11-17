@@ -163,14 +163,27 @@ class FakeAgent:
         output_tokens: int = 0,
         model: str | None = None,
         sub: bool = False,
+        message: str | None = None,
     ) -> None:
-        """One model request: what it used, and what the process says it cost."""
+        """One model request: what it used, and what the process says it cost.
+
+        ``message`` names the message, to report one more than once the way a real
+        process does while the message is written (little output counted at first,
+        all of it at the end); each report then gives the message's usage so far,
+        and only the first counts as a request.
+        """
         self._alive()
-        self.requests += 1
         model = model or self.options.model
         usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
-        self._conversation.add(model, usage, cost_usd)
-        self._sink(Used(f"msg-{self._conversation.driver.messages}", model, usage, sub))
+        seen = self._conversation.reported
+        before = seen.get(message or "", {})
+        if not before:
+            self.requests += 1
+        grown = {name: value - before.get(name, 0) for name, value in usage.items()}
+        if message:
+            seen[message] = usage
+        self._conversation.add(model, grown, cost_usd)
+        self._sink(Used(message or f"msg-{self._conversation.driver.messages}", model, usage, sub))
         self._conversation.driver.messages += 1
 
     def tick(self, times: int = 1) -> None:
@@ -190,7 +203,8 @@ class _FakeConversation:
         self.turns = 0
         self.interrupted = False
         self.closed = False
-        self._announced = False
+        #: message id -> the usage last reported for it (``FakeAgent.use(message=)``).
+        self.reported: dict[str, dict[str, int]] = {}
         resumed = driver.sessions.get(options.resume or "")
         # A resumed session carries on from the totals it had, as the real one does.
         self.session_id = options.resume if resumed else f"fake-{len(driver.sessions) + 1}"
@@ -211,13 +225,10 @@ class _FakeConversation:
         driver = self.driver
         driver.prompts.append(text)
         self.interrupted = False
-        if not self._announced:
-            self._announced = True
-            sink(
-                Started(
-                    {"model": self.options.model, "session_id": self.session_id, **driver.started}
-                )
-            )
+        # Said for every message, as the real process says it.
+        sink(
+            Started({"model": self.options.model, "session_id": self.session_id, **driver.started})
+        )
         if self.options.resume and self.options.resume in driver.unresumable:
             return Turn(
                 session_id=str(self.session_id),
@@ -244,6 +255,19 @@ class _FakeConversation:
             requests=agent.requests,
         )
 
+    def finish(self, sink: Sink, timeout: float) -> Turn | None:
+        """What a real process says when its turn was broken off: its totals so far, where
+        the test says that it still answers (``FakeDriver.reports_when_interrupted``)."""
+        if not self.driver.reports_when_interrupted:
+            return None
+        cost = sum(row.get("cost_usd", 0.0) for row in self._totals.values())
+        return Turn(
+            session_id=str(self.session_id),
+            cost_usd=cost,
+            model_usage={model: dict(row) for model, row in self._totals.items()},
+            ended="aborted_tools",
+        )
+
     def interrupt(self) -> None:
         self.interrupted = True
         self.driver.interrupts += 1
@@ -261,6 +285,9 @@ class FakeDriver:
         self.started: dict[str, Any] = {"fast_mode_state": "on", **(started or {})}
         #: Why no agent can be started (``(why, fix)``), for tests of the gate.
         self.missing: tuple[str, str] | None = None
+        #: Whether an agent whose turn is broken off from outside still says what its
+        #: session cost (a real one does unless the interrupt ended it too).
+        self.reports_when_interrupted = False
         self.opened: list[AgentOptions] = []
         self.conversations: list[_FakeConversation] = []
         self.prompts: list[str] = []

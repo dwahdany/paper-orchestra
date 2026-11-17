@@ -686,7 +686,13 @@ def experiment_message(
             granted,
             wanted,
             more,
-            "Leave `metrics.json` (and `artifacts/` if there are any) in your folder, then reply.",
+            "Leave `metrics.json` (and `artifacts/` if there are any) in your folder, then "
+            "reply. Your folder (the directory your shell starts in) is the only place "
+            "that counts: a file written anywhere else is refused or silently thrown away "
+            "by the sandbox, even when the command seems to succeed, and a run without "
+            "`metrics.json` in your folder is recorded as failed. The record of the run "
+            "names every file of the code you changed, so say in your reply what you "
+            "changed and why.",
         ]
     )
 

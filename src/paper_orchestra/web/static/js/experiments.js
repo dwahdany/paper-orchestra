@@ -345,7 +345,25 @@ function findingsOf(store, run) {
 }
 
 /** What it means that an agent carried a run out, said once on the run. */
-const AGENT_RUN = 'An agent carried out this run. It worked in a shell in the run\'s own folder, starting from the approved code, and may have changed that code there; the log is what it did and said, and the metrics and artifacts are what its work left.';
+const AGENT_RUN = 'An agent carried out this run. It worked in a shell in the run\'s own folder, starting from the approved code; the log is what it did and said, and the metrics and artifacts are what its work left. Nobody measured an exit status: the agent may have run the code more than once.';
+/** What the agent that carried a run out made of the approved code (`run.code_as_run`):
+    the files it changed, added and removed, each one a link to the file as it left it,
+    and for the person the choice to make that code the experiment's. */
+function codeAsRunHTML(store, eid, run) {
+  const c = run.code_as_run;
+  if (!byAgent(run)) return '';
+  if (!c) return run.status === 'running' ? '' : html`<p class="run-code" data-code="unknown">What the agent made of the approved code was not kept for this run.</p>`;
+  const kept = (name) => html`<a class="linkish" href="${api.fileUrl(store.pid, 'experiments/' + eid + '/runs/' + run.number + '/code-as-run/' + name)}" target="_blank" rel="noopener"><code>${name}</code></a>`;
+  const part = (verb, names, linked) => ((names || []).length ? html`<span class="run-code-part">${verb} ${names.map((n, i) => html`${i ? ', ' : ''}${linked ? kept(n) : html`<code>${n}</code>`}`)}</span>` : '');
+  const changed = (c.changed || []).length + (c.added || []).length + (c.removed || []).length;
+  if (!changed) return html`<p class="run-code" data-code="approved">The agent left the approved code as it was <span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>.</p>`;
+  const busy = app.ui.adopting === eid + '/' + run.number;
+  return html`<div class="note note-warn run-code" data-code="changed">${icon('warn')}<div><b>The agent changed the code it was given.</b>
+    <p>It ${part('changed', c.changed, true)}${(c.changed || []).length && ((c.added || []).length || (c.removed || []).length) ? '; ' : ''}${part('added', c.added, true)}${(c.added || []).length && (c.removed || []).length ? '; ' : ''}${part('removed', c.removed, false)}. The results of this run come from that code <span class="quiet">(digest ${String(c.digest || '').slice(0, 12)}…)</span>, not from the approved code shown under Code, which is unchanged: run again, the experiment would start from the approved code and be repaired again.</p>
+    ${(c.changed || []).length + (c.added || []).length ? html`<button class="btn btn-s" data-act="adopt-code" data-eid="${eid}" data-run="${run.number}"${busy ? raw(' disabled') : ''}>${busy ? 'Taking it over…' : 'Make this the experiment\'s code'}</button> <span class="quiet">As your own edit: the earlier version is kept, and the experiment must be approved again to run.</span>` : ''}</div></div>`;
+}
+/** A run whose code could call the Anthropic API: nothing here counted those calls. */
+const modelAccessHTML = (run) => (run.model_access ? html`<p class="run-models" data-model-access>This run was approved with network access while model access for jobs was on: its code could call the Anthropic API with the worker's federation settings. Those calls are billed to that account and are counted nowhere here.</p>` : '');
 function runBlock(store, page, data, run, open) {
   const eid = page.id, failed = run.status === 'failed' || run.status === 'cancelled';
   const head = html`<button class="run-h" data-act="show-run" data-eid="${eid}" data-run="${run.number}" aria-expanded="${tf(open)}">${icon(open ? 'down' : 'right')}<b>Run ${run.number}</b>
@@ -358,6 +376,7 @@ function runBlock(store, page, data, run, open) {
   const result = run.result_page && store.byPath.get(run.result_page);
   return html`<div class="run open">${head}<div class="run-b">
     ${byAgent(run) ? html`<p class="run-agent" data-by="agent">${AGENT_RUN}</p>` : ''}
+    ${codeAsRunHTML(store, eid, run)}${modelAccessHTML(run)}
     ${failed ? failureHTML(store, page, data, run) : ''}
     ${run.status === 'succeeded' ? repairsHTML(run, true) : ''}
     ${run.status === 'succeeded' ? html`<div class="res-grid"><div><h3 class="sec-h">Metrics <span class="quiet">${byAgent(run) ? 'metrics.json, as the agent\'s work left it' : 'metrics.json, as the run wrote it'}</span></h3>${metricsHTML(run, data)}</div>
@@ -367,7 +386,7 @@ function runBlock(store, page, data, run, open) {
     ${(run.notes || []).length ? html`<ul class="run-notes">${run.notes.map((n) => html`<li>${n}</li>`)}</ul>` : ''}
     ${logHTML(store, eid, run)}
     <p class="run-rec">${result ? html`Result record <a class="chip" href="${link({ view: 'wiki', sel: result.path, sub: '' })}" data-sel="${result.path}">${pageGlyph(result, 12)}${label(result)}</a> was written by code from this run${(result.meta || {}).edited_by_person ? html`, and <b class="rec-edited">edited by hand since</b>: it no longer reads as code wrote it` : ''}.` : run.status === 'running' ? 'The result record is written by code when the run ends.' : ''}
-      ${run.code_digest ? html`<span class="quiet">Code digest ${String(run.code_digest).slice(0, 12)}…</span>` : ''}</p></div></div>`;
+      ${run.code_digest ? html`<span class="quiet">${byAgent(run) ? 'Digest of the approved code' : 'Code digest'} ${String(run.code_digest).slice(0, 12)}…</span>` : ''}</p></div></div>`;
 }
 
 function liveHTML(store, page, data, run, does) {
@@ -401,7 +420,7 @@ function codeSection(store, page, data) {
   const file = files.find((f) => f.name === name);
   const editKey = eid + '/' + name, editing = app.ui.codeEdit[editKey];
   const locked = page.state === 'running' || page.state === 'queued';
-  return html`<section class="exp-code"><h2 class="sec-t">Code <span class="quiet">${plan.mode === 'repo' ? 'runs inside a copy of your repository; the working tree is never modified' : 'parsed, never executed before you approve'}</span></h2>
+  return html`<section class="exp-code"><h2 class="sec-t">Code <span class="quiet">${plan.mode === 'repo' ? 'runs inside a copy of your repository; the working tree is never modified' : agentWould(store, 'local') ? 'parsed; the designer may have tried it in its own sandboxed folder, and it does not run for the record before you approve' : 'parsed, never executed before you approve'}</span></h2>
     ${problems.length ? html`<div class="note note-warn">${icon('warn')}<div><b>The check of the code found:</b><ul class="reasons">${problems.map((p) => html`<li>${p}</li>`)}</ul></div></div>` : ''}
     ${files.length ? html`<div class="tabs" role="tablist" aria-label="Code files">${files.map((f) => html`<button role="tab" class="tab${f.name === name ? ' on' : ''}" aria-selected="${tf(f.name === name)}" data-act="code-tab" data-eid="${eid}" data-name="${f.name}">${f.name}<span>${plural(String(f.text).replace(/\n$/, '').split('\n').length, 'line')}</span></button>`)}
         ${editing == null ? html`<button class="btn btn-quiet btn-s tabs-r" data-act="edit-code" data-eid="${eid}"${locked ? raw(' disabled data-tip="The code cannot be changed while it runs"') : ''}>${icon('pencil')}Edit code</button>` : ''}</div>

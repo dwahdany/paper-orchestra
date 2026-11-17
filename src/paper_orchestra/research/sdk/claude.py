@@ -16,6 +16,7 @@ import json
 import queue
 import shutil
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ from paper_orchestra.research.sdk.driver import (
     board_name,
 )
 
-__all__ = ["INSTALL", "ClaudeDriver"]
+__all__ = ["INSTALL", "ClaudeDriver", "availability"]
 
 #: How the package is installed, said wherever it is found missing.
 INSTALL = (
@@ -276,6 +277,22 @@ class _Conversation:
                 raise self._failure(event) from event
             sink(event)
 
+    def finish(self, sink: Sink, timeout: float) -> Turn | None:
+        if self._closed:
+            return None
+        until = time.monotonic() + timeout
+        while (left := until - time.monotonic()) > 0:
+            try:
+                event = self._events.get(timeout=min(TICK_SECONDS, left))
+            except queue.Empty:
+                continue
+            if isinstance(event, Turn):
+                return event
+            if isinstance(event, BaseException):
+                return None  # the process is gone, and with it its account
+            sink(event)
+        return None
+
     def interrupt(self) -> None:
         if self._closed or self._client is None:
             return
@@ -293,19 +310,27 @@ class _Conversation:
         self._thread.join(CLOSE_SECONDS)
 
 
+def availability() -> dict[str, bool]:
+    """Whether the package is installed and whether there is a command line for the
+    agents to run in (the package's own, or ``claude`` on the path).  Imports nothing."""
+    try:
+        spec = importlib.util.find_spec("claude_agent_sdk")
+    except (ImportError, ValueError):
+        spec = None
+    package = spec is not None and bool(spec.origin)
+    bundled = Path(spec.origin).parent / "_bundled" if package else None
+    has_cli = bool(bundled and bundled.is_dir() and any(bundled.glob("claude*")))
+    return {"package": package, "command_line": has_cli or shutil.which("claude") is not None}
+
+
 class ClaudeDriver:
     """Starts Claude Agent SDK agents."""
 
     def unavailable(self) -> tuple[str, str] | None:
-        try:
-            spec = importlib.util.find_spec("claude_agent_sdk")
-        except (ImportError, ValueError):
-            spec = None
-        if spec is None or not spec.origin:
+        found = availability()
+        if not found["package"]:
             return ("the Claude Agent SDK (the package claude-agent-sdk) is not installed", INSTALL)
-        bundled = Path(spec.origin).parent / "_bundled"
-        has_cli = bundled.is_dir() and any(bundled.glob("claude*"))
-        if not has_cli and shutil.which("claude") is None:
+        if not found["command_line"]:
             return (
                 "the Claude Code command line that the agents run in was not found",
                 "install Claude Code, or reinstall claude-agent-sdk, which brings its own",

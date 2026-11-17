@@ -596,6 +596,13 @@ const ACT = {
     app.ui.agentsEdit = { runtime: a.runtime, model: a.model || '', fast: !!a.fast, ultracode: !!a.ultracode, credential: a.credential, sandbox: !!a.sandbox, error: null, saving: false };
     app.render('ui');
   },
+  /* From a phase that failed: to where the model and the credential of agents with a shell
+     are set, opened for a change (a mistyped model fails there, not in Setup). */
+  'agents-show': () => {
+    if (!app.ui.agentsEdit) ACT['agents-open']();
+    else app.render('ui');
+    requestAnimationFrame(() => { const sec = $('.ov-agents'); if (sec) { sec.scrollIntoView({ block: 'start', behavior: 'smooth' }); const first = $('.ov-agents input, .ov-agents select'); if (first) first.focus({ preventScroll: true }); } });
+  },
   stop: () => stopAgents(),
   'limit-edit': () => { const limits = (store().project.settings || {}).limits || {}; app.ui.limitEdit = { value: limits.model_usd > 0 ? String(Math.ceil(limits.model_usd * 1.5)) : '' }; app.render('limit'); setTimeout(() => { const el = $('#limit-usd'); if (el) el.select(); }, 0); },
   'limit-cancel': () => { app.ui.limitEdit = null; app.render('limit'); },
@@ -653,6 +660,25 @@ const ACT = {
     catch (error) { sayError(eid + ' was not started: ' + message(error)); s.invalidateExperiment(eid); s.refresh(); }
     delete app.ui.starting[eid];
     app.render('run');
+  },
+  /* The code an agent left after a run becomes the experiment's code, as the person's own
+     edit: the earlier version is kept, and the experiment must be approved again to run. */
+  'adopt-code': async (el) => {
+    const s = store(), eid = el.dataset.eid, run = el.dataset.run;
+    if (app.ui.adopting) return;
+    app.ui.adopting = eid + '/' + run;
+    app.render('adopt');
+    try {
+      const answer = await api.adoptCode(s.pid, eid, run);
+      s.invalidateExperiment(eid);
+      await s.refreshNow();
+      const files = (answer.files || []).join(', '), problems = answer.problems || [];
+      const left = (answer.removed || []).length ? ' ' + answer.removed.join(', ') + ' (removed by the agent) was left in place.' : '';
+      if (problems.length) sayError('The code of run ' + run + ' is now the code of ' + eid + ' (' + files + ').' + left + ' The check found: ' + problems.join(' '));
+      else say('The code of run ' + run + ' is now the code of ' + eid + ' (' + files + '); the earlier version is kept.' + left + ' Approve the experiment again to run it.');
+    } catch (error) { sayError('The code of run ' + run + ' was not taken over: ' + message(error)); }
+    app.ui.adopting = null;
+    app.render('adopt');
   },
   /* Take an approval back, or cancel a run: which of the two the press does is what the
      button said (`data-does`, the server's `cancel_does`), and the server is told so: it
@@ -731,12 +757,30 @@ async function saveAgents() {
   ui.saving = true; ui.error = null;
   app.render('agents');
   try {
+    const before = (s.project.settings || {}).agents || {};
     await api.patchProject(s.pid, { settings: { agents } });
     app.ui.agentsEdit = null;
     await s.refreshNow();
-    say('The agents are now ' + (ui.runtime === 'sdk' ? 'Claude agents with a shell' : ui.runtime === 'classic' ? 'run in the tool loop' : ui.runtime) + ', from the next phase on.');
+    say(agentsChange(before, agents));
   } catch (error) { ui.error = message(error); ui.saving = false; }
   app.render('agents');
+}
+
+/** What a change of `settings.agents` did, from the values that changed: the runtime when
+    it is another one, else each value by its name ("Fast mode off, helper agents off"). */
+export function agentsChange(before, after) {
+  const when = ', from the next phase on.';
+  if (after.runtime !== before.runtime) return 'The agents are now ' + (after.runtime === 'sdk' ? 'Claude agents with a shell' : after.runtime === 'classic' ? 'run in the tool loop' : after.runtime) + when;
+  if (after.runtime !== 'sdk') return 'Nothing changed: the agents are run in the tool loop, as before.';
+  const onOff = (v) => (v ? 'on' : 'off'), changed = [];
+  if (after.model !== before.model) changed.push('the model is ' + after.model);
+  if (!!after.fast !== !!before.fast) changed.push('fast mode ' + onOff(after.fast));
+  if (!!after.ultracode !== !!before.ultracode) changed.push('helper agents ' + onOff(after.ultracode));
+  if (after.credential !== before.credential) changed.push(after.credential === 'login' ? 'they work on your Claude Code login' : 'they work on the worker\'s federation');
+  if (!!after.sandbox !== !!before.sandbox) changed.push('the sandbox is ' + onOff(after.sandbox));
+  if (!changed.length) return 'Nothing changed: the agents work as before.';
+  const said = changed.join(', ');
+  return said.charAt(0).toUpperCase() + said.slice(1) + when;
 }
 
 async function saveCode(form) {

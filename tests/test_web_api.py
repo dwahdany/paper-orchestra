@@ -5748,12 +5748,93 @@ def test_how_the_agents_are_run_can_be_changed_and_a_refused_change_changes_noth
         ({"fast": "yes"}, "fast"),
         ({"model": " "}, "model"),
         ({"sandbox": True, "ultracode": 1}, "ultracode"),
+        # A name the group does not have: stored, it would silently do nothing.
+        ({"bogus": 1}, "bogus"),
+        ({"sandbx": False}, "sandbx"),
+        # Not the name of a model: it goes to the agents' command line as it stands.
+        ({"model": "claude-haiku-5-5 ; rm -rf"}, "model"),
     ):
         refused = client.patch(url(project), json={"settings": {"agents": wrong}})
         assert refused.status_code == 422, (wrong, refused.text)
         assert named in error_of(refused)["message"]
         assert (project.root / "project.json").read_text() == before
         assert client.get(url(project)).json()["settings"]["agents"] == {**wanted, "sandbox": True}
+
+
+def test_the_person_can_make_the_code_an_agent_left_the_experiments_code(real, project):
+    """An agent that carries a run out repairs the code in its own folder; the run's
+    record names what it changed, and the person can take that code over as their edit."""
+    from paper_orchestra.research import experiments
+
+    page = second_experiment(project)
+    eid = str(page.id)
+    runs = project.experiment_dir(eid) / "runs" / "1"
+    (runs / "code").mkdir(parents=True)
+    (runs / "code" / "main.py").write_text("print('hello')\n")
+    (runs / "code-as-run").mkdir()
+    (runs / "code-as-run" / "main.py").write_text("print('hello, repaired')\n")
+    (runs / "code-as-run" / "util.py").write_text("X = 1\n")
+    record = {
+        "experiment": eid,
+        "number": 1,
+        "status": "succeeded",
+        "backend": "local",
+        "carried_out_by": "agent",
+        "exit_code": None,
+        "code_as_run": {
+            "digest": "d" * 64,
+            "changed": ["main.py"],
+            "added": ["util.py"],
+            "removed": [],
+        },
+    }
+    (runs / "run.json").write_text(json.dumps(record))
+    shown = real.get(f"{url(project)}/experiments/{eid}/runs/1").json()["run"]
+    assert shown["code_as_run"]["changed"] == ["main.py"] and shown["exit_code"] is None
+    # The file as the agent left it can be opened from the run.
+    kept = real.get(f"{url(project)}/files/experiments/{eid}/runs/1/code-as-run/main.py")
+    assert kept.status_code == 200 and "repaired" in kept.text
+
+    adopted = real.post(f"{url(project)}/experiments/{eid}/runs/1/adopt-code")
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.json()["files"] == ["main.py", "util.py"] and adopted.json()["run"] == 1
+    assert experiments.code_files(project, eid) == {
+        "main.py": "print('hello, repaired')\n",
+        "util.py": "X = 1\n",
+    }
+    assert experiments.code_authors(project, eid)["main.py"]["author"] == "human"
+    # A run whose agent changed nothing has nothing to take over; neither has a run there is not.
+    record["code_as_run"] = {"digest": "d" * 64, "changed": [], "added": [], "removed": []}
+    (runs / "run.json").write_text(json.dumps(record))
+    assert real.post(f"{url(project)}/experiments/{eid}/runs/1/adopt-code").status_code in (
+        409,
+        422,
+    )
+    assert real.post(f"{url(project)}/experiments/{eid}/runs/9/adopt-code").status_code == 404
+
+
+def test_the_doctor_says_what_this_machine_has_for_agents_with_a_shell(
+    workspace, monkeypatch, tmp_path
+):
+    """Setup shows it: the package and its command line, a login, the federation
+    settings.  It is information; it never makes the report not ok, and no value of a
+    setting is in it."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    for name in ("ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "org-must-not-be-shown")
+    with TestClient(create_app(workspace), base_url=BASE_URL) as client:
+        report = client.get("/api/doctor").json()
+        agents = report["agents"]
+        assert agents["login"] in (False, None) and agents["federation"] is False
+        assert "ANTHROPIC_FEDERATION_RULE_ID" in agents["federation_missing"]
+        assert isinstance(agents["package"], bool) and isinstance(agents["command_line"], bool)
+        assert "org-must-not-be-shown" not in json.dumps(report)
+        (home / ".claude" / ".credentials.json").write_text("{}")
+        assert client.get("/api/doctor").json()["agents"]["login"] is True
 
 
 def test_the_feed_carries_the_parts_of_an_agents_line(client, project):

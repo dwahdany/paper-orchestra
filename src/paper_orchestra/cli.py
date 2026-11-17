@@ -1007,6 +1007,16 @@ def _needs_a_model(exc: BaseException) -> bool:
     return isinstance(refusal, type) and isinstance(exc, refusal)
 
 
+def _unreported_spend(project: Project) -> float:
+    """What of the model spend is a count from tokens for agents that never reported
+    their cost (``unreported_usd`` of the usage ledger); nothing when there is none."""
+    try:
+        ledger = read_json(project.root / "usage.json")
+        return max(0.0, float(ledger.get("unreported_usd") or 0.0))
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        return 0.0
+
+
 def _sweep(project: Project) -> None:
     """Remove the temporary files that writers which died left in the project.  Done when
     a worker starts: a crash must not leave litter that grows with every crash."""
@@ -1225,6 +1235,13 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         f"{_amount(spent.get('experiment_seconds')):.0f} s in all (one run may take up to "
         f"{limits.experiment_seconds:.0f} s)"
     )
+    unreported = _unreported_spend(project)
+    if unreported:
+        lines.append(
+            f"  The model spend is at least that: ${unreported:.2f} of it stands for agents "
+            "that were stopped before they reported their cost, counted from their tokens "
+            "at the list price"
+        )
     lines += _problem_lines(project)
     lines.append(_next_steps(project, state, counts))
     return lines
@@ -1971,6 +1988,56 @@ def research_approve(
         _say(line)
 
 
+@research_app.command("adopt-code")
+def research_adopt_code(
+    project: ProjectArgument,
+    experiment: Annotated[
+        str,
+        typer.Argument(
+            metavar="EXPERIMENT", help="The experiment, for example E1.", show_default=False
+        ),
+    ],
+    run: Annotated[
+        int | None,
+        typer.Option(
+            "--run",
+            min=1,
+            help="The run whose code to take. Default: the latest run an agent changed "
+            "the code in.",
+            show_default=False,
+        ),
+    ] = None,
+) -> None:
+    """Make the code an agent left after a run the experiment's code.
+
+    Under the sdk runtime the agent that carries an experiment out repairs the code in
+    its own folder, and the experiment's code stays what you approved: run again, it
+    would fail the same way and be repaired again.  This writes the files the agent
+    changed or added into the experiment's code as your own edit.  The earlier
+    versions are kept, and the experiment must be approved again before it runs.
+    """
+    from paper_orchestra.research.model import ProjectError
+
+    opened = _open_project(project)
+    try:
+        from paper_orchestra.research import experiments
+
+        page = opened.page(experiment)
+        adopted = experiments.adopt_run_code(opened, str(page.id or experiment), run)
+    except (ProjectError, ComputeError) as exc:
+        _fail(str(exc), code=1)
+    name, root = page.id or page.path, _quoted(opened.root)
+    _say(
+        f"The code of run {adopted['run']} is now the code of {name}: "
+        f"{', '.join(adopted['files'])}. The earlier versions are kept. `paper-orchestra "
+        f"research approve {root} {name}` approves it to run again."
+    )
+    if adopted["removed"]:
+        _say(f"Left in place, though the agent had removed it: {', '.join(adopted['removed'])}.")
+    for problem in adopted["problems"]:
+        _say(f"The check of the code found: {problem}", fg=typer.colors.YELLOW)
+
+
 def _how_to_accept(project: Project, ref: str) -> str:
     """For an approval that was refused: when the experiment's page is not accepted, the
     command that accepts it (the refusal says that it has to be, not how); else nothing."""
@@ -2097,9 +2164,11 @@ def research_run(
 ) -> None:
     """Run approved experiments now and write their result records.
 
-    No model is involved unless a run fails for a programming error and the code is
-    repaired.  `research advance` then analyses the results first.  One approval is one
-    run: an experiment whose approved run has ended is not run again.
+    Under the classic runtime no model is involved unless a run fails for a programming
+    error and the code is repaired.  Under the sdk runtime an agent carries each run
+    out; where the agents cannot start, the command says why and exits with code 3,
+    as `research advance` does.  `research advance` then analyses the results first.
+    One approval is one run: an experiment whose approved run has ended is not run again.
     """
     from paper_orchestra.research.model import ProjectError
 
@@ -2131,6 +2200,11 @@ def research_run(
             except WorkerBusy:
                 raise  # true of the project, so of every experiment: said once
             except (ProjectError, ComputeError) as exc:
+                if _needs_a_model(exc):
+                    # The agents that carry experiments out cannot start (the sdk
+                    # runtime): true of every experiment, and no error of the project.
+                    # Said once, with the exit code `advance` gives for the same thing.
+                    raise
                 # One experiment that cannot run does not keep the others from running.
                 events.flush()
                 _say(f"Error: {exc}", fg=typer.colors.RED, err=True)
@@ -2138,6 +2212,16 @@ def research_run(
                 continue
             events.flush()
             _say(_run_line(opened, record))
+            changed = _mapping(record.get("code_as_run"))
+            if any(changed.get(verb) for verb in ("changed", "added", "removed")):
+                # The result comes from other code than was approved: said where the
+                # result is, with what makes that code the experiment's.
+                _say(
+                    "  The agent that carried it out changed the code it was given "
+                    f"(kept in runs/{record.get('number')}/code-as-run). `paper-orchestra "
+                    f"research adopt-code {root} {record.get('experiment')}` makes it the "
+                    "experiment's code; without that, a new run starts from the approved code."
+                )
             outcomes.append(str(record.get("status")))
     # A run the person cancelled left nothing to analyse.
     if any(outcome in ("succeeded", "failed") for outcome in outcomes):

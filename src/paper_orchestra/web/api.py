@@ -542,6 +542,13 @@ class Services:
     def check_code(self, project: Project, experiment_id: str) -> list[str]:
         return list(self._experiments().check_code(project, experiment_id))
 
+    def adopt_run_code(self, project: Project, experiment_id: str, number: int) -> dict[str, Any]:
+        """Make the code an agent left after run ``number`` the experiment's code, as the
+        person's edit."""
+        return dict(
+            self._experiments().adopt_run_code(project, experiment_id, number, author="human")
+        )
+
     def code_digest(self, project: Project, experiment_id: str) -> str:
         """What identifies the code as it is now; ``approve`` takes it back as
         ``code_digest`` and refuses when the code changed in between."""
@@ -3938,6 +3945,23 @@ def get_run(eid: str, number: int, project: Proj, context: Ctx) -> dict[str, Any
     run = _find_run(context, project, str(page.id), number)
     tail = _log_piece(context, project, _run_log(str(page.id), number), -_LOG_TAIL_BYTES)
     return {"run": _run_view(context, project, str(page.id), run), "log": tail}
+
+
+@router.post("/projects/{pid}/experiments/{eid}/runs/{number}/adopt-code")
+def adopt_code(eid: str, number: int, project: Proj, context: Ctx) -> dict[str, Any]:
+    """The person makes the code that the agent of run ``number`` left the experiment's
+    code: ``{"run", "files", "removed", "problems"}``.
+
+    An agent that carries a run out repairs the code in its own folder, and the
+    experiment's code stays what was approved (``run.code_as_run`` names what the
+    agent changed).  This writes the changed and added files as the person's own
+    edit, with everything that follows from one: earlier versions are kept, and
+    an approval of the experiment no longer holds.  422 when the run has no
+    changed code, or a file of it cannot be taken over.
+    """
+    page = _experiment(project, eid)
+    _find_run(context, project, str(page.id), number)
+    return context.services.adopt_run_code(project, str(page.id), number)
 
 
 @router.get("/projects/{pid}/experiments/{eid}/runs/{number}/log")

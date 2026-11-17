@@ -40,6 +40,7 @@ from paper_orchestra.research.sdk.guard import (
     JOB_ENV_PREFIX,
     Guard,
     agent_env,
+    closed_host,
     launcher_text,
     runs_the_project_cli,
 )
@@ -50,6 +51,8 @@ from paper_orchestra.research.sdk.session import (
     AgentRuntime,
     AgentSession,
     describe_tool,
+    login_found,
+    machine_report,
     tool_parts,
 )
 from test_research_agents import activity, make_harness, make_project
@@ -69,7 +72,12 @@ def home(tmp_path, monkeypatch) -> Path:
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / ".credentials.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
-    for name in (*FEDERATION_ENV, AGENT_RUNTIME_ENV, "PAPER_ORCHESTRA_JOB_MODEL_ACCESS"):
+    for name in (
+        *FEDERATION_ENV,
+        AGENT_RUNTIME_ENV,
+        "PAPER_ORCHESTRA_JOB_MODEL_ACCESS",
+        "CLAUDE_CONFIG_DIR",
+    ):
         monkeypatch.delenv(name, raising=False)
     return home
 
@@ -158,13 +166,50 @@ def test_a_partial_change_keeps_the_rest_of_the_group_and_survives_a_save(tmp_pa
         "credential": "login",
         "sandbox": True,
     }
-    # A key a newer version wrote into the group is kept.
-    again.settings.update({"agents": {"effort": "max"}})
-    again.save_settings()
-    assert Project.open(project.root).settings.agents.to_dict()["effort"] == "max"
+    # A key a newer version wrote into the group's file is kept, also across a change.
+    file = project.root / "project.json"
+    data = json.loads(file.read_text(encoding="utf-8"))
+    data["settings"]["agents"]["effort"] = "max"
+    file.write_text(json.dumps(data), encoding="utf-8")
+    newer = Project.open(project.root)
+    newer.settings.update({"agents": {"fast": True}})
+    newer.save_settings()
+    kept = Project.open(project.root).settings.agents.to_dict()
+    assert (kept["effort"], kept["fast"]) == ("max", True)
     with pytest.raises(ProjectError):
         again.settings.update({"agents": {"sandbox": "off"}})
     assert again.settings.agents.sandbox is True
+
+
+def test_a_change_that_names_a_value_the_group_does_not_have_is_refused(tmp_path):
+    """A misspelt name would be stored and do nothing, silently: `sandbx: false` would
+    leave the person believing they had changed what they had not, and the reverse."""
+    project = make_project(tmp_path, settings={"agents": {"runtime": "sdk"}})
+    with pytest.raises(ProjectError) as refused:
+        project.settings.update({"agents": {"bogus": 1, "sandbx": False}})
+    assert "settings.agents has no value named bogus, sandbx" in str(refused.value)
+    assert "sandbox" in str(refused.value)  # ... and it says which there are
+    assert "bogus" not in project.settings.agents.to_dict()
+
+
+@pytest.mark.parametrize(
+    "model", ["claude-haiku-5-5 ; rm -rf", "two words", "", "-leading", "$(id)", "a" * 200]
+)
+def test_what_cannot_be_the_name_of_a_model_is_refused(tmp_path, model):
+    project = make_project(tmp_path, settings={"agents": {"runtime": "sdk"}})
+    with pytest.raises(ProjectError, match="it must be the name of a Claude model"):
+        project.settings.update({"agents": {"model": model}})
+    assert project.settings.agents.model == "claude-fable-5-2"
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["claude-haiku-5-5", "claude-fable-5-2[1m]", "us.anthropic.claude-opus-4-1-v1:0", "opus"],
+)
+def test_the_names_models_have_are_taken(tmp_path, model):
+    project = make_project(tmp_path, settings={"agents": {"runtime": "sdk"}})
+    project.settings.update({"agents": {"model": model}})
+    assert project.settings.agents.model == model
 
 
 def test_the_environment_names_the_runtime_of_projects_that_are_created():
@@ -428,6 +473,100 @@ def test_the_file_tools_read_the_folder_and_the_system_but_nothing_that_is_close
     assert not reads("Glob", pattern="../../wiki/*.md")
     assert not reads("Glob", pattern=str(home / ".ssh" / "*"))
     assert reads("Read", file_path=str(folder / ".env.example"))
+
+
+def test_the_file_tools_do_not_read_processes_or_devices(tmp_path, home):
+    """The trees that show processes (their environment holds the worker's credentials)
+    and devices are closed by this check itself, whatever the agent's process refuses."""
+    guard = make_guard(tmp_path, home)
+    for closed in ("/proc/1/environ", "/proc/self/environ", f"/proc/{os.getpid()}/environ", "/sys"):
+        refused = guard.check(ToolUse("Read", {"file_path": closed}))
+        assert refused is not None and "not yours to read" in refused, closed
+    assert guard.check(ToolUse("Grep", {"pattern": "KEY", "path": "/proc"})) is not None
+    assert guard.check(ToolUse("Glob", {"pattern": "/proc/*/environ"})) is not None
+    # The system's own files stay readable: the Python an experiment runs with is there.
+    assert guard.check(ToolUse("Read", {"file_path": "/usr/lib/python3/os.py"})) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://METADATA.google.internal./",
+        "http://169.254.170.2/v2/credentials",  # any link-local address
+        "http://[fe80::1]/",
+        "http://localhost:8501/api/projects",
+        "http://127.0.0.1:8501/api/projects",
+        "http://127.8.8.8/",
+        "http://[::1]:8501/",
+        "http://app.localhost/",
+        "http://0.0.0.0:8501/",
+        "http://[bad",
+        "",
+    ],
+)
+def test_the_web_tool_does_not_open_this_machines_own_services(tmp_path, home, url):
+    """WebFetch runs in the agent's process, outside the shell's sandbox.  The metadata
+    server of a cloud hands the machine's credentials to whoever asks from the machine,
+    and the app that decides proposals listens on the loopback: neither is the web."""
+    assert closed_host(url)
+    for sandbox in (True, False):
+        guard = make_guard(tmp_path, home, sandbox=sandbox)
+        refused = guard.check(ToolUse("WebFetch", {"url": url, "prompt": "What is there?"}))
+        assert refused is not None and "closed to agents" in refused
+        assert guard.check(ToolUse("WebFetch", {"url": url}, sub=True)) is not None  # a helper too
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://example.com/", "https://arxiv.org/abs/1706.03762", "http://10.0.0.5/", "example.com"],
+)
+def test_the_web_tool_opens_the_web(tmp_path, home, url):
+    assert not closed_host(url)
+    assert make_guard(tmp_path, home).check(ToolUse("WebFetch", {"url": url})) is None
+
+
+def test_the_shells_sandbox_is_told_which_hosts_are_closed(tmp_path, home):
+    network = make_guard(tmp_path, home).settings()["sandbox"]["network"]
+    for host in ("169.254.169.254", "metadata.google.internal", "localhost", "127.0.0.1"):
+        assert host in network["deniedDomains"]
+
+
+def test_a_login_kept_elsewhere_is_found_and_closed_to_the_agents(tmp_path, home, monkeypatch):
+    """``CLAUDE_CONFIG_DIR`` names where Claude Code keeps its login.  The gate looks
+    there, and that file is a credential like the one in the home directory."""
+    config = tmp_path / "claude-config"
+    config.mkdir()
+    (home / ".claude" / ".credentials.json").unlink()
+    runtime = AgentRuntime(sdk_project(tmp_path), FakeDriver())
+    environ = {"CLAUDE_CONFIG_DIR": str(config)}
+    assert "no Claude Code login" in runtime.need(environ, home)["why"]
+    (config / ".credentials.json").write_text("{}", encoding="utf-8")
+    assert runtime.need(environ, home) is None
+    assert runtime.need({}, home) is not None  # not named: the home directory's is asked
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    guard = make_guard(tmp_path, home)
+    login = config / ".credentials.json"
+    assert guard.check(ToolUse("Read", {"file_path": str(login)})) is not None
+    settings = guard.settings()
+    assert f"Read(/{login})" in settings["permissions"]["deny"]
+    # It lies outside everything that is hidden anyway, so the shell is told of it by name.
+    assert str(login) in settings["sandbox"]["filesystem"]["denyRead"]
+    assert str(login) in settings["sandbox"]["filesystem"]["denyWrite"]
+
+
+def test_where_the_login_is_not_a_file_the_gate_lets_the_first_agent_decide(tmp_path, home):
+    """On macOS the login is in the Keychain: a missing file says nothing there, and a
+    person who is signed in must not be told that no login was found."""
+    (home / ".claude" / ".credentials.json").unlink()
+    assert login_found({}, home, platform="linux") is False
+    assert login_found({}, home, platform="darwin") is None
+    report = machine_report({}, home)
+    assert report["login"] in (False, None) and report["federation"] is False
+    assert report["federation_missing"] == list(FEDERATION_ENV)
+    assert set(report) >= {"package", "command_line", "login_file", "install"}
 
 
 def test_without_the_sandbox_files_are_open_but_credentials_and_the_gate_are_not(tmp_path, home):
@@ -1033,6 +1172,15 @@ def test_what_the_agent_chose_stands_in_the_feed_as_a_quotation_and_secrets_are_
             "is not on (“preference”).",
         ),
         (
+            # No reason given (a model without fast mode gives none): the line says so,
+            # instead of leaving the person to guess whether their account refused it.
+            {"fast_mode_state": "off", "fast_mode_disabled_reason": None},
+            True,
+            "The scout works as a Claude agent on claude-fable-5-2; fast mode was asked for and "
+            "is not on (the agent's process gave no reason; not every model and not every "
+            "account has fast mode).",
+        ),
+        (
             {"fast_mode_state": "off"},
             False,
             "The scout works as a Claude agent on claude-fable-5-2.",
@@ -1203,7 +1351,8 @@ def test_a_turn_that_ends_without_a_report_is_counted_by_its_tokens_and_not_twic
     assert driver.conversations[0].closed
     (row,) = ledger(first)
     estimate = row["cost_usd"]
-    assert row["label"] == "scout.agent" and row["input_tokens"] == 10_000
+    # The row says of itself that it is a count from tokens, not the agent's own figure.
+    assert row["label"] == "scout.agent.unreported" and row["input_tokens"] == 10_000
     assert 0 < estimate < 0.75
 
     # Carried on: the process's totals include the turn that was killed (0.75) and the
@@ -1215,6 +1364,76 @@ def test_a_turn_that_ends_without_a_report_is_counted_by_its_tokens_and_not_twic
     (again,) = ledger(second)
     assert again["cost_usd"] == pytest.approx(1.0 - estimate)
     assert again["input_tokens"] == 0
+
+
+def test_the_count_of_an_unreported_turn_takes_each_messages_last_word_and_its_searches(
+    tmp_path, home
+):
+    """A real process reports a message several times while it is written, first with
+    almost no output counted.  The count of a turn that never reports must take the
+    last report of each message, and the web searches, which are billed apart."""
+    project = sdk_project(tmp_path)
+
+    def killed(agent: FakeAgent) -> None:
+        agent.use(input_tokens=1000, output_tokens=8, message="m1")
+        agent.use(input_tokens=1000, output_tokens=440, message="m1")
+        agent.web_search("warmup variance")
+        agent.web_search("label smoothing")
+        agent.use(input_tokens=2000, output_tokens=3, message="m2")
+        agent.use(input_tokens=2000, output_tokens=300, message="m2")
+        raise KeyboardInterrupt
+
+    ctx = sdk_context(project, FakeDriver(killed))
+    with pytest.raises(KeyboardInterrupt):
+        AgentSession(ctx, "scout").send("Go.")
+    (row,) = ledger(ctx)
+    assert row["label"] == "scout.agent.unreported"
+    assert (row["requests"], row["input_tokens"], row["output_tokens"]) == (2, 3000, 740)
+    assert row["web_searches"] == 2
+    from paper_orchestra.llm.base import Usage
+    from paper_orchestra.llm.pricing import estimate_cost_usd
+
+    counted = Usage(input_tokens=3000, output_tokens=740, requests=2, web_searches=2)
+    assert row["cost_usd"] == pytest.approx(
+        estimate_cost_usd(project.settings.agents.model, counted)
+    )
+
+
+def test_an_agent_interrupted_from_outside_is_asked_what_it_cost_before_it_is_ended(tmp_path, home):
+    """Ctrl-C and the app's Stop reach this process as an interrupt in the middle of a
+    turn.  Where the agent's process still answers, its own figure goes into the
+    ledger, not a count from tokens."""
+    project = sdk_project(tmp_path)
+
+    def interrupted(agent: FakeAgent) -> None:
+        agent.use(cost_usd=0.75, input_tokens=10_000, output_tokens=0)
+        raise KeyboardInterrupt
+
+    driver = FakeDriver(interrupted)
+    driver.reports_when_interrupted = True
+    ctx = sdk_context(project, driver)
+    with pytest.raises(KeyboardInterrupt):
+        AgentSession(ctx, "scout").send("Go.")
+    assert driver.interrupts == 1 and driver.conversations[0].closed
+    (row,) = ledger(ctx)
+    assert (row["label"], row["cost_usd"]) == ("scout.agent", 0.75)
+
+
+def test_an_agent_says_once_what_it_works_as_however_many_messages_it_is_sent(tmp_path, home):
+    """The agent's process says what it is at the start of every message.  It is one
+    agent that started once: a second start line reads like a restart that did not
+    happen (and a resumed session would say twice that it carries one on)."""
+    project = sdk_project(tmp_path)
+    driver = FakeDriver(lambda agent: agent.bash("ls") or "Done.")
+    session = AgentSession(sdk_context(project, driver), "scout")
+    session.send("Go.")
+    session.send("And the numbers?")
+    lines = activity(project)
+    assert [line for line in lines if "works as a Claude agent" in line] == [
+        "The scout works as a Claude agent on claude-fable-5-2, in fast mode."
+    ]
+    lines = transcript(project, "r1-research-scout")
+    assert len([line for line in lines if line["type"] == "started"]) == 1
 
 
 def test_the_agent_is_told_the_sum_it_must_not_pass(tmp_path, home):

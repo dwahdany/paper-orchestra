@@ -468,10 +468,12 @@ def test_a_worker_that_needs_a_model_is_told_apart_from_one_that_died_by_a_field
     # said stands once in the worker's log.
     assert len(project.events()) == events
     assert (project.root / WORKER_LOG).read_text().count("needs a model") == 1
-    # Any other kind of worker that ends with that code is not what this is about.
+    # A run says the same with the same code: where the project's agents have a shell,
+    # an agent carries the run out, and where the agents cannot start nothing was run.
     workers.start(project.root, "run", experiments=["E1"])
     assert workers.wait(project.root, timeout=60)
-    assert workers.status(project.root)["last_exit"]["reason"] is None
+    assert workers.status(project.root)["last_exit"]["reason"] == "needs_model"
+    assert len(project.events()) == events
 
 
 def test_an_engine_that_fails_before_it_records_anything_is_reported(tmp_path, project):

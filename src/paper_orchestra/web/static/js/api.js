@@ -125,6 +125,8 @@ export const api = {
   experiments: (pid) => request('GET', project(pid) + '/experiments'),
   experiment: (pid, eid) => request('GET', project(pid) + '/experiments/' + encodeURIComponent(eid)),
   putCode: (pid, eid, name, text) => request('PUT', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/code/' + pathOf(name), { text }),
+  /** Make the code the agent of a run left the experiment's code, as the person's edit. */
+  adoptCode: (pid, eid, run) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/runs/' + encodeURIComponent(run) + '/adopt-code'),
   approve: (pid, eid, body) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/approve', body || {}),
   run: (pid, eid) => request('POST', project(pid) + '/experiments/' + encodeURIComponent(eid) + '/run'),
   /** Take back the approval of an experiment that has not started, or cancel its run: the

@@ -164,7 +164,13 @@ function agentTraces(dir) {
   const runs = path.join(dir, 'experiments', 'E1', 'runs');
   fs.cpSync(path.join(runs, '1'), path.join(runs, '2'), { recursive: true });
   const record = JSON.parse(fs.readFileSync(path.join(runs, '2', 'run.json'), 'utf8'));
-  Object.assign(record, { number: 2, carried_out_by: 'agent', started: stamp(new Date(t0 + 30000)), finished: stamp(new Date(t0 + 48000)), seconds: 17.9, result: null });
+  /* ... and changed the code it was given: the record names no exit status, and the code as
+     the agent left it lies beside the approved code */
+  const approvedCode = fs.readFileSync(path.join(runs, '2', 'code', 'main.py'), 'utf8');
+  const changedCode = approvedCode + '\n# CHANGED-BY-THE-AGENT: the call that failed was corrected here.\n';
+  fs.mkdirSync(path.join(runs, '2', 'code-as-run'), { recursive: true });
+  fs.writeFileSync(path.join(runs, '2', 'code-as-run', 'main.py'), changedCode);
+  Object.assign(record, { number: 2, carried_out_by: 'agent', exit_code: null, model_access: true, code_as_run: { digest: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90', changed: ['main.py'], added: [], removed: [] }, started: stamp(new Date(t0 + 30000)), finished: stamp(new Date(t0 + 48000)), seconds: 17.9, result: null });
   fs.writeFileSync(path.join(runs, '2', 'run.json'), JSON.stringify(record, null, 2));
   const page = 'wiki/experiments/' + fs.readdirSync(path.join(dir, 'wiki', 'experiments')).find((name) => /^E1-/.test(name));
   const said = ['The experimenter works as a Claude agent on claude-haiku-5-5; fast mode was asked for and is not on (“preference”).', 'The experimenter ran “ls -la && cat main.py” in its shell.', 'The experimenter wrote main.py in its folder.', 'The experimenter ran “' + command + '” in its shell.', 'The experimenter ran “timeout 200 ./.venv/bin/python main.py; echo exit=$?; cat metrics.json” in its shell.'];
@@ -471,7 +477,23 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   const now = (await api('GET', project)).data.settings.agents;
   ok(JSON.stringify(now) === JSON.stringify({ runtime: 'sdk', model: 'claude-haiku-5-5', fast: false, ultracode: true, credential: 'federation', sandbox: true }), 'the server holds what the form said: ' + JSON.stringify(now));
   ok(/claude-haiku-5-5/.test(await text(page, '.agents-now')) && /federation/.test(await text(page, '.agents-now')) && /inside the sandbox/.test(await text(page, '.agents-now')) && !/fast mode/.test(await text(page, '.agents-now b')), 'and the sentence on the overview says it: ' + (await text(page, '.agents-now b')));
-  ok(/next phase/.test(await text(page, '.toast')), 'the toast says from when it holds: ' + (await text(page, '.toast')));
+  ok(/next phase/.test(await text(page, '.toast')) && /Claude agents with a shell/.test(await text(page, '.toast')), 'the toast says what changed and from when it holds: ' + (await text(page, '.toast')));
+  /* a change of one value says that value, not that the agents are now what they were already */
+  await page.click('[data-act="agents-open"]');
+  await page.waitForSelector('#ag-ultracode');
+  await page.uncheck('#ag-ultracode');
+  await page.click('.agents-form button[type=submit]');
+  await until(page, () => /helper agents off/i.test((document.querySelector('.toast') || {}).textContent || ''), null, 8000, 'the toast names the value that changed');
+  ok(!/are now Claude agents/.test(await text(page, '.toast')) && /next phase/.test(await text(page, '.toast')), 'and does not say that the runtime changed: ' + (await text(page, '.toast')));
+  await api('PATCH', project, { settings: { agents: { ultracode: true } } });
+  /* a value the group does not have is refused, not stored and ignored */
+  const bogus = await api('PATCH', project, { settings: { agents: { sandbx: false } } });
+  ok(bogus.status >= 400 && bogus.status < 500 && !('sandbx' in (await api('GET', project)).data.settings.agents), 'a misspelt value of the agents\' settings is refused: ' + bogus.status);
+  /* Setup says what this machine has of what agents with a shell need */
+  await open(page, '#/setup', '.setup [data-setup="agents"]');
+  const needs = await text(page, '.setup [data-setup="agents"]');
+  ok(/Claude Agent SDK/.test(needs) && /Your Claude Code login/.test(needs) && /Workload Identity Federation/.test(needs) && (await count(page, '.setup [data-setup="agents"] .doc-i')) === 3, 'Setup has the package, the login and the federation settings of agents with a shell: ' + needs.replace(/\s+/g, ' ').slice(0, 200));
+  await open(page, '#/p/' + pid + '/overview', '.ov-agents');
   /* the server's refusal is shown in the server's words, and the form keeps what was chosen */
   await page.click('[data-act="agents-open"]');
   await page.waitForSelector('#ag-runtime');
@@ -582,6 +604,20 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   ok(/Run 2/.test(await text(page, '.run.open .run-h')) && /by an agent/.test(await text(page, '.run.open .run-h .run-by')), 'the heading of the run says that an agent carried it out: ' + (await text(page, '.run.open .run-h')).replace(/\s+/g, ' ').slice(0, 120));
   ok(/An agent carried out this run/.test(await text(page, '.run.open .run-agent')), 'and a sentence says what that means: ' + (await text(page, '.run.open .run-agent')).slice(0, 100));
   ok((await text(page, '.run.open [data-log]')).includes('The experimenter ran') && (await text(page, '.run.open [data-log]')).includes(traces.command), 'its log is what the agent did and said');
+  /* the run names the code as the agent left it, not only the approved code, and no exit status */
+  ok(/changed the code it was given/.test(await text(page, '.run.open .run-code[data-code="changed"]')) && /main\.py/.test(await text(page, '.run.open .run-code')) && /not from the approved code/.test(await text(page, '.run.open .run-code')), 'the run says that the agent changed the code: ' + (await text(page, '.run.open .run-code')).replace(/\s+/g, ' ').slice(0, 160));
+  ok(!/exit \d/.test(await text(page, '.run.open .run-h')) && /Nobody measured an exit status/.test(await text(page, '.run.open .run-agent')), 'and names no exit status, because none was measured');
+  ok(/could call the Anthropic API/.test(await text(page, '.run.open [data-model-access]')) && /counted nowhere here/.test(await text(page, '.run.open [data-model-access]')), 'a run whose code could call the model API says that those calls are not counted');
+  const keptHref = await page.getAttribute('.run.open .run-code a.linkish', 'href');
+  const keptFile = await page.evaluate(async (href) => { const r = await fetch(href, { credentials: 'same-origin' }); return { status: r.status, text: await r.text() }; }, keptHref);
+  ok(keptFile.status === 200 && /CHANGED-BY-THE-AGENT/.test(keptFile.text), 'the changed file is a link to the code as the agent left it: ' + keptHref + ' ' + keptFile.status);
+  ok(/may have tried it in its own sandboxed folder/.test(await text(page, '.exp-code .sec-t')) && !/never executed/.test(await text(page, '.exp-code .sec-t')), 'the code of a project whose agents have a shell does not claim that it was never executed: ' + (await text(page, '.exp-code .sec-t')));
+  ok(!/CHANGED-BY-THE-AGENT/.test(await text(page, '.exp-code')), 'the Code section still shows the approved code');
+  await page.click('.run.open [data-act="adopt-code"]');
+  await until(page, () => /is now the code of E1/.test((document.querySelector('.toast') || {}).textContent || ''), null, 8000, 'the person makes the agent\'s code the experiment\'s');
+  const adopted = (await api('GET', '/api/projects/' + pid + '/experiments/E1')).data;
+  ok(/CHANGED-BY-THE-AGENT/.test(((adopted.code.files || []).find((f) => f.name === 'main.py') || {}).text || '') && ((adopted.code.files || []).find((f) => f.name === 'main.py') || {}).author === 'human', 'the experiment\'s code is then the agent\'s, as the person\'s edit: ' + JSON.stringify((adopted.code.files || []).map((f) => [f.name, f.author])));
+  await until(page, () => /CHANGED-BY-THE-AGENT/.test((document.querySelector('.exp-code') || {}).textContent || ''), null, 8000, 'the Code section shows the adopted code');
   ok((await count(page, '.run.open table.metrics tr')) >= 1 && /as the agent's work left it/.test(await text(page, '.run.open .res-grid .sec-h')), 'its metrics are shown as what the agent\'s work left: ' + (await text(page, '.run.open .res-grid .sec-h')));
   const first = page.locator('.exp-runs .run:not(.open) .run-h');
   ok((await first.count()) === 1 && !/by an agent/.test(await first.textContent()), 'the run before it, which the runner made, does not say so');
@@ -624,6 +660,19 @@ CHECKS.shell = async ({ browser, page, shell }) => {
     await phone.selectOption('#opt-agent-runtime', 'sdk');
     await phone.waitForSelector('#opt-agent-model');
     ok(!(await phone.evaluate(NARROW)).length && !(await phone.evaluate(SMALL)).length, width + ' the composer\'s fields about the agents on a phone: ' + (await phone.evaluate(NARROW)).concat(await phone.evaluate(SMALL)).join('; '));
+    /* the new-project page itself: no piece of text is squeezed to a letter's width (the hint
+       beside "Add files" was, and the route under the form broke its words in the middle) */
+    await open(phone, '#/start', '.composer-bar');
+    const squeezed = await phone.evaluate(() => { const out = [];
+      document.querySelectorAll('.composer-bar *, .start-est, .start-lede, .smap-route .smap-name, .smap-route .smap-hint').forEach((el) => { const r = el.getBoundingClientRect(), words = (el.textContent || '').trim();
+        if (!r.width || !words || el.children.length) return;
+        const longest = Math.max.apply(null, words.split(/\s+/).map((w) => w.length)), font = parseFloat(getComputedStyle(el).fontSize);
+        /* narrower than its longest word needs, or many times taller than its width */
+        if (r.width < Math.min(longest, 12) * font * 0.45 || r.height > 6 * Math.max(r.width, 1)) out.push((el.className || el.tagName) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' "' + words.slice(0, 24) + '"'); });
+      const names = Array.from(document.querySelectorAll('.smap-route .smap-name')).filter((el) => el.getBoundingClientRect().height > parseFloat(getComputedStyle(el).fontSize) * 2.2).map((el) => el.textContent);
+      return { out, names, wide: document.documentElement.scrollWidth > document.documentElement.clientWidth }; });
+    ok(!squeezed.out.length && !squeezed.names.length && !squeezed.wide, width + ' the new-project page on a phone squeezes no text: ' + JSON.stringify(squeezed));
+    await shot(phone, 'start-phone-' + width);
     await phone.evaluate(() => { localStorage.removeItem('po-composer'); });
     await open(phone, '#/p/' + pid + '/experiments/E1', '.exp-runs .run');
     await phone.waitForSelector('.run.open .run-agent');

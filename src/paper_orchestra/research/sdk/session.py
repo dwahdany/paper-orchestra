@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import shutil
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -65,7 +66,12 @@ from paper_orchestra.research.sdk.driver import (
     Used,
     bare_name,
 )
-from paper_orchestra.research.sdk.guard import FEDERATION_ENV, Guard, agent_env
+from paper_orchestra.research.sdk.guard import (
+    FEDERATION_ENV,
+    Guard,
+    agent_env,
+    claude_config_dir,
+)
 
 __all__ = [
     "AGENTS_DIR",
@@ -75,6 +81,9 @@ __all__ = [
     "AgentRuntime",
     "AgentSession",
     "describe_tool",
+    "login_file",
+    "login_found",
+    "machine_report",
     "memory_tool",
     "tool_parts",
 ]
@@ -98,8 +107,17 @@ HELPER_TOOLS: tuple[str, ...] = ("Agent", "Task", "Workflow")
 #: Seconds an agent that was asked to stop is given to end its turn before its process
 #: is ended for it.
 STOP_GRACE_SECONDS = 30.0
+#: Seconds an agent whose turn was interrupted from outside (Ctrl-C, the app's Stop) is
+#: given to say what its session cost.  Well below the time the app waits before it
+#: kills a worker that was asked to stop.
+INTERRUPT_REPORT_SECONDS = 5.0
 #: What a ledger row of an SDK agent is labelled, after its role: ``scout.agent``.
 LABEL_SUFFIX = ".agent"
+#: What is added to that label for spend the agent's process never reported, because it
+#: was stopped or killed first: ``scout.agent.unreported``.  Such a row is counted from
+#: the tokens the turn's messages named, at the list price, and is a lower bound (fast
+#: mode and helper agents cost more than that).
+UNREPORTED_SUFFIX = ".unreported"
 
 _USAGE_NAMES = (
     "input_tokens",
@@ -111,6 +129,10 @@ _USAGE_NAMES = (
 
 class AgentFailed(RuntimeError):
     """The agent's process reported an error instead of an answer."""
+
+    #: Its message is the whole of it (what the agent's process said): whoever logs it
+    #: adds no traceback.
+    plain = True
 
 
 class _Unresponsive(Exception):
@@ -249,6 +271,47 @@ def tool_parts(use: ToolUse, folder: Path, *, refused: bool = False) -> dict[str
     return parts
 
 
+def login_file(environ: Mapping[str, str], home: Path) -> Path:
+    """The file Claude Code keeps the person's login in, where it keeps it in a file:
+    in its configuration directory, which ``CLAUDE_CONFIG_DIR`` can name."""
+    return claude_config_dir(environ, home) / ".credentials.json"
+
+
+def login_found(environ: Mapping[str, str], home: Path, platform: str | None = None) -> bool | None:
+    """Whether there is a Claude Code login on this machine: ``True`` when its file is
+    there, ``False`` when it is not, and ``None`` where that cannot be told from a file
+    (on macOS the login is in the Keychain, and the first agent's start decides)."""
+    if login_file(environ, home).is_file():
+        return True
+    return None if (platform or sys.platform) == "darwin" else False
+
+
+def machine_report(
+    environ: Mapping[str, str] | None = None, home: Path | None = None
+) -> dict[str, Any]:
+    """What this machine has of what SDK agents need, for ``paper-orchestra doctor`` and
+    Setup in the app: the package, a command line, and each kind of credential.
+    Nothing is imported and nothing contacted; no value of a setting is in it."""
+    from paper_orchestra.research.sdk.claude import INSTALL, availability
+
+    environ = os.environ if environ is None else environ
+    home = home or Path.home()
+    found = availability()
+    missing = [name for name in FEDERATION_ENV if not environ.get(name)]
+    token = environ.get("ANTHROPIC_IDENTITY_TOKEN_FILE") or ""
+    return {
+        "package": found["package"],
+        "command_line": found["command_line"],
+        "install": INSTALL,
+        # true, false, or null where a file does not tell (macOS)
+        "login": login_found(environ, home),
+        "login_file": str(login_file(environ, home)),
+        "federation": not missing and Path(token).is_file(),
+        "federation_missing": missing,
+        "federation_token_file": bool(token) and Path(token).is_file(),
+    }
+
+
 class AgentRuntime:
     """The ``sdk`` runtime of one project: how its agents are started.
 
@@ -299,7 +362,7 @@ class AgentRuntime:
             return None
         # (A token in this process's environment is no login for the agents: like every
         # credential here it is kept from the agent's process.)
-        if not (home / ".claude" / ".credentials.json").is_file():
+        if login_found(environ, home) is False:
             return (
                 "no Claude Code login was found on this machine",
                 "run `claude` once and sign in, or set settings.agents.credential to "
@@ -426,7 +489,11 @@ class AgentSession:
         self._paid_total = 0.0
         self._last = ""
         self._turn = Usage()
-        self._seen: set[str] = set()
+        #: What each message of the turn in flight has used, as it was last reported.
+        self._by_message: dict[str, Usage] = {}
+        self._searches = 0
+        #: Whether this conversation has said what it works as (:meth:`_announce`).
+        self._announced = False
         self._acted = False
         #: Set when the agent was asked to end its turn, and why.
         self._asked_at: float | None = None
@@ -513,6 +580,7 @@ class AgentSession:
         paid = record.get("model_usage") if resume else None
         self._paid = {str(k): dict(v) for k, v in paid.items()} if isinstance(paid, dict) else {}
         self._paid_total = float(record.get("cost_usd") or 0.0) if resume else 0.0
+        self._announced = False
         self._conversation = self.runtime.driver.open(self._options(resume))
         return self._conversation
 
@@ -556,6 +624,11 @@ class AgentSession:
             # On file from the start: a session that is killed can still be carried on.
             self._sdk_session = str(data["session_id"])
             self._save_record()
+        if self._announced:
+            # The agent's process says this again for every message it is sent.  It is
+            # one agent that started once: a second line would read like a restart.
+            return
+        self._announced = True
         model = agents.named(data.get("model") or self._model, 60)
         state = str(data.get("fast_mode_state") or "off")
         said = f"The {self.role} works as a Claude agent on {model}"
@@ -565,7 +638,14 @@ class AgentSession:
             said += ", in fast mode."
         else:
             reason = data.get("fast_mode_disabled_reason")
-            why = f" ({agents.said(reason, 80)})" if reason else ""
+            # The process does not always give a reason (it gives none for a model
+            # that has no fast mode): the line then says that it gave none.
+            why = (
+                f" ({agents.said(reason, 80)})"
+                if reason
+                else " (the agent's process gave no reason; not every model and not "
+                "every account has fast mode)"
+            )
             said += f"; fast mode was asked for and is not on{why}."
         if self._resumed:
             said += " It carries on the session that was interrupted."
@@ -616,6 +696,10 @@ class AgentSession:
             self._count(event)
         elif isinstance(event, ToolUse):
             self._acted = True
+            if event.name == "WebSearch":
+                # Billed apart from the tokens; counted for a turn that never reports.
+                self._searches += 1
+                self._turn.web_searches = self._searches
             self._log("tool", id=event.id, name=event.name, input=event.input, sub=event.sub)
             if not self._ending():
                 described = self._described(event)
@@ -669,19 +753,22 @@ class AgentSession:
         )
 
     def _count(self, event: Used) -> None:
-        """Add one model request to what the turn in flight has used, and let the budget
-        see it.  This is an estimate from tokens, for ending a long turn in time; what
-        goes into the ledger is the agent's own figure, when the turn has ended."""
-        if event.message_id in self._seen:
-            return
-        self._seen.add(event.message_id)
+        """Take note of what one model request used, and let the budget see the turn so
+        far.  This is an estimate from tokens, for ending a long turn in time and for a
+        turn that never reports; what goes into the ledger otherwise is the agent's
+        own figure, when the turn has ended.
+
+        The agent's process reports a message more than once while it is written,
+        the first time with almost no output counted: the last report stands.
+        """
         usage = event.usage
-        self._turn.add(
-            Usage(
-                **{name: agents._whole(usage.get(name)) for name in _USAGE_NAMES},
-                requests=1,
-            )
+        self._by_message[event.message_id] = Usage(
+            **{name: agents._whole(usage.get(name)) for name in _USAGE_NAMES}, requests=1
         )
+        turn = Usage(web_searches=self._searches)
+        for used in self._by_message.values():
+            turn.add(used)
+        self._turn = turn
         self.ctx.used(self._model, self._turn)
 
     def _account(self, turn: Turn) -> None:
@@ -729,6 +816,8 @@ class AgentSession:
                 self._paid_total = float(turn.cost_usd)
         # What the ledger has of this turn is the process's figure now, not an estimate.
         self._turn = Usage()
+        self._by_message = {}
+        self._searches = 0
         if turn.session_id:
             self._sdk_session = turn.session_id
         self._save_record()
@@ -779,32 +868,68 @@ class AgentSession:
             self.close()
             self._account_unreported()
             return Turn(ended="closed")
+        except KeyboardInterrupt:
+            # Ctrl-C, or the app's Stop: the agent is asked what its session cost before
+            # its process is ended.  What it wrote on the board stays.
+            turn = self._last_report(conversation)
+            self.close()
+            if turn is None:
+                self._account_unreported()
+            else:
+                self._account(turn)
+            raise
         except BaseException:
-            # A failure of the agent's process, or Ctrl-C in this one: the process is
-            # ended; what the agent wrote on the board stays.
+            # A failure of the agent's process: it is ended, and what it used is counted
+            # from what its messages said.
             self.close()
             self._account_unreported()
             raise
 
+    def _last_report(self, conversation: AgentConversation) -> Turn | None:
+        """How the turn that was interrupted from outside ended, when the agent's process
+        still says so within :data:`INTERRUPT_REPORT_SECONDS`; ``None`` when it does not
+        (the interrupt reached it too, and it is gone) or the person interrupts again."""
+        finish = getattr(conversation, "finish", None)
+        if finish is None:
+            return None
+
+        def follow(event: Any) -> None:
+            if isinstance(event, Used):
+                self._count(event)
+
+        try:
+            conversation.interrupt()
+            turn = finish(follow, INTERRUPT_REPORT_SECONDS)
+        except BaseException:
+            return None
+        return turn if isinstance(turn, Turn) and turn.cost_usd is not None else None
+
     def _account_unreported(self) -> None:
         """Count a turn whose process ended without saying what it cost (it was killed,
-        or it failed): by the tokens its messages reported, at the price per token.
+        or it failed): by the tokens its messages reported and the web searches it
+        made, at the list price.
 
-        The estimate goes where the process's own figures go, and is added to what
-        the session counts as reported.  When the session is carried on and its
-        process then reports totals that include this turn, only what goes beyond
-        the estimate is new: nothing is counted twice.
+        The row says of itself that it is such a count (:data:`UNREPORTED_SUFFIX`):
+        it is a lower bound, since the list price knows nothing of fast mode or of
+        helper agents, and whoever shows the spend says so.  The amount is added to
+        what the session counts as in the ledger.  When the session is carried on
+        and its process then reports totals that include this turn, only what goes
+        beyond the estimate is new: nothing is counted twice.
         """
         if not any(self._turn.to_dict().values()):
             return
         estimate = estimate_cost_usd(self._model, self._turn) or 0.0
-        self.ctx.harness.usage.record(self._label, self._model, self._turn, cost_usd=estimate)
+        self.ctx.harness.usage.record(
+            f"{self._label}{UNREPORTED_SUFFIX}", self._model, self._turn, cost_usd=estimate
+        )
         row = self._paid.setdefault(self._model, {})
-        for name in _USAGE_NAMES:
+        for name in (*_USAGE_NAMES, "web_searches"):
             row[name] = float(row.get(name) or 0) + getattr(self._turn, name)
         row["cost_usd"] = float(row.get("cost_usd") or 0.0) + estimate
         self._paid_total += estimate
         self._turn = Usage()
+        self._by_message = {}
+        self._searches = 0
         self._save_record()
 
     def _save_record(self) -> None:
@@ -832,7 +957,8 @@ class AgentSession:
         self.ctx.guard()
         text = self._as_text(parts)
         self._turn = Usage()
-        self._seen = set()
+        self._by_message = {}
+        self._searches = 0
         self._asked_at = None
         self._acted = False
         try:

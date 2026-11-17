@@ -28,7 +28,8 @@ REDACTED = "[redacted]"
 WITHOUT_CREDENTIALS = (
     "The demonstration and the app work without credentials: `paper-orchestra research "
     "demo` builds a project to look at and `paper-orchestra ui` opens it. Running "
-    "approved experiments needs none either; the agents need a model."
+    "approved experiments needs none either, unless the project's agents are Claude "
+    "Agent SDK agents (an agent then carries each run out); the agents need a model."
 )
 
 _PACKAGES = (
@@ -223,11 +224,79 @@ def collect(model: str | None = None) -> dict[str, Any]:
         "compute": {name: _compute_report(name) for name in ("local", "modal")},
         "semantic_scholar_api_key": bool(environ.get(S2_KEY_ENV)),
         "memory": _memory_report(environ),
+        "agents": _agents_report(environ),
         "packages": _package_versions(),
         "ok": bool(provider["usable"]),
         "without_credentials": WITHOUT_CREDENTIALS,
     }
     return scrub(report, secret_values(environ))
+
+
+def _agents_report(environ: Mapping[str, str]) -> dict[str, Any]:
+    """What this machine has of what a project whose agents are Claude Agent SDK agents
+    (``settings.agents.runtime: sdk``) needs.  Informational: it never makes the report
+    not ``ok``, and the package itself is not imported."""
+    try:
+        from paper_orchestra.research.sdk.session import machine_report
+
+        return machine_report(environ)
+    except Exception as exc:  # the report must come out whatever is wrong here
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _agents_rows(agents: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """``(check, status, details)`` for the table: the package and its command line, and
+    each of the two credentials an sdk project can choose."""
+    if agents.get("error"):
+        return [("agents: sdk runtime (optional)", "unavailable", str(agents["error"]))]
+    rows = []
+    if not agents.get("package"):
+        rows.append(
+            (
+                "agents: sdk runtime (optional)",
+                "not installed",
+                f"the package claude-agent-sdk is missing: {agents.get('install')}",
+            )
+        )
+    elif not agents.get("command_line"):
+        rows.append(
+            (
+                "agents: sdk runtime (optional)",
+                "missing",
+                "claude-agent-sdk is installed, but the Claude Code command line the "
+                "agents run in was not found",
+            )
+        )
+    else:
+        rows.append(
+            ("agents: sdk runtime (optional)", "ok", "claude-agent-sdk and its command line")
+        )
+    login = agents.get("login")
+    rows.append(
+        (
+            "agents: credential login",
+            "ok" if login else "not configured" if login is False else "unknown",
+            f"a Claude Code login is in {agents.get('login_file')}"
+            if login
+            else "no Claude Code login was found: run `claude` once and sign in"
+            if login is False
+            else "on this system the login is not kept in a file; the first agent's start "
+            "shows whether you are signed in",
+        )
+    )
+    missing = agents.get("federation_missing") or []
+    rows.append(
+        (
+            "agents: credential federation",
+            "ok" if agents.get("federation") else "not configured",
+            "the Workload Identity Federation settings are set and the token file is there"
+            if agents.get("federation")
+            else f"not set: {', '.join(missing)}"
+            if missing
+            else "the file ANTHROPIC_IDENTITY_TOKEN_FILE names is not there",
+        )
+    )
+    return rows
 
 
 def _details(info: Mapping[str, Any], skip: Sequence[str] = ()) -> str:
@@ -294,6 +363,10 @@ def render(report: Mapping[str, Any], console: Console) -> None:
         )
     else:
         row("compute: modal (optional)", "not configured", " ".join(modal["problems"]))
+    table.add_section()
+
+    for check, status, details in _agents_rows(report.get("agents") or {}):
+        row(check, status, details)
     table.add_section()
 
     if report["semantic_scholar_api_key"]:

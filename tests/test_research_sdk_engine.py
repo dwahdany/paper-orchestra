@@ -47,7 +47,12 @@ def home(tmp_path, monkeypatch) -> Path:
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / ".credentials.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
-    for name in (*FEDERATION_ENV, AGENT_RUNTIME_ENV, "PAPER_ORCHESTRA_JOB_MODEL_ACCESS"):
+    for name in (
+        *FEDERATION_ENV,
+        AGENT_RUNTIME_ENV,
+        "PAPER_ORCHESTRA_JOB_MODEL_ACCESS",
+        "CLAUDE_CONFIG_DIR",
+    ):
         monkeypatch.delenv(name, raising=False)
     return home
 
@@ -533,7 +538,11 @@ def test_ctrl_c_ends_the_agents_process_and_leaves_the_phase_interrupted(project
     assert all(conversation.closed for conversation in engine.driver.conversations)
     # The turn that was killed is counted by its tokens: spend never goes unseen.
     labels = [row["label"] for row in usage(project)["by_label"]]
-    assert labels == ["intake.agent", "scout.agent"]
+    assert labels == ["intake.agent", "scout.agent.unreported"]
+    # ... and whoever shows the spend can say that this part of it is a lower bound.
+    assert usage(project)["unreported_usd"] > 0
+    status = runner.invoke(cli.app, ["research", "status", str(project.root)])
+    assert "The model spend is at least that" in status.output
     # The sources the scout had recorded by then are on record as produced.
     assert len(state["phases"][-1]["produced"]) == 2
 
@@ -666,6 +675,181 @@ def test_an_approved_experiment_is_carried_out_by_an_agent_in_a_folder_of_its_ow
     ]
     assert engine.driver.conversations[-1].closed
     assert "experimenter.agent" in [row["label"] for row in usage(project)["by_label"]]
+
+
+CHANGED_CODE = GOOD_CODE + "\n# The call that failed was corrected here.\n"
+
+
+def test_the_record_of_an_agents_run_names_the_code_as_the_agent_left_it(project, team, backend):
+    """The agent starts from the approved code and may change it.  The record must not
+    name the approved code as what produced the metrics, nor an exit status and a
+    command that nobody observed."""
+    to_approved(project, team, backend)
+
+    def repairs(agent: FakeAgent) -> None:
+        agent.write("main.py", CHANGED_CODE)
+        agent.write("helper.py", "SEEDS = 1\n")
+        agent.write("notes.txt", "not code\n")
+        (agent.cwd / "venv" / "lib").mkdir(parents=True)
+        (agent.cwd / "venv" / "lib" / "site.py").write_text("x = 1\n")
+        (agent.cwd / ".hidden.py").write_text("x = 1\n")
+        (agent.cwd / "link.py").symlink_to(project.root / "project.json")
+
+    team.during["experimenter"] = repairs
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert record["status"] == "succeeded"
+    run_dir = project.root / "experiments" / "E1" / "runs" / "1"
+    # The approved code is kept as it was, and its digest is still the approval's.
+    assert (run_dir / "code" / "main.py").read_text() == GOOD_CODE
+    assert record["code_digest"] == experiments.code_digest(project, "E1")
+    # Beside it lies the code as the agent left it: the approved files and the scripts
+    # it added, nothing hidden, no environment, no link, nothing that is not code.
+    kept = run_dir / "code-as-run"
+    assert sorted(p.relative_to(kept).as_posix() for p in kept.rglob("*") if p.is_file()) == [
+        "helper.py",
+        "main.py",
+    ]
+    assert (kept / "main.py").read_text() == CHANGED_CODE
+    as_run = record["code_as_run"]
+    assert (as_run["changed"], as_run["added"], as_run["removed"]) == (
+        ["main.py"],
+        ["helper.py"],
+        [],
+    )
+    assert as_run["digest"] != record["code_digest"]
+    assert any("changed main.py, added helper.py" in note for note in record["notes"])
+    # No exit status was measured, and the record names none.
+    assert record["exit_code"] is None
+    assert json.loads((run_dir / "run.json").read_text())["code_as_run"] == as_run
+    body = project.page("E1-run1").body
+    assert "| Exit status | not measured: an agent carried the run out" in body
+    assert "| Command of the plan | python main.py (the agent's log says what ran) |" in body
+    assert f"sha256 `{as_run['digest'][:12]}` as the agent left it: it changed main.py" in body
+    assert f"(approved: sha256 `{record['code_digest'][:12]}`)" in body
+    assert "the model of the agent that carried it out counts as model spend" in body
+
+    # The experiment's own code is still the approved one.  The person can make the
+    # agent's code theirs; it is then their edit, and the old approval does not cover it.
+    assert experiments.code_files(project, "E1")["main.py"] == GOOD_CODE
+    adopted = experiments.adopt_run_code(project, "E1")
+    assert (adopted["run"], adopted["files"]) == (1, ["helper.py", "main.py"])
+    assert experiments.code_files(project, "E1")["main.py"] == CHANGED_CODE
+    assert experiments.code_authors(project, "E1")["main.py"]["author"] == "human"
+    assert experiments.code_digest(project, "E1") == as_run["digest"]
+    with pytest.raises(experiments.ProjectError, match="nothing to adopt"):
+        experiments.adopt_run_code(project, "E1", 7)
+
+
+def test_an_agent_that_leaves_the_code_alone_ran_what_was_approved(project, team, backend):
+    to_approved(project, team, backend)
+    record = make_engine(project, team, backend).run_experiment("E1")
+    as_run = record["code_as_run"]
+    assert (as_run["changed"], as_run["added"], as_run["removed"]) == ([], [], [])
+    assert as_run["digest"] == record["code_digest"]
+    assert not experiments.run_code_changed(record)
+    assert "as approved: the agent left it as it was" in project.page("E1-run1").body
+    assert not any("changed" in note for note in record["notes"])
+    with pytest.raises(experiments.ProjectError, match="nothing to adopt"):
+        experiments.adopt_run_code(project, "E1")
+
+
+def test_a_budget_that_runs_out_during_a_run_names_the_agent_that_carried_it_out(
+    project, team, backend
+):
+    """`research run` starts a run outside the phases: the agent at work is the one that
+    carries the experiment out, not the agent of whatever phase ran last."""
+    to_approved(project, team, backend)
+    spent = read_state(project)["spent"]["model_usd"]
+    project.settings.update({"limits": {"model_usd": spent + 0.3}})
+    project.save_settings()
+
+    def expensive(agent: FakeAgent) -> None:
+        for _ in range(40):
+            agent.use(cost_usd=0.25, input_tokens=20_000, output_tokens=2_000)
+
+    team.during["experimenter"] = expensive
+    with pytest.raises(EngineError) as stopped:
+        make_engine(project, team, backend).run_experiment("E1")
+    said = str(stopped.value)
+    assert "in the middle of the work of the agent that carries out E1" in said
+    assert "E1 is in the queue again and is run when the work goes on" in said
+    assert "designer" not in said and "the phase then resumes" not in said
+    assert events(project, "budget.warning")[-1]["summary"] == said
+    assert project.page("E1").state == "queued"
+
+
+def test_a_failed_run_on_a_remote_backend_does_not_say_that_an_agent_repairs_it(
+    project, team, backend
+):
+    """Under sdk nobody repairs afterwards.  Why is said of the run that failed: an agent
+    worked on it and repaired as it went, or it ran where no agent works."""
+    to_approved(project, team, backend)
+
+    class Remote(FakeBackend):
+        name = "modal"
+
+    remote = Remote()
+    experiments.withdraw(project, "E1")
+    experiments.write_code(project, "E1", {"main.py": GOOD_CODE + "\n# BUG\n"}, author="human")
+    experiments.approve(project, "E1", backend="modal", backends={"modal": remote})
+    engine = Engine(
+        project,
+        compute=remote,
+        client_for=no_classic_model,
+        scholar=make_scholar(),
+        driver=FakeDriver(team),
+    )
+    record = engine.run_experiment("E1")
+    assert (record["status"], record["error_kind"], record["backend"]) == (
+        "failed",
+        "exit",
+        "modal",
+    )
+    assert team.calls.count("experimenter") == 0 and record["exit_code"] == 1
+    (note,) = [note for note in record["notes"] if "not repaired" in note]
+    assert "this run was on the modal backend, where no agent works" in note
+    assert "repairs its code itself" not in note
+
+
+def test_a_run_whose_code_can_call_the_model_api_says_that_those_calls_are_not_counted(
+    project, team, backend, monkeypatch, tmp_path
+):
+    to_approved(project, team, backend)
+    token = tmp_path / "identity.jwt"
+    token.write_text("jwt", encoding="utf-8")
+    for name in FEDERATION_ENV:
+        monkeypatch.setenv(name, "id")
+    monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN_FILE", str(token))
+    monkeypatch.setenv("PAPER_ORCHESTRA_JOB_MODEL_ACCESS", "1")
+    experiments.withdraw(project, "E1")
+    approve(project, "E1", backend, network=True)
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert record["status"] == "succeeded" and record["model_access"] is True
+    body = project.page("E1-run1").body
+    assert "its code could call the Anthropic API" in body and "counted nowhere here" in body
+    assert "| Estimated cost | nothing is billed |" not in body
+
+
+def test_a_run_without_model_access_does_not_say_so(project, team, backend):
+    to_approved(project, team, backend)
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert "model_access" not in record
+    assert "Anthropic API" not in project.page("E1-run1").body
+
+
+def test_research_run_exits_as_advance_does_when_the_agents_cannot_start(
+    project, team, backend, home
+):
+    """Under sdk a run needs an agent.  `research run` (which the app starts on approval)
+    says so with the exit code `research advance` uses, not as an error of the project."""
+    to_approved(project, team, backend)
+    (home / ".claude" / ".credentials.json").unlink()
+    ran = runner.invoke(cli.app, ["research", "run", str(project.root), "E1"])
+    assert ran.exit_code == cli.NEEDS_A_MODEL, ran.output
+    assert "Carrying out E1 needs a model" in ran.output and "Error:" not in ran.output
+    advanced = runner.invoke(cli.app, ["research", "advance", str(project.root)])
+    assert advanced.exit_code == cli.NEEDS_A_MODEL, advanced.output
+    assert project.page("E1").state == "approved"
 
 
 def test_an_agent_that_leaves_no_metrics_has_failed_and_the_run_says_so(project, team, backend):

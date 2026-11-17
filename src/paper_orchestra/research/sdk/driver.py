@@ -201,6 +201,11 @@ class AgentConversation(Protocol):
     def interrupt(self) -> None:
         """Ask the agent to stop what it is doing.  Safe from any thread, and twice."""
 
+    def finish(self, sink: Sink, timeout: float) -> Turn | None:
+        """After a :meth:`send` that was broken off (Ctrl-C): follow the turn that is
+        still in flight for at most ``timeout`` seconds and return how it ended, or
+        ``None`` when the agent does not say in that time."""
+
     def close(self) -> None:
         """End the agent's process, whatever it is doing."""
 

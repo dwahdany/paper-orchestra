@@ -291,8 +291,16 @@ export const setupView = {
       ${item(local.pdflatex ? 'ok' : 'optional', 'LaTeX', local.pdflatex || '', local.pdflatex ? 'A paper can be compiled on this machine.' : 'pdflatex was not found. Only needed for the optional paper step, and Modal can compile instead.', '')}</section>`;
     const lit = html`<section class="doc-g"><h2>Literature</h2>
       ${item(d.semantic_scholar_api_key ? 'ok' : 'warn', 'Semantic Scholar', d.semantic_scholar_api_key ? 'API key found' : 'no API key', d.semantic_scholar_api_key ? 'Papers are verified at the rate your key allows.' : 'Papers are still verified, at the slow rate of the public interface. A key makes the research phase faster.', d.semantic_scholar_api_key ? '' : 'export SEMANTIC_SCHOLAR_API_KEY=…')}</section>`;
+    /* What agents with a shell (`settings.agents.runtime: sdk`) need on this machine: the
+       package and its command line, and one of the two credentials a project can choose. */
+    const ag = d.agents || null;
+    const agentsSec = !ag ? '' : html`<section class="doc-g" data-setup="agents"><h2>Agents with a shell <span class="quiet">for projects whose agents are Claude Agent SDK agents</span></h2>
+      ${ag.error ? item('optional', 'Claude Agent SDK', '', 'This could not be checked: ' + ag.error, '')
+        : html`${item(ag.package && ag.command_line ? 'ok' : 'optional', 'Claude Agent SDK', ag.package ? 'package installed' : 'package not installed', ag.package && ag.command_line ? 'Agents with a shell can be started. Which model they use, and whose account, is set per project: on its overview under "How the agents work".' : ag.package ? 'The package is installed, but the Claude Code command line the agents run in was not found.' : 'Only needed for projects whose agents are Claude agents with a shell.', ag.package ? '' : "uv sync --extra agents")}
+          ${item(ag.login ? 'ok' : 'optional', 'Your Claude Code login', ag.login ? 'found' : ag.login === false ? 'not found' : 'not kept in a file here', ag.login ? 'Projects set to the credential "login" work on your own Claude account; fast mode works there.' : ag.login === false ? 'Projects set to the credential "login" cannot start their agents until you have signed in.' : 'On this system the login is not kept in a file; the first agent\'s start shows whether you are signed in.', ag.login === false ? 'claude' : '')}
+          ${item(ag.federation ? 'ok' : 'optional', 'Workload Identity Federation', ag.federation ? 'settings found' : 'not set up', ag.federation ? 'Projects set to the credential "federation" work on the worker\'s account.' : (ag.federation_missing || []).length ? 'Not set for this server: ' + ag.federation_missing.join(', ') + '. Only needed for projects set to the credential "federation".' : 'The file that ANTHROPIC_IDENTITY_TOKEN_FILE names is not there.', '')}`}</section>`;
     const pk = d.packages || {};
-    setHTML(root, html`<div class="setup"><div class="setup-wrap">${head}${models}${compute}${lit}
+    setHTML(root, html`<div class="setup"><div class="setup-wrap">${head}${models}${agentsSec}${compute}${lit}
       <p class="quiet setup-foot">Checked ${ago(new Date(doc.at).toISOString())} · PaperOrchestra ${d.version || ''} · Python ${d.python || ''}${app.ui.health && app.ui.health.workspace ? html` · workspace <code>${app.ui.health.workspace}</code>` : ''} · server at ${location.host}
         ${Object.keys(pk).length ? html`<br>Packages: ${Object.keys(pk).filter((k) => pk[k]).map((k) => k + ' ' + pk[k]).join(', ')}` : ''}</p></div></div>`);
   },

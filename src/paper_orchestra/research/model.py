@@ -1447,6 +1447,11 @@ AGENT_CREDENTIALS: tuple[str, ...] = ("login", "federation")
 AGENT_RUNTIME_ENV = "PAPER_ORCHESTRA_AGENT_RUNTIME"
 
 
+#: What the name of a model looks like: letters, digits and the few marks model names
+#: and their regional or versioned forms use.
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}\Z")
+
+
 @dataclass
 class AgentSettings(_Section):
     """How the project's agents are run (``settings.agents``).
@@ -1473,8 +1478,12 @@ class AgentSettings(_Section):
             wrong["runtime"] = (
                 f"is {self.runtime!r}; it must be one of: {', '.join(AGENT_RUNTIMES)}"
             )
-        if not isinstance(self.model, str) or not self.model.strip():
-            wrong["model"] = f"is {self.model!r}; it must be the name of a model"
+        if not isinstance(self.model, str) or not _MODEL_NAME.match(self.model):
+            # The name goes to the agents' command line as it stands: a name, nothing
+            # with spaces or punctuation of a shell in it.
+            wrong["model"] = (
+                f"is {self.model!r}; it must be the name of a Claude model, such as {DEFAULT_MODEL}"
+            )
         for name in ("fast", "ultracode", "sandbox"):
             value = getattr(self, name)
             if not isinstance(value, bool):
@@ -1738,6 +1747,17 @@ class ProjectSettings:
         """
         if not isinstance(changes, Mapping):
             raise ProjectError(f"settings must be an object, not {changes!r}")
+        agents = changes.get("agents")
+        if isinstance(agents, Mapping):
+            # A misspelt name here would be stored and silently do nothing, and one of
+            # these values is the sandbox.  (A file that holds a name this version does
+            # not know is still read: that is a newer version's value, kept as it is.)
+            unknown = sorted(str(key) for key in agents if key not in AgentSettings.names())
+            if unknown:
+                raise ProjectError(
+                    f"settings.agents has no value named {', '.join(unknown)}; it has: "
+                    f"{', '.join(AgentSettings.names())}."
+                )
         merged = self.to_dict()
         for key, value in changes.items():
             if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
