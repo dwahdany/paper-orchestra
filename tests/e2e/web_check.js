@@ -323,7 +323,7 @@ const tipNow = (page) => page.evaluate(() => { const t = document.querySelector(
 /* A project whose models cannot be used: where everybody is who tries the demonstration
    without credentials. What needs no model happens (the run of an approved experiment); the
    rest is something to set up, said once beside the main button in the engine's sentence,
-   and never an accident. On a project of its own, which no other check touches. */
+   and never an accident. On a project of its own, which no check touches before this one. */
 /* what an agent asks the person to choose: the open decision heads the inbox and is counted
    with what waits; an option and the person's own words are sent as the answer, which every
    list then shows; an answer given in another window arrives by itself; an answered one can

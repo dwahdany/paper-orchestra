@@ -20,6 +20,16 @@ with markup, scripts, odd Unicode and words longer than any column.
 It also checks that the interface follows the rules of the engine and the store, each
 against what the server answers:
 
+- what an agent asks the person to choose (a decision) heads the inbox and is counted with
+  what waits, on the tab, in its heading, on the overview and in the strip; on a phone every
+  option, the field for the person's own words and both answers are within the screen and a
+  finger wide; an option and the words are sent in one request, an empty answer is not
+  sent, the answered decision is listed folded with the answer, an answer changed in
+  another window arrives by itself (`decision.answered`), it can be answered again and left
+  to the agents, and the page it is about says how it stands; a decision the scripted
+  theorist asks while the app is open (`[scripted-decision]` in the instruction) appears by
+  itself and does not keep the phase from reaching its checkpoint (the check `decisions`,
+  on the copy of the demo project in the folder `nomodel`);
 - an instruction has an addressee (everyone, or one agent, from `GET /api/defaults`), an
   open one lists the phases that were given it so far, and it can be withdrawn;
 - more research is the person's choice: the list beside the main button offers "Search
@@ -87,7 +97,8 @@ against what the server answers:
   does not wait for the event stream to report it: while it holds a worker as busy and
   hears nothing, it asks the project view. Setup says what works without credentials
   (`without_credentials` of `GET /api/doctor`). On a third copy of the demo project, which
-  no other check touches, with the scripted model switched off (below);
+  no check touches before it (`decisions` uses it afterwards), with the scripted model
+  switched off (below);
 - an approved experiment whose code changed after the approval will not run
   (`will_not_run` of its rows, `not_running` of the forecast): its page, the list beside
   it, the table and the map show it as needing approval again, the main button does not
@@ -177,7 +188,7 @@ To look at the app yourself meanwhile, open the link the server printed.
 
 The flows change the project, so every run needs a fresh workspace. Options:
 
-- `--only map,inbox` / `--skip composer`: the checks are `screens`, `phone`, `nomodel`, `map`,
+- `--only map,inbox` / `--skip composer`: the checks are `screens`, `phone`, `nomodel`, `decisions`, `map`,
   `inbox`, `wiki`, `experiments`, `agents`, `states`, `rules`, `keys`, `paper`, `large`,
   `composer`, `hostile`. They are written to run in that order on one fresh demo project; a
   single one also runs alone.

@@ -71,6 +71,8 @@ uv run paper-orchestra research review  <project> --accept E1 # accept an experi
 uv run paper-orchestra research approve <project> E1          # ... and approve one run of it
 uv run paper-orchestra research advance <project>             # runs what you approved, then analyses it
 uv run paper-orchestra research request <project> "Also look at schedule-free optimisers" --for scout
+uv run paper-orchestra research decide  <project>             # what the agents ask you to choose
+uv run paper-orchestra research decide  <project> 1 --option 2 --say "and keep the first as a fallback"
 uv run paper-orchestra research cancel  <project> E1          # stop a run, or take an approval back
 ```
 
@@ -122,6 +124,16 @@ At a checkpoint nothing happens until you say so. You can edit any page, add pag
 
 A round after the first begins with hypotheses. Another look at the literature is your choice: `research advance --phase research`, or "Search the literature again" in the list beside Continue in the app. The analyst can recommend one in the round's journal, and the checkpoint after the analysis repeats the recommendation. An instruction for the scout waits for that phase, and every checkpoint says so.
 
+### Decisions the agents ask of you
+
+Some questions no source and no run settles, because the answer is your choice: which reading of your idea is meant, what exactly is to be studied, whether a wider scope is worth its cost. An agent that meets one asks you with a **decision**: the question in one sentence, why it matters, two to five options, the one it would take and why, and the default it goes on with. The project does not wait for your answer. The agents continue with the default and write so that the other answer can still be taken, and the next checkpoint says how many decisions wait.
+
+- **In the app** the open decisions are the first thing in the Inbox and are counted on its tab. Each option is a button; you can also answer in your own words, alone or together with an option, or say "Not for me to decide", which leaves it to the agents and their default. What you answered is listed below the proposals, folded, and can be answered again: the new answer holds and the earlier ones are kept with their times. The page a decision is about says how it stands.
+- **On the command line** `research decide <project>` lists what waits. `research decide <project> D --option N`, `--say "..."` or both answer the decision `D` (its id, or its number in the list), and `--dismiss` leaves it to the agents. `research status` counts the open ones.
+- **The agents** are shown, in every session of every role and for as long as the project lives, what waits (so that it is not asked twice), what you answered and what you left to them. An instruction is forgotten once its phases have run; an answer is not. They can only ask: at most three decisions per phase, none while twelve already wait, and nothing an agent is given answers or changes a decision. A question page that already says "the researcher has to decide" is raised as a decision by the next agent that reads it.
+
+A decision is one file, `decisions/d-<id>.json`: the question, the options, who asked in which round and phase, and every answer you gave. Options are numbered from 1 everywhere.
+
 A phase that fails is retried once. Stopping the agents (the Stop button, Ctrl-C where `research advance` runs, or `kill -INT` of the worker) ends the phase before its next model request and leaves it resumable: the same command continues it without writing anything twice.
 
 ### Experiments
@@ -156,7 +168,7 @@ The workspace is a directory of projects (default `./research`).
 
 - **Map**: the wiki laid out from the idea to the findings. Proposals are drawn dashed and can be decided on the map; selecting a page traces what it rests on and what it led to.
 - **Wiki**: every page, with an editor (live preview, history, restore), suggested edits marked in the text, and the number check on findings. Saving keeps a proposal open; "Save and accept" decides.
-- **Inbox**: everything waiting for you, with the keyboard (`J`/`K`, `A` accept, `E` edit, `R` reject, `Z` undo). A suggested edit to a finding that brings a number found on no record is marked in the list. On a phone it is the list, then one proposal with its answers at the foot of the screen.
+- **Inbox**: everything waiting for you, with the keyboard (`J`/`K`, `A` accept, `E` edit, `R` reject, `Z` undo). A suggested edit to a finding that brings a number found on no record is marked in the list. What the agents ask you to choose stands first, each option a button. On a phone it is the list, then one proposal with its answers at the foot of the screen.
 - **Experiments**: plan, code, approval, runs with a live log, metrics and figures, and what to do about a failed or interrupted run.
 - **Overview**: the checkpoint, the argument so far (each hypothesis with its experiments and findings), live activity, an instruction box, spending.
 - **Paper**: the optional write-up.
@@ -196,6 +208,7 @@ Proposed and rejected pages never reach a paper. A finding that rests only on a 
   proposals/       suggested edits, pending and decided
   history/         earlier versions of pages
   requests/        your instructions to the agents
+  decisions/       what the agents asked you to choose, and what you answered (made when the first one is asked)
   experiments/     code and runs of each experiment
   transcripts/     every model session, for checking what an agent actually saw and did
   notes/           kept for the memory harness the agents work through; the research agents write nothing here

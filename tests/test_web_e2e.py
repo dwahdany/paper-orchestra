@@ -109,7 +109,7 @@ def server(tmp_path):
     # The demo project, and beside it the same project filled up to 150 pages: the checks
     # of a large project (the map folded, a large inbox decided at once, nothing typed in
     # one project turning up in another) need a second project to look at.  A third copy,
-    # which no other check touches, is the project that is looked at without a model.
+    # which no check touches before that one, is the project that is looked at without a model.
     for name, extra in (("demo", []), ("large", ["--pages", "150"]), ("nomodel", [])):
         built = _run(
             [
