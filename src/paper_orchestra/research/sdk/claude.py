@@ -156,6 +156,9 @@ class _Conversation:
             tools=tools,
             allowed_tools=[*tools, *(board_name(item.name) for item in options.board)],
             mcp_servers={BOARD_SERVER: self._board()},
+            # The board is the only server: not the connectors of the person's account,
+            # which a signed-in process would bring along.
+            strict_mcp_config=True,
             # Nobody sits at this agent to answer a question: what it may do is decided
             # by the sandbox, the deny rules and the hook, not by a prompt.
             permission_mode="bypassPermissions",

@@ -250,3 +250,27 @@ needed (`next_step.blocked`), a worker whose phase needs one starts nothing and 
 that reason, and the run of an approved experiment still happens. Remove the file and the
 models can be used again; the switch takes effect at once. Without the variable nothing
 changes.
+
+# Live checks of the sdk runtime
+
+Two scripts start a real Claude Agent SDK agent. Neither is collected by pytest, and both
+need the `agents` extra and a credential; each costs a few cents on `claude-haiku-5-5`.
+
+`agent_guardrails.py` shows what the unit tests with a scripted agent cannot: that the
+sandbox of a real agent's shell, and the agent's own process, hold. It makes a scratch
+project, plants marker files where an agent must not read, tells a real scout agent to try
+each thing once, and then looks at what happened (not at what the agent says): no marker in
+anything it was answered, no file where none may be, credential places closed,
+`paper-orchestra` refused, and the web, its own folder and the board working. With
+`--helpers` a sub-agent tries too.
+
+```bash
+uv run --extra agents python tests/e2e/agent_guardrails.py --credential federation --model claude-haiku-5-5 --helpers
+```
+
+`agent_hello.py` starts one agent, has it say one word, and prints what its process
+reports: the model, whether fast mode is on (and why not), and its tools.
+
+```bash
+uv run --extra agents python tests/e2e/agent_hello.py --credential login --model claude-fable-5-2 --fast --ultracode
+```

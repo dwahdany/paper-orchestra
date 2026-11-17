@@ -28,6 +28,7 @@ PaperOrchestra is managed with [uv](https://docs.astral.sh/uv/) and needs Python
 ```bash
 uv sync --extra ui                 # the research workspace and its web app
 uv sync --extra ui --extra modal   # the same with Modal, for GPU experiments and sandboxed runs
+uv sync --extra ui --extra agents  # the same with the research agents as Claude Agent SDK agents
 uv sync --all-extras               # everything, including Gemini and OpenAI providers
 ```
 
@@ -146,6 +147,58 @@ Three things are never taken from the plan, which an agent may have written. The
 
 **Limits** (`limits` in `project.json`, or the overview's "Change the limits"): `model_usd` is the total model spend of the research agents (default $25), `experiment_usd` the total estimated compute spend of all runs ($5), `experiment_seconds` the longest time limit one run may be given (900). Reaching a limit stops at a checkpoint that says which. The model budget is looked at before every session and turn and after every model request, so at most the one request that crossed it goes beyond; the phase resumes where it stopped once you raise the limit. Costs on Modal are estimates from list prices. A GPU type without a list price is not approved, because nothing could hold its run to the limit, and a run that was stopped or lost still counts for the time it ran.
 
+### Two runtimes: the tool loop and Claude Agent SDK agents
+
+A project says how its agents are run, in `settings.agents` of its `project.json`:
+
+| `agents.runtime` | What an agent is | What it needs |
+|---|---|---|
+| `classic` (default) | A session of this package's own tool loop over a model API: it reads and writes the wiki through the memory tool, the scout has the provider's web search, and nothing an agent writes is executed before you approve a run. | The models under `settings.models` and their credentials ([Models and authentication](#models-and-authentication)). |
+| `sdk` | A [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) agent: it has a shell in a folder of its own, file tools, the web (search, fetch and the network from its shell) and the *board tools*, and it may do there whatever helps the work. | `uv sync --extra ui --extra agents` (the package `claude-agent-sdk`, which brings the Claude Code command line it runs in) and one of the two credentials below. |
+
+```bash
+paper-orchestra research new --brief "..." --runtime sdk     # or PAPER_ORCHESTRA_AGENT_RUNTIME=sdk for every new project
+paper-orchestra research settings <project>                  # show how its agents are run
+paper-orchestra research settings <project> --runtime sdk --credential federation --no-fast
+```
+
+`PAPER_ORCHESTRA_AGENT_RUNTIME=sdk` makes `sdk` the runtime of projects that are *created* while it is set, by the command line and by the web app; it is written into the new project and changes nothing about one that exists. `research settings` (or `PATCH /api/projects/<id>` with `{"settings": {"agents": {...}}}`) changes it later; the change holds from the next phase on. The other values of the group concern the `sdk` runtime: `model` (default `claude-fable-5-2`, one model for every agent; `settings.models` is not used), `fast` (ask for fast mode, default on), `ultracode` (the agent may start helper agents and workflows, default on), `credential` (`login` or `federation`, default `login`) and `sandbox` (default on).
+
+**What stays the same.** The wiki and your gate. Under `sdk` every role that uses a model is an agent (intake, scout, theorist, designer, analyst, and the one that carries out an experiment), with the same task, the same messages and the same checks afterwards as in the classic runtime. The wiki is not a directory on the agent's disk: it is reached only through the board tools, which are the project's existing tools (the memory tool over the wiki, `wiki_search`, `propose_edit`, the scout's `verify_paper`, the designer's `write_code` and repository tools, intake's `name_project`). So every rule holds unchanged: which role may create which kind of page, that a page an agent creates is a proposal, what a session may read, the caps of a phase, that sources and results are written by code. An agent that wants more (another experiment, more sources, a change to a page) proposes it on the board, and you decide.
+
+**An approved experiment is carried out by an agent.** Approving a run starts what it always started (`research run`, or the run phase of `research advance`); under `sdk` the job of a run on the `local` backend is done by an experiment agent instead of by `python main.py`. It gets the plan, the approved code (copied into its folder, `experiments/E1/runs/<k>/work/`; the run's record, log and code snapshot lie beside that folder, out of its reach), the time limit, and whether you granted network access. It writes or repairs the code, runs it, and must leave `metrics.json` (and optionally `artifacts/`) in its folder. The run record and the result page `E1-run<k>` are then written by the same code as for any run, so the analyst and the number check work unchanged; a missing or invalid `metrics.json` is a failed run and is recorded as one. Things to know:
+
+- The plan's `timeout_seconds` bounds the agent's whole work (writing, running, repairing), not one execution of the code: give an experiment more time than its code needs. The run's seconds are the agent's wall time. What the agent's model costs counts against `limits.model_usd`, not against the run's cost.
+- A plan without code can be approved (the approval says so as a warning): the agent writes the code from the plan. In the classic runtime such a plan is refused until the designer has written its code.
+- No separate repair is made by a model afterwards: the agent is the one that repairs.
+- It can propose follow-up experiments on the board; it cannot approve or run them.
+- A run approved for Modal runs on Modal as before; an agent works on this machine.
+- The agent's shell has the network whatever the approval says (it needs the web for its own work). "Without network access" is then an instruction to the agent about the experiment's code, not something the sandbox enforces; use Modal for code that must be cut off.
+- When a run was approved with network access and `PAPER_ORCHESTRA_JOB_MODEL_ACCESS=1` is set for the worker, the experiment's code may call the Anthropic API: the agent starts it as `./with-models python main.py`, which hands the command the worker's federation settings, and only this agent may read the identity token file. No other agent gets either.
+
+**Guardrails** (`agents.sandbox`, on by default). An agent with a shell must still not be able to decide proposals, approve runs or change the files the project is steered by, and must not get at the credentials of the machine:
+
+- Its shell runs in the Claude Code sandbox: it can write only in the agent's own folder (`agents/<session>/` in the project, or the run's `work/` folder), and it cannot read your home directory, the project's directory (state, approvals, proposals, the wiki's files, other agents' folders) or `/run/user`, except for its own folder, the Python it runs code with and the directory for temporary files.
+- The built-in file tools are held to the same by a check that runs in the worker before every tool call: Write and Edit only inside the agent's folder, Read, Glob and Grep nowhere that is closed, no `.env` file anywhere. Reading `~/.ssh`, `~/.anthropic`, `~/.config/{gh,op,anthropic,gcloud}`, `~/.aws`, `~/.netrc` and the Claude Code credentials is also denied by the agent's own permission rules.
+- A shell command that runs `paper-orchestra` (review, approve, advance, run, cancel, anything), or imports the package, is refused, and the agent is told to propose on the board instead. The feed shows the attempt as refused.
+- The agent's process starts without the worker's credentials (API keys, tokens, anything that looks like one), and with none of your own Claude Code settings, plugins, hooks, account connectors or `CLAUDE.md`.
+- The same check and the same sandbox apply to helper agents an agent starts (`ultracode`). `tests/e2e/agent_guardrails.py --helpers` shows this with a real agent for a sub-agent started with the Agent tool; workflows were not checked separately.
+
+`tests/e2e/agent_guardrails.py` checks all of this against a real agent on your machine (a few cents): `uv run --extra agents python tests/e2e/agent_guardrails.py --credential federation --model claude-haiku-5-5`. With `agents.sandbox: false` the shell is not sandboxed and the file tools are not confined: the agent can then reach what you can reach, and only the refusal of the project's command line, the rules about credential files and the environment without credentials remain, which a shell can get around. Leave it on unless the sandbox does not work on your machine.
+
+**Credentials: whose account pays, and where fast mode works.**
+
+| `agents.credential` | The agents sign in with | Who pays | Fast mode |
+|---|---|---|---|
+| `login` (default) | Your Claude Code login on this machine (`claude`, then sign in). No `ANTHROPIC_*` variable of the worker reaches the agent's process, because it would otherwise sign in with that. | Your Claude account (its subscription or its usage billing). | Works where your account has it. |
+| `federation` | The worker's Workload Identity Federation variables (the five under [Models and authentication](#models-and-authentication)). | The organization and workspace of the federation rule. | Refused where the organization has not enabled it; the agents then work at normal speed. |
+
+Every session says at its start, in the activity feed, which model it runs on and whether fast mode is on ("fast mode was asked for and is not on", with the reason the process gives). A phase does not fail over it. Fast mode costs considerably more per token than normal speed, and `ultracode` makes every session start with a larger prompt: one short turn of `claude-fable-5-2` with both on cost about $0.94 when this was written, so set `limits.model_usd` with that in mind, or turn `fast` off.
+
+**Spend, stopping, the feed, transcripts.** An agent's own dollar figure, which includes fast mode and helper agents, goes into `usage.json` (rows labelled `scout.agent` and so on, with `cost_usd`) and counts against `limits.model_usd`. The budget can end a session in the middle of a turn: while a turn runs it is watched by an estimate from the tokens its messages report (at list prices, so fast mode is underestimated until the turn ends), and the agent's process is also told the sum that is left and stops itself there. Stop (the button, Ctrl-C, SIGTERM) interrupts the agent within a moment and leaves the phase resumable; the next attempt carries the agent's own session on where that is possible, and otherwise starts again with what is on the board. The feed gets one line for each shell command, web search, page fetched, file written, helper started and board tool used. `transcripts/agents/<session>.jsonl` keeps what the agent was sent, its tool calls with their answers, what it said and what each turn cost; `<session>.json` beside it names the agent's own Claude Code session (its full transcript is in Claude Code's session files) and what of its cost is already counted.
+
+`tests/e2e/agent_hello.py` starts one agent with a credential and prints what its process reports (model, fast mode, tools): the quickest way to see whether the runtime works on a machine.
+
 ### The web app
 
 ```bash
@@ -197,6 +250,7 @@ Proposed and rejected pages never reach a paper. A finding that rests only on a 
   history/         earlier versions of pages
   requests/        your instructions to the agents
   experiments/     code and runs of each experiment
+  agents/          the folders of the agents of the `sdk` runtime, one per session (workbenches, not the record)
   transcripts/     every model session, for checking what an agent actually saw and did
   notes/           kept for the memory harness the agents work through; the research agents write nothing here
   MEMORY.md        the index of the wiki that every agent session starts from, written by code
@@ -206,6 +260,8 @@ Proposed and rejected pages never reach a paper. A finding that rests only on a 
 Pages are plain Markdown with `key: value` front matter. You can edit them with any editor while no agent is running; `research status` and the app report what they had to guess in a hand-edited project. If `state.json` is lost or damaged, the project is not started over: where it stands is read from `events.jsonl`, both say so, and the engine writes the file again when it next works on the project. A copy of a project directory is a project of its own. A project in which `project.json`, `wiki/`, `inputs/`, `proposals/`, `requests/` or `transcripts/` is a symbolic link that leads out of the directory is not opened. Where `history/` or `experiments/` is such a link, nothing is read, written or run through it, and no paper is written through a linked `paper/`. No agent or experiment is started while a link stands in the place of `state.json`, `events.jsonl` or `usage.json`.
 
 ## Models and authentication
+
+This section is about the classic runtime of the research agents and about the paper pipeline; a project whose agents are Claude Agent SDK agents signs in as described under [Two runtimes](#two-runtimes-the-tool-loop-and-claude-agent-sdk-agents).
 
 All agents, of the research workspace and of the paper pipeline, default to `claude-fable-5-2`. A project's models are set per role in its `project.json` (`models.research` for intake and the scout, `models.reasoning` for the theorist and the analyst, `models.coding` for the designer and the runner); the app's options for a new project set the reasoning effort, not the models. Two ways to authenticate:
 
