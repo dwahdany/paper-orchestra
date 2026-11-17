@@ -3188,6 +3188,9 @@ CHECKS.queue = async ({ page, pid, large }) => {
   await approveAndRun(a);
   await toast(a + ' is approved; its run is starting', 'the first approval starts its run');
   /* the second and the third are approved while the first runs */
+  await open(page, '#/p/' + id + '/experiments/' + b, '.approve [data-act="approve"][data-start]');
+  const offered = await page.evaluate(() => Array.from(document.querySelectorAll('.approve [data-act="approve"]')).map((el) => el.textContent.trim()));
+  ok(offered.length === 1 && offered[0] === 'Approve; it runs in line', 'while experiments are being run the approval form offers the line, and no "when I continue": ' + offered.join(' | '));
   await approveAndRun(b);
   const second = await toast(b + ' is approved; it runs after ' + ahead + '\\.', 'the second approval says behind what it waits');
   ok(!/could not start|already has a worker|was not approved/.test(second), 'approving while a run is under way is not an error: ' + second.trim());

@@ -1409,6 +1409,24 @@ def test_run_with_queue_goes_on_with_what_is_approved_while_a_run_is_under_way(l
     assert out.index("E3 run 1 succeeded") < out.index("E2 run 1 succeeded")
 
 
+def test_an_experiment_approved_again_while_the_queue_goes_on_is_run_again(lined, engine):
+    """One approval is one run, and the queue tries each approval once: an experiment
+    that ran and is approved again while the worker is still at work is in line again."""
+    approve_now(lined, "E1")
+    approve_now(lined, "E2")
+
+    def second():
+        approve_now(lined, "E1")  # the person wants E1 once more
+        return run_record("E2", 1, "succeeded")
+
+    engine.runs = {"E1": run_record("E1", 1, "succeeded"), "E2": second}
+
+    result = invoke("run", str(lined.root), "E1", "--queue")
+
+    assert [call[1] for call in engine.instances[0].calls] == ["E1", "E2", "E1"]
+    assert result.exit_code == 0, result.output
+
+
 def test_a_plain_run_runs_what_it_was_given_and_nothing_approved_meanwhile(lined, engine):
     approve_now(lined, "E1")
 

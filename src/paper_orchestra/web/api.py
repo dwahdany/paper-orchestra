@@ -3061,6 +3061,18 @@ def _start_run(context: Context, project: Project, experiment_id: str) -> dict[s
     return answer
 
 
+def _already_in_line(context: Context, project: Project, experiment_id: str) -> dict[str, Any]:
+    """What an approval that asked for no start says when the project's worker runs
+    experiments and goes on with every approved one: the experiment is in its line
+    all the same (``{"in_line"}``), and the person is told so.  Empty otherwise: the
+    experiment then waits until the person continues or runs it."""
+    worker = context.workers.status(project.root)
+    if _waits_for(worker, experiment_id) != "line":
+        return {}
+    found = _in_line(experiment_id, worker, context.services.line(project))
+    return {"in_line": found} if found else {}
+
+
 def _waits_for(worker: Mapping[str, Any], experiment_id: str) -> str | None:
     """How an approved experiment gets its run from the project's worker with no
     further request: ``"line"`` (the worker runs experiments one after the other and
@@ -3225,6 +3237,8 @@ def _decide(context: Context, project: Project, item: ReviewItem) -> dict[str, A
         )
         return {**outcome, **failure, "approved": False}
     outcome.update(page=page.to_dict(body=False), approved=True, ok=True)
+    if not run_options.get("start"):
+        outcome.update(_already_in_line(context, project, str(page.id or decided.path)))
     if run_options.get("start"):
         try:
             outcome.update(_start_run(context, project, str(page.id or decided.path)))
@@ -3777,7 +3791,9 @@ def approve(
     phase, a write-up) a worker is started for it when that one has ended.  Only
     with a worker that is being stopped, or one this server cannot verify, is nothing
     arranged (``worker_error``): the experiment stays approved and runs when the
-    person continues, or runs it.
+    person continues, or runs it.  Without ``start`` nothing is started or arranged;
+    ``in_line`` is still given when a worker that runs experiments is at work, since
+    that worker goes on with every approved experiment.
     """
     body = body or ApproveBody()
     page = _experiment(project, eid)
@@ -3786,6 +3802,9 @@ def approve(
         options["base_updated"] = body.base_updated
     approved = context.services.approve(project, page.path, **options)
     answer: dict[str, Any] = {"page": approved.to_dict(body=False)}
+    if not body.start:
+        # A worker that runs experiments goes on with every approved one, asked or not.
+        answer.update(_already_in_line(context, project, str(page.id)))
     if body.start:
         try:
             answer.update(_start_run(context, project, str(page.id)))

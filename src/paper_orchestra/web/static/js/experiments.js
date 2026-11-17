@@ -184,6 +184,11 @@ export const diffText = (text) => html`<pre class="diff">${String(text || '').re
 
 function approveHTML(store, page, data) {
   const eid = page.id, plan = data.plan || {}, options = data.options || [];
+  /* what an approval leads to while the project's worker is at work: a worker that runs
+     experiments goes on with every approved one (there is no "when I continue" to offer),
+     and after any other worker a run that was asked for starts by itself */
+  const worker = store.project.worker || {}, working = worker.state === 'running' && worker.verified !== false;
+  const draining = working && (!!worker.queue || (worker.kind === 'advance' && worker.phase === 'run')), atWork = working && !draining;
   const limits = (store.project.settings || {}).limits || {};
   const chosen = approvalChoice(eid, data);
   const runnable = options.filter((o) => o.can_run);
@@ -231,8 +236,8 @@ function approveHTML(store, page, data) {
               <button class="btn" data-act="accept" data-ref="${page.path}">Accept, keep planned <kbd>A</kbd></button>
               <button class="btn" data-act="edit" data-ref="${page.path}">Edit <kbd>E</kbd></button>
               <button class="btn btn-neg-quiet" data-act="reject-ask" data-ref="${page.path}">Reject… <kbd>R</kbd></button>`
-          : html`<button class="btn btn-primary" data-act="approve" data-eid="${eid}" data-start="1"${runnable.length ? '' : raw(' disabled')}>${icon('play')}Approve and run now</button>
-              <button class="btn" data-act="approve" data-eid="${eid}"${runnable.length ? '' : raw(' disabled')} data-tip="It runs first, and is analysed, when you next continue the project">Approve, run when I continue</button>
+          : html`<button class="btn btn-primary" data-act="approve" data-eid="${eid}" data-start="1"${runnable.length ? '' : raw(' disabled')}${draining ? raw(' data-tip="A worker is running experiments and goes on with every approved one, in the order you approved them"') : ''}>${icon('play')}${draining ? 'Approve; it runs in line' : atWork ? 'Approve and run when the agents are done' : 'Approve and run now'}</button>
+              ${draining ? '' : html`<button class="btn" data-act="approve" data-eid="${eid}"${runnable.length ? '' : raw(' disabled')} data-tip="It runs first, and is analysed, when you next continue the project">Approve, run when I continue</button>`}
               <button class="btn" data-act="edit" data-ref="${page.path}">Edit the plan <kbd>E</kbd></button>
               ${app.ui.reapprove === eid ? html`<button class="btn btn-quiet" data-act="reapprove" data-eid="">Cancel</button>` : ''}`}</div></div>`}
   </section>`;

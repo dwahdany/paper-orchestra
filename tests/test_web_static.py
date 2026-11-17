@@ -1399,6 +1399,16 @@ out.idleTable = text(render(idle));
 /* a worker that is being stopped takes nothing on: the button is off, as before */
 const stopping = projectStore({ pages: [e7], experiments: [row(e7)], project: { state: checkpoint('design', 'run'), next_step: said({}), worker: { state: 'stopping', kind: 'run', verified: true, queue: true, then_runs: [] } } });
 out.stopping = detail(stopping, 'E7');
+/* the approval form: while a worker runs experiments there is no "when I continue" to offer */
+const form = (worker) => {
+  const p7 = page('experiment', 'E7', { state: 'planned', meta: {} });
+  const store = projectStore({ pages: [p7], experiments: [row(p7, { cancel_does: null })], project: Object.assign({ state: checkpoint('design', 'run'), next_step: said({}) }, worker ? { worker } : {}) });
+  store.exps.set('E7', { key: store.expKey('E7'), gen: 0, loading: false, error: null,
+    data: { page: Object.assign({}, store.expById.get('E7'), { html: '' }), runs: [], plan: { backend: 'local', timeout_seconds: 60 }, code: { files: [], digest: 'd' }, options: [{ backend: 'local', can_run: true, reasons: [], est_minutes: 1, est_usd: null, notes: [] }], approval: { digest: null, at: null, matches: false, changed: [] }, cancel_does: null, will_not_run: null, last_success: null, interrupted: false } });
+  const markup = render(store, p7.path);
+  return Array.from(markup.matchAll(/<button[^>]*data-act="approve"[^>]*>([\s\S]*?)<\/button>/g)).map((m) => text(m[1]).trim());
+};
+out.forms = { idle: form(null), draining: form(busy), phase: form({ state: 'running', kind: 'advance', phase: 'analyze', verified: true, queue: false, then_runs: [] }) };
 console.log(JSON.stringify(out));
 """
 
@@ -1440,3 +1450,9 @@ def test_experiments_that_wait_in_line_are_shown_in_order_with_what_they_wait_be
     assert out["idle"]["run"] and not out["idle"]["off"] and "Run now" in out["idle"]["says"]
     assert "waits in line" not in out["idleTable"]
     assert out["stopping"]["run"] and out["stopping"]["off"], out["stopping"]
+    # The approval form offers what an approval leads to as things stand.
+    assert out["forms"] == {
+        "idle": ["Approve and run now", "Approve, run when I continue"],
+        "draining": ["Approve; it runs in line"],
+        "phase": ["Approve and run when the agents are done", "Approve, run when I continue"],
+    }, out["forms"]

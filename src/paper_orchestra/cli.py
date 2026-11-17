@@ -2396,10 +2396,10 @@ def research_run(
         engine = Engine(opened)
         engine.drains = queue
         ahead: list[str] = list(refs)
-        tried: set[str] = set()
+        tried: set[tuple[str, str]] = set()
         while ahead:
             ref = ahead.pop(0)
-            tried.add(_experiment_name(opened, ref))
+            tried.add(_approval_tried(opened, ref))
             # Looked up again after every run: the person may approve one more while
             # another runs, and may take one back that was waiting.
             look_again = queue and not ahead
@@ -2497,22 +2497,28 @@ def _when_it_runs(project: Project, name: str) -> str:
     )
 
 
-def _experiment_name(project: Project, ref: str) -> str:
-    """The id of the experiment ``ref`` names (``E4`` for its path, too); ``ref`` as it
-    is when it names none, which the engine says when it is asked to run it."""
+def _approval_of(page: Any) -> tuple[str, str]:
+    """What one try of an experiment is a try of: the experiment and the approval it
+    has (its id and ``approved_at``).  One approval is one run, so a line of runs tries
+    each approval once; approved again, the experiment is in line again."""
+    return str(page.id or page.path), str(page.meta.get("approved_at") or "")
+
+
+def _approval_tried(project: Project, ref: str) -> tuple[str, str]:
+    """:func:`_approval_of` the experiment ``ref`` names, as it is now; ``ref`` as it is
+    when it names none, which the engine says when it is asked to run it."""
     from paper_orchestra.research.model import ProjectError
 
     try:
-        page = project.page(ref)
+        return _approval_of(project.page(ref))
     except (ProjectError, OSError, ValueError):
-        return str(ref)
-    return str(page.id or page.path)
+        return str(ref), ""
 
 
-def _next_in_line(project: Project, tried: Collection[str]) -> list[str]:
-    """The experiments that wait for their run now and were not tried by this command,
-    in the order of their approvals.  The project is read again: another process (the
-    app, a second terminal) is what approves one while this command runs."""
+def _next_in_line(project: Project, tried: Collection[tuple[str, str]]) -> list[str]:
+    """The experiments that wait for their run now and whose approval this command has
+    not tried, in the order of their approvals.  The project is read again: another
+    process (the app, a second terminal) is what approves one while this command runs."""
     from paper_orchestra.research import experiments
     from paper_orchestra.research.model import ProjectError
 
@@ -2521,7 +2527,7 @@ def _next_in_line(project: Project, tried: Collection[str]) -> list[str]:
         waiting = experiments.waiting_in_line(project)
     except (ProjectError, OSError, ValueError):
         return []
-    return [str(page.id) for page in waiting if str(page.id) not in tried]
+    return [str(page.id) for page in waiting if _approval_of(page) not in tried]
 
 
 def _did_to_the_code(as_run: Mapping[str, Any]) -> str:

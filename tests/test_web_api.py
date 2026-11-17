@@ -1662,9 +1662,11 @@ def test_one_approved_without_a_start_is_in_the_line_of_a_worker_that_runs_the_q
 
     approved = client.post(url(project, "/experiments/E2/approve"), json={}).json()
 
-    # No start was asked, so the answer promises nothing; the list says what is true:
-    # the worker that runs experiments goes on with every approved one.
-    assert "in_line" not in approved and "worker" not in approved
+    # No start was asked and none is arranged; the worker that runs experiments goes
+    # on with every approved one all the same, and the answer says so, as the list does.
+    assert "worker" not in approved and "worker_error" not in approved
+    assert approved["in_line"]["message"] == "E2 is approved; it runs after E1."
+    assert client.get(url(project)).json()["worker"]["then_runs"] == []
     row = next(
         row
         for row in client.get(url(project, "/experiments")).json()["experiments"]
@@ -1695,6 +1697,13 @@ def test_a_run_approved_during_a_phase_starts_by_itself_when_the_phase_has_ended
     row = client.get(url(project, "/experiments")).json()["experiments"][0]
     assert row["in_line"]["waits"] == "worker"
     assert [kind for kind, _ in launched.calls] == ["advance"]
+
+    # Without a start during a phase nothing is arranged, and nothing is promised.
+    more_experiments(project, 1)
+    parked = client.post(url(project, "/experiments/E2/approve"), json={}).json()
+    assert "in_line" not in parked and "worker" not in parked
+    rows = client.get(url(project, "/experiments")).json()["experiments"]
+    assert next(row for row in rows if row["id"] == "E2")["in_line"] is None
 
 
 def test_cancel_asks_the_running_job_to_stop(client, project, services):
