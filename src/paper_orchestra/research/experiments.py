@@ -1510,6 +1510,15 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
     plan = _plan_for_code(project, experiment_id)
     files = dict(_code_paths(code_dir(project, experiment_id)))
     in_repo = plan.mode == "repo"
+    # Under the ``sdk`` runtime an approved experiment is carried out by an agent that
+    # writes and repairs code itself: what is wrong with the starting code is then
+    # something the person should know when approving, not something that stops them.
+    by_agent = bool(project.settings.agents.sdk) and not in_repo
+    if not files and by_agent:
+        return [
+            f"{WARNING}{experiment_id} has no code yet. The agent that carries out the "
+            "experiment writes it from the plan, so read the plan as what will run."
+        ]
     if not files and not in_repo:
         return [
             f"{experiment_id} has no code yet: write its files to "
@@ -1548,6 +1557,10 @@ def check_code(project: Project, experiment_id: str) -> list[str]:
             "not a Python file of the experiment or the repository. Read the command "
             "before approving it."
         )
+    if by_agent and errors:
+        said = "the agent that carries out the experiment has to put this right first."
+        warnings = [f"{WARNING}{error} With the sdk runtime, {said}" for error in errors] + warnings
+        errors = []
     return errors + warnings[:20]
 
 

@@ -835,13 +835,18 @@ class Engine:
         compute: ComputeBackend | Callable[[Any], ComputeBackend] | None = None,
         client_for: Callable[[str], Any] | None = None,
         scholar: SemanticScholar | None = None,
+        driver: Any = None,
     ) -> None:
         """``harness`` is the context harness every model call goes through; without one
         the engine builds the project's own (``client_for`` then chooses the clients).
         ``compute`` is a backend, or a callable choosing one for a plan; without one the
         backend named at approval, or in the project's settings, is used.  ``scholar``
-        is the Semantic Scholar client of the research phase."""
+        is the Semantic Scholar client of the research phase.  ``driver`` starts the
+        agents of a project whose runtime is ``sdk`` (``research.sdk.driver``); without
+        one the Claude Agent SDK is used, which is an optional package."""
         self.project = project
+        self._driver = driver
+        self._agents: Any = None
         self.harness = harness or agents.build_harness(project, client_for=client_for)
         self._client_for: Callable[[str], Any] | None = self.harness.client_for
         #: Whether the project's models can be used, asked once for each call that works
@@ -886,6 +891,8 @@ class Engine:
         reader._lock = threading.RLock()
         reader._client_for = client_for
         reader._needs = {}
+        reader._driver = None
+        reader._agents = None
         return reader
 
     # -- public ------------------------------------------------------------------
@@ -1006,6 +1013,12 @@ class Engine:
                     "research approve` or in the app, then run it again."
                 )
             self._tidy_hypotheses(release=False)
+            if self._sdk():
+                # An agent carries the experiment out: it needs what every agent needs.
+                need = self._agents_need()
+                if need is not None:
+                    sentence = agents.need_sentence(need, f"Carrying out {page.id}")
+                    raise ModelNeeded(sentence, phase="run", need=need)
             try:
                 self._check_experiment_budget(page, self._limits_with(limits))
             except _BudgetSpent as exc:
@@ -1014,7 +1027,18 @@ class Engine:
             compute = self._compute.named(backend) if isinstance(backend, str) else backend
             round = max(1, self._state["round"])
             ctx = self._context("run", round, f"r{round}-run-{page.id}", (), None)
-            return self._run_one(page, ctx, compute=compute, limits=limits)
+            try:
+                return self._run_one(page, ctx, compute=compute, limits=limits)
+            except _BudgetSpent as exc:
+                self._warn_budget(exc, phase="run")
+                raise EngineError(str(exc)) from None
+            except agents.SessionStopped as exc:
+                if isinstance(exc.reason, _BudgetSpent):
+                    self._warn_budget(exc.reason, phase="run")
+                    raise EngineError(str(exc.reason)) from None
+                # A stop request: the run went back to the queue, and its record says so.
+                runs = experiments.runs(self.project, str(page.id))
+                return runs[-1] if runs else {}
 
     # -- the worker --------------------------------------------------------------
 
@@ -1270,7 +1294,43 @@ class Engine:
         models can be used, as before: a round whose research can be paid for and
         whose design then cannot be done is refused before anything is spent.
         """
+        if self._sdk():
+            return self._agents_need()
         return None if name == "run" else self._models_need()
+
+    def _sdk(self) -> bool:
+        """Whether the project's agents are Claude Agent SDK agents (``settings.agents``)."""
+        return bool(self.project.settings.agents.sdk)
+
+    def _runtime(self) -> Any:
+        """The ``sdk`` runtime of this engine: how its agents are started."""
+        if self._agents is None:
+            from paper_orchestra.research.sdk.session import AgentRuntime
+
+            self._agents = AgentRuntime(self.project, self._driver)
+        return self._agents
+
+    def _agents_need(self) -> dict[str, Any] | None:
+        """What keeps the project's SDK agents from starting, in the shape of
+        :meth:`_models_need`; ``None`` when they can start, and for an engine that
+        was not told to look.
+
+        Under the ``sdk`` runtime this is the whole gate, for every phase: the
+        models of ``settings.models`` are not used, so they are not asked about,
+        and the run phase is no exception, because an approved experiment is
+        carried out by an agent too.
+        """
+        if self._client_for is None:
+            return None
+        key = ("agents",)
+        if key not in self._needs:
+            self._needs[key] = self._runtime().need()
+        return self._needs[key]
+
+    def _budget_left(self) -> float:
+        """What is left of the model budget, for a session that is told a sum."""
+        with self._lock:
+            return float(self.project.settings.limits.model_usd) - self._ledger_usd()
 
     def _wait_for_a_model(
         self,
@@ -1773,6 +1833,8 @@ class Engine:
             scholar=self._scholar,
             compute=self._compute,
             handover=self._handover(name, round),
+            runtime=self._runtime() if self._sdk() else None,
+            left=self._budget_left,
         )
 
     def _handover(self, name: str, round: int) -> tuple[str, ...]:
@@ -1913,6 +1975,22 @@ class Engine:
         )
 
     def _execute(self, ctx: AgentContext) -> AgentReport:
+        """Run the phase of ``ctx`` in the project's runtime.
+
+        This is where the runtime is chosen.  With ``settings.agents.runtime`` set
+        to ``sdk``, the context carries the runtime, and every role function below
+        opens its session as a Claude Agent SDK agent (``agents._open_session``);
+        the functions themselves, their messages and their checks are the same.
+        Whatever the phase's agents still hold when it ends, also by a stop or a
+        failure, is closed here.
+        """
+        ctx.runtime = self._runtime() if self._sdk() else None
+        try:
+            return self._execute_phase(ctx)
+        finally:
+            ctx.close_sessions()
+
+    def _execute_phase(self, ctx: AgentContext) -> AgentReport:
         name = ctx.phase
         if name == "intake":
             return agents.run_intake(ctx)
@@ -2550,23 +2628,61 @@ class Engine:
 
         before = set(settled())
         repair, unrepaired = self._repairer(ctx)
+        carried_out: list[Any] = []
+        chosen = compute or self._compute
+        if self._sdk():
+            # The seam of the sdk runtime: the job of the run is an agent's.  Its model
+            # spend is the model budget's, which is looked at before it starts.
+            ctx.runtime = self._runtime()
+            self._guard()
+            chosen = self._agent_backend(page, ctx, chosen, carried_out)
         try:
-            return experiments.run(
+            record = experiments.run(
                 project,
                 experiment,
-                compute=compute or self._compute,
+                compute=chosen,
                 should_stop=self._stopping,
                 repair=repair,
                 unrepaired=unrepaired,
                 limits=self._run_limits(limits),
             )
+            for backend in carried_out:
+                stopped = backend.stopped
+                if isinstance(stopped, agents.SessionStopped):
+                    # A stop request or the model budget ended the agent; the run is
+                    # queued again, and the phase ends the way it does for any session.
+                    raise stopped
+            return record
         finally:
+            ctx.close_sessions()
             self._count_runs()
             self._save()
             # Also a run found unfinished and settled on the way: it ended now.
             new = [run for number, run in settled().items() if number not in before]
             pages = [project.resolve(f"{experiment}-run{run.get('number')}") for run in new]
             ctx.note(path for path in pages if path)
+
+    def _agent_backend(
+        self, page: ResearchPage, ctx: AgentContext, compute: Any, made: list[Any]
+    ) -> Callable[[Any], Any]:
+        """The chooser of the backend for a run that an agent carries out.
+
+        The backend is still the one the person approved; where that is the local
+        one, an agent does its job (``research.sdk.experiment.AgentBackend``).  A
+        run approved for a remote backend runs there as it always did: an agent
+        works on this machine.
+        """
+        from paper_orchestra.research.sdk.experiment import AgentBackend
+
+        def choose(plan: Any) -> Any:
+            inner = compute if hasattr(compute, "run_job") else compute(plan)
+            if getattr(inner, "name", "") != "local":
+                return inner
+            backend = AgentBackend(ctx, inner, page)
+            made.append(backend)
+            return backend
+
+        return choose
 
     def _repairer(self, ctx: AgentContext) -> tuple[Callable[..., Any] | None, str | None]:
         """The callback that repairs a failed run, or ``None`` and why there is none.
@@ -2576,6 +2692,11 @@ class Engine:
         be used, the run happens all the same, a failure stands, and its record
         says why nothing was tried (``experiments.run(..., unrepaired=...)``).
         """
+        if self._sdk():
+            return None, (
+                "under the sdk runtime the agent that carries out an experiment repairs "
+                "its code itself, so no separate repair is made."
+            )
         setting = agents.MODEL_ROLES["runner"]
         try:
             need = self._models_need((setting,))
