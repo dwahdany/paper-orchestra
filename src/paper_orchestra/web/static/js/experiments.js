@@ -370,7 +370,7 @@ function runBlock(store, page, data, run, open) {
     <span class="st-word t-${TONE[run.status] || 'open'}">${glyph('result', 'accepted', run.status, 12)}${run.status}</span>
     <span class="run-m">${backendName(run.backend, run.plan && run.plan.gpu)}${byAgent(run) ? html` <span class="run-by" data-by="agent">by an agent</span>` : ''}</span><span class="run-m">${dateTime(run.started)}</span>
     <span class="run-m n">${run.status === 'running' ? sinceClock(run.started) : duration(run.seconds)}</span><span class="run-m n">${run.cost_usd != null ? money(run.cost_usd) : run.backend === 'local' ? 'no cost' : ''}</span>
-    <span class="run-m n">${run.exit_code == null ? '' : 'exit ' + run.exit_code}</span><span class="run-m">${(run.repairs || []).length ? plural(run.repairs.length, 'repair') : ''}</span></button>`;
+    <span class="run-m n">${run.exit_code == null || byAgent(run) ? '' : 'exit ' + run.exit_code}</span><span class="run-m">${(run.repairs || []).length ? plural(run.repairs.length, 'repair') : ''}</span></button>`;
   if (!open) return html`<div class="run">${head}</div>`;
   const findings = findingsOf(store, run);
   const result = run.result_page && store.byPath.get(run.result_page);

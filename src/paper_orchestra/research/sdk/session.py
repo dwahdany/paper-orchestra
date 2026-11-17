@@ -877,6 +877,14 @@ class AgentSession:
                 self._account_unreported()
             else:
                 self._account(turn)
+            self._log(
+                "result",
+                text="",
+                ended=(turn.ended if turn is not None else None) or "interrupted",
+                error=None,
+                cost_usd=turn.cost_usd if turn is not None else None,
+                session=turn.session_id if turn is not None else self._sdk_session,
+            )
             raise
         except BaseException:
             # A failure of the agent's process: it is ended, and what it used is counted

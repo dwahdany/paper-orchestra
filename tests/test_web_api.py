@@ -343,6 +343,7 @@ POST /api/projects/{pid}/experiments/{eid}/approve
 POST /api/projects/{pid}/experiments/{eid}/cancel
 GET /api/projects/{pid}/experiments/{eid}/runs/{number}
 GET /api/projects/{pid}/experiments/{eid}/runs/{number}/log
+POST /api/projects/{pid}/experiments/{eid}/runs/{number}/adopt-code
 GET /api/projects/{pid}/files/{path}
 POST /api/projects/{pid}/paper
 GET /api/projects/{pid}/paper
