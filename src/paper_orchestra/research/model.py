@@ -1388,7 +1388,7 @@ class ModelSettings(_Section):
 class Limits(_Section):
     """What the project may spend before it stops at a checkpoint and says so."""
 
-    model_usd: float = 25.0
+    model_usd: float = 25000.0
     experiment_seconds: float = 900
     experiment_usd: float = 5.0
     repair_rounds: int = 3
