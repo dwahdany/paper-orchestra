@@ -475,6 +475,62 @@ def test_the_file_tools_read_the_folder_and_the_system_but_nothing_that_is_close
     assert reads("Read", file_path=str(folder / ".env.example"))
 
 
+def test_a_search_does_not_start_above_what_is_closed(tmp_path, home):
+    """Grep and Glob walk down from where they start, in the agent's process and not in
+    the shell's sandbox: started at ``/`` or ``/home`` they would read the project's
+    files and the person's.  A directory with a closed place beneath it is closed."""
+    import tempfile
+
+    guard = make_guard(tmp_path, home)
+    project = guard.project
+    above = [Path("/"), tmp_path, home.parent, project.parent, Path(tempfile.gettempdir())]
+    for place in dict.fromkeys(above):
+        assert not guard.may_read(Path(os.path.realpath(place))), place
+        for tool in ("Grep", "Glob"):
+            refused = guard.check(ToolUse(tool, {"pattern": "state", "path": str(place)}))
+            assert refused is not None and "not yours to read" in refused, (tool, place)
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": "/", "glob": "**/state.json"}))
+    assert guard.check(ToolUse("Glob", {"pattern": "/**/state.json"})) is not None
+    assert guard.check(ToolUse("Glob", {"pattern": f"{tmp_path}/**/state.json"})) is not None
+    assert guard.check(ToolUse("Glob", {"pattern": "../../../**/*.json"})) is not None
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": "/run"})) is not None  # the token
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": "../.."})) is not None
+    # Where nothing closed lies beneath, a search is the agent's to make.
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": "/usr/lib"})) is None
+    assert guard.check(ToolUse("Grep", {"pattern": "x", "path": str(guard.folder)})) is None
+    assert guard.check(ToolUse("Glob", {"pattern": "**/*.py", "path": sys.prefix})) is None
+
+    # Without the sandbox the files are open, and the credentials are still not: a search
+    # of the home directory would walk into them.
+    opened = make_guard(tmp_path, home, sandbox=False)
+    assert opened.check(ToolUse("Grep", {"pattern": "x", "path": str(project)})) is None
+    assert opened.check(ToolUse("Grep", {"pattern": "x", "path": str(home / "notes")})) is None
+    for place in (home, Path("/"), home / ".config"):
+        assert opened.check(ToolUse("Grep", {"pattern": "KEY", "path": str(place)})), place
+
+
+@pytest.mark.parametrize(
+    "name", [".env", ".env.local", ".env.production", ".envrc", "prod.env", "secrets.env"]
+)
+def test_a_file_of_settings_with_secrets_is_closed_under_every_usual_name(tmp_path, home, name):
+    for sandbox in (True, False):
+        guard = make_guard(tmp_path, home, sandbox=sandbox)
+        for place in (guard.folder, Path("/srv/app"), Path("/tmp/x")):
+            assert guard.check(ToolUse("Read", {"file_path": str(place / name)})), (place, name)
+    guard = make_guard(tmp_path, home)
+    assert guard.check(ToolUse("Glob", {"pattern": f"**/{name}"})) is not None
+    deny = guard.settings()["permissions"]["deny"]
+    if name in (".env", ".env.local", ".envrc"):
+        assert f"Read(//**/{name})" in deny and f"Read(**/{name})" in deny
+    assert "Read(//**/*.env)" in deny
+
+
+def test_a_sample_of_such_a_file_and_a_file_about_environments_stay_readable(tmp_path, home):
+    guard = make_guard(tmp_path, home)
+    for name in (".env.example", ".env.sample", "environment.py", "env.md", "gym_env.py"):
+        assert guard.check(ToolUse("Read", {"file_path": str(guard.folder / name)})) is None, name
+
+
 def test_the_file_tools_do_not_read_processes_or_devices(tmp_path, home):
     """The trees that show processes (their environment holds the worker's credentials)
     and devices are closed by this check itself, whatever the agent's process refuses."""
@@ -502,6 +558,8 @@ def test_the_file_tools_do_not_read_processes_or_devices(tmp_path, home):
         "http://[::1]:8501/",
         "http://app.localhost/",
         "http://0.0.0.0:8501/",
+        "http://0:8501/",
+        "http://[::]:8501/",
         "http://[bad",
         "",
     ],
@@ -530,6 +588,9 @@ def test_the_web_tool_opens_the_web(tmp_path, home, url):
 def test_the_shells_sandbox_is_told_which_hosts_are_closed(tmp_path, home):
     network = make_guard(tmp_path, home).settings()["sandbox"]["network"]
     for host in ("169.254.169.254", "metadata.google.internal", "localhost", "127.0.0.1"):
+        assert host in network["deniedDomains"]
+    # The unspecified address arrives at the loopback: it is closed under its spellings.
+    for host in ("0.0.0.0", "0", "::", "::1"):
         assert host in network["deniedDomains"]
 
 
@@ -651,6 +712,20 @@ def test_the_agents_process_starts_without_this_processes_credentials():
     assert not any(name in federation for name in FEDERATION_ENV)
     assert federation["ANTHROPIC_API_KEY"] == "" and federation["ANTHROPIC_BASE_URL"] == ""
     assert federation["OPENAI_API_KEY"] == ""
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["AWS_ACCESS_KEY_ID", "VAULT_SECRET_ID", "CLIENT_SECRET_ID", "GCP_SA_KEY_ID", "HF_TOKEN_ID"],
+)
+def test_half_a_credential_that_is_called_an_id_does_not_reach_the_agent(name):
+    """A name ending in ``_ID`` can be a credential's own (an access key's id)."""
+    environ = {name: "AKIAEXAMPLE", "AWS_ACCOUNT_ID": "1234", "TOKEN_FILE": "/x", "KEY_DIR": "/k"}
+    for credential in ("login", "federation"):
+        env = agent_env(credential, environ)
+        assert env[name] == ""
+        # What only names an account or a place is left alone.
+        assert not {"AWS_ACCOUNT_ID", "TOKEN_FILE", "KEY_DIR"} & set(env)
 
 
 def test_an_experiments_federation_settings_travel_under_other_names(tmp_path):
@@ -1397,6 +1472,111 @@ def test_the_count_of_an_unreported_turn_takes_each_messages_last_word_and_its_s
     assert row["cost_usd"] == pytest.approx(
         estimate_cost_usd(project.settings.agents.model, counted)
     )
+
+
+def spend(tmp_path, driver, project, **options) -> list[dict]:
+    """One turn of the scout by a fresh worker (a ledger of its own); its rows."""
+    ctx = sdk_context(project, driver, **options)
+    AgentSession(ctx, "scout").send("Go.")
+    ctx.close_sessions()
+    return ledger(ctx)
+
+
+def test_a_process_that_carries_a_killed_session_on_counts_from_nothing(tmp_path, home):
+    """A real process saves its totals when it ends in good order.  After a kill the next
+    process of the session counts from nothing (seen with real agents): all it reports
+    is new, and none of it may be taken for spend that is in the ledger already."""
+    project = sdk_project(tmp_path)
+    driver = FakeDriver(
+        lambda agent: agent.use(cost_usd=0.40, input_tokens=1000, output_tokens=100)
+    )
+    driver.killed = True
+    (row,) = spend(tmp_path, driver, project)
+    assert row["cost_usd"] == pytest.approx(0.40)
+
+    driver.killed = False
+    driver.script = lambda agent: agent.use(cost_usd=0.30, input_tokens=2000, output_tokens=50)
+    (row,) = spend(tmp_path, driver, project, left=lambda: 5.0)
+    assert driver.opened[1].resume == "fake-1"
+    assert driver.sessions["fake-1"]["claude-fable-5-2"]["cost_usd"] == pytest.approx(0.30)
+    assert (row["cost_usd"], row["input_tokens"]) == (pytest.approx(0.30), 2000)
+    # The sum the process was told not to pass allows for a count that carries on: it
+    # is never too low, and here it is too high by what the killed process forgot.
+    assert driver.opened[1].max_budget_usd == pytest.approx(5.40)
+
+    # The process after that one carries its count on, and only what is new is recorded.
+    driver.script = lambda agent: agent.use(cost_usd=0.10, input_tokens=500, output_tokens=10)
+    (row,) = spend(tmp_path, driver, project)
+    assert driver.sessions["fake-1"]["claude-fable-5-2"]["cost_usd"] == pytest.approx(0.40)
+    assert (row["cost_usd"], row["input_tokens"]) == (pytest.approx(0.10), 500)
+
+
+def test_a_process_can_count_from_a_total_older_than_the_last_one(tmp_path, home):
+    """Closed in good order, carried on, killed, carried on: the last process counts from
+    what the first one saved, not from nothing and not from where the second stood."""
+    project = sdk_project(tmp_path)
+    driver = FakeDriver(
+        lambda agent: agent.use(cost_usd=0.40, input_tokens=1000, output_tokens=100)
+    )
+    spend(tmp_path, driver, project)
+    driver.killed = True
+    driver.script = lambda agent: agent.use(cost_usd=0.20, input_tokens=3000, output_tokens=100)
+    (row,) = spend(tmp_path, driver, project)
+    assert row["cost_usd"] == pytest.approx(0.20)
+    driver.killed = False
+    driver.script = lambda agent: agent.use(cost_usd=0.05, input_tokens=500, output_tokens=10)
+    (row,) = spend(tmp_path, driver, project)
+    # It reports 0.45 in all (0.40 saved by the first, 0.05 of its own).
+    assert driver.sessions["fake-1"]["claude-fable-5-2"]["cost_usd"] == pytest.approx(0.45)
+    assert (row["cost_usd"], row["input_tokens"]) == (pytest.approx(0.05), 500)
+
+
+def test_a_helper_on_another_model_is_counted_at_that_models_price_and_once(tmp_path, home):
+    """The count of a turn that never reports prices each model's tokens at its own list
+    price, and the budget sees the same during the turn.  When the session is carried
+    on and its process reports the helper's model, that is new only beyond the count."""
+    from paper_orchestra.llm.pricing import estimate_cost_usd
+
+    project = sdk_project(tmp_path)
+    helper = "claude-haiku-5-5"
+    asked: list[tuple[str, int, float]] = []
+
+    def killed(agent: FakeAgent) -> None:
+        agent.use(cost_usd=0.01, input_tokens=1000, output_tokens=100)
+        agent.use(cost_usd=0.02, input_tokens=100_000, output_tokens=10_000, model=helper, sub=True)
+        raise KeyboardInterrupt
+
+    def over_budget(model, usage, more_usd=0.0):
+        asked.append((model, usage.input_tokens, more_usd))
+
+    driver = FakeDriver(killed)
+    first = sdk_context(project, driver, over_budget=over_budget)
+    with pytest.raises(KeyboardInterrupt):
+        AgentSession(first, "scout").send("Go.")
+    rows = {row["model"]: row for row in ledger(first)}
+    assert set(rows) == {"claude-fable-5-2", helper}
+    assert all(row["label"] == "scout.agent.unreported" for row in rows.values())
+    cheap = estimate_cost_usd(helper, Usage(input_tokens=100_000, output_tokens=10_000))
+    dear = estimate_cost_usd("claude-fable-5-2", Usage(input_tokens=100_000, output_tokens=10_000))
+    assert rows[helper]["cost_usd"] == pytest.approx(cheap) and cheap < dear / 3
+    assert rows[helper]["input_tokens"] == 100_000
+    assert rows["claude-fable-5-2"]["input_tokens"] == 1000
+    # The budget was asked with the agent's own tokens, and the helper's as dollars.
+    assert asked[-1] == ("claude-fable-5-2", 1000, pytest.approx(cheap))
+
+    # Carried on by a process whose totals include that turn (helper: 0.02 in all).
+    driver.script = lambda agent: agent.use(cost_usd=0.03, input_tokens=500, output_tokens=10)
+    second = sdk_context(project, driver)
+    AgentSession(second, "scout").send("Go.")
+    again = {row["model"]: row for row in ledger(second)}
+    # Of the helper's, only what its own figure is above the count is new, and no token
+    # is counted a second time.
+    assert 0 < cheap < 0.02
+    assert again[helper]["cost_usd"] == pytest.approx(0.02 - cheap)
+    assert again[helper]["input_tokens"] == again[helper]["output_tokens"] == 0
+    assert again["claude-fable-5-2"]["label"] == "scout.agent"
+    main_estimate = rows["claude-fable-5-2"]["cost_usd"]
+    assert again["claude-fable-5-2"]["cost_usd"] == pytest.approx(0.04 - main_estimate)
 
 
 def test_an_agent_interrupted_from_outside_is_asked_what_it_cost_before_it_is_ended(tmp_path, home):

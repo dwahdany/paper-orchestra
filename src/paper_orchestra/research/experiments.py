@@ -123,6 +123,7 @@ __all__ = [
     "number_report",
     "options",
     "plan_digest",
+    "read_metrics",
     "recover",
     "reportable_text",
     "request_cancel",
@@ -2306,6 +2307,12 @@ def _metric(name: str, value: Any) -> tuple[Any, str]:
         return value, value
     kind = {type(None): "null", list: "a list", dict: "an object"}.get(type(value), "not a value")
     raise ValueError(f"{label} is {kind} ({_shown(value)})")
+
+
+def read_metrics(directory: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """The metrics a run left in ``directory`` (see :func:`_read_metrics`), for whoever
+    has to know before the run is judged whether they are there."""
+    return _read_metrics(directory)
 
 
 def _read_metrics(directory: Path) -> tuple[dict[str, Any], dict[str, str]]:

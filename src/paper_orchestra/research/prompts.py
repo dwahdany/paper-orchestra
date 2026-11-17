@@ -608,6 +608,14 @@ def system_prompt(role: str, *, index: str, runtime: str = "classic", helpers: b
     return "\n\n".join([COMMON, how, _sdk_role_part(role), wiki])
 
 
+#: Said before the message of a run to the second agent that takes it up.
+TAKEN_UP = (
+    "Another agent began this run and its process failed before it had finished. Your "
+    "folder is as it left it: look at what is there (code it changed, results it wrote) "
+    "before you do anything again. The task, as it was given:\n\n"
+)
+
+
 def experiment_message(
     *,
     experiment: str,
@@ -641,8 +649,18 @@ def experiment_message(
         f"You have {round(timeout_seconds)} seconds (about {minutes} minute"
         f"{'s' if minutes != 1 else ''}) from now for everything: writing, running, "
         "repairing and running again. When the time is up your work is ended where it "
-        "stands and the run is recorded as failed, so run the experiment early and keep a "
-        "valid `metrics.json` in place as soon as you have one."
+        "stands. The run is then recorded as failed, unless a valid `metrics.json` is "
+        "in place and you changed no file of the code after it was written; so run the "
+        "experiment early, and keep a valid `metrics.json` in place as soon as you have "
+        "one.\n\n"
+        "Run the code in the foreground, as one shell command that ends when the code "
+        f"does: `{command}`, with `timeout <seconds>` in front of it if it could hang. A "
+        "command of your shell may take as long as your whole time, and you see its "
+        "output when it ends; what it prints also goes into the log of the run, where "
+        "the researcher reads it. Do not start the code in the background (`nohup`, "
+        "`&`) and wait for it with `sleep`: the time you sleep is lost, and it is how a "
+        "run that had finished gets recorded as failed. As soon as `metrics.json` holds "
+        "the results, reply: do not wait, and do not run anything again that worked."
     )
     if models:
         granted = (

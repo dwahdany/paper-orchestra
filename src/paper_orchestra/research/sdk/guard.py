@@ -87,7 +87,10 @@ JOB_ENV_PREFIX = "PAPER_ORCHESTRA_JOB_"
 LAUNCHER = "with-models"
 
 _SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
-_NOT_A_SECRET_SUFFIX = ("_FILE", "_PATH", "_DIR", "_ID")
+#: A name that says where something lies is no credential.  (``_ID`` is not among these:
+#: ``AWS_ACCESS_KEY_ID`` is half of a credential, and a name is only asked about here
+#: when it has one of the words above in it.)
+_NOT_A_SECRET_SUFFIX = ("_FILE", "_PATH", "_DIR")
 #: What separates the words of a shell command, for finding the programs it names.
 _WORD_BREAKS = re.compile(r"[\s;|&()<>`$\"'=,{}\[\]]+")
 _CLI_NAMES = ("paper-orchestra", "paper_orchestra")
@@ -100,7 +103,8 @@ _BOARD_INSTEAD = (
 )
 #: Hosts no agent's shell or web tool reaches: the metadata servers of the clouds, which
 #: hand the machine's own credentials to whoever asks from the machine, and the machine
-#: itself, where the app that decides proposals may be listening.
+#: itself, where the app that decides proposals may be listening.  The unspecified
+#: address is among them: a connection to ``0.0.0.0`` arrives at the loopback.
 CLOSED_HOSTS: tuple[str, ...] = (
     "metadata.google.internal",
     "metadata.goog",
@@ -112,6 +116,10 @@ CLOSED_HOSTS: tuple[str, ...] = (
     "168.63.129.16",
     "localhost",
     "127.0.0.1",
+    "0.0.0.0",
+    "0",
+    "::",
+    "::1",
 )
 #: Trees of the system that show processes and devices, not files: closed to the file
 #: tools whatever else is readable (the shell's sandbox has its own view of them).
@@ -191,9 +199,23 @@ def _temporary_places() -> list[str]:
     return list(dict.fromkeys([tempfile.gettempdir(), *(path for path in named if path)]))
 
 
+#: Endings of a file that shows which settings an ``.env`` file takes, without values.
+_ENV_SAMPLES = (".example", ".sample", ".template", ".dist")
+
+
 def _is_env_file(path: Path) -> bool:
+    """Whether ``path`` is named like a file that holds settings with their secrets:
+    ``.env``, ``.env.local``, ``.envrc``, ``prod.env``; not ``.env.example``."""
     name = path.name
-    return name == ".env" or (name.startswith(".env.") and not name.endswith(".example"))
+    if name in (".env", ".envrc") or name.endswith(".env"):
+        return True
+    return name.startswith(".env.") and not name.endswith(_ENV_SAMPLES)
+
+
+def _holds(place: Path, closed: Sequence[Path]) -> bool:
+    """Whether one of ``closed`` lies beneath ``place``: a search that starts at
+    ``place`` would walk into it."""
+    return any(place in other.parents for other in closed)
 
 
 @dataclass(frozen=True)
@@ -273,16 +295,28 @@ class Guard:
         ]
 
     def may_read(self, path: Path) -> bool:
-        """Whether the real path ``path`` is the agent's to read."""
+        """Whether the real path ``path`` is the agent's to read.
+
+        A directory is read by searching it (Grep, Glob), and a search walks down:
+        a directory that has a closed place anywhere beneath it is closed as well,
+        whatever else lies in it.  ``/`` and ``/home`` are such directories.
+        """
         if self.token_file is not None and path == Path(os.path.realpath(self.token_file)):
             return True
-        if _is_env_file(path) or any(_within(path, place) for place in self.credential_places()):
+        credentials = self.credential_places()
+        if _is_env_file(path) or any(_within(path, place) for place in credentials):
+            return False
+        if _holds(path, credentials):
             return False
         if not self.sandbox:
             return True
         if any(_within(path, tree) for tree in _SYSTEM_TREES):
             # Processes (their environment, their memory) and devices.  The agent's
             # process has refusals of its own for these; this one does not rest on them.
+            return False
+        if _holds(path, [*_SYSTEM_TREES, *self.hidden()]):
+            # No exception for a place that is open: the directory for temporary files
+            # is, and a project that lies beneath it is hidden all the same.
             return False
         # The closest place decides: the agent's folder is open inside the hidden
         # project, the project is hidden wherever it lies, and what is named as
@@ -302,7 +336,9 @@ class Guard:
         credentials = self.credential_places()
         denied = [f"Read(/{place}/**)" for place in credentials if place.suffix == ""]
         denied += [f"Read(/{place})" for place in credentials]
-        denied += ["Read(**/.env)", "Read(**/.env.local)"]
+        # (Two spellings: beneath the agent's folder, and anywhere on the machine.)
+        for name in (".env", ".env.local", ".envrc", "*.env"):
+            denied += [f"Read(**/{name})", f"Read(//**/{name})"]
         settings: dict[str, Any] = {"permissions": {"deny": list(dict.fromkeys(denied))}}
         if not self.sandbox:
             return settings
@@ -363,7 +399,8 @@ class Guard:
                 fixed = re.split(r"[*?\[{]", pattern, maxsplit=1)[0]
                 if fixed.startswith(("/", "~")) or ".." in fixed.split("/"):
                     targets.append(fixed if fixed.endswith("/") else os.path.dirname(fixed) or "/")
-                if os.path.basename(pattern).startswith(".env"):
+                named = os.path.basename(pattern)
+                if named.startswith(".env") or named.endswith(".env"):
                     targets.append(os.path.join(fixed or ".", ".env"))
             for target in targets or ["."]:
                 if not self.may_read(_real(target, folder)):

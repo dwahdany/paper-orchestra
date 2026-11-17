@@ -85,6 +85,7 @@ __all__ = [
     "login_found",
     "machine_report",
     "memory_tool",
+    "output_tail",
     "tool_parts",
 ]
 
@@ -115,8 +116,9 @@ INTERRUPT_REPORT_SECONDS = 5.0
 LABEL_SUFFIX = ".agent"
 #: What is added to that label for spend the agent's process never reported, because it
 #: was stopped or killed first: ``scout.agent.unreported``.  Such a row is counted from
-#: the tokens the turn's messages named, at the list price, and is a lower bound (fast
-#: mode and helper agents cost more than that).
+#: the tokens the turn's messages named, each model's at its own list price, and is a
+#: lower bound (fast mode costs more than that, and a message can end longer than its
+#: last report said).
 UNREPORTED_SUFFIX = ".unreported"
 
 _USAGE_NAMES = (
@@ -125,6 +127,41 @@ _USAGE_NAMES = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
+#: What a row of a session's totals holds, per model.
+_ROW_NAMES = (*_USAGE_NAMES, "web_searches", "cost_usd")
+#: The counters of a row by which the point a process counts from is told: what went
+#: into the model.  (Not the output: a message's last report can name less than it
+#: came to.)
+_INPUT_NAMES = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+#: How many earlier totals of a session are kept, per model, to tell that point by.
+_MAX_HISTORY = 40
+
+
+def _row(given: Any) -> dict[str, float]:
+    given = given if isinstance(given, Mapping) else {}
+    row = {}
+    for name in _ROW_NAMES:
+        try:
+            row[name] = float(given.get(name) or 0)
+        except (TypeError, ValueError):
+            row[name] = 0.0
+    return row
+
+
+#: Lines of a shell command's output that go into the log of a run, and their length.
+OUTPUT_LINES = 40
+OUTPUT_LINE_CHARS = 400
+
+
+def output_tail(text: str) -> str:
+    """The end of what a shell command printed, for the run's log: whole lines, bounded."""
+    lines = [line[:OUTPUT_LINE_CHARS] for line in str(text or "").splitlines()]
+    if not lines:
+        return ""
+    left_out = len(lines) - OUTPUT_LINES
+    if left_out > 0:
+        lines = [f"({left_out} earlier lines of this output are not shown)", *lines[-OUTPUT_LINES:]]
+    return "\n".join(lines) + "\n"
 
 
 class AgentFailed(RuntimeError):
@@ -410,9 +447,11 @@ class AgentSession:
         folder: Path | None = None,
         guard: Guard | None = None,
         job_models: Mapping[str, str] | None = None,
+        env: Mapping[str, str] | None = None,
         should_stop: Callable[[], bool] | None = None,
         deadline: float | None = None,
         on_line: Callable[[str], None] | None = None,
+        on_output: Callable[[str], None] | None = None,
         max_turns: int | None = agents.MAX_TURNS,
         record: str | None = None,
         resume: bool = True,
@@ -422,10 +461,13 @@ class AgentSession:
 
         The rest is for an agent that is not a phase's role (the one that carries out
         an experiment): its ``folder`` and ``guard`` where they are not the usual
-        ones, the federation settings its code may use (``job_models``), a further
+        ones, the federation settings its code may use (``job_models``), settings of
+        the agent's process itself (``env``: how long a command may run), a further
         reason to stop (``should_stop``), the moment its time is up (``deadline``,
-        on ``time.monotonic()``), and ``on_line``, which is given every line the
-        feed is given and what the agent says.  ``record`` names the session's
+        on ``time.monotonic()``), ``on_line``, which is given every line the
+        feed is given and what the agent says, and ``on_output``, which is given
+        the end of what each of its shell commands printed (the log of a run is
+        where a person looks for the experiment's own output).  ``record`` names the session's
         record and transcript where the session id does not tell this agent from
         another (every run of a run phase has the same), and ``resume=False``
         makes it start anew whatever is on file: a run begins in a fresh folder.
@@ -468,9 +510,13 @@ class AgentSession:
             folder=self.folder, project=project.root, sandbox=bool(settings.sandbox)
         )
         self._job_models = dict(job_models or {})
+        self._env = dict(env or {})
         self._should_stop = should_stop
         self._deadline = deadline
         self._on_line = on_line
+        self._on_output = on_output
+        #: The shell commands that are under way, by the id of their call.
+        self._shell_calls: set[str] = set()
         self._max_turns = max_turns
         self._model = str(settings.model)
         self._label = f"{role}{LABEL_SUFFIX}"
@@ -483,14 +529,21 @@ class AgentSession:
         self._resumed = False
         #: The agent's own session, as its process names it: what a later attempt resumes.
         self._sdk_session = ""
-        #: What the agent's session had cost in total when this process last heard of it,
-        #: by model: what a result reports beyond that is new.
-        self._paid: dict[str, dict[str, float]] = {}
-        self._paid_total = 0.0
+        #: Totals the agent's processes have reported for this session, by model, oldest
+        #: first, all of them in the ledger: the point a new process counts from is one
+        #: of these, or nothing (:meth:`_counts_from`).
+        self._history: dict[str, list[dict[str, float]]] = {}
+        #: What the process that runs now last reported, by model; empty until it has.
+        self._seen: dict[str, dict[str, float]] = {}
+        #: The same for a process that reports one sum and no models.
+        self._seen_total: float | None = None
+        self._last_total = 0.0
         self._last = ""
-        self._turn = Usage()
-        #: What each message of the turn in flight has used, as it was last reported.
-        self._by_message: dict[str, Usage] = {}
+        #: What the turn in flight has used so far, by model.
+        self._turn: dict[str, Usage] = {}
+        #: What each message of the turn in flight has used, as it was last reported,
+        #: and the model it was written by.
+        self._by_message: dict[str, tuple[str, Usage]] = {}
         self._searches = 0
         #: Whether this conversation has said what it works as (:meth:`_announce`).
         self._announced = False
@@ -560,14 +613,21 @@ class AgentSession:
             board=self._board,
             builtin=(*BUILTIN_TOOLS, *(HELPER_TOOLS if helpers else ())),
             settings=process,
-            env=agent_env(str(settings.credential), job_models=self._job_models),
+            env={
+                **agent_env(str(settings.credential), job_models=self._job_models),
+                **self._env,
+            },
             check=self._guard.check,
             resume=resume,
             max_turns=self._max_turns,
             # The agent's process counts its own cost, sub-agents and fast mode
-            # included, and ends the session when it has spent what is left.  A
-            # resumed session counts on from what it had cost before.
-            max_budget_usd=None if left is None else max(0.01, left + self._paid_total),
+            # included, and ends the session when it has spent what is left.  The
+            # process of a session that is carried on counts from a total an earlier
+            # one left, at most the last one reported: with that added, the sum is
+            # never too low, and it can be too high by what that process forgot
+            # (:meth:`_counts_from`).  The count during a turn and the look at the
+            # ledger between turns do not depend on it.
+            max_budget_usd=None if left is None else max(0.01, left + self._last_reported()),
         )
 
     def _open(self, *, fresh: bool = False) -> AgentConversation:
@@ -577,12 +637,34 @@ class AgentSession:
         resume = str(record.get("sdk_session") or "") or None
         self._resumed = resume is not None
         self._sdk_session = resume or ""
-        paid = record.get("model_usage") if resume else None
-        self._paid = {str(k): dict(v) for k, v in paid.items()} if isinstance(paid, dict) else {}
-        self._paid_total = float(record.get("cost_usd") or 0.0) if resume else 0.0
+        self._history = self._history_of(record) if resume else {}
+        self._last_total = float(record.get("cost_usd") or 0.0) if resume else 0.0
+        self._seen, self._seen_total = {}, None
         self._announced = False
         self._conversation = self.runtime.driver.open(self._options(resume))
         return self._conversation
+
+    @staticmethod
+    def _history_of(record: Mapping[str, Any]) -> dict[str, list[dict[str, float]]]:
+        """The totals on file for a session.  A record written before there was a
+        history holds the last totals alone (``model_usage``)."""
+        history = record.get("history")
+        if isinstance(history, dict):
+            return {
+                str(model): [_row(row) for row in rows if isinstance(row, dict)]
+                for model, rows in history.items()
+                if isinstance(rows, list)
+            }
+        last = record.get("model_usage")
+        if isinstance(last, dict):
+            return {str(model): [_row(row)] for model, row in last.items()}
+        return {}
+
+    def _last_reported(self) -> float:
+        """What the session had cost when a process of it last said so: the most a
+        process that carries it on counts from."""
+        by_model = sum(rows[-1]["cost_usd"] for rows in self._history.values() if rows)
+        return max(float(by_model), self._last_total)
 
     def close(self) -> None:
         """End the agent's process.  What it wrote on the board stays; its session can be
@@ -699,8 +781,10 @@ class AgentSession:
             if event.name == "WebSearch":
                 # Billed apart from the tokens; counted for a turn that never reports.
                 self._searches += 1
-                self._turn.web_searches = self._searches
+                self._turn.setdefault(self._model, Usage()).web_searches = self._searches
             self._log("tool", id=event.id, name=event.name, input=event.input, sub=event.sub)
+            if event.name == "Bash" and event.id:
+                self._shell_calls.add(event.id)
             if not self._ending():
                 described = self._described(event)
                 if described is not None:
@@ -714,6 +798,10 @@ class AgentSession:
                 is_error=event.is_error,
                 sub=event.sub,
             )
+            if event.id in self._shell_calls:
+                self._shell_calls.discard(event.id)
+                if self._on_output is not None and event.text.strip():
+                    self._on_output(output_tail(event.text))
         elif isinstance(event, Said):
             self._log("said", text=event.text, sub=event.sub)
             if self._on_line is not None and not event.sub:
@@ -752,6 +840,14 @@ class AgentSession:
             tool_parts(use, self.folder, refused=True),
         )
 
+    def _model_of(self, event: Used) -> str:
+        """The model a message was written by, under the name the session's totals use:
+        the agent's own model is named there as the project names it."""
+        model = str(event.model or "")
+        if not model or model.startswith(self._model) or self._model.startswith(model):
+            return self._model
+        return model
+
     def _count(self, event: Used) -> None:
         """Take note of what one model request used, and let the budget see the turn so
         far.  This is an estimate from tokens, for ending a long turn in time and for a
@@ -759,40 +855,77 @@ class AgentSession:
         own figure, when the turn has ended.
 
         The agent's process reports a message more than once while it is written,
-        the first time with almost no output counted: the last report stands.
+        the first time with almost no output counted: the last report stands.  A
+        helper can work on another model than the agent: each model's tokens are
+        kept apart and priced at that model's own list price.
         """
         usage = event.usage
-        self._by_message[event.message_id] = Usage(
-            **{name: agents._whole(usage.get(name)) for name in _USAGE_NAMES}, requests=1
+        self._by_message[event.message_id] = (
+            self._model_of(event),
+            Usage(**{name: agents._whole(usage.get(name)) for name in _USAGE_NAMES}, requests=1),
         )
-        turn = Usage(web_searches=self._searches)
-        for used in self._by_message.values():
-            turn.add(used)
+        turn: dict[str, Usage] = {self._model: Usage(web_searches=self._searches)}
+        for model, used in self._by_message.values():
+            turn.setdefault(model, Usage()).add(used)
         self._turn = turn
-        self.ctx.used(self._model, self._turn)
+        others = sum(
+            estimate_cost_usd(model, used) or 0.0
+            for model, used in turn.items()
+            if model != self._model
+        )
+        self.ctx.used(self._model, turn[self._model], more_usd=others)
+
+    def _counts_from(self, model: str, row: Mapping[str, float]) -> dict[str, float]:
+        """The totals the process that runs now started its count of ``model`` from, told
+        at its first report (``row``).
+
+        A process that carries a session on does not always count on from where the
+        last one stood.  It counts from the totals a process of the session saved
+        when it ended in good order: after a process was killed that is an older
+        total, or nothing (checked against real agents).  So the point is measured:
+        what the report names, less what the messages of this turn used, is where
+        the count began, and the latest total on file that is not beyond that point
+        is taken for it.  Every total on file is in the ledger, so what the report
+        names beyond the one taken is new.  Where the measure fails (a message
+        whose usage was never reported), the latest total is taken and nothing is
+        counted twice; what a killed process had not saved is then missed.
+        """
+        used = self._turn.get(model, Usage())
+        began = {name: row[name] - getattr(used, name) for name in _INPUT_NAMES}
+        # (A report that names no tokens at all is told by its dollars alone.  They are
+        # not asked otherwise: a count from tokens on file can be above the process's
+        # own figure for the same turn.)
+        bare = not any(row[name] for name in _USAGE_NAMES)
+        for known in reversed(self._history.get(model, [])):
+            if (
+                all(known[name] <= began[name] for name in _INPUT_NAMES)
+                and known["output_tokens"] <= row["output_tokens"]
+                and (not bare or known["cost_usd"] <= row["cost_usd"] + 1e-9)
+            ):
+                return known
+        return _row({})
+
+    def _remember(self, model: str, row: dict[str, float]) -> None:
+        rows = self._history.setdefault(model, [])
+        if not rows or rows[-1] != row:
+            rows.append(row)
+            del rows[:-_MAX_HISTORY]
 
     def _account(self, turn: Turn) -> None:
         """Put what the agent's session cost since it was last heard of into the ledger.
 
-        The agent's process reports totals for its session, per model, and a resumed
-        session counts on from where it stood.  What is new since the last report
-        is recorded once, with the dollar figure the process gave.
+        The agent's process reports totals for its session, per model.  What is new
+        since its last report is recorded once, with the dollar figure the process
+        gave; at the first report of a process, since the totals it started its
+        count from (:meth:`_counts_from`).
         """
         ledger = self.ctx.harness.usage
-        seen_models = False
-        for model, row in turn.model_usage.items():
-            before = self._paid.get(model, {})
-            new = {
-                name: max(0.0, float(row.get(name) or 0) - float(before.get(name) or 0))
-                for name in (*_USAGE_NAMES, "web_searches", "cost_usd")
-            }
-            # Never below what is in the ledger already (an estimate for a turn that was
-            # killed can be above what the process then reports for it).
-            self._paid[model] = {
-                name: max(float(row.get(name) or 0), float(before.get(name) or 0))
-                for name in (*_USAGE_NAMES, "web_searches", "cost_usd")
-            }
-            seen_models = True
+        for model, given in turn.model_usage.items():
+            row = _row(given)
+            before = self._seen.get(model) or self._counts_from(model, row)
+            new = {name: max(0.0, row[name] - before[name]) for name in _ROW_NAMES}
+            self._seen[model] = row
+            self._remember(model, row)
             if not any(new.values()):
                 continue
             ledger.record(
@@ -805,17 +938,19 @@ class AgentSession:
                 ),
                 cost_usd=new["cost_usd"],
             )
-        if seen_models:
-            self._paid_total = sum(float(row.get("cost_usd") or 0.0) for row in self._paid.values())
-        elif turn.cost_usd is not None:
-            added = float(turn.cost_usd) - self._paid_total
-            if added > 0:
+        if not turn.model_usage and turn.cost_usd is not None:
+            total = float(turn.cost_usd)
+            before = self._seen_total
+            if before is None:
+                # A process that counts on names at least what the last one named.
+                before = self._last_total if total >= self._last_total else 0.0
+            if total > before:
                 ledger.record(
-                    self._label, self._model, Usage(requests=turn.requests), cost_usd=added
+                    self._label, self._model, Usage(requests=turn.requests), cost_usd=total - before
                 )
-                self._paid_total = float(turn.cost_usd)
+            self._seen_total = self._last_total = total
         # What the ledger has of this turn is the process's figure now, not an estimate.
-        self._turn = Usage()
+        self._turn = {}
         self._by_message = {}
         self._searches = 0
         if turn.session_id:
@@ -915,27 +1050,33 @@ class AgentSession:
     def _account_unreported(self) -> None:
         """Count a turn whose process ended without saying what it cost (it was killed,
         or it failed): by the tokens its messages reported and the web searches it
-        made, at the list price.
+        made, each model's at its own list price.
 
-        The row says of itself that it is such a count (:data:`UNREPORTED_SUFFIX`):
-        it is a lower bound, since the list price knows nothing of fast mode or of
-        helper agents, and whoever shows the spend says so.  The amount is added to
-        what the session counts as in the ledger.  When the session is carried on
-        and its process then reports totals that include this turn, only what goes
-        beyond the estimate is new: nothing is counted twice.
+        The rows say of themselves that they are such a count
+        (:data:`UNREPORTED_SUFFIX`): a lower bound, since the list price knows
+        nothing of fast mode, and whoever shows the spend says so.  The totals the
+        process would have reported are put on file as it would have named them, so
+        far as they can be told.  When the session is carried on by a process whose
+        totals include this turn, only what goes beyond the estimate is new; when
+        its totals do not (the process was killed, and counts from an older point),
+        the estimate stands alone.  Nothing is counted twice either way.
         """
-        if not any(self._turn.to_dict().values()):
-            return
-        estimate = estimate_cost_usd(self._model, self._turn) or 0.0
-        self.ctx.harness.usage.record(
-            f"{self._label}{UNREPORTED_SUFFIX}", self._model, self._turn, cost_usd=estimate
-        )
-        row = self._paid.setdefault(self._model, {})
-        for name in (*_USAGE_NAMES, "web_searches"):
-            row[name] = float(row.get(name) or 0) + getattr(self._turn, name)
-        row["cost_usd"] = float(row.get("cost_usd") or 0.0) + estimate
-        self._paid_total += estimate
-        self._turn = Usage()
+        ledger = self.ctx.harness.usage
+        for model, used in self._turn.items():
+            if not any(used.to_dict().values()):
+                continue
+            estimate = estimate_cost_usd(model, used) or 0.0
+            ledger.record(f"{self._label}{UNREPORTED_SUFFIX}", model, used, cost_usd=estimate)
+            rows = self._history.get(model) or []
+            base = self._seen.get(model) or (rows[-1] if rows else _row({}))
+            would = dict(base)
+            for name in (*_USAGE_NAMES, "web_searches"):
+                would[name] += getattr(used, name)
+            would["cost_usd"] += estimate
+            self._remember(model, would)
+            self._last_total += estimate
+        self._seen, self._seen_total = {}, None
+        self._turn = {}
         self._by_message = {}
         self._searches = 0
         self._save_record()
@@ -955,8 +1096,11 @@ class AgentSession:
                     "sdk_session": self._sdk_session,
                     "model": self._model,
                     "folder": str(self.folder),
-                    "cost_usd": self._paid_total,
-                    "model_usage": self._paid,
+                    # What the session's processes said it had cost, last and before
+                    # (:meth:`_counts_from`); all of it is in the ledger.
+                    "cost_usd": self._last_reported(),
+                    "model_usage": {m: rows[-1] for m, rows in self._history.items() if rows},
+                    "history": self._history,
                     "transcript": self._transcript_path.name,
                 },
             )
@@ -964,7 +1108,7 @@ class AgentSession:
     def send(self, parts: Part | Sequence[Part] | str) -> str:
         self.ctx.guard()
         text = self._as_text(parts)
-        self._turn = Usage()
+        self._turn = {}
         self._by_message = {}
         self._searches = 0
         self._asked_at = None

@@ -1414,7 +1414,13 @@ class Engine:
             )
 
     def _over_budget(
-        self, model: str, usage: Usage, *, phase: str | None = None, experiment: str | None = None
+        self,
+        model: str,
+        usage: Usage,
+        *,
+        phase: str | None = None,
+        experiment: str | None = None,
+        more_usd: float = 0.0,
     ) -> _BudgetSpent | None:
         """Asked after every model request of a session's turn: is the model budget spent?
 
@@ -1429,10 +1435,11 @@ class Engine:
         before a session; without this, one turn of up to ``agents.MAX_TURNS``
         requests could spend many times the limit before anything looked.  A model
         without a known price counts as nothing here, as it does in the ledger.
+        ``more_usd`` is what the turn cost on other models, priced by whoever asks.
         """
         limit = float(self.project.settings.limits.model_usd)
         with self._lock:
-            spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0)
+            spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0) + more_usd
         if spent < limit:
             return None
         if experiment:

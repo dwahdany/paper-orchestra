@@ -179,6 +179,9 @@ class AgentOptions:
     check: Callable[[ToolUse], str | None] = field(default=lambda use: None, repr=False)
     #: The session to carry on, as an earlier :class:`Turn` named it; ``None`` starts anew.
     resume: str | None = None
+    #: With ``resume``: carry the session on as a new one of its own (a copy of what was
+    #: said so far, under a new name), whose process counts its cost from nothing.
+    fork: bool = False
     max_turns: int | None = None
     #: The agent's process ends the session itself once it has cost this much.
     max_budget_usd: float | None = None

@@ -208,7 +208,7 @@ def _never() -> bool:
     return False
 
 
-def _within_budget(model: str, usage: Usage) -> BaseException | None:
+def _within_budget(model: str, usage: Usage, **more: Any) -> BaseException | None:
     return None
 
 
@@ -245,7 +245,8 @@ class AgentContext:
     instead of running to its end.  ``over_budget`` is asked after every model
     request of a turn with the model and what the turn has used so far (which the
     harness's ledger learns only when the turn ends); it returns why the work must
-    stop, or ``None``, and a turn it stopped ends where a stop request ends one.
+    stop, or ``None``, and a turn it stopped ends where a stop request ends one
+    (it is also given ``more_usd=`` when helpers of the turn worked on other models).
     ``compute`` is a backend, or a
     callable choosing one for a plan, as ``research.experiments.run`` takes it.
     ``handover`` names the roles whose undecided pages of this round the session
@@ -264,7 +265,7 @@ class AgentContext:
     instruction: str | None = None
     guard: Callable[[], None] = _no_guard
     stopping: Callable[[], bool] = _never
-    over_budget: Callable[[str, Usage], BaseException | None] = _within_budget
+    over_budget: Callable[..., BaseException | None] = _within_budget
     scholar: SemanticScholar | None = None
     compute: ComputeBackend | Callable[[Any], ComputeBackend] | None = None
     handover: Sequence[str] = ()
@@ -284,15 +285,22 @@ class AgentContext:
     def session_id(self, role: str) -> str:
         return f"{self.session}-{role}"
 
-    def used(self, model: str, usage: Usage) -> None:
+    def used(self, model: str, usage: Usage, *, more_usd: float = 0.0) -> None:
         """Take note of what the turn in flight has used after one more model request.
+
+        ``more_usd`` is what the turn has cost besides, already priced: the requests
+        of helpers that work on another model than ``model``.
 
         Nothing is raised here.  A turn that is past the budget ends at
         :meth:`heed_stop`, which the session asks before each of its tool calls and
         after each model request that leads to another.
         """
         if self._spent is None:
-            self._spent = self.over_budget(model, usage)
+            self._spent = (
+                self.over_budget(model, usage, more_usd=more_usd)
+                if more_usd
+                else self.over_budget(model, usage)
+            )
 
     def ending(self) -> bool:
         """Whether the turn in flight ends the next time :meth:`heed_stop` is asked."""

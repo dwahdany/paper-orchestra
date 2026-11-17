@@ -10,9 +10,14 @@ agent.  What the fake does not have is the sandbox of the shell: a command is
 not executed unless the script says what it does.
 
 It behaves like the real thing where the runtime depends on it: an interrupt
-ends the turn at the agent's next action, the cost it reports is a total that
-a resumed session carries on from, and the first event of a session is what
-the process says about itself.
+ends the turn at the agent's next action, the cost it reports is a total for
+the session, and the first event of a session is what the process says about
+itself.  As with the real thing, a process that carries a session on counts
+from the totals a process of that session saved when it was closed in good
+order: one that was killed (``FakeDriver.killed``) saved nothing, and the next
+counts from an older total or from nothing.  A process ends its session by
+itself at the sum it was told (``AgentOptions.max_budget_usd``) where the test
+asks for that (``FakeDriver.ends_at_budget``).
 """
 
 from __future__ import annotations
@@ -117,11 +122,20 @@ class FakeAgent:
         self, command: str, does: Callable[[], Any] | None = None, *, sub: bool = False
     ) -> str:
         """Run ``command`` in the agent's shell.  Nothing is executed: ``does`` is what the
-        command would do, called when the call was let through."""
-        refused = self._refused(ToolUse("Bash", {"command": command}, sub))
+        command would do, called when the call was let through, and a text it returns
+        is what the command printed."""
+        self._conversation.driver.calls_made += 1
+        use = ToolUse(
+            "Bash", {"command": command}, sub, f"call-{self._conversation.driver.calls_made}"
+        )
+        refused = self._refused(use)
         if refused is not None:
             return refused
-        return str(does() or "") if does is not None else ""
+        done = does() if does is not None else ""
+        # What the command printed, as the agent is answered it (a text ``does`` returns).
+        printed = done if isinstance(done, str) else ""
+        self._sink(Answered(use.id, printed, False, sub))
+        return printed
 
     def _path(self, path: str | os.PathLike[str]) -> Path:
         return Path(path) if os.path.isabs(path) else self.cwd / path
@@ -206,11 +220,13 @@ class _FakeConversation:
         #: message id -> the usage last reported for it (``FakeAgent.use(message=)``).
         self.reported: dict[str, dict[str, int]] = {}
         resumed = driver.sessions.get(options.resume or "")
-        # A resumed session carries on from the totals it had, as the real one does.
         self.session_id = options.resume if resumed else f"fake-{len(driver.sessions) + 1}"
-        self._totals: dict[str, dict[str, float]] = (
-            {model: dict(row) for model, row in resumed.items()} if resumed else {}
-        )
+        # A resumed session counts on from the totals that were saved for it, as the
+        # real one does: those of the last process that was closed, not killed.
+        saved = driver.saved.get(str(self.session_id), {}) if resumed else {}
+        self._totals: dict[str, dict[str, float]] = {
+            model: dict(row) for model, row in saved.items()
+        }
         driver.sessions[str(self.session_id)] = self._totals
 
     def add(self, model: str, usage: Mapping[str, Any], cost_usd: float) -> None:
@@ -246,12 +262,16 @@ class _FakeConversation:
         finally:
             self.turns += 1
         cost = sum(row.get("cost_usd", 0.0) for row in self._totals.values())
+        cap = self.options.max_budget_usd
+        over = driver.ends_at_budget and cap is not None and cost >= cap
         return Turn(
             text=said,
             session_id=str(self.session_id),
             cost_usd=cost,
             model_usage={model: dict(row) for model, row in self._totals.items()},
-            ended=ended,
+            is_error=bool(over),
+            error="Reached maximum budget" if over else None,
+            ended="error_max_budget_usd" if over else ended,
             requests=agent.requests,
         )
 
@@ -273,6 +293,10 @@ class _FakeConversation:
         self.driver.interrupts += 1
 
     def close(self) -> None:
+        if not self.closed and not self.driver.killed:
+            self.driver.saved[str(self.session_id)] = {
+                model: dict(row) for model, row in self._totals.items()
+            }
         self.closed = True
 
 
@@ -288,13 +312,22 @@ class FakeDriver:
         #: Whether an agent whose turn is broken off from outside still says what its
         #: session cost (a real one does unless the interrupt ended it too).
         self.reports_when_interrupted = False
+        #: Whether an agent's process ends its session itself once it has cost what it
+        #: was told not to pass (``error_max_budget_usd``), as a real one does.
+        self.ends_at_budget = False
+        #: Whether the processes are killed instead of closed: a killed process does not
+        #: save its totals, and whoever carries its session on counts from older ones.
+        self.killed = False
         self.opened: list[AgentOptions] = []
         self.conversations: list[_FakeConversation] = []
         self.prompts: list[str] = []
         self.interrupts = 0
         self.messages = 0
-        #: session id -> the totals that session has reported.
+        self.calls_made = 0
+        #: session id -> the totals that session's last process has reported.
         self.sessions: dict[str, dict[str, dict[str, float]]] = {}
+        #: session id -> the totals a process of it saved when it was closed.
+        self.saved: dict[str, dict[str, dict[str, float]]] = {}
         #: Sessions that can no longer be carried on (their file is gone).
         self.unresumable: set[str] = set()
 

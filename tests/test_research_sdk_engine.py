@@ -9,6 +9,7 @@ handed to the engine raises.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -776,6 +777,211 @@ def test_a_budget_that_runs_out_during_a_run_names_the_agent_that_carried_it_out
     assert "designer" not in said and "the phase then resumes" not in said
     assert events(project, "budget.warning")[-1]["summary"] == said
     assert project.page("E1").state == "queued"
+
+
+def dear_experimenter(project: Project, team: AgentTeam, backend: FakeBackend) -> FakeDriver:
+    """An approved E1, 30 cents left of the model budget, and an experiment agent whose
+    process says it cost 50: dollars far above the list price of its tokens (fast mode,
+    helpers), so that the count from tokens does not end it first.  Its process ends the
+    session itself at the sum it was told, as a real one does."""
+    to_approved(project, team, backend)
+    spent = read_state(project)["spent"]["model_usd"]
+    project.settings.update({"limits": {"model_usd": spent + 0.3}})
+    project.save_settings()
+    team.during["experimenter"] = lambda agent: agent.use(
+        cost_usd=0.5, input_tokens=10, output_tokens=10
+    )
+    team.metrics = None
+    driver = FakeDriver(team)
+    driver.ends_at_budget = True
+    return driver
+
+
+def test_an_agent_ended_by_its_own_budget_cap_leaves_the_run_in_the_queue(project, team, backend):
+    """The agent's process ends its session at the sum it was told.  That is the model
+    budget, not a failure of the experiment: the run goes back to the queue and keeps
+    its approval, and the person is told that the budget is spent."""
+    driver = dear_experimenter(project, team, backend)
+    with pytest.raises(EngineError, match="The model budget is used up"):
+        make_engine(project, driver, backend).run_experiment("E1")
+    (run,) = experiments.runs(project, "E1")
+    assert (run["status"], run["requeued"]) == ("cancelled", True)
+    assert project.page("E1").state == "queued" and project.pages(kind="result") == []
+    assert experiments.will_not_run(project, "E1") is None  # its approval stands
+    assert len(events(project, "budget.warning")) == 1
+    assert team.calls.count("experimenter") == 1
+
+
+def test_the_run_phase_stops_at_the_budget_when_the_agents_process_ends_at_its_cap(
+    project, team, backend
+):
+    driver = dear_experimenter(project, team, backend)
+    state = make_engine(project, driver, backend).advance()
+    assert (state["status"], state["phase"], state["next_phase"]) == ("checkpoint", "run", "run")
+    assert state["phases"][-1]["status"] == "interrupted"
+    assert "The model budget is used up" in state["phases"][-1]["error"]
+    (run,) = experiments.runs(project, "E1")
+    assert (run["status"], run["requeued"]) == ("cancelled", True)
+    assert project.page("E1").state == "queued" and project.pages(kind="result") == []
+    assert len(events(project, "budget.warning")) == 1
+    assert "analyst" not in team.calls
+
+
+def test_an_agent_whose_process_fails_once_is_followed_by_another_and_the_run_succeeds(
+    project, team, backend
+):
+    """An overloaded API ends an agent's process with an error.  That says nothing about
+    the experiment: a second agent takes the run up in the same folder."""
+    to_approved(project, team, backend)
+    failures = []
+
+    def overloaded(agent: FakeAgent) -> None:
+        if not failures:
+            failures.append(1)
+            raise RuntimeError("API Error: 529 Overloaded")
+
+    team.during["experimenter"] = overloaded
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert (record["status"], record["number"]) == ("succeeded", 1)
+    assert team.calls.count("experimenter") == 2
+    assert team.prompts["experimenter"][1].startswith("Another agent began this run")
+    log = (project.root / "experiments" / "E1" / "runs" / "1" / "log.txt").read_text()
+    assert "The agent's process failed (RuntimeError: API Error: 529 Overloaded)" in log
+    assert "another agent takes the run up once more" in log
+
+
+def test_an_agent_whose_process_keeps_failing_does_not_cost_the_run_its_approval(
+    project, team, backend
+):
+    """A failure of the agent's process is the backend being unusable, not the experiment
+    failing: the run goes back to the queue, nothing is analysed, and the phase ends
+    with the reason.  The agent is started twice and no more."""
+    to_approved(project, team, backend)
+
+    def overloaded(agent: FakeAgent) -> None:
+        raise RuntimeError("API Error: 529 Overloaded")
+
+    team.during["experimenter"] = overloaded
+    state = advance(project, team, backend)
+    assert team.calls.count("experimenter") == 2 and "analyst" not in team.calls
+    assert (state["status"], state["phase"]) == ("failed", "run")
+    assert "API Error: 529 Overloaded" in state["phases"][-1]["error"]
+    assert "E1 keeps its approval" in state["phases"][-1]["error"]
+    (run,) = experiments.runs(project, "E1")
+    assert (run["status"], run["error_kind"], run["requeued"]) == ("failed", "backend", True)
+    assert project.page("E1").state == "queued" and project.pages(kind="result") == []
+    assert experiments.will_not_run(project, "E1") is None
+
+    # When the agents work again, the same approval is enough.
+    del team.during["experimenter"]
+    advance(project, team, backend)
+    assert project.page("E1").state == "succeeded"
+
+
+def test_a_run_whose_results_were_written_before_the_time_ran_out_keeps_them(
+    project, team, backend, monkeypatch
+):
+    """The agent is told to keep a valid metrics.json in place.  One that was waiting
+    (for a command, to write its reply) when its time ran out has finished the run."""
+    to_approved(project, team, backend)
+    from paper_orchestra.research.sdk import session as session_module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(session_module.time, "monotonic", lambda: clock["now"])
+
+    def waits(agent: FakeAgent) -> None:
+        metrics = json.dumps(METRICS)
+        agent.bash(
+            "python main.py",
+            does=lambda: (agent.cwd / "metrics.json").write_text(metrics, encoding="utf-8"),
+        )
+        clock["now"] += 301.0  # the plan gives 300 seconds
+        agent.bash("sleep 60; cat run.log")
+
+    team.during["experimenter"] = waits
+    team.metrics = None
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert (record["status"], record["timed_out"], record["error"]) == ("succeeded", False, None)
+    assert record["metrics"] == METRICS
+    assert any("was up before it had said that it was done" in note for note in record["notes"])
+    assert project.page("E1").state == "succeeded"
+    assert "no file of the code was changed after it was written" in project.page("E1-run1").body
+
+
+def test_results_that_a_change_of_the_code_followed_do_not_stand_when_the_time_runs_out(
+    project, team, backend, monkeypatch
+):
+    to_approved(project, team, backend)
+    from paper_orchestra.research.sdk import session as session_module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(session_module.time, "monotonic", lambda: clock["now"])
+
+    def changes(agent: FakeAgent) -> None:
+        (agent.cwd / "metrics.json").write_text(json.dumps(METRICS), encoding="utf-8")
+        agent.write("main.py", GOOD_CODE + "\n# another way of measuring\n")
+        # (The clock of the files: the code is newer than the metrics.)
+        os.utime(agent.cwd / "metrics.json", (1_000_000, 1_000_000))
+        clock["now"] += 301.0
+        agent.bash("python main.py")
+
+    team.during["experimenter"] = changes
+    team.metrics = None
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert (record["status"], record["error_kind"], record["timed_out"]) == (
+        "failed",
+        "timeout",
+        True,
+    )
+    assert record["metrics"] == {}
+
+
+def test_the_log_of_an_agents_run_holds_what_its_commands_printed(
+    project, team, backend, monkeypatch
+):
+    """In the classic runtime the log of a run is the program's output.  An agent's run
+    shows that too, under the line that names the command, with secrets masked and
+    long output cut to its end."""
+    to_approved(project, team, backend)
+    monkeypatch.setenv("WANDB_API_KEY", "wandb-secret-0123456789abcdef")
+
+    def noisy(agent: FakeAgent) -> None:
+        agent.bash(
+            "python main.py --trials 100",
+            does=lambda: "\n".join(
+                [f"[{n}/100] arm=direct trial={n}" for n in range(1, 101)]
+                + ["key wandb-secret-0123456789abcdef", "trial failed: TypeError"]
+            ),
+        )
+
+    team.during["experimenter"] = noisy
+    record = make_engine(project, team, backend).run_experiment("E1")
+    assert record["status"] == "succeeded"
+    log = (project.root / "experiments" / "E1" / "runs" / "1" / "log.txt").read_text()
+    lines = log.splitlines()
+    told = next(i for i, line in enumerate(lines) if "python main.py --trials 100" in line)
+    assert lines[told].startswith("[paper-orchestra] The experimenter ran")
+    assert lines[told + 1] == "(62 earlier lines of this output are not shown)"
+    assert "[100/100] arm=direct trial=100" in lines and "trial failed: TypeError" in lines
+    assert "[1/100] arm=direct trial=1" not in lines
+    assert "wandb-secret-0123456789abcdef" not in log
+    # The program's lines are not marked as the project's own.
+    assert not any(line.startswith("[paper-orchestra] [") for line in lines)
+
+
+def test_a_command_of_an_experiment_agent_may_take_as_long_as_the_run(project, team, backend):
+    """The agent's process moves a shell command to the background after two minutes
+    unless it is told otherwise; an agent then waits with `sleep` and loses its time."""
+    to_approved(project, team, backend)
+    engine = make_engine(project, team, backend)
+    engine.run_experiment("E1")
+    options = engine.driver.opened[-1]
+    assert options.env["BASH_DEFAULT_TIMEOUT_MS"] == options.env["BASH_MAX_TIMEOUT_MS"] == "300000"
+    said = team.prompts["experimenter"][-1]
+    assert "Run the code in the foreground" in said and "`nohup`" in said
+    assert "unless a valid `metrics.json` is in place" in said
+    # No other agent's shell is changed.
+    assert all("BASH_DEFAULT_TIMEOUT_MS" not in o.env for o in engine.driver.opened[:-1])
 
 
 def test_a_failed_run_on_a_remote_backend_does_not_say_that_an_agent_repairs_it(

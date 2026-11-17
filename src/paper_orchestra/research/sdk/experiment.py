@@ -25,7 +25,15 @@ the code that was approved.
 The plan's ``timeout_seconds`` bounds the agent's whole work (writing, running,
 repairing), not one execution of the code.  The seconds of the run are the
 agent's wall time, accounted as for any run.  What the agent's model costs goes
-to the model budget, not to the run's ``cost_usd``.
+to the model budget, not to the run's ``cost_usd``.  When the time is up and a
+valid ``metrics.json`` is in place that no change of the code followed, the run
+is recorded with those metrics: the agent was told to keep one in place, and
+its results do not depend on whether it had also said that it was done.
+
+Three ways an agent can end are not the experiment's failure, and the run then
+goes back to the queue with its approval: a stop request, a spent model budget,
+and an agent whose process fails (an overloaded API, a login that ran out),
+which is tried once more first.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from paper_orchestra.compute.base import (
+    BackendUnusable,
     ComputeError,
     JobLog,
     JobResult,
@@ -48,16 +57,29 @@ from paper_orchestra.compute.base import (
     open_run,
 )
 from paper_orchestra.compute.local import collect_outputs, copy_source, job_model_env
+from paper_orchestra.errors import stops_the_run
 from paper_orchestra.research import agents, experiments, prompts
 from paper_orchestra.research.sdk.guard import LAUNCHER, Guard, launcher_text
 from paper_orchestra.research.sdk.session import AgentSession
 
-__all__ = ["ROLE", "WORK_DIR", "AgentBackend"]
+__all__ = ["ROLE", "WORK_DIR", "AgentBackend", "AgentUnusable"]
 
 #: The role an experiment agent works as, and writes its proposals as.
 ROLE = "experimenter"
 #: The agent's folder inside the run directory.
 WORK_DIR = "work"
+#: Seconds that must be left of a run's time for a second agent to take it up after
+#: the first one's process failed.
+RETRY_NEEDS_SECONDS = 30.0
+
+
+class AgentUnusable(BackendUnusable):
+    """The agent that was to carry a run out could not work: its process failed, twice.
+
+    Not the experiment's failure.  As with a backend that cannot be used, the run
+    goes back to the queue and keeps its approval, and the work stops with the
+    reason for the person to act on.
+    """
 
 
 class AgentBackend:
@@ -100,6 +122,44 @@ class AgentBackend:
         return None  # the engine closes the backend it made
 
     # -- the job ---------------------------------------------------------------------
+
+    def _stop_of(self, exc: BaseException) -> BaseException | None:
+        """Why the work must stop, when ``exc`` ended the agent because it must: a stop
+        request, or the project's guard saying so (the model budget).  The guard is
+        asked again here, because it answers with an exception of whoever runs the
+        phase; ``None`` when the agent's process simply failed."""
+        ctx = self._ctx
+        if ctx.stopping():
+            return exc
+        try:
+            ctx.guard()
+        except Exception as why:
+            if ctx.stopping():
+                return why
+            return agents.SessionStopped(str(why), reason=why)
+        return None
+
+    @staticmethod
+    def _results_stand(work: Path, run_dir: Path) -> bool:
+        """Whether the agent's folder holds results an agent whose time ran out may be
+        taken to have finished: a ``metrics.json`` that reads as metrics and that no
+        change of the code followed.  (The code is what was kept as the code of the
+        run; a file changed after the metrics were written may not be what produced
+        them.)"""
+        metrics = work / "metrics.json"
+        try:
+            experiments.read_metrics(work)
+            written = metrics.stat().st_mtime
+            kept = run_dir / experiments.CODE_AS_RUN_DIR
+            if not kept.is_dir():
+                return False
+            for path in kept.rglob("*"):
+                source = work / path.relative_to(kept)
+                if path.is_file() and source.is_file() and source.stat().st_mtime > written:
+                    return False
+        except (OSError, ValueError):
+            return False
+        return True
 
     def _folder(
         self, source_dir: Path, run_dir: Path, outputs: Sequence[str]
@@ -159,60 +219,87 @@ class AgentBackend:
             entry = next((word for word in spec.command[1:] if word.endswith(".py")), "main.py")
             command = shlex.join(spec.command)
             log.note(f"An agent carries out {page.id}; it has {round(spec.timeout)} seconds.")
-            try:
-                session = AgentSession(
-                    ctx,
-                    ROLE,
-                    caps={"experiment": int(limits.max_experiments)},
-                    folder=work,
-                    guard=Guard(
+            message = prompts.experiment_message(
+                experiment=str(page.id),
+                title=page.title,
+                plan=page.body,
+                files=files,
+                entrypoint=entry,
+                command=command,
+                timeout_seconds=float(spec.timeout),
+                network=bool(spec.network),
+                models=bool(models),
+                launcher=LAUNCHER,
+                packages=spec.packages,
+                max_experiments=int(limits.max_experiments),
+            )
+            deadline = began + float(spec.timeout)
+            # A command of the agent's shell may take as long as the run may: without
+            # this the agent's process moves a command to the background after two
+            # minutes, and the agent is left to wait for it with `sleep`.
+            command_ms = str(max(1, round(float(spec.timeout) * 1000)))
+            for attempt in (1, 2):
+                try:
+                    session = AgentSession(
+                        ctx,
+                        ROLE,
+                        caps={"experiment": int(limits.max_experiments)},
                         folder=work,
-                        project=project.root,
-                        sandbox=bool(project.settings.agents.sandbox),
-                        token_file=Path(token) if token else None,
-                    ),
-                    job_models=models,
-                    should_stop=should_stop,
-                    deadline=began + float(spec.timeout),
-                    on_line=log.note,
-                    max_turns=None,
-                    # One agent for one run: every run of a phase has the same session
-                    # id, and a run starts in a fresh folder, so nothing is carried on.
-                    record=f"{ctx.session_id(ROLE)}-{page.id}-run{Path(run_dir).name}",
-                    resume=False,
-                )
-                session.send(
-                    prompts.experiment_message(
-                        experiment=str(page.id),
-                        title=page.title,
-                        plan=page.body,
-                        files=files,
-                        entrypoint=entry,
-                        command=command,
-                        timeout_seconds=float(spec.timeout),
-                        network=bool(spec.network),
-                        models=bool(models),
-                        launcher=LAUNCHER,
-                        packages=spec.packages,
-                        max_experiments=int(limits.max_experiments),
+                        guard=Guard(
+                            folder=work,
+                            project=project.root,
+                            sandbox=bool(project.settings.agents.sandbox),
+                            token_file=Path(token) if token else None,
+                        ),
+                        job_models=models,
+                        env={
+                            "BASH_DEFAULT_TIMEOUT_MS": command_ms,
+                            "BASH_MAX_TIMEOUT_MS": command_ms,
+                        },
+                        should_stop=should_stop,
+                        deadline=deadline,
+                        on_line=log.note,
+                        on_output=lambda text: log.feed(text.encode("utf-8", "replace")),
+                        max_turns=None,
+                        # One agent for one run: every run of a phase has the same
+                        # session id, and a run starts in a fresh folder, so nothing is
+                        # carried on.
+                        record=f"{ctx.session_id(ROLE)}-{page.id}-run{Path(run_dir).name}",
+                        resume=False,
                     )
-                )
-            except agents.SessionStopped as exc:
-                # A stop request, or the model budget: the run was not carried out, and
-                # goes back to the queue.  Whoever started it is told why.
-                self.stopped = exc
-                log.note("The agent was stopped before the run was finished.")
-                return result(cancelled=True, notes=notes)
-            except Exception as exc:
-                if ctx.stopping():
+                    session.send(message if attempt == 1 else prompts.TAKEN_UP + message)
+                    break
+                except agents.SessionStopped as exc:
+                    # A stop request, or the model budget: the run was not carried out,
+                    # and goes back to the queue.  Whoever started it is told why.
                     self.stopped = exc
                     log.note("The agent was stopped before the run was finished.")
                     return result(cancelled=True, notes=notes)
-                why = experiments.mask_credentials(project, f"{type(exc).__name__}: {exc}")
-                log.note(f"The agent could not carry out the run: {why}")
-                return result(error=f"The agent could not carry out the run: {why}", notes=notes)
-            finally:
-                ctx.close_sessions()
+                except Exception as exc:
+                    stop = self._stop_of(exc)
+                    if stop is not None:
+                        self.stopped = stop
+                        log.note("The agent was stopped before the run was finished.")
+                        return result(cancelled=True, notes=notes)
+                    # The agent's process failed.  That says nothing about the
+                    # experiment: a second agent takes the run up, and when that one
+                    # fails too the run goes back to the queue with its approval.
+                    why = experiments.mask_credentials(project, f"{type(exc).__name__}: {exc}")
+                    left = deadline - time.monotonic()
+                    if attempt == 1 and not stops_the_run(exc) and left > RETRY_NEEDS_SECONDS:
+                        log.note(
+                            f"The agent's process failed ({why}); another agent takes the "
+                            "run up once more."
+                        )
+                        continue
+                    log.note(f"The agent could not carry out the run: {why}")
+                    raise AgentUnusable(
+                        f"the agent that was to carry out {page.id} could not work ({why}). "
+                        f"{page.id} keeps its approval and is in the queue again; it is run "
+                        "when the work goes on."
+                    ) from exc
+                finally:
+                    ctx.close_sessions()
             # The agent has ended.  What it made of the approved code is kept beside
             # it, for the record to name the code that was there with the results.
             with contextlib.suppress(OSError):
@@ -222,10 +309,22 @@ class AgentBackend:
                     whole=Path(source_dir) == Path(run_dir) / experiments.CODE_DIR,
                     skip=(LAUNCHER,),
                 )
+            # (Asked before the outputs are moved: of the files as the agent left them.)
+            results_stand = session.timed_out and self._results_stand(work, Path(run_dir))
             notes += collect_outputs(work, spec.outputs, Path(run_dir))
             if session.cancelled:
                 log.note("The run was cancelled while the agent was at work.")
                 return result(cancelled=True, notes=notes)
+            if session.timed_out and results_stand:
+                said = (
+                    f"The agent's time ({round(spec.timeout)} seconds) was up before it had "
+                    "said that it was done. metrics.json was in place by then, and no "
+                    "file of the code was changed after it was written: the run is recorded "
+                    "with those metrics. What the agent would have said about the run is "
+                    "missing; its log shows what it did."
+                )
+                log.note(said)
+                return result(returncode=0, notes=[*notes, said])
             if session.timed_out:
                 log.note(
                     f"The agent's time ({round(spec.timeout)} seconds) was up before it "
