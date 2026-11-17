@@ -43,6 +43,7 @@ from paper_orchestra.llm.base import (
     ToolSpec,
     Usage,
 )
+from paper_orchestra.llm.pricing import estimate_cost_usd
 from paper_orchestra.memory.wiki import TRANSCRIPTS_DIR
 from paper_orchestra.research import agents, experiments, prompts
 from paper_orchestra.research.access import propose_edit_tool, search_tool
@@ -53,6 +54,7 @@ from paper_orchestra.research.sdk.driver import (
     AgentConversation,
     AgentDriver,
     AgentOptions,
+    Answered,
     BoardTool,
     Said,
     Started,
@@ -357,6 +359,8 @@ class AgentSession:
         self._transcript_path = records / f"{self.session_id}.jsonl"
         self._conversation: AgentConversation | None = None
         self._resumed = False
+        #: The agent's own session, as its process names it: what a later attempt resumes.
+        self._sdk_session = ""
         #: What the agent's session had cost in total when this process last heard of it,
         #: by model: what a result reports beyond that is new.
         self._paid: dict[str, dict[str, float]] = {}
@@ -446,6 +450,7 @@ class AgentSession:
         record = {} if fresh else self._record()
         resume = str(record.get("sdk_session") or "") or None
         self._resumed = resume is not None
+        self._sdk_session = resume or ""
         paid = record.get("model_usage") if resume else None
         self._paid = {str(k): dict(v) for k, v in paid.items()} if isinstance(paid, dict) else {}
         self._paid_total = float(record.get("cost_usd") or 0.0) if resume else 0.0
@@ -485,6 +490,10 @@ class AgentSession:
         """Say what the agent's process reports about itself: its model, and whether fast
         mode is on.  A project that asked for fast mode and did not get it is told why;
         the phase goes on all the same."""
+        if data.get("session_id"):
+            # On file from the start: a session that is killed can still be carried on.
+            self._sdk_session = str(data["session_id"])
+            self._save_record()
         model = agents.named(data.get("model") or self._model, 60)
         state = str(data.get("fast_mode_state") or "off")
         said = f"The {self.role} works as a Claude agent on {model}"
@@ -520,8 +529,10 @@ class AgentSession:
         return False
 
     def _ask_to_stop(self) -> None:
-        if self._asked_at is None:
-            self._asked_at = time.monotonic()
+        """Ask the agent to end its turn; once is enough, whoever notices first."""
+        if self._asked_at is not None:
+            return
+        self._asked_at = time.monotonic()
         conversation = self._conversation
         if conversation is not None:
             conversation.interrupt()
@@ -535,20 +546,33 @@ class AgentSession:
             self._count(event)
         elif isinstance(event, ToolUse):
             self._acted = True
-            self._log("tool", name=event.name, input=event.input, sub=event.sub)
+            self._log("tool", id=event.id, name=event.name, input=event.input, sub=event.sub)
             if not self._ending():
                 described = self._described(event)
                 if described is not None:
                     self._tell(described[0], described[1])
+        elif isinstance(event, Answered):
+            # Kept for whoever reads the transcript; long answers are cut.
+            self._log(
+                "answer",
+                id=event.id,
+                text=event.text[:4000],
+                is_error=event.is_error,
+                sub=event.sub,
+            )
         elif isinstance(event, Said):
             self._log("said", text=event.text, sub=event.sub)
             if self._on_line is not None and not event.sub:
                 for line in event.text.strip().splitlines()[:40]:
                     self._on_line(line)
         if self._ending():
-            if self._asked_at is None:
-                self._ask_to_stop()
-            elif isinstance(event, Tick) and time.monotonic() - self._asked_at > STOP_GRACE_SECONDS:
+            asked = self._asked_at
+            self._ask_to_stop()
+            if (
+                asked is not None
+                and isinstance(event, Tick)
+                and time.monotonic() - asked > STOP_GRACE_SECONDS
+            ):
                 raise _Unresponsive()
 
     def _described(self, use: ToolUse) -> tuple[str, list[str]] | None:
@@ -597,13 +621,16 @@ class AgentSession:
         seen_models = False
         for model, row in turn.model_usage.items():
             before = self._paid.get(model, {})
-            if float(row.get("cost_usd") or 0.0) + 1e-12 < float(before.get("cost_usd") or 0.0):
-                before = {}  # the totals started again: all of it is new
             new = {
                 name: max(0.0, float(row.get(name) or 0) - float(before.get(name) or 0))
                 for name in (*_USAGE_NAMES, "web_searches", "cost_usd")
             }
-            self._paid[model] = dict(row)
+            # Never below what is in the ledger already (an estimate for a turn that was
+            # killed can be above what the process then reports for it).
+            self._paid[model] = {
+                name: max(float(row.get(name) or 0), float(before.get(name) or 0))
+                for name in (*_USAGE_NAMES, "web_searches", "cost_usd")
+            }
             seen_models = True
             if not any(new.values()):
                 continue
@@ -617,31 +644,20 @@ class AgentSession:
                 ),
                 cost_usd=new["cost_usd"],
             )
-        if turn.cost_usd is not None:
-            total = float(turn.cost_usd)
-            if not seen_models:
-                added = total - self._paid_total if total >= self._paid_total else total
-                if added > 0:
-                    ledger.record(
-                        self._label, self._model, Usage(requests=turn.requests), cost_usd=added
-                    )
-            self._paid_total = total
-        if turn.session_id:
-            with contextlib.suppress(OSError):
-                self._record_path.parent.mkdir(parents=True, exist_ok=True)
-                write_record(
-                    self._record_path,
-                    {
-                        "session": self.session_id,
-                        "role": self.role,
-                        "sdk_session": turn.session_id,
-                        "model": self._model,
-                        "folder": str(self.folder),
-                        "cost_usd": self._paid_total,
-                        "model_usage": self._paid,
-                        "transcript": self._transcript_path.name,
-                    },
+        if seen_models:
+            self._paid_total = sum(float(row.get("cost_usd") or 0.0) for row in self._paid.values())
+        elif turn.cost_usd is not None:
+            added = float(turn.cost_usd) - self._paid_total
+            if added > 0:
+                ledger.record(
+                    self._label, self._model, Usage(requests=turn.requests), cost_usd=added
                 )
+                self._paid_total = float(turn.cost_usd)
+        # What the ledger has of this turn is the process's figure now, not an estimate.
+        self._turn = Usage()
+        if turn.session_id:
+            self._sdk_session = turn.session_id
+        self._save_record()
 
     # -- a turn ----------------------------------------------------------------------
 
@@ -697,12 +713,46 @@ class AgentSession:
             raise
 
     def _account_unreported(self) -> None:
-        """Count a turn whose process ended without saying what it cost: by the tokens
-        its messages reported, at the price per token, under a label of its own (a row
-        with the process's own dollar figure is never mixed with an estimate)."""
-        if any(self._turn.to_dict().values()):
-            self.ctx.harness.usage.record(f"{self._label}.unreported", self._model, self._turn)
-            self._turn = Usage()
+        """Count a turn whose process ended without saying what it cost (it was killed,
+        or it failed): by the tokens its messages reported, at the price per token.
+
+        The estimate goes where the process's own figures go, and is added to what
+        the session counts as reported.  When the session is carried on and its
+        process then reports totals that include this turn, only what goes beyond
+        the estimate is new: nothing is counted twice.
+        """
+        if not any(self._turn.to_dict().values()):
+            return
+        estimate = estimate_cost_usd(self._model, self._turn) or 0.0
+        self.ctx.harness.usage.record(self._label, self._model, self._turn, cost_usd=estimate)
+        row = self._paid.setdefault(self._model, {})
+        for name in _USAGE_NAMES:
+            row[name] = float(row.get(name) or 0) + getattr(self._turn, name)
+        row["cost_usd"] = float(row.get("cost_usd") or 0.0) + estimate
+        self._paid_total += estimate
+        self._turn = Usage()
+        self._save_record()
+
+    def _save_record(self) -> None:
+        """Keep what a later attempt needs to carry this session on: the agent's own
+        session, and what of its cost is in the ledger already."""
+        if not self._sdk_session:
+            return
+        with contextlib.suppress(OSError):
+            self._record_path.parent.mkdir(parents=True, exist_ok=True)
+            write_record(
+                self._record_path,
+                {
+                    "session": self.session_id,
+                    "role": self.role,
+                    "sdk_session": self._sdk_session,
+                    "model": self._model,
+                    "folder": str(self.folder),
+                    "cost_usd": self._paid_total,
+                    "model_usage": self._paid,
+                    "transcript": self._transcript_path.name,
+                },
+            )
 
     def send(self, parts: Part | Sequence[Part] | str) -> str:
         self.ctx.guard()

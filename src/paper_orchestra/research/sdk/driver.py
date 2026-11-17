@@ -25,6 +25,7 @@ __all__ = [
     "AgentConversation",
     "AgentDriver",
     "AgentOptions",
+    "Answered",
     "BoardTool",
     "Said",
     "Started",
@@ -79,6 +80,19 @@ class ToolUse:
 
     name: str
     input: Mapping[str, Any]
+    sub: bool = False
+    #: What tells this call from the others of the session, where the driver knows.
+    id: str = ""
+
+
+@dataclass(frozen=True)
+class Answered:
+    """What a tool call came to, as the agent was told: the text, and whether it was an
+    error or a refusal.  ``id`` is the call's (:attr:`ToolUse.id`)."""
+
+    id: str
+    text: str
+    is_error: bool = False
     sub: bool = False
 
 
@@ -179,8 +193,8 @@ class AgentConversation(Protocol):
     def send(self, text: str, sink: Sink) -> Turn:
         """Give the agent a message and follow it until it has answered.
 
-        Every event (:class:`Started`, :class:`ToolUse`, :class:`Said`,
-        :class:`Used`, :class:`Tick`) is handed to ``sink`` on the calling
+        Every event (:class:`Started`, :class:`ToolUse`, :class:`Answered`,
+        :class:`Said`, :class:`Used`, :class:`Tick`) is handed to ``sink`` on the calling
         thread.  ``sink`` may call :meth:`interrupt`.
         """
 

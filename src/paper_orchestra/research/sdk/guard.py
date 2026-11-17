@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +109,12 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _temporary_places() -> list[str]:
+    """Where this process, and so the agent's, keeps temporary files."""
+    named = [os.environ.get(name) for name in ("TMPDIR", "CLAUDE_CODE_TMPDIR")]
+    return list(dict.fromkeys([tempfile.gettempdir(), *(path for path in named if path)]))
+
+
 def _is_env_file(path: Path) -> bool:
     name = path.name
     return name == ".env" or (name.startswith(".env.") and not name.endswith(".example"))
@@ -173,6 +180,9 @@ class Guard:
             home / ".cache" / "uv",
             home / ".cache" / "pip",
             *(Path(os.path.realpath(path)) for path in self.readable),
+            # The directory for temporary files, where it lies in a hidden place: the
+            # sandbox keeps there what connects a command to the network.
+            *(Path(os.path.realpath(path)) for path in _temporary_places()),
         ]
         if self.token_file is not None:
             places.append(Path(os.path.realpath(self.token_file)))
@@ -191,9 +201,12 @@ class Guard:
             return False
         if not self.sandbox:
             return True
-        if any(_within(path, place) for place in self.open_places()):
-            return True
-        return not any(_within(path, place) for place in self.hidden())
+        # The closest place decides: the agent's folder is open inside the hidden
+        # project, the project is hidden wherever it lies, and what is named as
+        # readable is open inside a hidden home directory.
+        hidden = max((len(p.parts) for p in self.hidden() if _within(path, p)), default=0)
+        opened = max((len(p.parts) for p in self.open_places() if _within(path, p)), default=0)
+        return hidden == 0 or opened >= hidden
 
     def may_write(self, path: Path) -> bool:
         """Whether the real path ``path`` is the agent's to write: only its own folder."""

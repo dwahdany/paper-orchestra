@@ -24,6 +24,7 @@ from typing import Any
 
 from paper_orchestra.research.sdk.driver import (
     AgentOptions,
+    Answered,
     Said,
     Sink,
     Started,
@@ -79,6 +80,7 @@ class FakeAgent:
         if reason is None:
             return None
         self.denied.append((use.name, reason))
+        self._sink(Answered(use.id, reason, True, use.sub))
         return Denied(reason)
 
     def tool(self, name: str, tool_input: Mapping[str, Any], *, sub: bool = False) -> str | None:
@@ -87,7 +89,7 @@ class FakeAgent:
 
     # -- the board -----------------------------------------------------------------
 
-    def board(self, name: str, tool_input: Mapping[str, Any] | None = None, **given: Any) -> str:
+    def board(self, name: str, tool_input: Mapping[str, Any] | None = None, /, **given: Any) -> str:
         """Call the board tool ``name``; the text it answered.  :attr:`failed` then says
         whether that was an error."""
         tool_input = {**(tool_input or {}), **given}
@@ -100,6 +102,7 @@ class FakeAgent:
             raise KeyError(f"board tool '{name}' was not offered (have: {sorted(offered)})")
         result: ToolResult = offered[name].call(dict(tool_input))
         self.failed = result.is_error
+        self._sink(Answered("", result.text, result.is_error))
         self._alive()
         return result.text
 
@@ -210,7 +213,11 @@ class _FakeConversation:
         self.interrupted = False
         if not self._announced:
             self._announced = True
-            sink(Started({"model": self.options.model, **driver.started}))
+            sink(
+                Started(
+                    {"model": self.options.model, "session_id": self.session_id, **driver.started}
+                )
+            )
         if self.options.resume and self.options.resume in driver.unresumable:
             return Turn(
                 session_id=str(self.session_id),

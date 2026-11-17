@@ -23,6 +23,7 @@ from typing import Any
 from paper_orchestra.research.sdk.driver import (
     BOARD_SERVER,
     AgentOptions,
+    Answered,
     BoardTool,
     Said,
     Sink,
@@ -67,6 +68,16 @@ def _model_usage(raw: Any) -> dict[str, dict[str, float]]:
                 if isinstance(row.get(theirs) or 0, (int, float))
             }
     return usage
+
+
+def _answer_text(content: Any) -> str:
+    """The text of a tool's answer, whatever shape it came in."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [str(item.get("text") or "") for item in content if isinstance(item, dict)]
+        return "\n".join(text for text in texts if text)
+    return "" if content is None else str(content)
 
 
 class _Conversation:
@@ -168,7 +179,9 @@ class _Conversation:
             ResultMessage,
             SystemMessage,
             TextBlock,
+            ToolResultBlock,
             ToolUseBlock,
+            UserMessage,
         )
 
         put = self._events.put
@@ -192,9 +205,21 @@ class _Conversation:
                         )
                     for block in message.content:
                         if isinstance(block, ToolUseBlock):
-                            put(ToolUse(block.name, dict(block.input or {}), sub))
+                            put(ToolUse(block.name, dict(block.input or {}), sub, str(block.id)))
                         elif isinstance(block, TextBlock) and block.text.strip():
                             put(Said(block.text, sub))
+                elif isinstance(message, UserMessage) and isinstance(message.content, list):
+                    sub = bool(message.parent_tool_use_id)
+                    for block in message.content:
+                        if isinstance(block, ToolResultBlock):
+                            put(
+                                Answered(
+                                    str(block.tool_use_id),
+                                    _answer_text(block.content),
+                                    bool(block.is_error),
+                                    sub,
+                                )
+                            )
                 elif isinstance(message, ResultMessage):
                     failed = bool(message.is_error)
                     errors = "; ".join(str(error) for error in message.errors or [])
