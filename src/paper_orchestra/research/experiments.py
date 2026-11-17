@@ -3010,10 +3010,12 @@ def _judge(
         return _Outcome(
             "failed", f"The run was stopped after its time limit of {limit:g} s.", kind="timeout"
         )
-    if result.declared_failed:
-        # An agent carried the run out and says that it failed.  Its words are a
+    declared = getattr(result, "declared_failed", None)
+    if declared:
+        # An agent carried the run out and says that it failed (the result of a job
+        # an agent did, ``research.sdk.experiment.AgentJobResult``).  Its words are a
         # quotation; the files it left are kept, and count as no result.
-        said = quotable(result.declared_failed, 600)
+        said = quotable(declared, 600)
         return _Outcome(
             "failed",
             f'The agent that carried out the run says that it failed: "{said}".',

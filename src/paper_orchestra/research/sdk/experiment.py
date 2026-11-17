@@ -44,6 +44,7 @@ import shlex
 import shutil
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,15 @@ from paper_orchestra.research import agents, experiments, prompts
 from paper_orchestra.research.sdk.guard import LAUNCHER, Guard, SandboxUnavailable, launcher_text
 from paper_orchestra.research.sdk.session import AgentSession
 
-__all__ = ["FAIL_TOOL", "ROLE", "WORK_DIR", "AgentBackend", "AgentUnusable", "fail_run_tool"]
+__all__ = [
+    "FAIL_TOOL",
+    "ROLE",
+    "WORK_DIR",
+    "AgentBackend",
+    "AgentJobResult",
+    "AgentUnusable",
+    "fail_run_tool",
+]
 
 #: The role an experiment agent works as, and writes its proposals as.
 ROLE = "experimenter"
@@ -91,6 +100,15 @@ class AgentUnusable(BackendUnusable):
     #: before it, and no name of a class.
     whole_sentence = True
     plain = True
+
+
+@dataclass
+class AgentJobResult(JobResult):
+    """How a job went that an agent did: what every job's result says, and besides why
+    the agent says the run failed although its work ran to its end (``fail_run``).
+    Kept here, not in the compute contract, which no other backend's result changes."""
+
+    declared_failed: str | None = None
 
 
 def fail_run_tool(said: list[str]) -> ToolSpec:
@@ -251,7 +269,7 @@ class AgentBackend:
         log_path = open_run(run_dir, spec.outputs)
 
         def result(**how: Any) -> JobResult:
-            return JobResult(
+            return AgentJobResult(
                 returncode=how.pop("returncode", None),
                 seconds=time.monotonic() - began,
                 log_path=log_path,

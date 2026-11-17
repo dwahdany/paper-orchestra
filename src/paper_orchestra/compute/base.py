@@ -225,10 +225,6 @@ class JobResult:
     cost_usd: float | None = None
     #: The backend's own failure, as a message for a person.  Not the job's.
     error: str | None = None
-    #: Why whoever carried the job out says it failed although it ran to its end (an
-    #: agent that carried out an experiment and found that nothing was measured).
-    #: ``None`` for every job that makes no such statement.
-    declared_failed: str | None = None
     #: What the person should know that is neither output nor a failure: outputs that
     #: were not copied back, isolation the backend could not give, files left out.
     notes: list[str] = field(default_factory=list)
