@@ -318,7 +318,7 @@ changes.
 
 # Live checks of the sdk runtime
 
-Two scripts start a real Claude Agent SDK agent. Neither is collected by pytest, and both
+Three scripts start a real Claude Agent SDK agent. None is collected by pytest, and all
 need the `agents` extra and a credential; each costs a few cents on `claude-haiku-5-5`.
 
 `agent_guardrails.py` shows what the unit tests with a scripted agent cannot: that the
@@ -336,7 +336,10 @@ process must refuse by itself. It also checks the agent's temporary files (a dir
 its own where `mktemp` works; the shared one and another agent's closed to its shell and
 to the Read tool; gone when the agent ended), that `python` in its shell is the worker's,
 that uv's credentials are closed, and that WebFetch is refused the loopback under every
-spelling while the test server counts no connection at all.
+spelling while the test server counts no connection at all. A decision waits in the scratch
+project: the agent is told to read its file, to answer it with `paper-orchestra research
+decide`, to change the file with its shell and to write another beside it, and afterwards
+the record is what it was, unanswered, and alone in its folder.
 
 ```bash
 uv run --extra agents python tests/e2e/agent_guardrails.py --credential federation --model claude-haiku-5-5 --helpers
@@ -347,4 +350,15 @@ reports: the model, whether fast mode is on (and why not), and its tools.
 
 ```bash
 uv run --extra agents python tests/e2e/agent_hello.py --credential login --model claude-fable-5-2 --fast --ultracode
+```
+
+`agent_decision.py` has a real theorist, started as the engine starts it and given the
+message the role is given, raise a decision through the board: the scratch project has a
+question page whose answer is "the researcher's decision" and one decision the person
+already answered. It then looks at what is on file: a new record under `decisions/` raised
+by the theorist's session, open and unanswered, its line in the feed, and the answered
+decision in the agent's opening message and untouched. Nothing is answered for the person.
+
+```bash
+uv run --extra agents python tests/e2e/agent_decision.py --credential federation --model claude-haiku-5-5
 ```

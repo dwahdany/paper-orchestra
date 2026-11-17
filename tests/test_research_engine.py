@@ -1756,7 +1756,9 @@ def test_spending_never_goes_down_when_the_usage_ledger_is_lost(project, team, b
     (warning,) = events(project, "budget.warning")
     assert warning["data"]["limit"] == "model_usd"
     assert warning["data"]["carried"] == pytest.approx(spent, abs=1e-4)
-    assert "usage.json" in warning["summary"] and f"${spent:.2f}" in warning["summary"]
+    # (An amount under a cent is said with the digits that tell it from nothing.)
+    said = f"${spent:.2f}" if spent >= 0.01 else f"${spent:.4f}".rstrip("0")
+    assert "usage.json" in warning["summary"] and f"{said} of that record" in warning["summary"]
     usage = json.loads(ledger.read_text())
     assert usage["carried_usd"] == pytest.approx(spent, abs=1e-4)
     assert usage["estimated_cost_usd"] == pytest.approx(state["spent"]["model_usd"], abs=1e-4)
