@@ -1475,7 +1475,7 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
 .agents-when { margin: 0; font-size: 12px; }
 
 /* the feed: an agent's name fits its column; what an agent chose (a command, a file, an address) is set apart from the words around it */
-.ev { grid-template-columns: 40px 78px minmax(0, 1fr); }
+.ev { grid-template-columns: 40px 88px minmax(0, 1fr); }
 .ev-act .ev-did, .ev-act .ev-helper { color: var(--ink-3); }
 .ev-text { color: var(--ink); } code.ev-text { font-size: 11.5px; padding: .08em .3em; border-radius: 3px; background: var(--sunk); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
 .ev-act-refused code.ev-text { text-decoration: line-through; text-decoration-color: var(--neg); }

@@ -176,6 +176,8 @@ function agentTraces(dir) {
   said.forEach((summary, i) => act('experimenter', 'run', summary, parts[i]));
   emit('run.finished', 'runner', '', 'Run 2 of experiment E1 succeeded after 17.9 s.', { experiment: 'E1', run: 2, status: 'succeeded', seconds: 17.9, error: null, requeued: false, result: null }, [page]);
   state('succeeded');
+  /* (a line of that agent after its run has ended stands by itself, under the agent's own name) */
+  act('experimenter', 'run', 'The experimenter read wiki/idea.md.', { did: 'board', tool: 'memory' });
   /* then a scout at work: the newest lines of the feed, so that a further step joins them */
   emit('phase.started', 'scout', 'research', 'Round ' + round + ': the research phase started.', {});
   act('scout', 'research', 'The scout works as a Claude agent on claude-haiku-5-5; fast mode was asked for and is not on (“preference”).', { did: 'start', model: 'claude-haiku-5-5', fast: 'off', fast_asked: true });
@@ -391,7 +393,9 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   ok(JSON.stringify(await page.$$eval('#opt-agent-runtime option', (options) => options.map((o) => o.value))) === JSON.stringify([''].concat(defaults.agent_runtimes)) && defaults.agent_runtimes.length === 2, 'the composer offers the runtimes the server says its settings accept: ' + (await page.$$eval('#opt-agent-runtime option', (options) => options.map((o) => o.value)).then((v) => v.join())));
   ok(/^Default \(/.test(await page.$eval('#opt-agent-runtime option', (o) => o.textContent)) && (await page.inputValue('#opt-agent-runtime')) === '', 'with the runtime a new project would get named as the default: ' + (await page.$eval('#opt-agent-runtime option', (o) => o.textContent)));
   ok((await says(page, 'runtime')).length > 40, 'and one sentence says what that runtime means: ' + (await says(page, 'runtime')));
-  ok(base.runtime === 'sdk' || (await count(page, '#opt-agent-model')) === 0, 'the fields of agents with a shell are not shown for the tool loop');
+  /* the default is the server's, which follows its environment (PAPER_ORCHESTRA_AGENT_RUNTIME): named, and its fields shown or not, before anything is chosen */
+  ok((base.runtime === 'sdk' ? /shell/ : /tool loop/i).test(await page.$eval('#opt-agent-runtime option', (o) => o.textContent)) && (base.runtime === 'sdk' ? /shell/ : /no shell/).test(await says(page, 'runtime')), 'the default that is named is the server\'s (' + base.runtime + '): ' + (await page.$eval('#opt-agent-runtime option', (o) => o.textContent)));
+  ok(((await count(page, '#opt-agent-model')) === 1) === (base.runtime === 'sdk'), 'the fields of agents with a shell are shown where the default is such agents, and not for the tool loop');
   await page.selectOption('#opt-agent-runtime', 'sdk');
   await page.waitForSelector('#opt-agent-model');
   ok(/shell/.test(await says(page, 'runtime')) && (await page.getAttribute('#opt-agent-model', 'placeholder')) === base.model, 'agents with a shell: the sentence says so, and the model field shows the server\'s default: ' + (await page.getAttribute('#opt-agent-model', 'placeholder')));
@@ -548,6 +552,8 @@ CHECKS.shell = async ({ browser, page, shell }) => {
   ok(!!work && /tried/.test(work.says) && /refused/.test(work.says), 'which shows the latest step, here one that was refused: ' + (work && work.says.slice(0, 120)));
   const start = rows.find((r) => r.who === 'scout' && /works as a Claude agent/.test(r.says));
   ok(!!start && /fast mode was asked for and is not on/.test(start.says) && !/ ev-work/.test(start.cls), 'the line that says whether fast mode is on stands by itself: ' + (start && start.says));
+  const own = await page.evaluate(() => { const li = Array.from(document.querySelectorAll('.feed > .ev')).find((x) => (x.querySelector('.ev-who') || {}).textContent === 'experimenter'); if (!li) return null; const who = li.querySelector('.ev-who'), r = who.getBoundingClientRect(), next = li.children[2].getBoundingClientRect(); return { lines: Math.round(r.height / parseFloat(getComputedStyle(who).lineHeight)), clear: who.scrollWidth <= who.clientWidth + 1 && r.right <= next.left + 1 }; });
+  ok(!!own && own.lines === 1 && own.clear, 'the longest name of an agent stands on one line in its column: ' + JSON.stringify(own));
   /* unfolded: each step sets what the agent chose apart from the words around it */
   await page.click('.feed .ev-work .ev-steps > summary');
   const steps = await page.evaluate(() => Array.from(document.querySelectorAll('.feed .ev-work .ev-steps li')).map((li) => ({ did: (li.querySelector('.ev-act') || { dataset: {} }).dataset.did || '', verb: (li.querySelector('.ev-did') || {}).textContent || '', text: (li.querySelector('.ev-text') || {}).textContent || '', code: !!li.querySelector('code.ev-text'), helper: !!li.querySelector('.ev-helper'), refused: !!li.querySelector('.ev-refused'), says: li.textContent.replace(/\s+/g, ' ').trim() })));

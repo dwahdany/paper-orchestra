@@ -216,7 +216,10 @@ The flows change the project, so every run needs a fresh workspace. Options:
 - `shell` looks at the project in the folder `shell` (a fourth copy of the demo project),
   whose agents it gives a shell and into whose files it writes; it says in a `note` line
   that it was skipped when the workspace has no such project, and which parts it left out
-  when the server is on another machine or when such agents can start here.
+  when the server is on another machine or when such agents can start here. It passes
+  with `PAPER_ORCHESTRA_AGENT_RUNTIME=sdk` set for the server too, and then sees the
+  composer name such agents as the default; the other checks need that variable unset,
+  because the projects they make run on the scripted model, which is no such agent.
 - `--shots DIR`: photographs of the moving states (a running phase, a live log, a failure)
   as the checks pass them.
 - `--scheme dark`: the flows in the dark theme. The checks are meant to pass in both
