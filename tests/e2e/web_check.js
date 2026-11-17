@@ -381,7 +381,7 @@ CHECKS.decisions = async ({ page, pid: demo, spare }) => {
   ok(await page.evaluate((id) => !document.querySelector('.dc-old[data-decision="' + id + '"]').open, d.id), 'folded until it is opened');
   /* the feed says it as the person's */
   const events = (await api('GET', project + '/activity?limit=5')).data.events;
-  ok(events.some((ev) => ev.type === 'decision.answered' && ev.data.by === 'human' && /^You decided: /.test(ev.summary)), 'the activity has the answer as an event of the person: ' + JSON.stringify(events.map((ev) => ev.type)));
+  ok(events.some((ev) => ev.type === 'decision.answered' && ev.data.by === 'human' && /^You decided “/.test(ev.summary)), 'the activity has the answer as an event of the person: ' + JSON.stringify(events.map((ev) => ev.type)));
   /* another window changes the answer: this one shows it without being asked */
   await api('POST', project + '/decisions/' + d.id + '/answer', { option: 1 });
   await until(page, (id) => /option 1/.test((document.querySelector('.dc-old[data-decision="' + id + '"] .dc-oa') || {}).textContent || '') && /changed/.test(document.querySelector('.dc-old[data-decision="' + id + '"] .in-when').textContent), d.id, 8000, 'an answer changed in another window arrives by itself, and is said to be a changed one');

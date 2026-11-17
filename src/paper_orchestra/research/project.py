@@ -409,6 +409,14 @@ def _no_tags(text: str) -> str:
     return _TAG_START.sub("‹", text)
 
 
+def _quoted(text: str, limit: int) -> str:
+    """Words an agent wrote, as a quotation in a sentence of the feed: on one line, cut to
+    ``limit`` characters, with quotation marks of their own made apostrophes, so that
+    they never read as a further sentence of whoever the event is from."""
+    words = re.sub('["“”„«»]', "'", _clip(text, limit))
+    return f"“{words}”"
+
+
 def _sentence(text: str) -> str:
     text = _one_line(text)
     return text if text.endswith((".", "!", "?")) else text + "."
@@ -2943,7 +2951,7 @@ class Project:
             _check_storable("The decision", decision.to_dict())
             (self.root / DECISIONS_DIR).mkdir(exist_ok=True)
             write_json(self._decision_path(decision.id), decision.to_dict())
-            asks = f"The {decision.role} asks you to decide: {_clip(decision.question, 200)}"
+            asks = f"The {decision.role} asks you to decide: {_quoted(decision.question, 200)}"
             self.emit(
                 decision_records.DECISION_ASKED,
                 _sentence(asks),
@@ -2999,13 +3007,17 @@ class Project:
                 before, at=stamp_after(self._clock.now(), latest), option=option, text=text
             )
             _check_storable("The answer", decision.answers[-1].text)
-            verb = "changed your answer" if before.state != "open" else "decided"
-            said = decision_records.answer_words(decision)
-            said = _clip(said[:1].upper() + said[1:], 200)
+            verb = "changed your answer to" if before.state != "open" else "decided"
+            # The question and the labels are an agent's words: quoted, as the answer is.
+            answer, chosen = decision.answers[-1], decision.chosen
+            parts = [
+                *([f"option {answer.option}, {_quoted(chosen.label, 80)}"] if chosen else []),
+                *([_quoted(answer.text, 160)] if answer.text else []),
+            ]
             return self._decided(
                 decision,
                 decision_records.DECISION_ANSWERED,
-                f"You {verb}: {_sentence(_clip(decision.question, 120))} {said}",
+                f"You {verb} {_quoted(decision.question, 120)}: {'; '.join(parts)}",
                 before.state != "open",
             )
 
@@ -3024,14 +3036,15 @@ class Project:
             decision = decision_records.with_dismissal(
                 before, at=stamp_after(self._clock.now(), latest)
             )
-            asked = _sentence(_clip(decision.question, 120))
             goes_on = (
-                f" They go on with: {_clip(decision.default, 160)}" if decision.default else ""
+                f"; they go on with their default, {_quoted(decision.default, 160)}"
+                if decision.default
+                else ""
             )
             return self._decided(
                 decision,
                 decision_records.DECISION_DISMISSED,
-                f"You left a decision to the agents: {asked}{goes_on}",
+                f"You left {_quoted(decision.question, 120)} to the agents{goes_on}",
                 before.state != "open",
             )
 

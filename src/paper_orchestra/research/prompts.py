@@ -527,7 +527,7 @@ def _decision_line(item: Mapping[str, Any]) -> str:
 #: Said with the list of decisions, whether it is empty or not: a choice that stands only
 #: on a page has reached nobody, and a session that builds on such a page is the one to ask.
 _UNASKED = (
-    "If a page you read or build on in this session leaves a choice to the researcher that "
+    "If a page you read, write or build on in this session leaves a choice to the researcher that "
     "is not among them (for example a question page whose answer is \"the researcher's "
     'decision"), put it to them with ask_decision before you finish, naming that page: a '
     "page asks nobody, and mentioning the open choice in your reply does not ask them either."

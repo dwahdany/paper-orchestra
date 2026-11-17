@@ -1724,7 +1724,8 @@ def test_a_phase_that_ends_past_the_model_budget_says_so_at_its_checkpoint(tmp_p
     )
     assert state["phases"][-1]["status"] == "completed" and state["spent"]["model_usd"] > 4
     summary = state["checkpoint"]["summary"]
-    assert "The model budget is used up: $4.00 of $1.00 is spent." in summary
+    # (The cents follow the length of what the sessions were sent: four dollars and a bit.)
+    assert re.search(r"The model budget is used up: \$4\.0\d of \$1\.00 is spent\.", summary)
     assert "settings.limits.model_usd" in summary
     assert "2 questions and 2 topics await your review." in summary
     (warning,) = events(project, "budget.warning")
