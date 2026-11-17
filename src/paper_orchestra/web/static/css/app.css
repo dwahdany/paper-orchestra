@@ -1380,3 +1380,82 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
 /* the table of experiments on a narrow sheet: the line under a title gives way, so that a
    state said in three words ("needs approval again") does not push the table past its edge */
 @media (max-width: 960px) { .ex-sub { max-width: 50ch; } }
+
+/* ---------- a phone: one column, read with a thumb ----------
+   Nothing above changes from 701 px up (the top bar needs 666), but for a phone held on
+   its side, which is wider than that and too low for two panes: a touched screen at most
+   480 px high (`listAlone` in core.js asks the same question). Here the top bar keeps the
+   views (they scroll sideways) and the status bar keeps where things stand and what waits;
+   the inbox is its list, then one proposal with its answers at the foot of the screen;
+   what is pressed is about 44 px, and what is typed in is 16 px, whatever its class says
+   above, so that the phone does not zoom in on it. */
+.in-back { display: none; }
+@media (max-width: 700px), (max-height: 480px) and (pointer: coarse) {
+  input:not([type=checkbox]):not([type=radio]), select, textarea { font-size: 16px !important; }
+  .btn kbd { display: none; }
+
+  /* the top bar: the mark, the views, find and the theme; where things stand is in the status bar */
+  .top { gap: 0; padding: 0 2px 0 4px; }
+  .brand { padding: 0 10px; }
+  .views { flex: 1 1 auto; min-width: 0; margin-left: 0; gap: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; } .views::-webkit-scrollbar { display: none; }
+  .views a { padding: 0 10px; font-size: 14px; } .views a[aria-current]::after { bottom: 0; }
+  .top-status, .top-spend, .top-r [data-act="help"] { display: none; }
+  .top-r { gap: 0; } .top-r .ibtn { width: 40px; height: 44px; } .top-prob { min-height: 44px; }
+
+  /* the status bar: the state gives way, the count and the connection do not; the money is on the overview */
+  .statusbar { height: auto; padding: 0 4px env(safe-area-inset-bottom, 0px); font-size: 12.5px; }
+  .sb-i { flex: none; height: 32px; padding: 0 8px; }
+  .sb-state { display: block; flex: 1 1 0; line-height: 32px; overflow: hidden; text-overflow: ellipsis; } .sb-state > span { display: inline; } .sb-state .ic, .sb-state .live-dot { display: inline-block; margin-right: 5px; vertical-align: -2px; }
+  .sb-gap, .sb-run, .statusbar span.sb-i:not(.sb-conn) { display: none; }
+
+  /* what was just done, and its Undo: under the head of the screen, clear of the answers at its foot.
+     Over the list it would lie on the row that moves up under the finger: there it stands at
+     the foot, and the list ends above it (`toast-on-list`, set where the toast is placed) */
+  #toast { left: 8px !important; right: 8px; top: 94px; bottom: auto !important; transform: none; display: grid; justify-items: center; pointer-events: none; } .toast { pointer-events: auto; }
+  .toast-on-list #toast { top: auto; bottom: calc(40px + env(safe-area-inset-bottom, 0px)) !important; } .toast-on-list .in-list { padding-bottom: calc(var(--toast-h, 56px) + 12px); }
+  .toast { max-width: 100%; font-size: 14px; } .toast .btn-s { height: 40px; padding: 0 12px; font-size: 14px; } .toast .ibtn { width: 40px; height: 40px; }
+
+  /* the inbox: the list, or the proposal an address names; the one that is not shown keeps its place */
+  .inbox { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+  .in-list, .in-detail { grid-area: 1 / 1; min-width: 0; }
+  .in-detail, .in-open .in-list { visibility: hidden; } .in-open .in-detail { visibility: visible; }
+  .inbox .btn { height: 44px; padding: 0 14px; font-size: 14.5px; }
+
+  /* the list: its heading and "Select all" on one line; the two answers for what is ticked come up at the foot */
+  .in-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: auto auto minmax(0, 1fr) auto; border: 0; }
+  .in-head, .in-bulk { display: contents; }
+  .in-head h1 { grid-area: 1 / 1 / auto / -1; align-self: center; padding: 12px 124px 8px 16px; font-size: 21px; }
+  .in-all { grid-area: 1 / 2; justify-self: end; min-height: 44px; margin: 0; padding: 0 16px 0 8px; font-size: 14px; }
+  .in-all input, .in-check input { width: 20px; height: 20px; margin: 0; }
+  .in-head .reject-form { grid-area: 2 / 1 / auto / -1; margin: 0; padding: 0 12px 10px; }
+  .in-scroll { grid-area: 3 / 1 / auto / -1; padding: 0 8px 28px; }
+  .in-bulk .btn { grid-row: 4; margin: 8px 6px; } .in-bulk .btn:disabled { display: none; }
+  .in-row { gap: 0; padding: 0; }
+  .in-check { width: 40px; height: 48px; }
+  .in-main { padding: 12px 0; }
+  .in-name { align-items: flex-start; } .in-name .glyph { margin-top: 2px; } .in-name .pn-id { font-size: 14px; line-height: 22px; }
+  .in-name .pn-t { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; white-space: normal; font-size: 16.5px; line-height: 1.32; }
+  .in-sum { font-size: 14px; } .in-what, .in-flag { white-space: normal; font-size: 13px; }
+  .in-quick { flex-direction: column; gap: 0; padding-top: 2px; opacity: 1; } .in-quick .ibtn { width: 44px; height: 44px; }
+  .in-quick .ibtn-yes { color: var(--pos); } .in-quick .ibtn-no { color: var(--neg); }
+  .in-old { min-height: 44px; padding: 6px 12px; } .in-old .in-name .pn-t { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; } .in-old .in-when { flex: 1 1 100%; margin-left: 28px; } .in-when, .in-why { font-size: 12.5px; }
+  .in-more { min-height: 44px; font-size: 14px; }
+
+  /* the proposal: the way back at its head, its answers held at the foot of the screen
+     (those of the first note; where a page has several, the others stay where they are) */
+  .in-back { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 4px; min-height: 44px; margin: 0; padding: 0 16px; border-bottom: 1px solid var(--rule); background: var(--surface); font-size: 14.5px; color: var(--ink-2); }
+  .page-inbox { max-width: none; padding: 8px 18px 190px; }
+  .in-detail { scroll-padding-top: 56px; }
+  .page-inbox .page-title { font-size: 23px; margin-top: 6px; } .page-inbox .page-kicker { flex-wrap: wrap; min-height: 44px; } .page-inbox .kicker-kind { flex: 1 1 0; min-width: min-content; overflow-wrap: normal; } .page-inbox .page-tools { margin: 0 -10px 0 auto; gap: 0; } .page-inbox .page-tools .ibtn { width: 40px; height: 44px; }
+  .page-inbox .review { padding: 12px 12px 13px 22px; } .page-inbox .review-say { font-size: 14.5px; } .page-inbox .review-why, .page-inbox .runon { font-size: 13.5px; }
+  .page-inbox .review-count .linkish, .page-inbox .page-foot .linkish, .page-inbox .page-unaccept { min-height: 44px; }
+  .page-inbox .review:not(.review ~ .review) .review-actions { position: fixed; left: 0; right: 0; bottom: calc(32px + env(safe-area-inset-bottom, 0px)); z-index: 3; margin: 0; padding: 8px 12px; border-top: 1px solid var(--rule); background: var(--surface); }
+  .page-inbox .review-actions .btn { flex: 1 1 auto; }
+  .reject-form { flex-wrap: wrap; } .reject-form input { flex: 1 1 100%; height: 44px; } .reject-form .btn { flex: 1 1 0; }
+  .runon select, .ed-fields input, .ed-fields select { height: auto; min-height: 44px; }
+  .page-inbox .lin { min-height: 40px; }
+
+  /* the button that continues the project, on the map and the overview: its words wrap, its menu stays within reach */
+  .strip-actions { flex: 1 1 auto; min-width: 0; } .go { flex: 0 1 auto; min-width: 0; }
+  .go > .btn { height: auto; min-height: 44px; } .go > .btn:first-child { flex: 0 1 auto; min-width: 0; padding-top: 5px; padding-bottom: 5px; white-space: normal; text-align: left; } .go:not(.go-pick) > .go-more { flex: none; width: 44px; }
+}

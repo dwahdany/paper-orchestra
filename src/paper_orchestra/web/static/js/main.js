@@ -4,7 +4,7 @@
    the open route into the page, keeping scroll positions and the caret. A render caused by
    the event stream waits while the person is in the middle of typing. */
 
-import { app, askHealth, openProjectUi, parseHash } from './core.js';
+import { app, askHealth, link, listAlone, openProjectUi, parseHash, phone } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $, $$, clock, html, parseStamp, plain, setHTML } from './util.js';
 import { Store } from './store.js';
@@ -160,8 +160,10 @@ function render(reason, background) {
   const focused = focusKey(active);
   if (!same) app.ui.focusEditor = route.name === 'project' && route.sub === 'edit' ? key : '';
 
+  const navAt = ($('#top .views') || {}).scrollLeft || 0;
   setHTML($('#top'), topbar(route));
   const viewKey = route.name === 'project' ? route.pid + '/' + route.view + (store.loaded ? '' : '/loading') : route.name;
+  showView(navAt, main.dataset.view !== viewKey);
   if (main.dataset.view !== viewKey) { setHTML(main, html``); main.dataset.view = viewKey; main.className = 'view view-' + (route.view || route.name); }
   const bar = $('#status');
   if (route.name === 'project') {
@@ -179,7 +181,7 @@ function render(reason, background) {
   document.body.classList.toggle('in-project', route.name === 'project' && !!store && store.loaded);
 
   Object.keys(saved).forEach((sel) => { const el = $(sel, main); if (el) el.scrollTop = saved[sel]; });
-  if (!same) showCurrent(main);
+  if (!same && !listAlone(route)) showCurrent(main);      // (the list of a phone has no current row: it stays where it was read)
   logs.forEach((log) => { const el = $('.log-body[data-log="' + CSS.escape(log.key || '') + '"]', main); if (el && !log.stuck) el.scrollTop = log.top; });
   opened.forEach((keep) => { const el = $('details[data-keep="' + CSS.escape(keep) + '"]', main); if (el) el.open = true; });
   renderToast();
@@ -188,6 +190,7 @@ function render(reason, background) {
   setHTML(ban, banner());
   /* the keyboard is where it was: on the same control, though its markup is new */
   refocus(focused);
+  if (!same) stepFocus(main, route, app.lastRoute);
   /* an editor that has just opened takes the keyboard: E, then type */
   if (app.ui.focusEditor === key) {
     const body = $('#ed-body', main);
@@ -197,9 +200,32 @@ function render(reason, background) {
   const page = store && store.loaded && route.sel ? store.byPath.get(route.sel) : null;
   document.title = (store && store.loaded ? (page ? label(page) + ' · ' : '') + store.project.title : { start: 'New project', setup: 'Setup', library: 'Projects', project: 'Project' }[route.name]) + ' · PaperOrchestra';
   app.lastRenderKey = key;
+  app.lastRoute = route;
   lastKey = key;
 }
 app.render = render;
+
+/** The views of the top bar scroll sideways where the bar is too narrow for them (a phone).
+    The bar is written again by every render: the row stays where the person left it, and
+    only a view that has just been opened (`moved`) is brought into sight. */
+function showView(at, moved) {
+  const nav = (at || moved) && $('#top .views'), cur = nav && $('a[aria-current]', nav);
+  if (!nav) return;
+  if (at) nav.scrollLeft = at;
+  if (!moved || !cur || nav.scrollWidth <= nav.clientWidth) return;
+  const a = cur.getBoundingClientRect(), b = nav.getBoundingClientRect();
+  if (a.left < b.left || a.right > b.right) nav.scrollLeft += a.left - b.left - (b.width - a.width) / 2;
+}
+
+/** On a phone a touched row of the inbox gives way to its proposal, and the way back to
+    the list: the keyboard (and a screen reader) goes along, to the way back at the head
+    of the proposal, then to the row that was left; without this it stays on a row that is
+    no longer shown, and lands in the top bar. */
+function stepFocus(main, route, was) {
+  if (!phone() || route.view !== 'inbox' || !was || was.view !== 'inbox' || was.pid !== route.pid || !route.sel === !was.sel) return;
+  const to = route.sel ? $('.in-back', main) : $('.in-row a.in-main[href="' + CSS.escape(link({ view: 'inbox', sel: was.sel, sub: '' })) + '"]', main) || $('.in-row a.in-main', main);
+  if (to) to.focus({ preventScroll: true });
+}
 
 /* ---------- the clock: stopwatches and meters move without a render ---------- */
 function tick() {

@@ -16,6 +16,10 @@ let toastTimer = 0;
 function placeToast(el) {
   const box = el.firstElementChild;
   el.style.bottom = ''; el.style.left = '';
+  /* (on a phone the list of the inbox ends above its toast: the stylesheet reads both of these) */
+  const onList = !!box && !!$('.inbox:not(.in-open)');
+  document.body.classList.toggle('toast-on-list', onList);
+  if (onList) document.body.style.setProperty('--toast-h', box.offsetHeight + 'px');
   if (!box) return;
   const foot = $('.map-view .map-foot'), pane = $('.inbox .in-detail');
   if (foot) { const top = foot.getBoundingClientRect().top; if (top > 0) el.style.bottom = Math.round(window.innerHeight - top + 10) + 'px'; }

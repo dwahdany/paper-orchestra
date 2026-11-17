@@ -1,7 +1,7 @@
 /* What the person can do: one table of actions (the `data-act` attributes of the markup),
    one handler each for clicks, submits, typing, changes, drops and keys. */
 
-import { VIEWS, app, askHealth, codeKey, go, link, reasonsKey, requestForKey, requestKey, select } from './core.js';
+import { VIEWS, app, askHealth, codeKey, go, link, listAlone, reasonsKey, requestForKey, requestKey, select } from './core.js';
 import { api, connection, Unreachable } from './api.js';
 import { $, $$, ago, bytes, cap, cutoffFrom, cutoffParts, cutoffWords, lineDiff, listOf, plain, plural, storage } from './util.js';
 import { STAGES, EXTRA_KINDS, PHASE_DO, ROLE, agentName, phaseName, roleName } from './vocab.js';
@@ -51,7 +51,7 @@ function entryFor(ref, decision, options) {
 /** Where the inbox goes once the item in front is decided: the next one, or nothing. */
 function nextInInbox(item) {
   const r = app.route;
-  if (r.view !== 'inbox') return undefined;
+  if (r.view !== 'inbox' || listAlone(r)) return undefined;      // (decided in the list of a phone: the list stays)
   const items = store().pending(), cur = currentItem(store(), r);
   if (!cur || cur.ref !== item.ref) return undefined;
   const i = items.findIndex((it) => it.ref === item.ref);
@@ -495,7 +495,7 @@ function startProject() {
 function reviewTarget() {
   const r = app.route, s = store();
   if (!r || r.name !== 'project' || !s || !s.loaded) return null;
-  if (r.view === 'inbox') { const it = currentItem(s, r); return it ? { ref: it.ref, page: it.page } : null; }
+  if (r.view === 'inbox') { const it = listAlone(r) ? null : currentItem(s, r); return it ? { ref: it.ref, page: it.page } : null; }
   const page = s.byPath.get(r.sel);
   if (!page) return null;
   if (page.review === 'proposed') return { ref: page.path, page };
@@ -943,7 +943,7 @@ export function installActions() {
     else if (r.view === 'experiments') keys = s.experiments.filter((x) => x.review !== 'rejected').map((x) => x.path);
     else if (r.view === 'wiki') keys = [].concat(...STAGES.concat(EXTRA_KINDS.filter((k) => k !== 'lesson' || app.ui.showLessons)).map((k) => s.pages.filter((x) => x.kind === k).map((x) => x.path)));
     else return false;
-    const cur = r.view === 'inbox' ? (currentItem(s, r) || { page: {} }).page.path : r.sel;
+    const cur = r.view === 'inbox' ? ((!listAlone(r) && currentItem(s, r)) || { page: {} }).page.path : r.sel;
     const i = keys.indexOf(cur), next = keys[i < 0 ? 0 : Math.max(0, Math.min(keys.length - 1, i + dir))];
     if (next) select(next);
     return true;
