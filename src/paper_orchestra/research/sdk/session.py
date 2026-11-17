@@ -7,7 +7,8 @@ the checks they run afterwards are the same code in both runtimes.
 
 What differs is what the session is: an agent with a shell in a folder of its
 own, the web, and the *board tools*.  Those are the project's existing tools
-(``ToolSpec`` objects: ``wiki_search``, ``propose_edit``, a role's own) and the
+(``ToolSpec`` objects: ``wiki_search``, ``propose_edit``, ``ask_decision``, a
+role's own) and the
 memory tool over the session's ``_SessionBackend``, offered to the agent as
 in-process tools.  The wiki is reached through them alone, so every rule of the
 project (who creates which kind, what a session may read, the phase's caps)
