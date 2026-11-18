@@ -1408,6 +1408,31 @@ const form = (worker) => {
   const markup = render(store, p7.path);
   return Array.from(markup.matchAll(/<button[^>]*data-act="approve"[^>]*>([\s\S]*?)<\/button>/g)).map((m) => text(m[1]).trim());
 };
+/* A press for one experiment starts a worker that goes on with every approved one: the
+   sentences after the press name the others (the server's `also_runs`), and the pages say
+   it before the press, where others wait. */
+const also = { experiments: ['E4', 'E8'], message: 'E4 and E8 are approved too: they run after it, in that order.' };
+out.said = {
+  approveAlone: experiments.approvedWords('E7', {}, true),
+  approve: experiments.approvedWords('E7', { also_runs: also }, true),
+  later: experiments.approvedWords('E7', {}, false),
+  runNow: experiments.runNowWords('E7', { also_runs: also }, false),
+  runNowAlone: experiments.runNowWords('E7', {}, false),
+  again: experiments.runNowWords('E7', { also_runs: also }, true),
+  afterPhase: experiments.approvedWords('E7', { in_line: { message: 'E7 is approved. The agents are at work: it starts by itself.' }, also_runs: { message: 'E4 is approved too and runs then as well.' } }, true),
+};
+const others = projectStore({ pages: [e7, e8, e9], experiments: [row(e7), row(e8), row(e9, { will_not_run: 'the run it was approved for is over' })], project: { state: checkpoint('design', 'run'), next_step: said({}) } });
+out.before = detail(others, 'E7').says;
+out.beforeAlone = out.idle.says;
+const formNote = (rows) => {
+  const p7 = page('experiment', 'E7', { state: 'planned', meta: {} });
+  const store = projectStore({ pages: [p7].concat(rows), experiments: [row(p7, { cancel_does: null })].concat(rows.map((r) => row(r))), project: { state: checkpoint('design', 'run'), next_step: said({}) } });
+  store.exps.set('E7', { key: store.expKey('E7'), gen: 0, loading: false, error: null,
+    data: { page: Object.assign({}, store.expById.get('E7'), { html: '' }), runs: [], plan: { backend: 'local', timeout_seconds: 60 }, code: { files: [], digest: 'd' }, options: [{ backend: 'local', can_run: true, reasons: [], est_minutes: 1, est_usd: null, notes: [] }], approval: { digest: null, at: null, matches: false, changed: [] }, cancel_does: null, will_not_run: null, last_success: null, interrupted: false } });
+  return Array.from(render(store, p7.path).matchAll(/<p class="also-runs"[^>]*>([\s\S]*?)<\/p>/g)).map((m) => text(m[1]).trim());
+};
+out.formNotes = { others: formNote([e8, e9]), alone: formNote([]) };
+out.actions = (await import('node:fs')).readFileSync(new URL('./js/actions.js', import.meta.url), 'utf8');
 out.forms = { idle: form(null), draining: form(busy), phase: form({ state: 'running', kind: 'advance', phase: 'analyze', verified: true, queue: false, then_runs: [] }) };
 console.log(JSON.stringify(out));
 """
@@ -1425,7 +1450,8 @@ def test_experiments_that_wait_in_line_are_shown_in_order_with_what_they_wait_be
     assert out["marks"] == ["1", "2"]
     assert "approved · waits in line, no. 1 · runs after E6" in out["table"], out["table"]
     assert "approved · waits in line, no. 2 · runs after E7" in out["table"], out["table"]
-    assert "approved · runs first when you continue, or now" in out["table"]  # E9: not in line
+    # E9 is not in line.  "When you continue" is not all: any run that is started runs it.
+    assert "approved · runs when you continue, or with the next run you start" in out["table"]
     assert out["words"] == {
         "E7": "approved · runs after E6",
         "E8": "approved · runs after E7",
@@ -1452,7 +1478,52 @@ def test_experiments_that_wait_in_line_are_shown_in_order_with_what_they_wait_be
     assert out["stopping"]["run"] and out["stopping"]["off"], out["stopping"]
     # The approval form offers what an approval leads to as things stand.
     assert out["forms"] == {
-        "idle": ["Approve and run now", "Approve, run when I continue"],
+        "idle": ["Approve and run now", "Approve, run later"],
         "draining": ["Approve; it runs in line"],
-        "phase": ["Approve and run when the agents are done", "Approve, run when I continue"],
+        "phase": ["Approve and run when the agents are done", "Approve, run later"],
     }, out["forms"]
+
+
+@needs_node
+def test_a_press_for_one_experiment_says_which_others_run_with_it(tmp_path):
+    """ "Approve and run now" and "Run now" start a worker that goes on with every
+    approved experiment, also the ones approved to run later (which may cost money).
+    No sentence about such a start names the one experiment alone, the pages say it
+    before the press, and "run later" does not promise to wait for Continue."""
+    out = _client(tmp_path, LINE_SCRIPT)
+    also = "E4 and E8 are approved too: they run after it, in that order."
+    said = out["said"]
+    assert said["approve"] == "E7 is approved; its run is starting. " + also
+    assert said["runNow"] == "The run of E7 is starting. " + also
+    assert said["again"].startswith("E7 is run again.") and said["again"].endswith(also)
+    assert said["afterPhase"].endswith(
+        "it starts by itself. E4 is approved too and runs then as well."
+    )
+    # With nothing else approved the sentences are as short as they were.
+    assert said["approveAlone"] == "E7 is approved; its run is starting."
+    assert said["runNowAlone"] == "The run of E7 is starting."
+    # Approved to run later: not only when the person continues.
+    assert said["later"] == (
+        "E7 is approved. It runs when you continue, or as soon as you run any experiment: "
+        "a run that is started goes on with every approved one."
+    )
+    assert "It runs first when you continue, or now" not in out["actions"]
+    # The toasts are these sentences: none is put together from the one name alone.
+    for use in ("approvedWords(eid, answer, start)", "runNowWords(eid, answer, again)"):
+        assert use in out["actions"], use
+    assert "its run is starting.' + alsoRuns(first)" in out["actions"]
+    assert "acceptedInLine(result.in_line) + alsoRuns(result)" in out["actions"]
+    # Before the press: E8 waits approved and would run too; E9 would not run, and E7
+    # itself is not named.
+    assert (
+        "“Run now” also runs E8 , which is approved: a run that is started goes on with "
+        "every approved experiment." in out["before"]
+    ), out["before"]
+    assert "also runs" not in out["beforeAlone"]
+    assert "as soon as a run of any experiment is started" in out["beforeAlone"]
+    notes = out["formNotes"]
+    assert notes["others"][0].startswith(
+        "“Approve and run now” also runs E8 and E9 , which are approved"
+    )
+    assert len(notes["alone"]) == 1 and notes["alone"][0].startswith("“Approve, run later” starts")
+    assert "or as soon as you run any experiment" in notes["alone"][0]

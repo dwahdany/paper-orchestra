@@ -1652,6 +1652,67 @@ def test_experiments_approved_while_one_runs_wait_in_line_in_the_order_approved(
     assert row["in_line"]["message"] == "E2 is approved; it runs after E1."
 
 
+def test_a_start_for_one_experiment_says_which_others_run_with_it(
+    client, project, services, launched
+):
+    """The worker started for one experiment goes on with every approved one, also those
+    the person approved "to run later".  The answer names them, so that the sentence the
+    person reads is not about the one experiment alone."""
+    project.review("E1", "accept")
+    more_experiments(project, 3)
+    # Approved without a start: nothing runs them, and nothing is said to run with them.
+    for name in ("E3", "E2"):
+        parked = client.post(url(project, f"/experiments/{name}/approve"), json={}).json()
+        assert "also_runs" not in parked and "worker" not in parked
+
+    started = client.post(url(project, "/experiments/E1/approve"), json={"start": True}).json()
+
+    assert launched.calls == [("run", {"experiments": ["E1"], "queue": True})]
+    assert started["also_runs"] == {
+        "experiments": ["E3", "E2"],  # in the order they run in: that of the approvals
+        "message": "E3 and E2 are approved too: they run after it, in that order.",
+    }
+
+
+def test_run_now_says_which_others_run_with_it_and_nothing_when_none_does(
+    client, project, services, launched
+):
+    project.review("E1", "accept")
+    more_experiments(project, 1)
+    client.post(url(project, "/experiments/E1/approve"), json={})
+    alone = client.post(url(project, "/experiments/E1/run"))
+    assert alone.status_code == 202 and "also_runs" not in alone.json()
+    wait_for(lambda: (project.root / "ready").exists())
+    client.post(url(project, "/stop"))
+    wait_for(lambda: client.get(url(project)).json()["worker"]["state"] == "idle")
+
+    client.post(url(project, "/experiments/E2/approve"), json={})
+    both = client.post(url(project, "/experiments/E1/run")).json()
+
+    assert both["also_runs"] == {
+        "experiments": ["E2"],
+        "message": "E2 is approved too and runs after it.",
+    }
+
+
+def test_a_run_arranged_for_after_a_phase_says_which_others_run_then(
+    client, project, services, launched
+):
+    project.review("E1", "accept")
+    more_experiments(project, 1)
+    client.post(url(project, "/experiments/E2/approve"), json={})
+    assert client.post(url(project, "/advance"), json={"phase": "research"}).status_code < 300
+    wait_for(lambda: (project.root / "ready").exists())
+
+    answer = client.post(url(project, "/experiments/E1/approve"), json={"start": True}).json()
+
+    assert answer["in_line"]["waits"] == "worker"
+    assert answer["also_runs"] == {
+        "experiments": ["E2"],
+        "message": "E2 is approved too and runs then as well.",
+    }
+
+
 def test_one_approved_without_a_start_is_in_the_line_of_a_worker_that_runs_the_queue(
     client, project, services, launched
 ):

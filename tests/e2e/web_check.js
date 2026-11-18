@@ -3186,7 +3186,10 @@ CHECKS.queue = async ({ page, pid, large }) => {
   };
   const toast = async (pattern, what) => { await until(page, (source) => new RegExp(source).test((document.querySelector('#toast') || {}).textContent || ''), pattern, 10000, what); return text(page, '#toast'); };
   await approveAndRun(a);
-  await toast(a + ' is approved; its run is starting', 'the first approval starts its run');
+  const first = await toast(a + ' is approved; its run is starting', 'the first approval starts its run');
+  /* the worker started for it goes on with what was approved before: the sentence says so,
+     and does not name the one experiment alone */
+  if (earlier.length) ok(earlier.every((eid) => first.indexOf(eid) >= 0) && /approved too/.test(first), 'the start names what else runs with it (' + earlier.join(', ') + '): ' + first.replace(/\s+/g, ' ').trim());
   /* the second and the third are approved while the first runs */
   await open(page, '#/p/' + id + '/experiments/' + b, '.approve [data-act="approve"][data-start]');
   const offered = await page.evaluate(() => Array.from(document.querySelectorAll('.approve [data-act="approve"]')).map((el) => el.textContent.trim()));

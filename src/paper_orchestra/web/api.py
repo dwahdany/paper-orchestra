@@ -3042,7 +3042,9 @@ def _approval_options(given: Mapping[str, Any]) -> dict[str, Any]:
 
 def _start_run(context: Context, project: Project, experiment_id: str) -> dict[str, Any]:
     """Have an approved experiment run with no further request; what the answer says of
-    it: ``{"worker"}``, and ``"in_line"`` when the project's worker is at other work.
+    it: ``{"worker"}``, ``"in_line"`` when the project's worker is at other work, and
+    ``"also_runs"`` when the worker that runs it runs other experiments too, which the
+    person did not name with this press (see :func:`_also_runs`).
 
     With no worker one is started for the experiment (``research run E --queue``),
     which afterwards goes on with whatever else is approved, in the order of the
@@ -3053,12 +3055,45 @@ def _start_run(context: Context, project: Project, experiment_id: str) -> dict[s
     status = dict(context.workers.run_in_line(project.root, experiment_id))
     waits = status.pop("waits", None)
     answer: dict[str, Any] = {"worker": status}
+    line = context.services.line(project)
     if waits:
-        line = context.services.line(project)
         answer["in_line"] = _in_line(experiment_id, status, line) or _in_line(
             experiment_id, status, {**line, "waiting": [*line["waiting"], experiment_id]}
         )
+    if waits != "line":
+        # A worker was started for it, or is started for it later: that worker goes on
+        # with everything else that is approved.  (In the line of a worker that is
+        # running experiments, what else waits is what the line shows.)
+        also = _also_runs(experiment_id, line, later=bool(waits))
+        if also:
+            answer["also_runs"] = also
     return answer
+
+
+def _also_runs(
+    experiment_id: str, line: Mapping[str, Any], *, later: bool = False
+) -> dict[str, Any] | None:
+    """What else runs when a run of ``experiment_id`` is started: the other experiments
+    that are approved and wait, which the worker goes on with after it, in the order
+    of their approvals.  ``{"experiments", "message"}``, or ``None`` when nothing else
+    waits.
+
+    The person pressed for one experiment, and the sentence they read about it must
+    not name that one alone: one approved "to run later" runs now too, and may cost
+    money.  ``later`` is for a run that starts when the work under way has ended.
+    """
+    others = [str(name) for name in line.get("waiting") or () if str(name) != experiment_id]
+    if not others:
+        return None
+    names = others[0] if len(others) == 1 else f"{', '.join(others[:-1])} and {others[-1]}"
+    if later:
+        verb = "is approved too and runs" if len(others) == 1 else "are approved too and run"
+        message = f"{names} {verb} then as well."
+    elif len(others) == 1:
+        message = f"{names} is approved too and runs after it."
+    else:
+        message = f"{names} are approved too: they run after it, in that order."
+    return {"experiments": others, "message": message}
 
 
 def _already_in_line(context: Context, project: Project, experiment_id: str) -> dict[str, Any]:
@@ -3783,7 +3818,8 @@ def approve(
     (Modal for a GPU), and without ``network`` it runs without network access; a plan
     that asks for the network (``network: true``) is refused (422) until the request
     says ``"network": true`` or ``false``.  With ``start`` the run begins at once
-    (``worker``).  When the project already has a worker the approval still succeeds
+    (``worker``); the worker goes on with every other approved experiment, and
+    ``also_runs`` (``{"experiments", "message"}``) names them when there are any.  When the project already has a worker the approval still succeeds
     and the experiment waits in line with no further request: ``in_line`` is
     ``{"waits", "position", "after", "message"}`` (``E7 is approved; it runs after
     E6.``).  A worker that runs experiments goes on with every one that is approved
@@ -3817,7 +3853,8 @@ def approve(
 def run_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
     """Run an approved experiment now, in a worker of its own (no model is called
     unless its code has to be repaired).  The worker then goes on with whatever else
-    is approved until nothing waits.  When the project already has a worker the
+    is approved until nothing waits, and ``also_runs`` names it (``{"experiments",
+    "message"}``: what the person is told with the start).  When the project already has a worker the
     experiment waits in line instead (``in_line``, as the approval answers it); 409
     only for a worker that is being stopped or cannot be verified.
 
@@ -3844,11 +3881,15 @@ def run_experiment(eid: str, project: Proj, context: Ctx) -> dict[str, Any]:
                 "the experiment's run lock). Wait for that run, or cancel it.",
             )
         # With a worker at work the start below is refused, as any second worker is.
-        return {
+        answer: dict[str, Any] = {
             "worker": context.workers.start(
                 project.root, "run", experiments=[str(page.id)], queue=True
             )
         }
+        also = _also_runs(str(page.id), context.services.line(project))
+        if also:
+            answer["also_runs"] = also
+        return answer
     if page.state not in ("approved", "queued"):
         raise ApiError(
             422,

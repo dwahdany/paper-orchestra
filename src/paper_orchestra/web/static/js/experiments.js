@@ -28,6 +28,32 @@ export function lineWords(x) {
   if (l.waits === 'line') return l.after ? 'runs after ' + l.after : 'runs next';
   return 'starts by itself when the work under way is done';
 }
+/** What else a press for one experiment runs: a worker that is started for a run goes on with
+    every other approved experiment, and the server names them (`also_runs` of its answer).
+    Said with every sentence about a start, so that none names the one experiment alone. */
+export const alsoRuns = (answer) => { const also = answer && answer.also_runs; return also && also.message ? ' ' + plain(also.message) : ''; };
+/** What the person reads after an approval (`answer` is the server's): that its run is
+    starting or where it waits, with what else runs; for one approved to run later, when. */
+export function approvedWords(eid, answer, start) {
+  if (answer.in_line) return plain(answer.in_line.message) + alsoRuns(answer);   // "E7 is approved; it runs after E6."
+  if (start) return eid + ' is approved; its run is starting.' + alsoRuns(answer);
+  return eid + ' is approved. ' + LATER;
+}
+/** What the person reads after "Run now" (or "Run it again", for an interrupted run). */
+export function runNowWords(eid, answer, again) {
+  if (answer.in_line) return plain(answer.in_line.message) + alsoRuns(answer);
+  return (again ? eid + ' is run again. What was left of the interrupted run is settled first.' : 'The run of ' + eid + ' is starting.') + alsoRuns(answer);
+}
+/** When an experiment runs that was approved without a start: not only when the person
+    continues. Whoever starts a run of any experiment starts a worker that goes on with
+    every approved one, this one too. */
+const LATER = 'It runs when you continue, or as soon as you run any experiment: a run that is started goes on with every approved one.';
+/** The other experiments that are approved and wait for a run (the list's rows): what a
+    run started now would run as well. */
+export const approvedToo = (store, eid) => (store.experiments || []).filter((x) => x.id !== eid && x.review === 'accepted' && (x.state === 'approved' || x.state === 'queued') && !lapsed(x)).map((x) => x.id);
+const andList = (ids) => (ids.length < 2 ? ids.join('') : ids.slice(0, -1).join(', ') + ' and ' + ids[ids.length - 1]);
+/** Said before a press that starts a run, where other approved experiments wait. */
+const alsoNote = (store, eid, press) => { const ids = approvedToo(store, eid); return ids.length ? html`<p class="also-runs" data-also-runs="${ids.join(' ')}">${press} also runs <b>${andList(ids)}</b>, which ${ids.length === 1 ? 'is' : 'are'} approved: a run that is started goes on with every approved experiment.</p>` : ''; };
 /** The experiments of one group in the order they are shown in: those that are being run and
     those that wait come in the order they run in (the run that is going, then the line by
     its positions, then what waits for the person to continue); the others as they are listed. */
@@ -64,8 +90,8 @@ function subline(store, x) {
   if (x.state === 'planned' || !x.state) return (x.meta || {}).state_reason ? html`<span class="t-prop">back to planned · ${plain(x.meta.state_reason)}</span>` : html`accepted · runs only after you approve it`;
   if (lapsed(x)) return html`<span class="t-prop">will not run · ${whyNot(x.will_not_run)} · approve it again</span>`;
   if ((x.state === 'approved' || x.state === 'queued') && x.in_line) return html`<span data-in-line="${x.in_line.position}">${x.state} · ${x.in_line.waits === 'line' ? 'waits in line, no. ' + x.in_line.position + ' · ' : ''}${lineWords(x)}</span>`;
-  if (x.state === 'approved') return html`approved · runs first when you continue, or now`;
-  if (x.state === 'queued') return html`queued · runs first when you continue, or now`;
+  if (x.state === 'approved') return html`approved · runs when you continue, or with the next run you start`;
+  if (x.state === 'queued') return html`queued · runs when you continue, or with the next run you start`;
   if (x.state === 'running' && x.interrupted) return html`<span class="t-prop">interrupted · the worker that ran it is gone · run it again, or cancel it</span>`;
   if (x.state === 'running') return html`<span class="ex-tail" data-tail="${x.id}">${store.tails[x.id] || 'run ' + (run.number || '') + ' started ' + ago(run.started)}</span>`;
   if (x.state === 'succeeded') return html`${metricLine(run) || 'succeeded'}`;
@@ -237,9 +263,11 @@ function approveHTML(store, page, data) {
               <button class="btn" data-act="edit" data-ref="${page.path}">Edit <kbd>E</kbd></button>
               <button class="btn btn-neg-quiet" data-act="reject-ask" data-ref="${page.path}">Reject… <kbd>R</kbd></button>`
           : html`<button class="btn btn-primary" data-act="approve" data-eid="${eid}" data-start="1"${runnable.length ? '' : raw(' disabled')}${draining ? raw(' data-tip="A worker is running experiments and goes on with every approved one, in the order you approved them"') : ''}>${icon('play')}${draining ? 'Approve; it runs in line' : atWork ? 'Approve and run when the agents are done' : 'Approve and run now'}</button>
-              ${draining ? '' : html`<button class="btn" data-act="approve" data-eid="${eid}"${runnable.length ? '' : raw(' disabled')} data-tip="It runs first, and is analysed, when you next continue the project">Approve, run when I continue</button>`}
+              ${draining ? '' : html`<button class="btn" data-act="approve" data-eid="${eid}"${runnable.length ? '' : raw(' disabled')} data-tip="It runs when you next continue the project, or as soon as you run any experiment: a run that is started goes on with every approved one">Approve, run later</button>`}
               <button class="btn" data-act="edit" data-ref="${page.path}">Edit the plan <kbd>E</kbd></button>
-              ${app.ui.reapprove === eid ? html`<button class="btn btn-quiet" data-act="reapprove" data-eid="">Cancel</button>` : ''}`}</div></div>`}
+              ${app.ui.reapprove === eid ? html`<button class="btn btn-quiet" data-act="reapprove" data-eid="">Cancel</button>` : ''}`}</div>
+        ${draining || !runnable.length ? '' : alsoNote(store, eid, proposed ? '“Accept and run”' : atWork ? '“Approve and run when the agents are done”' : '“Approve and run now”')}
+        ${proposed || draining ? '' : html`<p class="also-runs" data-run-later>“Approve, run later” starts nothing now: the experiment runs when you continue the project, or as soon as you run any experiment.</p>`}</div>`}
   </section>`;
 }
 
@@ -531,7 +559,8 @@ function detailHTML(store, page, route) {
       ? html`It waits in line${inLine.after ? html`: it runs after <b>${inLine.after}</b>` : ': it runs next'}, with nothing more to press. The worker that is running experiments goes on with every approved one, in the order you approved them.`
       : html`A run of it is asked for: it starts by itself when the work under way is done (or in the agents' run phase, if that comes first).`;
     top = html`<section class="callout"${inLine ? html` data-in-line="${inLine.position}"` : ''}><h2>${page.state === 'queued' ? 'Queued' : 'Approved'} to run on ${backendName(meta.backend || (data.plan || {}).backend, meta.gpu)}${meta.timeout_seconds ? ', for at most ' + minutes(meta.timeout_seconds / 60) : ''}</h2>
-      <p>${inLine ? waits : canFollow ? 'The agents are at work. Their run phase runs it if that is still to come; press the button and it also starts by itself when they are done.' : busy ? held : 'It runs first, and is analysed, when you continue the project; or run it now.'}</p>
+      <p>${inLine ? waits : canFollow ? 'The agents are at work. Their run phase runs it if that is still to come; press the button and it also starts by itself when they are done.' : busy ? held : 'It runs when you continue the project, or as soon as a run of any experiment is started; or run it now.'}</p>
+      ${inLine || (busy && !canFollow) ? '' : alsoNote(store, eid, canFollow ? '“Run when they are done”' : '“Run now”')}
       <div class="row">${inLine ? '' : html`<button class="btn btn-primary" data-act="run-now" data-eid="${eid}"${(busy && !canFollow) || starting ? raw(' disabled') : ''}>${icon('play')}${starting ? 'Starting…' : canFollow ? 'Run when they are done' : 'Run now'}</button>`}<button class="btn" data-act="reapprove" data-eid="${eid}">Change where it runs…</button>
         ${cancelButton(eid, does, {})}</div></section>`;
   } else if (page.state === 'running' && latest && latest.status === 'running') top = liveHTML(store, page, data, latest, does);
