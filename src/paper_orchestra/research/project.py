@@ -125,6 +125,9 @@ TITLE_FROM_BRIEF = "title_from_brief"
 TITLE_LIMIT = 120
 STATE_FILE = "state.json"
 EVENTS_FILE = "events.jsonl"
+#: What a worker command leaves when somebody stopped it (Ctrl-C, SIGTERM, a stop
+#: request): ``{"pid", "host", "at"}``.  See :func:`record_worker_stop`.
+STOPPED_FILE = ".worker-stopped.json"
 INPUTS_DIR = "inputs"
 BRIEF_FILE = "brief.md"
 MANIFEST_FILE = "manifest.json"
@@ -340,6 +343,50 @@ class _Clock:
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def record_worker_stop(root: str | Path) -> None:
+    """Leave word in the project that this process, a worker of it, was stopped by
+    somebody (``STOPPED_FILE``).
+
+    A server that did not start the worker (`research run` in a terminal) cannot see
+    its exit code.  It reads this instead, and starts nothing after a worker that
+    was stopped: a stop ends the line of experiments, wherever it came from.  Never
+    raises: a stop goes on whether or not this could be written.
+    """
+    import socket
+
+    with contextlib.suppress(OSError, ValueError):
+        write_json(
+            Path(root) / STOPPED_FILE,
+            {
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "at": format_stamp(datetime.now(UTC)),
+            },
+        )
+
+
+def worker_stop_recorded(root: str | Path, pid: int | None) -> bool:
+    """Whether the worker with ``pid`` left word that it was stopped
+    (:func:`record_worker_stop`).  The word of another process (an earlier worker)
+    says nothing about this one."""
+    if pid is None:
+        return False
+    file = Path(root) / STOPPED_FILE
+    try:
+        if file.is_symlink() or file.stat().st_size > 4096:
+            return False
+        left = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(left, dict) and type(left.get("pid")) is int and left["pid"] == pid
+
+
+def forget_worker_stop(root: str | Path) -> None:
+    """Remove the word a stopped worker left: a worker that starts now is another one."""
+    with contextlib.suppress(OSError):
+        (Path(root) / STOPPED_FILE).unlink()
 
 
 def _read_json(path: Path) -> Any:

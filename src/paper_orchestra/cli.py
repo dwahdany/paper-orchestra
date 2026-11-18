@@ -1014,6 +1014,7 @@ def _working(project: Project, command: str = "advance") -> Iterator[_EventPrint
 
     _restore_interrupt()
     _sweep(project)
+    _forget_stop(project)
     # `advance` ends by saying its checkpoint in full; `run` reaches none.
     said_at_the_end = ("checkpoint",) if command == "advance" else ()
     try:
@@ -1059,7 +1060,12 @@ def _sweep(project: Project) -> None:
 
 
 def _stopped(project: Project, command: str = "advance") -> NoReturn:
-    """Say that the command was stopped and what goes on from there; exit with 130."""
+    """Say that the command was stopped and what goes on from there; exit with 130.
+
+    The stop is left on file first (``project.record_worker_stop``): the app's server
+    starts the runs that wait when a worker has ended, and not after one that was
+    stopped, which it cannot tell of a worker started here without that word."""
+    _record_stop(project)
     root = _quoted(project.root)
     if command == "run":
         how = _after_a_stopped_run(project, root)
@@ -1070,6 +1076,19 @@ def _stopped(project: Project, command: str = "advance") -> NoReturn:
         )
     _say(f"Stopped. {how}", fg=typer.colors.YELLOW, err=True)
     raise typer.Exit(INTERRUPTED)
+
+
+def _record_stop(project: Project) -> None:
+    from paper_orchestra.research.project import record_worker_stop
+
+    record_worker_stop(project.root)
+
+
+def _forget_stop(project: Project) -> None:
+    """A command that starts work is not the worker that was stopped before it."""
+    from paper_orchestra.research.project import forget_worker_stop
+
+    forget_worker_stop(project.root)
 
 
 def _after_a_stopped_run(project: Project, root: str) -> str:
@@ -3015,12 +3034,14 @@ def research_write(
     options = {name: value for name, value in given.items() if value is not None}
     _restore_interrupt()
     _sweep(opened)
+    _forget_stop(opened)
     try:
         from paper_orchestra.research import writeup
 
         with _EventPrinter(opened):
             result = writeup.write_paper(opened, template=template, **options)
     except KeyboardInterrupt:
+        _record_stop(opened)
         _say(
             "Stopped. The same command continues the write-up.",
             fg=typer.colors.YELLOW,

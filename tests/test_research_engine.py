@@ -2619,6 +2619,42 @@ def test_a_stop_request_is_still_known_after_the_run_it_ended(project, team):
     assert engine.stop_requested is False and project.page("E2").state == "succeeded"
 
 
+def test_a_run_that_was_stopped_leaves_word_of_it_before_its_name_is_taken_off(
+    project, team, monkeypatch
+):
+    """The app's server starts the runs that wait when a worker has ended, and not after
+    one that was stopped.  Of a worker started in a terminal it sees the name leave
+    state.json and nothing else: the word of the stop must be there by then."""
+    from paper_orchestra.research.project import forget_worker_stop, worker_stop_recorded
+
+    backend = FakeBackend()
+    two_experiments_accepted(project, team, backend)
+    approve(project, "E1", backend)
+    approve(project, "E2", backend)
+    engine = make_engine(project, team, backend)
+    seen: list[tuple[bool, bool]] = []
+    save = engine_module.Engine._save
+
+    def watched(self):
+        named = self._state.get("worker") is not None
+        seen.append((named, worker_stop_recorded(project.root, os.getpid())))
+        return save(self)
+
+    monkeypatch.setattr(engine_module.Engine, "_save", watched)
+    backend.before = engine.stop
+
+    engine.run_experiment("E1")
+
+    assert worker_stop_recorded(project.root, os.getpid())
+    assert seen[-1] == (False, True)  # the name goes with the word already on file
+
+    # A run that ends by itself leaves none, and takes away the one that was there.
+    backend.before = lambda: None
+    engine.run_experiment("E2")
+    assert not worker_stop_recorded(project.root, os.getpid())
+    forget_worker_stop(project.root)  # nothing to forget is no error
+
+
 def test_a_worker_that_goes_on_with_what_is_approved_says_so_with_its_name(project, team):
     backend = FakeBackend()
     two_experiments_accepted(project, team, backend)

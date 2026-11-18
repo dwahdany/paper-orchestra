@@ -85,7 +85,14 @@ from paper_orchestra.research.model import (
     parse_stamp,
     phase_name,
 )
-from paper_orchestra.research.project import EVENTS_FILE, EXPERIMENTS_DIR, STATE_FILE, Project
+from paper_orchestra.research.project import (
+    EVENTS_FILE,
+    EXPERIMENTS_DIR,
+    STATE_FILE,
+    Project,
+    forget_worker_stop,
+    record_worker_stop,
+)
 from paper_orchestra.research.sources import CutoffError
 from paper_orchestra.utils.common import write_json
 from paper_orchestra.utils.scholar import SemanticScholar
@@ -1090,6 +1097,7 @@ class Engine:
                 raise WorkerBusy(self._busy_message(lock.error))
             _refuse_unwritable_state(self.project)
             self._stop.clear()
+            forget_worker_stop(self.project.root)  # an earlier worker's, if any
             self.project.reload()
             self._needs.clear()  # the settings, and what is configured, as they are now
             # What writers that were killed left behind does not pile up crash by crash.
@@ -1123,12 +1131,21 @@ class Engine:
             beat = _Heartbeat(self._beat, self.HEARTBEAT_SECONDS)
             beat.start()
             restore = self._stop_on_sigterm()
+            stopped = False
             try:
                 yield
+            except KeyboardInterrupt:
+                stopped = True
+                raise
             finally:
                 restore()
                 beat.stop()
                 self._compute.close()
+                if stopped or self._stop.is_set():
+                    # Said before the name is taken off: whoever watches this worker
+                    # from outside (the app's server, for one started in a terminal)
+                    # sees the name go, and must find by then that it was stopped.
+                    record_worker_stop(self.project.root)
                 with self._lock:
                     self._state["worker"] = None
                     self._write_usage()

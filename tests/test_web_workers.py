@@ -84,6 +84,12 @@ if mode == "no-model":
     print("The intake phase needs a model, and the model set for research cannot be used "
           "because no Anthropic credentials were found: set ANTHROPIC_API_KEY.", flush=True)
     sys.exit(3)
+if mode == "fail":
+    # Works until the test lets it end, and then ends as a run does that failed.
+    while not (root / "go").exists():
+        time.sleep(0.02)
+    (root / "go").unlink()
+    sys.exit(1)
 if mode == "until-go":
     # Works until the test lets it end, and then ends as a worker does that is done.
     ready()
@@ -91,6 +97,34 @@ if mode == "until-go":
         time.sleep(0.02)
     (root / "go").unlink()
     sys.exit(0)
+if mode == "queue":
+    # Like `research run --queue` in a terminal: it names itself in state.json, and
+    # an interrupt (Ctrl-C, or SIGTERM from kill) is a stop.  A stop is left on file
+    # as the command leaves it, the name is taken off, and the exit code is 130.
+    def name(worker):
+        temporary = state_file.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"schema": 1, "status": "checkpoint", "worker": worker}))
+        os.replace(temporary, state_file)
+
+    def on_stop(signum, frame):
+        from paper_orchestra.research.project import record_worker_stop
+
+        record_worker_stop(root)
+        name(None)
+        sys.exit(130)
+
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    name({"pid": os.getpid(), "host": os.uname().nodename, "started": stamp,
+          "heartbeat": stamp, "queue": True})
+    ready()
+    while not (root / "go").exists():
+        time.sleep(0.02)
+    (root / "go").unlink()
+    if not (root / "leave-name").exists():
+        name(None)
+    os._exit(0)
 if mode == "die":
     write_state("running", "running")
     ready()
@@ -2639,6 +2673,114 @@ def test_a_stop_ends_the_line_nothing_is_started_after_it(project, lined):
     time.sleep(0.3)
 
     assert len(lined.calls) == 1 and lined.status(project.root)["state"] == "idle"
+
+
+@pytest.fixture
+def terminal(project, script):
+    """Start a stand-in `research run --queue` as a terminal does: no server started it,
+    it names itself in state.json.  All are ended afterwards."""
+    started: list[subprocess.Popen] = []
+
+    def start() -> subprocess.Popen:
+        worker = subprocess.Popen(
+            worker_command(script, "run", project.root, "queue"), start_new_session=True
+        )
+        started.append(worker)
+        ready_again(project)
+        return worker
+
+    yield start
+    for worker in started:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=30)
+
+
+def nothing_was_started(lined: Workers, project: Project) -> bool:
+    wait_for(lambda: lined.status(project.root)["state"] == "idle")
+    time.sleep(0.5)  # time for a worker that is started by itself to show
+    return lined.calls == [] and lined.status(project.root)["state"] == "idle"
+
+
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT])
+def test_a_stop_from_the_terminal_ends_the_line_too(project, lined, terminal, stop):
+    """`research run --queue` in a terminal, a run asked for in the app meanwhile, then
+    Ctrl-C or kill in the terminal: the server sees no exit code of that worker.  It
+    must not start a worker a moment later, which would run what waits and run again
+    the experiment that was just stopped."""
+    worker = terminal()
+    asked = lined.run_in_line(project.root, "E2")
+    assert (asked["waits"], asked["adopted"], asked["then_runs"]) == ("line", True, ["E2"])
+    lined.waiting[:] = ["E1", "E2"]  # the run that was stopped is back in the queue
+
+    worker.send_signal(stop)
+    assert worker.wait(timeout=30) == 130
+
+    assert nothing_was_started(lined, project)
+
+
+def test_a_worker_from_the_terminal_that_was_killed_ends_the_line(project, lined, terminal):
+    """Killed, it says nothing and leaves its name in state.json."""
+    worker = terminal()
+    assert lined.run_in_line(project.root, "E2")["waits"] == "line"
+    lined.waiting[:] = ["E1", "E2"]
+
+    worker.kill()
+    worker.wait(timeout=30)
+
+    assert nothing_was_started(lined, project)
+
+
+def test_after_a_worker_from_the_terminal_that_ended_by_itself_the_line_goes_on(
+    project, lined, terminal
+):
+    """The stop of an earlier worker, still on file, says nothing about this one."""
+    from paper_orchestra.research.project import STOPPED_FILE
+
+    worker = terminal()
+    stale = {"pid": worker.pid + 1, "host": HOST, "at": "2026-11-17T09:00:00Z"}
+    (project.root / STOPPED_FILE).write_text(json.dumps(stale))
+    assert lined.run_in_line(project.root, "E2")["waits"] == "line"
+    lined.waiting[:] = ["E2"]  # approved after the worker's last look at the line
+
+    (project.root / "go").write_text("")
+    assert worker.wait(timeout=30) == 0
+
+    # A look is what notices the end of a worker that was found.
+    wait_for(
+        lambda: lined.status(project.root) and len(lined.calls) == 1,
+        message="a worker for what still waits",
+    )
+    assert lined.calls[0] == ("run", {"experiments": ["E2"], "queue": True})
+
+
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT, signal.SIGKILL])
+def test_a_worker_of_the_app_that_is_stopped_from_outside_ends_the_line(project, lined, stop):
+    """Somebody ends the worker the app started with kill, not with the app's Stop: an
+    interrupt it answers with exit code 130, or a kill it cannot answer."""
+    first = lined.start(project.root, "run", mode="sleep", experiments=["E1"], queue=True)
+    wait_for(lambda: (project.root / "ready").exists())
+    assert lined.run_in_line(project.root, "E2")["waits"] == "line"
+    lined.waiting[:] = ["E1", "E2"]
+
+    os.kill(first["pid"], stop)
+    wait_for(lambda: not process_exists(first["pid"]))
+    wait_for(lambda: lined.status(project.root)["state"] == "idle")
+    time.sleep(0.5)
+
+    assert len(lined.calls) == 1 and lined.status(project.root)["state"] == "idle"
+
+
+def test_a_worker_that_fails_does_not_end_the_line(project, lined):
+    """One experiment that failed (exit code 1) keeps nothing else from running."""
+    first = lined.start(project.root, "run", mode="fail", experiments=["E1"], queue=True)
+    assert lined.run_in_line(project.root, "E2")["waits"] == "line"
+    lined.waiting[:] = ["E2"]
+
+    let_it_end(lined, project, first["pid"])
+
+    wait_for(lambda: len(lined.calls) == 2, message="a worker for what still waits")
+    assert lined.calls[1] == ("run", {"experiments": ["E2"], "queue": True})
 
 
 def test_a_plain_run_worker_from_a_terminal_is_told_from_one_that_runs_the_queue(

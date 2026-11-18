@@ -89,7 +89,12 @@ from pathlib import Path
 from typing import Any
 
 from paper_orchestra.research.model import format_stamp, parse_stamp, quotable
-from paper_orchestra.research.project import EVENTS_FILE, STATE_FILE
+from paper_orchestra.research.project import (
+    EVENTS_FILE,
+    STATE_FILE,
+    forget_worker_stop,
+    worker_stop_recorded,
+)
 from paper_orchestra.utils.common import write_json
 from paper_orchestra.web.security import TOKEN_ENV, PathEscape, open_confined, open_for_append
 
@@ -1084,8 +1089,9 @@ class Workers:
         self._settling: dict[Path, threading.Thread] = {}
         self._waiting_runs: Callable[[Path], Sequence[str]] = waiting_runs or experiments_in_line
         #: Experiments whose run the person asked for while the project's worker was at
-        #: other work: when that worker ends (and nobody stopped it), a worker is
-        #: started for what still waits.  In memory only: a server that is restarted
+        #: other work: when that worker ends by itself (nobody stopped or killed it,
+        #: here or anywhere else: see :meth:`_line_ended`), a worker is started for
+        #: what still waits.  In memory only: a server that is restarted
         #: has forgotten it, and the approval then waits for Continue or Run now.
         self._promised: dict[Path, set[str]] = {}
         #: Projects whose files could not be judged, so that the log says it once.
@@ -1151,7 +1157,12 @@ class Workers:
         started for what still waits then.  That also covers a worker that was
         just past its last look at the line when the approval came.
 
-        ``WorkerBusy`` for a worker that is being stopped (a stop ends the line)
+        A stop ends the line, wherever it comes from: the Stop of the app, Ctrl-C or
+        ``kill`` in the terminal the worker was started in, a kill of the process.
+        After a worker that ended that way nothing is started; the approvals stand,
+        and Continue or Run now runs them.
+
+        ``WorkerBusy`` for a worker that is being stopped
         and for one this server cannot verify, whose end it cannot see either;
         ``WorkerError`` when a worker cannot be started.
         """
@@ -1437,6 +1448,7 @@ class Workers:
                 f"The worker's log {root / WORKER_LOG} cannot be written ({exc}); no worker "
                 "was started. Check that the project directory can be written to."
             ) from exc
+        forget_worker_stop(root)  # the word of a worker that was stopped earlier
         try:
             # What was asked is on disk before anything runs: the command line carries the
             # person's instruction, and nothing they typed may exist in memory only.
@@ -1783,6 +1795,7 @@ class Workers:
             _remove_record(entry.root)
         phase = None
         unexpected = not entry.stop_requested
+        line_ended = self._line_ended(entry, code)  # before the name is taken off
         try:
             phase = self._settle(entry, code)
         except Exception:
@@ -1807,12 +1820,12 @@ class Workers:
         promised = self._promised.pop(key, None)
         if needs_model:
             return  # nothing died, and nothing ran that could have left a run behind
-        if promised and unexpected and not self._closed:
+        if promised and not line_ended and not self._closed:
             # The person asked for a run while this worker was at work: it is started
             # now, for whatever still waits.  Not after a stop, which ends the line.
             threading.Thread(
                 target=self._start_what_waits,
-                args=(entry.root, set(promised)),
+                args=(entry.root, set(promised), entry.pid),
                 name="run-next",
                 daemon=True,
             ).start()
@@ -1822,6 +1835,26 @@ class Workers:
             # It may have been in the middle of a run of an experiment, which only the
             # process that runs it settles: killed, it left the run at "running".
             self._settle_later(entry.root)
+
+    @staticmethod
+    def _line_ended(entry: _Entry, code: int | None) -> bool:
+        """Whether the worker that is gone was stopped or killed, by anybody: nothing is
+        started after such a worker, since a stop ends the line of experiments (and
+        the worker started next would run again the one that was just stopped).
+
+        The Stop of this server; an interrupt from elsewhere, which a worker command
+        answers with exit code 130 (Ctrl-C or ``kill`` in a terminal); a signal that
+        ended the process.  Of a worker this server did not start no exit code is
+        known: the command leaves word of a stop in the project
+        (``project.record_worker_stop``), and one that was killed leaves its name in
+        ``state.json``, which a worker that ends by itself takes off.  Asked before
+        that name is taken off for it.
+        """
+        if entry.stop_requested or worker_stop_recorded(entry.root, entry.pid):
+            return True
+        if code is not None:
+            return code == 130 or code < 0
+        return entry.pid is not None and _named_pid(read_state(entry.root)) == entry.pid
 
     @staticmethod
     def _ended_badly(entry: _Entry, code: int | None) -> bool:
@@ -1907,17 +1940,23 @@ class Workers:
         except (ProjectError, OSError) as exc:
             log.warning("Could not record the end of the worker in %s: %s", entry.root, exc)
 
-    def _start_what_waits(self, root: Path, promised: Collection[str]) -> None:
+    def _start_what_waits(
+        self, root: Path, promised: Collection[str], ended: int | None = None
+    ) -> None:
         """Start a worker for the experiments that wait in line, after a worker ended
         while the person had asked for a run.  On a thread of its own: looking at the
         line reads pages and code, and starting waits for what the worker left to be
         settled.  With nothing waiting (the worker that ended ran it, or the person
         took the approval back) nothing is started.  The worker starts with the first
-        of ``promised`` that still waits, and goes on with everything else in line."""
+        of ``promised`` that still waits, and goes on with everything else in line.
+        ``ended`` is the pid of the worker that ended: word that it was stopped may
+        have come a moment after its end was seen, and then nothing is started."""
         try:
             waiting = [str(name) for name in self._waiting_runs(root)]
             asked = [name for name in waiting if name in promised]
-            if asked:
+            if asked and worker_stop_recorded(root, ended):
+                log.info("The runs waiting in %s were not started: the worker was stopped.", root)
+            elif asked:
                 self.run_in_line(root, asked[0])
         except WorkerBusy as exc:
             # Somebody started a worker first: the run phase of an advance runs what is

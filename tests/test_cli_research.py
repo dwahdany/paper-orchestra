@@ -1483,6 +1483,76 @@ def test_a_stop_request_ends_the_queue(lined, engine):
     assert "Stopped. The run that was in flight is back in the queue" in flat(result.stderr)
 
 
+def stop_on_file(project: Project) -> bool:
+    from paper_orchestra.research.project import worker_stop_recorded
+
+    return worker_stop_recorded(project.root, os.getpid())
+
+
+@pytest.mark.parametrize("how", ["request", "interrupt", "between runs"])
+def test_a_stopped_queue_leaves_word_of_the_stop_for_the_apps_server(lined, engine, how):
+    """A server that did not start this worker cannot see its exit code.  It starts the
+    runs that wait when a worker has ended, unless the worker says it was stopped."""
+    approve_now(lined, "E1")
+    approve_now(lined, "E2")
+
+    def stopped():
+        engine.instances[0].stop_requested = True
+        lined.set_state("E1", "queued", by="system")
+        return run_record("E1", 1, "cancelled", error="The worker was stopped.", requeued=True)
+
+    if how == "between runs":
+        # The interrupt arrives while the command looks at the line, outside the engine.
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        engine.runs = {"E1": run_record("E1", 1, "succeeded")}
+        from paper_orchestra import cli as command_line
+
+        original = command_line._next_in_line
+        command_line._next_in_line = interrupted
+        try:
+            result = invoke("run", str(lined.root), "E1", "--queue")
+        finally:
+            command_line._next_in_line = original
+    else:
+        engine.runs = {"E1": stopped if how == "request" else KeyboardInterrupt()}
+        result = invoke("run", str(lined.root), "E1", "--queue")
+
+    assert result.exit_code == cli.INTERRUPTED
+    assert stop_on_file(lined)
+
+
+def test_a_queue_that_ends_by_itself_leaves_no_word_of_a_stop(lined, engine):
+    from paper_orchestra.research.project import record_worker_stop
+
+    approve_now(lined, "E1")
+    record_worker_stop(lined.root)  # what an earlier command left when it was stopped
+    engine.runs = {"E1": run_record("E1", 1, "succeeded")}
+
+    result = invoke("run", str(lined.root), "E1", "--queue")
+
+    assert result.exit_code == 0
+    assert not stop_on_file(lined)
+
+
+def test_a_stopped_advance_and_a_stopped_write_up_leave_word_of_the_stop(
+    project, engine, monkeypatch
+):
+    engine.outcome = KeyboardInterrupt()
+    assert invoke("advance", str(project.root)).exit_code == 130
+    assert stop_on_file(project)
+
+    from paper_orchestra.research.project import forget_worker_stop
+
+    forget_worker_stop(project.root)
+    monkeypatch.setattr(
+        "paper_orchestra.research.writeup.write_paper", Writer(raises=KeyboardInterrupt())
+    )
+    assert invoke("write", str(project.root), "--template", "cvpr2025").exit_code == 130
+    assert stop_on_file(project)
+
+
 def test_a_run_the_person_cancelled_does_not_end_the_queue(lined, engine):
     approve_now(lined, "E1")
     approve_now(lined, "E2")
