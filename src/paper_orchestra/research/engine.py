@@ -70,9 +70,10 @@ from paper_orchestra.memory.lock import WikiLock
 # The usage ledger is the paper pipeline's, so that usage.json has one shape and one
 # way of pricing wherever it is written.
 from paper_orchestra.pipeline import read_carried_usage, usage_report
-from paper_orchestra.research import agents, decisions, experiments
+from paper_orchestra.research import agents, autopilot, decisions, experiments
 from paper_orchestra.research.agents import AgentContext, AgentReport
 from paper_orchestra.research.model import (
+    AUTOPILOT,
     FOR_ALL,
     SCHEMA,
     Limits,
@@ -160,6 +161,14 @@ _DOING = {
     "design": "designing experiments for the hypotheses you accepted",
     "run": "running the experiments you approved",
     "analyze": "analysing the new results",
+}
+#: The same where the person's standing rule (autopilot) decided: nothing here was
+#: accepted or approved by them, and no sentence says it was.
+_DOING_UNATTENDED = {
+    **_DOING,
+    "hypothesize": "proposing hypotheses from what is accepted",
+    "design": "designing experiments for the accepted hypotheses",
+    "run": "running the experiments that are approved",
 }
 #: Phases whose agent can act on a request of the person.
 _TAKES_REQUESTS = ("research", "hypothesize", "design", "analyze")
@@ -344,6 +353,10 @@ def _read_leniently(data: Mapping[str, Any]) -> dict[str, Any]:
     elif phases:
         # Nothing says how the last call ended: a checkpoint that is on file, else stopped.
         state["status"] = "checkpoint" if state["checkpoint"] else "stopped"
+    stretch = autopilot.read_stretch(data.get(autopilot.STRETCH_KEY))
+    if stretch is not None:
+        # Only a project that ran unattended has the key: the others are as they were.
+        state[autopilot.STRETCH_KEY] = stretch
     return state
 
 
@@ -367,6 +380,13 @@ def _from_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     records: list[dict[str, Any]] = state["phases"]
     for event in events:
         kind, phase, round = event.get("type"), event.get("phase"), event.get("round")
+        if kind in (autopilot.STARTED, autopilot.CONTINUED, autopilot.STOPPED):
+            # The record of an unattended stretch travels with its events.
+            carried = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+            stretch = autopilot.read_stretch(carried.get("stretch"))
+            if stretch is not None:
+                state[autopilot.STRETCH_KEY] = stretch
+            continue
         if phase not in PHASES or not _whole(round):
             continue
         data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
@@ -444,6 +464,11 @@ def _from_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     if state["status"] == "running":
         # Between two phases, or in one: either way no worker is there to go on.
         state["status"] = "stopped"
+    stretch = state.get(autopilot.STRETCH_KEY)
+    if stretch is not None and not stretch["ended"]:
+        # Its worker is not there to go on either, and nothing starts it again.
+        stretch.update(reason="worker_gone", said=None)
+        stretch["ended"] = stretch["started"]
     return state
 
 
@@ -454,6 +479,9 @@ def _rebuilt(project: Project, written: Mapping[str, Any] | None) -> dict[str, A
         return None
     spent = written.get("spent") if written and isinstance(written.get("spent"), Mapping) else {}
     state["spent"] = {name: _number(spent.get(name)) for name in state["spent"]}
+    kept = autopilot.read_stretch(written.get(autopilot.STRETCH_KEY)) if written else None
+    if kept is not None:
+        state[autopilot.STRETCH_KEY] = kept  # the file's own account of it, where it has one
     if not spent:
         # The ledger of the model spend is a file of its own; what the runs cost is
         # counted again from their records by the next worker.
@@ -905,6 +933,14 @@ class Engine:
         #: What was wrong with state.json when this worker started, before it wrote the
         #: file anew (:func:`state_problem`); ``None`` when nothing was.
         self._lost: str | None = None
+        #: The unattended stretch this worker is in (``state["autopilot"]``, its own to
+        #: change), and the clock its hours are counted by; ``None`` outside of one.
+        self._stretch: dict[str, Any] | None = None
+        self._stretch_clock = 0.0
+        #: How the latest pass of :meth:`advance` ended (see :meth:`_pass`).
+        self._pass_end = ""
+        #: What the standing rule would not approve in the run phase in flight.
+        self._held: dict[str, str] = {}
 
     @classmethod
     def _reading(
@@ -929,6 +965,7 @@ class Engine:
         reader._needs = {}
         reader._driver = None
         reader._agents = None
+        reader._stretch = None
         return reader
 
     # -- public ------------------------------------------------------------------
@@ -992,6 +1029,20 @@ class Engine:
         :class:`ModelNeeded` with that sentence, and the project is left as it
         stood: no event, no phase on record, nothing spent.
 
+        **Autopilot.**  In a project whose person switched it on
+        (``settings.autonomy.mode: autopilot``) the call does not end at its first
+        checkpoint: it is the start of an unattended stretch, in which this worker
+        goes on with the next phase by itself, round after round, in this process
+        (the web app may be restarted meanwhile).  The stretch ends, at a
+        checkpoint and with an ``autopilot.stopped`` event that says why and what
+        was decided without the person, when a cap of ``settings.autonomy`` is
+        reached (rounds, model spend or hours of this stretch), when a limit of
+        the project itself stops the work, when a phase fails, when the same
+        experiment failed twice, when a model is missing, when nothing more can
+        happen without the person, or on a stop request.  Its record is
+        ``state["autopilot"]`` (``research.autopilot``).  Only this call starts a
+        stretch: the next one begins when the person starts the agents again.
+
         Raises :class:`WorkerBusy` when another worker has the project,
         :class:`ModelNeeded` as said above, :class:`EngineError` when nothing on
         file says where the project stands and no phase is named, and
@@ -1001,32 +1052,334 @@ class Engine:
             raise EngineError(f"{phase!r} is not a phase; the phases are: {', '.join(PHASES)}.")
         instruction = (instruction or "").strip() or None
         with self._working():
-            if phase is None:
-                self._refuse_unknown_position()
-            # A phase that had completed without its checkpoint counts as done in this call.
-            done: str | None = self._unsettled_phase() if phase is None else None
-            name: str | None = phase or self._first_phase()
-            told: list[str] = []
-            notes: list[str] = []
-            back: str | None = None
-            if phase is None and name:
-                name, back = self._comes_first(name)
-            while name:
-                need = self._model_need(name)
-                if need is not None:
-                    self._wait_for_a_model(name, need, done, told, notes)
-                    break
-                done = name
-                outcome = self._run_phase(name, instruction)
-                if outcome.status != "completed" or outcome.report is None:
-                    break
-                # What the phases of this call did and found is told at its checkpoint.
-                told.append(outcome.report.summary)
-                notes += outcome.report.notes
-                if name == "analyze" and back is not None and instruction:
-                    notes.append(self._instruction_note(instruction, back))
-                name = self._after(name, outcome, told, notes, back=back, named=phase is not None)
+            # What autopilot approved for a stretch that is over runs in no other.
+            self._take_back_rule_approvals()
+            why: tuple[str, str] | None = None
+            try:
+                self._pass(phase, instruction)
+                while self._stretch is not None:
+                    why = self._stretch_over()
+                    if why is not None:
+                        break
+                    self._say_it_goes_on()
+                    try:
+                        self._pass(None, None)
+                    except ModelNeeded as exc:
+                        why = ("needs_model", str(exc))
+                        break
+            except KeyboardInterrupt:
+                why = ("stopped", "It was stopped.")
+                raise
+            except BaseException as exc:
+                why = why or ("failed", _one_line(self._clean(exc), 300))
+                raise
+            finally:
+                if self._stretch is not None:
+                    self._end_stretch(why or ("stopped", "It was stopped."))
         return self.state
+
+    def _pass(self, phase: str | None, instruction: str | None) -> None:
+        """One run of the engine from the next phase (or ``phase``) up to its next pause:
+        what ``advance()`` is in a supervised project, and one step of a stretch in
+        autopilot.  How it ended is left in ``_pass_end``: ``checkpoint`` (the phases
+        completed and the pause after them is written), ``needs_model``, ``budget:``
+        and the limit that was reached, ``interrupted`` or ``failed``.
+        """
+        self._pass_end = "checkpoint"
+        if phase is None:
+            self._refuse_unknown_position()
+        # A phase that had completed without its checkpoint counts as done in this call.
+        done: str | None = self._unsettled_phase() if phase is None else None
+        name: str | None = phase or self._first_phase()
+        told: list[str] = []
+        notes: list[str] = []
+        back: str | None = None
+        if phase is None and name:
+            name, back = self._comes_first(name)
+        while name:
+            need = self._model_need(name)
+            if need is not None:
+                self._wait_for_a_model(name, need, done, told, notes)
+                self._pass_end = "needs_model"
+                break
+            if self._stretch is None and self._autopilot_on():
+                # Work begins: so does the stretch.  (A call that starts nothing, for
+                # want of a model, leaves the project as it stood.)
+                self._begin_stretch()
+            done = name
+            outcome = self._run_phase(name, instruction)
+            if outcome.status != "completed" or outcome.report is None:
+                if outcome.status != "budget":
+                    self._pass_end = outcome.status
+                break
+            # What the phases of this call did and found is told at its checkpoint.
+            told.append(outcome.report.summary)
+            notes += outcome.report.notes
+            if name == "analyze" and back is not None and instruction:
+                notes.append(self._instruction_note(instruction, back))
+            name = self._after(name, outcome, told, notes, back=back, named=phase is not None)
+
+    # -- autopilot: the unattended stretch ---------------------------------------
+
+    def _autopilot_on(self) -> bool:
+        """Whether the person's standing rule holds (``settings.autonomy.mode``), as the
+        project's file says now."""
+        return bool(self.project.settings.autonomy.autopilot)
+
+    def _caps(self) -> dict[str, Any]:
+        """The caps of a stretch as the settings have them now: the person may tighten
+        (or widen) one while a stretch runs, and nobody else can write them."""
+        autonomy = self.project.settings.autonomy
+        return {
+            "rounds": int(autonomy.rounds),
+            "model_usd": float(autonomy.model_usd),
+            "hours": float(autonomy.hours),
+            "network": bool(autonomy.network),
+        }
+
+    def _begin_stretch(self) -> None:
+        """Begin an unattended stretch: its record in the state, and the event that says
+        what it is held to.  Called from :meth:`advance` alone, which the person starts."""
+        caps = self._caps()
+        spent = self._write_usage()
+        stretch = autopilot.new_stretch(
+            caps, started=_now(), spent_usd=spent, round=self._state["round"]
+        )
+        network = (
+            "runs it approves get the network access their plans ask for"
+            if caps["network"]
+            else "runs it approves get no network access"
+        )
+        event = self.project.emit(
+            autopilot.STARTED,
+            f"Autopilot goes on from here without you: {autopilot.caps_in_words(caps)}; "
+            f"{network}. Stop ends it.",
+            agent=AUTOPILOT,
+            data={"by": AUTOPILOT, "caps": caps},
+            round=self._state["round"],
+        )
+        stretch["seq"] = event["seq"]
+        self._stretch_clock = time.monotonic()
+        with self._lock:
+            self._stretch = self._state[autopilot.STRETCH_KEY] = stretch
+            self._save()
+
+    def _stretch_spent(self, more_usd: float = 0.0) -> float:
+        """What the models cost in this stretch so far (``more_usd`` on top: what a turn
+        in flight has used and the ledger does not hold yet)."""
+        assert self._stretch is not None
+        with self._lock:
+            return max(0.0, self._ledger_usd() + more_usd - self._stretch["spent_at_start"])
+
+    def _stretch_hours(self) -> float:
+        return (time.monotonic() - self._stretch_clock) / 3600.0
+
+    def _stretch_cap(self, more_usd: float = 0.0, who: str = "") -> _BudgetSpent | None:
+        """The cap of the stretch that is reached, as the limit that stops the work, or
+        ``None``: the dollars of this stretch, or its hours.  Asked wherever the model
+        budget is asked (before a session, before a turn, after every model request),
+        so that no agent works past a cap for longer than one request."""
+        if self._stretch is None:
+            return None
+        caps = self._caps()
+        spent, hours = self._stretch_spent(more_usd), self._stretch_hours()
+        ended = f" The work of {who} was ended at its next model call." if who else ""
+        again = "Continue starts a new stretch; the phase then resumes where it stopped."
+        if spent >= caps["model_usd"]:
+            return _BudgetSpent(
+                "autopilot.model_usd",
+                f"Autopilot's cap on model spend for this stretch is reached: {_money(spent)} "
+                f"of {_money(caps['model_usd'])} went to the models since it began "
+                f"(settings.autonomy.model_usd).{ended} {again}",
+                spent=spent,
+                allowed=caps["model_usd"],
+            )
+        if hours >= caps["hours"]:
+            return _BudgetSpent(
+                "autopilot.hours",
+                f"Autopilot's cap on time for this stretch is reached: it has run for "
+                f"{autopilot._hours(hours)} of {autopilot._hours(caps['hours'])} "
+                f"(settings.autonomy.hours).{ended} {again}",
+                spent=hours,
+                allowed=caps["hours"],
+            )
+        return None
+
+    def _failed_twice(self) -> str | None:
+        """The experiment that failed twice since the stretch began, if one did."""
+        assert self._stretch is not None
+        for page in self.project.pages(kind="experiment", review="accepted"):
+            if not page.id:
+                continue
+            try:
+                count = experiments.failures(
+                    self.project, str(page.id), since=self._stretch["started"]
+                )
+            except (ProjectError, OSError, ValueError):
+                continue
+            if count >= 2:
+                return str(page.id)
+        return None
+
+    def _stretch_over(self) -> tuple[str, str] | None:
+        """Why the stretch ends after the pass that has just ended, as ``(reason code,
+        sentence)``; ``None`` when the worker goes on with the next phase.
+
+        Going on is the exception that has to be earned: the pass ended at the
+        checkpoint after phases that completed, no cap is reached, the person has
+        not asked to stop or switched autopilot off, no experiment failed twice,
+        and what comes next is not the phase that has just found nothing to do.
+        """
+        stretch, state = self._stretch, self._state
+        assert stretch is not None
+        end, name = self._pass_end, state.get("phase")
+        if end == "interrupted" or self._stop.is_set():
+            return "stopped", "It was stopped."
+        if end == "failed":
+            error = _one_line(state.get("error") or "no error was recorded", 300)
+            return "failed", f"{phase_in_words(name).capitalize()} failed: {error}"
+        if end == "needs_model":
+            return "needs_model", (
+                f"{phase_in_words(state.get('next_phase')).capitalize()} needs a model that "
+                "cannot be used; the checkpoint says what is missing."
+            )
+        if end.startswith("budget:"):
+            limit = end.removeprefix("budget:")
+            checkpoint = state.get("checkpoint") or {}
+            said = _one_line(checkpoint.get("did") or "", 600)
+            if limit == "autopilot.model_usd":
+                return "model_usd", said or "The cap on model spend of this stretch was reached."
+            if limit == "autopilot.hours":
+                return "hours", said or "The cap on hours of this stretch was reached."
+            return "limits", said or "A limit of the project was reached."
+        if end != "checkpoint" or state.get("status") != "checkpoint":
+            return "stopped", f"The work ended without a checkpoint ({end or 'no account'})."
+        with contextlib.suppress(ProjectError):
+            self.project.reload()
+        if not self._autopilot_on():
+            return "switched_off", "You switched autopilot off."
+        caps = self._caps()
+        with self._lock:
+            stretch["passes"] += 1
+            if name == "analyze":
+                stretch["rounds"] += 1
+            stretch["caps"] = caps
+            stretch["spent_usd"] = autopilot.round_usd(self._stretch_spent())
+            self._save()
+        twice = self._failed_twice()
+        if twice:
+            return "experiment_failed_twice", (
+                f"{twice} failed twice in this stretch; autopilot does not try a third time."
+            )
+        if stretch["rounds"] >= caps["rounds"]:
+            done = stretch["rounds"]
+            return "rounds", (
+                f"The cap on rounds was reached: {_plural(done, 'round')} completed in this "
+                f"stretch, of at most {caps['rounds']} (settings.autonomy.rounds)."
+            )
+        cap = self._stretch_cap()
+        if cap is not None:
+            return cap.limit.removeprefix("autopilot."), str(cap)
+        following = state.get("next_phase")
+        if following == name:
+            # The phase found nothing it could do (a run phase with nothing it may
+            # run): doing it again would find the same.
+            held = "; ".join(f"{eid}: {why}" for eid, why in list(self._held.items())[:6])
+            return "needs_you", (
+                "Nothing more can happen without you: "
+                + (f"autopilot did not approve {held}." if held else self._nothing_to_run())
+            )
+        return None
+
+    def _say_it_goes_on(self) -> None:
+        """Say in the feed that the worker goes on by itself, and where the stretch stands."""
+        stretch, state = self._stretch, self._state
+        assert stretch is not None
+        caps = stretch["caps"]
+        following = str(state.get("next_phase"))
+        self.project.emit(
+            autopilot.CONTINUED,
+            f"Autopilot goes on with {phase_in_words(following)}: "
+            f"{_plural(stretch['rounds'], 'round')} of at most {caps['rounds']} completed in "
+            f"this stretch, {_money(stretch['spent_usd'])} of {_money(caps['model_usd'])} spent "
+            f"on models, {autopilot._hours(self._stretch_hours())} of "
+            f"{autopilot._hours(caps['hours'])} used.",
+            agent=AUTOPILOT,
+            data={"by": AUTOPILOT, "next": following, "stretch": dict(stretch)},
+            round=state["round"],
+        )
+
+    def _end_stretch(self, why: tuple[str, str]) -> None:
+        """End the stretch: take back the approvals it did not get to run, write why it
+        ended and what was decided without the person, and say so in the feed.
+
+        Runs when the worker leaves ``advance()`` for whatever reason, so nothing in
+        it may hide the reason: a failure to write the account is logged and the
+        stretch is over all the same (the next worker finds it without an end and
+        records that).
+        """
+        stretch, self._stretch = self._stretch, None
+        if stretch is None:
+            return
+        code, said = why
+        try:
+            self._take_back_rule_approvals()
+            with self._lock:
+                stretch.update(ended=_now(), reason=code, said=_one_line(said, 900))
+                stretch["caps"] = self._caps()
+                stretch["spent_usd"] = autopilot.round_usd(
+                    max(0.0, self._write_usage() - stretch["spent_at_start"])
+                )
+                self._save()
+            found = autopilot.digest(self.project, self._state)
+            account = autopilot.summary(found) if found else ""
+            self.project.emit(
+                autopilot.STOPPED,
+                _one_line(f"Autopilot stopped: {_sentence(said, 900)} {account}", 2400),
+                agent=AUTOPILOT,
+                data={
+                    "by": AUTOPILOT,
+                    "reason": code,
+                    "stretch": dict(stretch),
+                    "accepted": len(found["accepted"]) if found else 0,
+                    "edits": len(found["edits"]) if found else 0,
+                    "decisions": len(found["decisions"]) if found else 0,
+                    "runs": [run["id"] for run in found["runs"]] if found else [],
+                    "held": found["held"] if found else [],
+                },
+                round=self._state["round"],
+            )
+        except Exception:
+            log.exception("The end of the unattended stretch could not be recorded.")
+
+    def _take_back_rule_approvals(self) -> None:
+        """Make a plan again of every experiment that autopilot approved and that has
+        not run: its approval was for the stretch it was made in.
+
+        A stretch that ends between an approval and its run (a cap, a stop, a worker
+        that was killed) leaves such an experiment approved or in the queue.  Nobody
+        but the worker of a stretch runs what the rule approved: without this, the
+        next `research run`, or the app when it starts what waits in line, would run
+        it with nobody having asked and no cap counting.  The next stretch approves
+        it again.
+        """
+        try:
+            waiting = self.project.pages(
+                kind="experiment", review="accepted", state=["approved", "queued"]
+            )
+        except (ProjectError, OSError):
+            return
+        for page in waiting:
+            if not experiments.approved_by_rule(page):
+                continue
+            with contextlib.suppress(ProjectError):
+                self.project.set_state(
+                    page.path,
+                    "planned",
+                    by="system",
+                    reason="autopilot approved it for a stretch that ended before it ran; "
+                    "the next stretch approves it again",
+                )
 
     def run_experiment(
         self,
@@ -1044,6 +1397,8 @@ class Engine:
         """
         with self._working():
             self._recover()
+            # What autopilot approved was for its stretch, and this is none.
+            self._take_back_rule_approvals()
             page = self.project.page(experiment_ref)
             if page.kind != "experiment" or not page.id:
                 raise EngineError(
@@ -1108,6 +1463,12 @@ class Engine:
                 lost = self._lost = state_problem(self.project)
                 self._state = read_state(self.project)
                 self._settle_dead_worker()
+                left = self._state.get(autopilot.STRETCH_KEY)
+                if left is not None and not left["ended"]:
+                    # A stretch whose worker went without ending it (it was killed, or
+                    # the machine went down): it is over, and is not taken up again.
+                    left.update(ended=_now(), reason="worker_gone", said=None)
+                self._stretch = None
                 self._count_runs()
                 started = _now()
                 self._state["worker"] = {
@@ -1499,6 +1860,9 @@ class Engine:
                 spent=spent,
                 allowed=limit,
             )
+        cap = self._stretch_cap()
+        if cap is not None:
+            raise cap
 
     def _over_budget(
         self,
@@ -1525,10 +1889,17 @@ class Engine:
         ``more_usd`` is what the turn cost on other models, priced by whoever asks.
         """
         limit = float(self.project.settings.limits.model_usd)
+        in_flight = (estimate_cost_usd(model, usage) or 0.0) + more_usd
         with self._lock:
-            spent = self._ledger_usd() + (estimate_cost_usd(model, usage) or 0.0) + more_usd
+            spent = self._ledger_usd() + in_flight
         if spent < limit:
-            return None
+            # The project's budget holds; the cap of an unattended stretch may not.
+            who = (
+                f"the agent that carries out {experiment}"
+                if experiment
+                else f"the {_ROLE.get(str(phase or self._state.get('phase')), 'agent')}"
+            )
+            return self._stretch_cap(in_flight, who)
         if experiment:
             work = f"the work of the agent that carries out {experiment}"
             then = f"{experiment} is in the queue again and is run when the work goes on."
@@ -1565,7 +1936,7 @@ class Engine:
         with self._lock:
             spent = self._ledger_usd()
         if limit - spent >= needed:
-            return None
+            return self._stretch_short_of(needed, phase=phase, experiment=experiment)
         if experiment:
             who = f"the agent that carries out {experiment}"
             then = f"{experiment} keeps its approval and is run when the work goes on."
@@ -1582,6 +1953,33 @@ class Engine:
             f"{then}",
             spent=spent,
             allowed=limit,
+        )
+
+    def _stretch_short_of(
+        self, needed: float, *, phase: str | None = None, experiment: str | None = None
+    ) -> _BudgetSpent | None:
+        """:meth:`_short_of` for the cap of an unattended stretch: an agent that would
+        pass it with its first request is not started."""
+        if self._stretch is None:
+            return None
+        cap = float(self._caps()["model_usd"])
+        spent = self._stretch_spent()
+        if cap - spent >= needed:
+            return None
+        who = (
+            f"the agent that carries out {experiment}"
+            if experiment
+            else f"the {_ROLE.get(str(phase or self._state.get('phase')), 'agent')}"
+        )
+        return _BudgetSpent(
+            "autopilot.model_usd",
+            f"What is left of autopilot's cap on model spend for this stretch does not cover "
+            f"the start of {who}: {_money(spent)} of {_money(cap)} went to the models since "
+            f"it began (settings.autonomy.model_usd), and the first request of an agent was "
+            f"last seen to cost about {_money(needed)} here, so it was not started. Continue "
+            "starts a new stretch.",
+            spent=spent,
+            allowed=cap,
         )
 
     def _as_spent(self, exc: _BudgetSpent) -> _BudgetSpent:
@@ -2312,6 +2710,8 @@ class Engine:
     ) -> _Outcome:
         name = record["phase"]
         exc = self._as_spent(exc)
+        # Which limit it was decides whether an unattended stretch may go on (it may not).
+        self._pass_end = f"budget:{exc.limit}"
         self._settle(record, clock, ctx, "interrupted", str(exc))
         self._warn_budget(exc, phase=name)
         extra = (
@@ -2619,7 +3019,7 @@ class Engine:
             *missing,
             review,
             decisions.waiting(undecided),
-            f"Next: {_DOING[following]}{resumes}.",
+            f"Next: {self._doing(following)}{resumes}.",
         ]
         refs = [page.path for page in self.project.pages(review="proposed")][:50]
         event = self._emit(
@@ -2658,6 +3058,11 @@ class Engine:
                 },
             )
             self._save()
+
+    def _doing(self, following: str) -> str:
+        """What the phase that is next does, in words that are true of this project:
+        where autopilot decided, nothing is called accepted or approved by the person."""
+        return (_DOING_UNATTENDED if self._autopilot_on() else _DOING)[following]
 
     def _overrun_note(self, name: str) -> list[str]:
         """What a checkpoint says when the model spend has reached its limit.
@@ -2957,6 +3362,17 @@ class Engine:
     def _nothing_to_run(self) -> str:
         project = self.project
         planned = project.pages(kind="experiment", review="accepted", state="planned")
+        if planned and self._autopilot_on():
+            # Under autopilot a plan that is still a plan is one the rule left alone.
+            back = "".join(f" {sentence}" for sentence in self._planned_again())
+            held = [
+                f"{page.id}: {self._held.get(str(page.id)) or 'it waits for your approval'}"
+                for page in planned[:6]
+            ]
+            return (
+                f"No experiment is approved to run.{back} Autopilot did not approve "
+                f"{'; '.join(held)}{' and others' if len(planned) > 6 else ''}."
+            )
         if planned:
             # A title is an agent's words more often than not: given as a quotation.
             names = _and([f"{page.id} {agents.said(page.title, 60)}" for page in planned[:6]])
@@ -3035,7 +3451,7 @@ class Engine:
         the app shows, see ``experiments.waiting_in_line``), then those that read
         approved and will not run as they stand, which are tried so that the
         checkpoint says why."""
-        line = experiments.waiting_in_line(self.project, skip=tried)
+        line = experiments.waiting_in_line(self.project, skip=tried, rule=self._stretch is not None)
         ahead = {page.path for page in line}
         rest = [
             page
@@ -3047,10 +3463,18 @@ class Engine:
         return line + rest
 
     def _run_approved(self, ctx: AgentContext) -> AgentReport:
-        """Run every experiment the person approved, one after the other."""
+        """Run every experiment the person approved, one after the other.
+
+        In an unattended stretch their standing rule approves in their place: one
+        experiment at a time, right before its run, so that a stretch that ends
+        leaves no line of approved experiments behind.
+        """
         self._recover()
         self._tidy_hypotheses(release=False)
+        self._held = {}
         waiting = self._waiting_to_run()
+        if not waiting:
+            waiting = self._rule_approves_next()
         if not waiting:
             earlier = len(self._new_results())
             if not earlier:
@@ -3072,7 +3496,7 @@ class Engine:
                 self._check_experiment_budget(page)
                 record = self._run_one(page, ctx)
             except _BudgetSpent as exc:
-                if self._return_phase() is None:
+                if self._return_phase() is None or exc.limit.startswith("autopilot."):
                     raise  # the round's own run phase stops here, at a checkpoint
                 # A run the person approved outside the order of the phases: what the
                 # budget does not cover must not keep the phase that was next from running.
@@ -3085,7 +3509,7 @@ class Engine:
                 notes.append(self._not_run(page, exc))
             # Looked up again after every run: the person may approve one more while
             # another is running, and may cancel or change one that was waiting.
-            waiting = self._waiting_to_run(tried)
+            waiting = self._waiting_to_run(tried) or self._rule_approves_next()
             if record is None:
                 continue
             refused = self._refused_note(page, record)
@@ -3100,7 +3524,53 @@ class Engine:
             self._heed_stop()
         how = _and([f"{_and(ids)} {status}" for status, ids in outcomes.items()])
         summary = f"{_plural(self._ran, 'experiment')} ran: {how}." if how else "No experiment ran."
+        notes += [
+            f"Autopilot did not approve {name}: {_sentence(why, 400)}"
+            for name, why in self._held.items()
+        ]
         return AgentReport(produced=list(ctx.produced), summary=summary, notes=notes)
+
+    def _rule_approves_next(self) -> list[ResearchPage]:
+        """In an unattended stretch, when nothing waits to run: let the person's standing
+        rule approve the next experiment it may, and return it as what waits (nothing
+        otherwise, and always nothing outside a stretch).
+
+        One at a time, and only when the line is empty: the approval is made right
+        before the run it is for.  What the rule would not approve, or what the
+        approval itself refused, is kept in ``_held`` with the reason, said at the
+        checkpoint and tried no more in this run phase.
+        """
+        if self._stretch is None or not self._autopilot_on():
+            return []
+        for page in experiments.rule_candidates(self.project):
+            name = str(page.id)
+            if name in self._held:
+                continue
+            self._heed_stop()
+            try:
+                held = experiments.rule_holds(self.project, page.path)
+                if held is None:
+                    self._check_experiment_budget(page)
+                    approved = experiments.approve_by_rule(
+                        self.project, page.path, backends=self._rule_backends(page)
+                    )
+                    return [approved]
+            except _BudgetSpent as exc:
+                held = str(exc)
+            except (ProjectError, ComputeError) as exc:
+                if stops_the_run(exc):
+                    raise
+                held = self._clean(exc)
+            self._held[name] = _one_line(held, 500).rstrip(".")
+        return []
+
+    def _rule_backends(self, page: ResearchPage) -> Any:
+        """The backend the approval asks whether it can run ``page``: the one this engine
+        was given to run on, where it was given one; else the approval builds its own."""
+        given = self._compute._given if hasattr(self._compute, "_given") else None
+        if given is None or not hasattr(given, "run_job"):
+            return None
+        return {str(getattr(given, "name", "")): given}
 
     # -- analysis ----------------------------------------------------------------
 
