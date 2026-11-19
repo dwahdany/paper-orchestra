@@ -250,6 +250,30 @@ def _now() -> str:
     return format_stamp(datetime.now(UTC))
 
 
+_NOTHING_APPROVED = "No experiment is approved to run."
+#: How a checkpoint says which runs autopilot did not approve, and why.
+_NOT_APPROVED = "Autopilot did not approve "
+
+
+def _without_held(parts: Sequence[str]) -> list[str]:
+    """What a checkpoint tells, without which runs autopilot did not approve.
+
+    That is what waited at that moment, like the count of proposals, and no part of
+    what was done (``did``): whoever shows the checkpoint later says what waits then
+    (``autopilot.held``), which a raised limit or an approval of the person's may
+    have changed.
+    """
+    kept: list[str] = []
+    for part in parts:
+        text = part.strip() if part else ""
+        if text.startswith(_NOT_APPROVED):
+            continue
+        if text.startswith(_NOTHING_APPROVED) and f" {_NOT_APPROVED}" in text:
+            text = text.partition(f" {_NOT_APPROVED}")[0]
+        kept.append(text)
+    return kept
+
+
 def _blank_state() -> dict[str, Any]:
     return {
         "schema": SCHEMA,
@@ -1175,11 +1199,23 @@ class Engine:
         )
         limits = self.project.settings.limits
         runs = experiments.rule_leaves_runs(self.project)
+        # Where the runs would be on a Modal that cannot be used here, no approval goes
+        # through: said before the stretch finds it out at its run phase.
+        blocked = (
+            None
+            if runs
+            else experiments.rule_cannot_run(self.project, backends=self._rule_backends())
+        )
         event = self.project.emit(
             autopilot.STARTED,
             f"Autopilot goes on from here without you: {autopilot.caps_in_words(caps)}; "
             f"{network}. "
             + (f"Runs on this machine it does not approve: {_sentence(runs, 600)} " if runs else "")
+            + (
+                f"No run can be approved now, by autopilot or by you: {_sentence(blocked, 600)} "
+                if blocked
+                else ""
+            )
             + "What the experiments cost is no part of these caps: the project's own limit "
             f"holds it ({_money(self._state['spent']['experiment_usd'])} of "
             f"{_money(float(limits.experiment_usd))} spent, settings.limits.experiment_usd). "
@@ -2143,7 +2179,8 @@ class Engine:
         limits = limits or self.project.settings.limits
         usd, allowed = self._state["spent"]["experiment_usd"], float(limits.experiment_usd)
         estimate = _number(page.meta.get("est_usd"))
-        if (usd > 0 and usd >= allowed) or (estimate > 0 and usd + estimate > allowed):
+        # (The same question whoever shows what waits asks: ``experiments.rule_refused``.)
+        if experiments.budget_refusal(page, usd, allowed) is not None:
             planned = f" and {page.id} is estimated at {_money(estimate)}" if estimate else ""
             raise _BudgetSpent(
                 "experiment_usd",
@@ -3129,7 +3166,12 @@ class Engine:
         waiting = [agents.count_of(count, kind) for kind, count in pending["by_kind"].items()]
         if pending["proposals"]:
             waiting.append(_plural(pending["proposals"], "suggested edit"))
-        verb = "awaits" if pending["total"] == 1 else "await"
+        # What autopilot did not approve waits as a proposal does: the runs its rule
+        # leaves to the person, and those whose approval would be refused as things are.
+        held = self._held_now()
+        if held:
+            waiting.append(f"{_plural(len(held), 'run')} that autopilot did not approve")
+        verb = "awaits" if pending["total"] + len(held) == 1 else "await"
         review = (
             f"{_and(waiting)} {verb} your review." if waiting else "Nothing awaits your review."
         )
@@ -3156,6 +3198,7 @@ class Engine:
                 "pending": pending["by_kind"],
                 "edits": pending["proposals"],
                 "next": following,
+                **({"held": [item["id"] for item in held]} if held else {}),
                 **({"decisions": undecided} if undecided else {}),
                 **recommended,
             },
@@ -3175,13 +3218,27 @@ class Engine:
                         part.strip() for part in [*told, *closing] if part and part.strip()
                     ),
                     "did": " ".join(
-                        part.strip() for part in [*told, *account] if part and part.strip()
+                        part.strip()
+                        for part in _without_held([*told, *account])
+                        if part and part.strip()
                     ),
                     "pending": dict(pending["by_kind"]),
                     **_recommendation(recommended),
                 },
             )
             self._save()
+
+    def _held_now(self) -> list[dict[str, str]]:
+        """The runs that wait for the person although autopilot is on, as the project is
+        at this moment (``autopilot.held``); nothing where it is off, or cannot be told."""
+        if not self._autopilot_on():
+            return []
+        try:
+            # (Asked of the backend the rule's approvals are asked of.)
+            return autopilot.held(self.project, self._state, backends=self._rule_backends())
+        except Exception:  # a count for a sentence: the checkpoint is written without it
+            log.exception("What autopilot left in %s could not be counted.", self.project.root)
+            return []
 
     def _doing(self, following: str) -> str:
         """What the phase that is next does, in words that are true of this project:
@@ -3493,10 +3550,7 @@ class Engine:
                 (str(page.id), self._held.get(str(page.id)) or "it waits for your approval")
                 for page in planned
             ]
-            return (
-                f"No experiment is approved to run.{back} Autopilot did not approve "
-                f"{autopilot.grouped(held)}."
-            )
+            return f"{_NOTHING_APPROVED}{back} {_NOT_APPROVED}{autopilot.grouped(held)}."
         if planned:
             # A title is an agent's words more often than not: given as a quotation.
             names = _and([f"{page.id} {agents.said(page.title, 60)}" for page in planned[:6]])
@@ -3662,7 +3716,7 @@ class Engine:
         how = _and([f"{_and(ids)} {status}" for status, ids in outcomes.items()])
         summary = f"{_plural(self._ran, 'experiment')} ran: {how}." if how else "No experiment ran."
         notes += [
-            f"Autopilot did not approve {name}: {_sentence(why, 400)}"
+            f"{_NOT_APPROVED}{name}: {_sentence(why, 400)}"
             for name, why in self._held.items()
             if why
         ]
@@ -3711,7 +3765,7 @@ class Engine:
             self._held[name] = _one_line(held, 500).rstrip(".")
         return []
 
-    def _rule_backends(self, page: ResearchPage) -> Any:
+    def _rule_backends(self, page: ResearchPage | None = None) -> Any:
         """The backend the approval asks whether it can run ``page``: the one this engine
         was given to run on, where it was given one; else the approval builds its own."""
         given = self._compute._given if hasattr(self._compute, "_given") else None

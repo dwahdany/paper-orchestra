@@ -6,7 +6,7 @@ import { connection, RESTARTED } from './api.js';
 import { clock, codeSpans, dateTime, duration, hm, html, listOf, money, parseStamp, plain, plural, raw, storage, tf, whyNot } from './util.js';
 import { AGENT_SAYS, CREDENTIAL, DID, KIND, PHASE_DO, RUNTIME, STAGES, credentialName, icon, lapsed, phaseName, runtimeName } from './vocab.js';
 import { decisionsSentence, openDecisions, waitingCount } from './decisions.js';
-import { heldRuns } from './autopilot.js';
+import { leftRuns, refusedRuns } from './autopilot.js';
 
 const MARK = raw('<svg class="brand-mark" width="18" height="18" viewBox="-10 -10 20 20" aria-hidden="true"><circle r="8"/><circle class="core" r="3"/></svg>');
 
@@ -96,8 +96,10 @@ export function crashText(store, exit) {
 
 export function waitingSentence(store) {
   /* what autopilot did not approve waits for the person as a proposal does */
-  const runs = heldRuns(store).length, left = runs ? plural(runs, 'run') + (runs === 1 ? ' waits' : ' wait') + ' for your approval: autopilot did not approve ' + (runs === 1 ? 'it' : 'them') + '.' : '';
-  const items = store.pending(), asked = [decisionsSentence(openDecisions(store).length), left].filter(Boolean).join(' ');
+  const runs = leftRuns(store).length, left = runs ? plural(runs, 'run') + (runs === 1 ? ' waits' : ' wait') + ' for your approval: autopilot did not approve ' + (runs === 1 ? 'it' : 'them') + '.' : '';
+  /* and what it would approve and cannot, as things are: that waits for the person to remove the cause */
+  const stuck = refusedRuns(store).length, refused = stuck ? plural(stuck, 'run') + ' cannot be approved as things are, by autopilot or by you: what waits for you says what to change.' : '';
+  const items = store.pending(), asked = [decisionsSentence(openDecisions(store).length), left, refused].filter(Boolean).join(' ');
   if (!items.length) return asked || 'Nothing is waiting for you.';
   const by = {};
   let edits = 0;

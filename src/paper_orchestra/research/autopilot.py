@@ -48,8 +48,11 @@ __all__ = [
     "caps_in_words",
     "digest",
     "grouped",
+    "held",
+    "left",
     "new_stretch",
     "read_stretch",
+    "refused",
     "summary",
 ]
 
@@ -223,14 +226,15 @@ def digest(
          "edits": [{"proposal", "path"}],
          "decisions": [{"decision", "page"}],
          "runs": [{"id", "path", "network", "outcome"}], "runs_with_network": n,
-         "held": [{"id", "reason"}], "uncounted": sentence}
+         "held": [{"id", "reason", "kind"}], "uncounted": sentence}
 
     ``accepted`` are the pages the standing rule accepted, ``edits`` the edit
     proposals it applied, ``decisions`` those it left at their default, ``runs`` the
     experiments it approved, each with how its run ended (``outcome``: the state the
     experiment reached since, or ``None`` when it has not run).  ``held`` is what
-    the rule would not approve as the project stands, with the reason: what truly
-    waits for the person.  Everything but ``held`` is counted from the project's
+    waits for the person all the same, as the project stands, with the reason
+    (:func:`held`): the runs the rule leaves to them and those whose approval would
+    be refused.  Everything but ``held`` is counted from the project's
     events since the stretch began; nothing is written.
 
     ``spent_usd`` is what counts against the dollar cap; ``unpriced_usd`` of it stands
@@ -322,29 +326,54 @@ def digest(
         "decisions": defaulted,
         "runs": list(runs.values()),
         "runs_with_network": sum(1 for run in runs.values() if run["network"]),
-        "held": held(project),
+        "held": held(project, state),
         "uncounted": UNCOUNTED,
     }
 
 
-def held(project: Project) -> list[dict[str, str]]:
-    """The accepted experiments the standing rule does not approve as the project
-    stands, each with the reason: what waits for the person although autopilot is on.
-    Empty where it is off."""
+def held(
+    project: Project, state: Mapping[str, Any] | None = None, *, backends: Any = None
+) -> list[dict[str, str]]:
+    """The accepted experiments that wait for the person although autopilot is on, each
+    with the reason: ``[{"id", "reason", "kind"}]``.  Empty where it is off.
+
+    ``kind: rule`` is a plan the standing rule leaves to the person, who can approve it
+    (``experiments.rule_holds``).  ``kind: refused`` is one the rule would approve and
+    the approval itself would refuse as the project and this machine are (the
+    experiment budget is used up, Modal is not signed in, the code has errors:
+    ``experiments.rule_refused``): the reason is the refusal's own sentences, which
+    say what the person can do.  Both are asked of the project as it is, at every
+    call, so neither outlives its cause.  ``state`` is the engine's state (read from
+    ``state.json`` without it), for what it counts as spent on experiments.
+    """
     if not project.settings.autonomy.autopilot:
         return []
     from paper_orchestra.research import experiments
-    from paper_orchestra.research.model import ProjectError
 
-    found = []
-    for page in project.pages(kind="experiment", review="accepted", state="planned"):
+    if state is None:
+        from paper_orchestra.research.engine import read_state
+
         try:
-            reason = experiments.rule_holds(project, page.path)
-        except (ProjectError, OSError, ValueError):
-            continue
-        if reason:
-            found.append({"id": str(page.id or page.path), "reason": reason})
-    return found
+            state = read_state(project)
+        except Exception:  # what the run records say is counted instead
+            state = {}
+    spent = state.get("spent") if isinstance(state.get("spent"), Mapping) else {}
+    counted = spent.get("experiment_usd")
+    return experiments.rule_left(
+        project,
+        spent_usd=_number(counted) if counted is not None else None,
+        backends=backends,
+    )
+
+
+def refused(found: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Of what :func:`held` found: the runs nobody can approve until their cause is gone."""
+    return [item for item in found if item.get("kind") == "refused"]
+
+
+def left(found: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Of what :func:`held` found: the runs the rule left for the person to approve."""
+    return [item for item in found if item.get("kind") != "refused"]
 
 
 def summary(found: Mapping[str, Any]) -> str:

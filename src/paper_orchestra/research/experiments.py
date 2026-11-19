@@ -109,6 +109,8 @@ __all__ = [
     "approve",
     "approve_by_rule",
     "approved_by_rule",
+    "backend_problem",
+    "budget_refusal",
     "check_code",
     "code_authors",
     "code_digest",
@@ -135,7 +137,10 @@ __all__ = [
     "request_cancel",
     "result_records",
     "rule_candidates",
+    "rule_cannot_run",
     "rule_holds",
+    "rule_left",
+    "rule_refused",
     "run",
     "run_code_changed",
     "runs",
@@ -2086,6 +2091,41 @@ def approve(
         raise ProjectError(
             f"{name} is running. Cancel that run, or wait for it, before approving another."
         )
+    reading, reasons = _why_refused(
+        project,
+        page,
+        backend=backend,
+        gpu=gpu,
+        timeout_seconds=timeout_seconds,
+        network=network,
+        backends=backends,
+    )
+    if reasons:
+        raise ProjectError(f"{name} cannot be approved:\n- " + "\n- ".join(reasons))
+    approved = _record_approval(project, page, reading.plan, read, base_updated, by)
+    with contextlib.suppress(OSError):
+        _flag_path(project, name).unlink(missing_ok=True)  # of a run cancelled earlier
+    _mark_testing(project, approved)
+    return approved
+
+
+def _why_refused(
+    project: Project,
+    page: ResearchPage,
+    *,
+    backend: str | None,
+    gpu: str | None,
+    timeout_seconds: float | None,
+    network: bool | None,
+    backends: Any,
+) -> tuple[_Reading, list[str]]:
+    """The plan as an approval with these options would read it, and every reason that
+    approval is refused as things are (none: it would be made).  Nothing is written.
+
+    :func:`approve` asks this before it records anything, and so does whoever says
+    beforehand whether an approval would go through (:func:`rule_refused`): the two
+    cannot come to differ.
+    """
     overrides = _approval_options(
         project, page, backend=backend, gpu=gpu, timeout_seconds=timeout_seconds, network=network
     )
@@ -2097,13 +2137,7 @@ def approve(
         reasons = _refusals(project, reading, choice, _limits(project), _spent_usd(project))
     finally:
         choice.close()
-    if reasons:
-        raise ProjectError(f"{name} cannot be approved:\n- " + "\n- ".join(reasons))
-    approved = _record_approval(project, page, reading.plan, read, base_updated, by)
-    with contextlib.suppress(OSError):
-        _flag_path(project, name).unlink(missing_ok=True)  # of a run cancelled earlier
-    _mark_testing(project, approved)
-    return approved
+    return reading, reasons
 
 
 def _record_approval(
@@ -2186,9 +2220,15 @@ RUNS_WAIT = (
     "an experiment that needs no GPU would run on this machine as you, outside a sandbox "
     "(the local backend under the classic runtime), and autopilot does not approve code "
     "nobody has read for that, so those runs still wait for your approval (one that asks "
-    "for a GPU runs on Modal, and is approved). With sandboxed sdk agents (`--runtime "
-    "sdk`) or Modal as the compute backend it approves them all"
+    "for a GPU runs on Modal, and is approved where Modal can be used). With sandboxed sdk "
+    "agents (`--runtime sdk`) or Modal as the compute backend (`--compute modal`) it "
+    "approves them all"
 )
+
+#: Where the project's experiments run on Modal and Modal cannot be used on this machine
+#: as it is: no run can be approved, by the rule or by the person (the start of
+#: :func:`rule_cannot_run`'s sentence, which goes on with what is wrong and what to do).
+RUNS_BLOCKED = "this project's experiments run on Modal, which cannot be used on this machine now"
 
 
 def rule_leaves_runs(project_or_settings: Any, compute: str | None = None) -> str | None:
@@ -2205,6 +2245,116 @@ def rule_leaves_runs(project_or_settings: Any, compute: str | None = None) -> st
     sandboxed_agents = agents.runtime == "sdk" and agents.sandbox is True
     backend = settings.compute if compute is None else compute
     return RUNS_WAIT if backend == "local" and not sandboxed_agents else None
+
+
+def backend_problem(name: str, backends: Any = None) -> str | None:
+    """Why the backend called ``name`` could start no experiment on this machine as it is
+    (it cannot be built, or its own check says so: Modal without a token), in its own
+    sentences; ``None`` when it could.  Found without starting or contacting anything."""
+    choice = _chosen(name, backends)
+    try:
+        if choice.problem:
+            return choice.problem
+        if choice.backend is None:
+            return None
+        checks = [str(reason) for reason in choice.backend.check(python=True, latex=False)]
+    finally:
+        choice.close()
+    if not checks:
+        return None
+    if any("Modal is not authenticated" in reason for reason in checks):
+        return (
+            "Modal is not authenticated (no token is configured on this machine). Run "
+            "`modal setup` (or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET)."
+        )
+    return " ".join(checks)
+
+
+def rule_cannot_run(
+    project_or_settings: Any, compute: str | None = None, *, backends: Any = None
+) -> str | None:
+    """Why no run of a project with these settings can be approved on this machine as it
+    is, by the standing rule or by the person, as the rest of a sentence; ``None`` where
+    nothing says so.
+
+    That is a project whose experiments run on Modal while Modal cannot be used here
+    (not installed, not signed in): what the settings promise ("runs approved") is
+    then not what happens, and whoever says the promise asks this first.
+    """
+    settings = getattr(project_or_settings, "settings", project_or_settings)
+    backend = settings.compute if compute is None else compute
+    if backend != "modal":
+        return None
+    problem = backend_problem("modal", backends)
+    return None if problem is None else f"{RUNS_BLOCKED}: {problem.rstrip('.')}"
+
+
+def budget_refusal(
+    page: ResearchPage, spent: float, allowed: float, *, name: str | None = None
+) -> str | None:
+    """Why what the project may spend on its experiments (``limits.experiment_usd``, a
+    total for all runs) does not cover one more run of ``page``, as a sentence about
+    it; ``None`` when it does.  ``spent`` is what the runs have cost so far, and
+    ``name`` what the sentence calls the experiment (its id, unless given).
+
+    The limit is used up, or the plan's own estimate goes past what is left of it.
+    """
+    name = name or str(page.id)
+    estimate = page.meta.get("est_usd")
+    if not isinstance(estimate, int | float) or isinstance(estimate, bool):
+        estimate = 0.0
+    if not ((spent > 0 and spent >= allowed) or (estimate > 0 and spent + estimate > allowed)):
+        return None
+    planned = f" and {name} is estimated at ${estimate:,.2f}" if estimate else ""
+    return (
+        f"The experiment cost budget does not cover {name}: ${spent:,.2f} of "
+        f"${allowed:,.2f} is spent{planned}."
+    )
+
+
+#: What the person can do about :func:`budget_refusal`.
+RAISE_THE_LIMIT = "Raise settings.limits.experiment_usd in the project's settings to run it."
+
+
+def rule_refused(
+    project: Project, ref: str, *, spent_usd: float | None = None, backends: Any = None
+) -> str | None:
+    """Why a run of the experiment that the standing rule would try (:func:`rule_holds`
+    says nothing against it) could not be approved as the project and this machine are,
+    in the refusal's own sentences with what the person can do; ``None`` when the
+    approval would go through.  Nothing is written.
+
+    The refusals are the approval's own, asked with the options the rule would give it
+    (:func:`approve_by_rule`): errors in the plan or its code, a backend that cannot run
+    it (Modal that is not signed in), a cost above what is left of the project's limit.
+    Before them, as the engine asks before it lets the rule approve: an experiment
+    budget that is used up (``spent_usd`` is what the engine's state counts as spent
+    on experiments; ``None`` counts the run records).  The person could not approve
+    such a run either, so it waits for them to remove the cause, not for their
+    approval: asked anew each time, it stops being said when the cause is gone.
+    """
+    page = _experiment(project, ref)
+    spent = _spent_usd(project) if spent_usd is None else float(spent_usd)
+    # (Called "it": the sentence is said of several experiments at once where they share it.)
+    allowed = float(project.settings.limits.experiment_usd)
+    over = budget_refusal(page, spent, allowed, name="it")
+    if over is not None:
+        return f"{over} {RAISE_THE_LIMIT}"
+    wrong: list[str] = []
+    asks = _flag(page.meta.get("network"), "network", wrong)
+    try:
+        _, reasons = _why_refused(
+            project,
+            page,
+            backend=None,
+            gpu=None,
+            timeout_seconds=None,
+            network=bool(asks and project.settings.autonomy.network),
+            backends=backends,
+        )
+    except ProjectError as exc:
+        reasons = [str(exc)]
+    return " ".join(" ".join(reason.split()) for reason in reasons) or None
 
 
 def _ended_runs(project: Project, experiment_id: str) -> list[dict[str, Any]]:
@@ -2285,6 +2435,67 @@ def rule_candidates(project: Project) -> list[ResearchPage]:
         return (int(digits) if digits else 0, str(page.id))
 
     return sorted((page for page in pages if page.id), key=order)
+
+
+#: How a run the rule would try and the approval refuses is said among what waits: the
+#: start of its reason, before the refusal's own sentences.
+REFUSED_NOW = "it cannot be approved as things are"
+
+
+def rule_left(
+    project: Project, *, spent_usd: float | None = None, backends: Any = None
+) -> list[dict[str, str]]:
+    """The accepted experiments that wait for the person although autopilot is on, as the
+    project and this machine are now: ``[{"id", "reason", "kind"}]``, by id.
+
+    ``kind`` is ``rule`` where the standing rule leaves a plan to the person
+    (:func:`rule_holds`; ``reason`` is the rest of a sentence about it, and they can
+    approve it themselves), and ``refused`` where the rule would try and the approval
+    itself would be refused (:func:`rule_refused`; ``reason`` begins with
+    :data:`REFUSED_NOW` and goes on with the refusal's sentences, which say what the
+    person can do: nobody can approve it until the cause is gone, and then the rule
+    does in the next stretch).  An experiment that failed and is not tried again as it
+    stands is not among them: that was said when it failed.
+
+    Nothing is recorded and nothing is written: asked again after a limit was
+    raised or Modal was signed in, it no longer names what waited for that.  Each
+    backend is built once for all the experiments that would run on it.
+    """
+    made: dict[str, Any] = dict(backends) if isinstance(backends, Mapping) else {}
+    owned: list[_Choice] = []
+    found: list[dict[str, str]] = []
+    try:
+        for page in rule_candidates(project):
+            name = str(page.id)
+            try:
+                reason = rule_holds(project, page.path)
+                if reason is not None:
+                    if page.state == "planned":
+                        found.append({"id": name, "reason": reason, "kind": "rule"})
+                    continue
+                where = _default_backend(project, page)
+                if where not in made and where in COMPUTE_BACKENDS:
+                    choice = _build(where)
+                    if choice.backend is not None:
+                        owned.append(choice)
+                        made[where] = choice.backend
+                refused = rule_refused(
+                    project, page.path, spent_usd=spent_usd, backends=made or None
+                )
+            except (ProjectError, ComputeError, OSError, ValueError):
+                continue
+            if refused:
+                found.append(
+                    {
+                        "id": name,
+                        "reason": f"{REFUSED_NOW}: {refused.rstrip('.')}",
+                        "kind": "refused",
+                    }
+                )
+    finally:
+        for choice in owned:
+            choice.close()
+    return found
 
 
 def approve_by_rule(project: Project, ref: str, *, backends: Any = None) -> ResearchPage:

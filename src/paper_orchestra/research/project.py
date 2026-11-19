@@ -1431,8 +1431,9 @@ class Project:
 
         Proposed pages are accepted, edit proposals applied and open decisions left
         at their default, each recorded as the rule's doing; from here on the rule
-        also covers the experiments that were planned before it was switched on (they
-        are approved and run in the next stretch, under its caps: nothing runs here).
+        also covers the experiments that were planned before it was switched on (those
+        it approves at all are approved and run in the next stretch, under its caps:
+        nothing runs here, and what would run unsandboxed as the person still waits).
         Returns what was done: ``{"accepted": [paths], "applied": [proposal ids],
         "defaulted": [decision ids], "left": [what the rule leaves for the person]}``.
         """

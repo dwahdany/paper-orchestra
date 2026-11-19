@@ -809,6 +809,21 @@ class Services:
             }
         return found
 
+    def autopilot_runs_blocked(self) -> dict[str, str | None]:
+        """For each compute backend of a new project: why no run on it could be approved
+        on this machine as it is, or ``None`` (``experiments.rule_cannot_run``)."""
+        from paper_orchestra.research.experiments import rule_cannot_run
+
+        settings = ProjectSettings.from_dict(settings_for_new_project(None))
+        found: dict[str, str | None] = {}
+        for backend in COMPUTE_BACKENDS:
+            try:
+                found[backend] = rule_cannot_run(settings, backend)
+            except Exception:  # a sentence for a tick: the form is shown without it
+                log.exception("Whether %s can be used could not be told.", backend)
+                found[backend] = None
+        return found
+
     def doctor(self, model: str | None = None) -> dict[str, Any]:
         from paper_orchestra import doctor
 
@@ -1148,9 +1163,10 @@ class _Counts:
     Counting reads every page of a project, which the listing of hundreds of
     projects cannot do at every look.  So the numbers of a project are kept until
     something changes in it: its events (every change made through the project
-    adds one) or a directory that holds pages or edit proposals (a file put
-    there or replaced by hand); that costs a dozen ``stat`` calls and reads
-    nothing.  One listing spends a bounded time on counting; a project it does
+    adds one), a directory that holds pages or edit proposals (a file put
+    there or replaced by hand) or ``project.json`` (a change of the settings alters
+    which runs autopilot approves, and need not write an event); that costs a dozen
+    ``stat`` calls and reads nothing.  One listing spends a bounded time on counting; a project it does
     not get to is counted by the next one.  A project is opened apart for
     counting, so that the pages of every project in the library are not kept in
     memory.
@@ -1165,6 +1181,9 @@ class _Counts:
         # Plain strings: this runs for every project at every look at the library.
         wiki = os.path.join(root, WIKI_DIR)
         places = [os.path.join(root, EVENTS_FILE), os.path.join(root, PROPOSALS_DIR), wiki]
+        # The settings decide what autopilot approves (the backend, the agents' runtime,
+        # the experiment limit), and not every change of them writes an event.
+        places.append(os.path.join(root, PROJECT_FILE))
         places += [os.path.join(wiki, section) for section in SECTIONS.values() if section]
         found = []
         for place in places:
@@ -1190,7 +1209,9 @@ class _Counts:
         project = Project.open(root)
         counts = project.counts()
         # What autopilot did not approve waits for the person as a proposal does, and
-        # is counted at the same look (a change of it is an event, as theirs is).
+        # is counted at the same look (what changes it is an event or a change of the
+        # project's file, and the signature watches both; whether Modal is signed in is
+        # read once by this process, so that changes with a new server only).
         try:
             held = len(autopilot.held(project))
         except (ProjectError, OSError, ValueError):
@@ -1590,7 +1611,10 @@ def defaults(context: Ctx) -> dict[str, Any]:
     one unattended stretch, for the composer's tick.  ``autopilot_runs_wait`` says for
     each runtime and compute backend a project can be created with why autopilot would
     approve no run of it (``{"classic": {"local": sentence, "modal": null}, ...}``;
-    ``experiments.rule_leaves_runs``), so that the tick promises what will happen.
+    ``experiments.rule_leaves_runs``), so that the tick promises what will happen;
+    ``autopilot_runs_blocked`` says for each compute backend why no run on it could be
+    approved on this machine as it is (``{"local": null, "modal": sentence or null}``;
+    ``experiments.rule_cannot_run``: Modal is not signed in).
 
     ``creatable_kinds`` are the kinds of page the person can write (``kind`` of
     ``POST .../pages``), and ``kind_writers`` says for each kind which agents write
@@ -1599,6 +1623,7 @@ def defaults(context: Ctx) -> dict[str, Any]:
         "settings": context.services.default_settings(),
         "autonomy": context.services.default_autonomy(),
         "autopilot_runs_wait": context.services.autopilot_runs_wait(),
+        "autopilot_runs_blocked": context.services.autopilot_runs_blocked(),
         "phases": list(PHASES),
         "request_for": list(REQUEST_FOR),
         "efforts": list(EFFORTS),
@@ -2006,22 +2031,27 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
 
 def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]) -> dict[str, Any]:
     """Autopilot as the project view carries it: ``{"mode", "refused", "since",
-    "digest", "held", "runs_wait"}``.
+    "digest", "held", "runs_wait", "runs_blocked"}``.
 
     ``runs_wait`` is why the standing rule approves no run of the project as its
     settings stand (``experiments.rule_leaves_runs``: unread code would run as the
     person outside a sandbox), as the rest of a sentence, or ``null``: what the
-    switch must not promise.
+    switch must not promise.  ``runs_blocked`` is why no run of it can be approved
+    on this machine as it is, by the rule or by the person
+    (``experiments.rule_cannot_run``: its experiments run on Modal, which is not
+    signed in), likewise.
 
     ``refused`` is the sentence with which switching it on would be refused (the
     project's agents work outside the sandbox), or ``null``.  ``since`` is when the
     person switched it on (empty where the rule covers everything).  ``digest`` is the
     account of the latest unattended stretch ("While you were away"), ``null`` for
     a project that never had one, and ``held`` what waits for the person although it
-    is on: the experiments the rule does not approve, each with the reason.  A digest
-    that cannot be built does not cost the project view.
+    is on, each with the reason and its ``kind``: ``rule`` for an experiment the rule
+    leaves for them to approve, ``refused`` for one whose approval would be refused as
+    things are (``autopilot.held``).  A digest that cannot be built does not cost the
+    project view.
     """
-    from paper_orchestra.research.experiments import rule_leaves_runs
+    from paper_orchestra.research.experiments import rule_cannot_run, rule_leaves_runs
 
     settings = project.settings
     view: dict[str, Any] = {
@@ -2031,10 +2061,13 @@ def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]
         "digest": None,
         "held": [],
         "runs_wait": rule_leaves_runs(project),
+        "runs_blocked": None,
     }
     try:
+        if settings.autonomy.autopilot and not view["runs_wait"]:
+            view["runs_blocked"] = rule_cannot_run(project)
         view["digest"] = autopilot.digest(project, state)
-        view["held"] = view["digest"]["held"] if view["digest"] else autopilot.held(project)
+        view["held"] = view["digest"]["held"] if view["digest"] else autopilot.held(project, state)
     except Exception as exc:
         if context.standings.first_complaint(project.root, f"autopilot:{type(exc).__name__}"):
             log.exception("The account of autopilot in %s could not be built.", project.root)

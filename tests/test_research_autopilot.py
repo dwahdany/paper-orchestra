@@ -50,6 +50,24 @@ class Remote(FakeBackend):
 AUTO = {"mode": "autopilot", "rounds": 1}
 
 
+def modal_signed_in(monkeypatch, signed_in: bool) -> None:
+    """Make Modal read as signed in on this machine, or not: what its own check asks,
+    without a token and without contacting anything."""
+    module = pytest.importorskip("paper_orchestra.compute.modal_backend")
+    monkeypatch.setattr(module, "modal_token_configured", lambda: signed_in)
+
+
+@pytest.fixture(autouse=True)
+def _modal_is_signed_in(monkeypatch):
+    """What waits is asked of the machine as it is (would an approval go through now),
+    and no test's answer may depend on whether this one has a Modal token."""
+    try:
+        from paper_orchestra.compute import modal_backend
+    except ImportError:
+        return
+    monkeypatch.setattr(modal_backend, "modal_token_configured", lambda: True)
+
+
 def notes(tmp_path: Path) -> Path:
     path = tmp_path / "notes.md"
     path.write_text("Warmup of 4000 steps was used in the first runs.\n")
@@ -503,7 +521,9 @@ def test_the_rule_does_not_approve_unread_code_to_run_as_the_person(tmp_path):
     with pytest.raises(ProjectError, match="outside a sandbox"):
         experiments.approve_by_rule(project, name, backends={"local": FakeBackend()})
     assert project.page(name).state == "planned"
-    assert autopilot.held(project) == [{"id": name, "reason": experiments.UNSANDBOXED_RUN}]
+    assert autopilot.held(project) == [
+        {"id": name, "reason": experiments.UNSANDBOXED_RUN, "kind": "rule"}
+    ]
     # Sandboxed sdk agents carry such a run out in their own folder: that is fine.
     sandboxed = make_project(
         tmp_path, name="q", settings={"agents": {"runtime": "sdk"}, "autonomy": AUTO}
@@ -949,6 +969,136 @@ def test_nothing_that_may_run_ends_the_stretch_and_says_what_waits(tmp_path):
     )
     assert record["said"].count("outside a sandbox") == 1
     assert {page.state for page in project.pages(kind="experiment")} == {"planned"}
+
+
+def test_what_waited_at_a_checkpoint_is_counted_there_and_is_no_part_of_what_was_done(tmp_path):
+    """The checkpoint of a stretch that stopped for run approvals does not say that
+    nothing awaits the person, and keeps what waited apart from what was done: that is
+    said from the project as it is whenever it is shown."""
+    project = make_project(tmp_path, files=[notes(tmp_path)], settings={"autonomy": AUTO})
+    state = stretch(project, backend=FakeBackend())
+    checkpoint = state["checkpoint"]
+    assert "2 runs that autopilot did not approve await your review." in checkpoint["summary"]
+    assert "Nothing awaits your review" not in checkpoint["summary"]
+    assert checkpoint["did"] == "No experiment is approved to run."
+    [event] = events(project, "checkpoint")[-1:]
+    assert event["data"]["held"] == ["E1", "E2"]
+    # A supervised project's checkpoint reads as it always did.
+    plain = make_project(tmp_path, name="s", files=[notes(tmp_path)])
+    told = stretch(plain, backend=FakeBackend())["checkpoint"]["summary"]
+    assert "autopilot" not in told.lower()
+
+
+def test_a_run_the_budget_does_not_cover_waits_for_the_person_until_the_limit_is_raised(tmp_path):
+    """The rule tries the run and the experiment budget is used up: nobody approves it,
+    the stretch ends for want of the person, and it is listed as waiting for them with
+    the refusal's sentence, for as long as that is true and no longer."""
+    project = classic_project(
+        tmp_path, autonomy={"mode": "autopilot", "rounds": 3}, limits={"experiment_usd": 0.5}
+    )
+    state = stretch(project, backend=Remote(cost_usd=0.75))
+    record = state["autopilot"]
+    assert record["reason"] == "needs_you", record["said"]
+    assert "The experiment cost budget does not cover E2" in record["said"]
+    assert experiments.rule_holds(project, "E2") is None  # the rule itself has no objection
+    found = autopilot.digest(project)
+    waits = [item for item in found["held"] if item["id"] == "E2"]
+    assert waits == [
+        {
+            "id": "E2",
+            "kind": "refused",
+            "reason": (
+                "it cannot be approved as things are: The experiment cost budget does not "
+                "cover it: $0.75 of $0.50 is spent. Raise settings.limits.experiment_usd in "
+                "the project's settings to run it"
+            ),
+        }
+    ]
+    assert autopilot.held(project) == found["held"]
+    assert "Waiting for you: " in autopilot.summary(found)
+    assert "settings.limits.experiment_usd in the project's settings" in autopilot.summary(found)
+    assert "await your review" in state["checkpoint"]["summary"]
+    # A second stretch finds the same, and still says so.
+    again = stretch(project, backend=Remote(cost_usd=0.75))
+    assert again["autopilot"]["reason"] == "needs_you"
+    assert [item["id"] for item in autopilot.held(project)] == [w["id"] for w in found["held"]]
+    # The cause is gone: nothing was recorded that could outlive it.
+    project.settings.update({"limits": {"experiment_usd": 50}})
+    project.save_settings()
+    assert autopilot.held(Project.open(project.root)) == []
+    assert autopilot.digest(Project.open(project.root))["held"] == []
+    assert stretch(project, backend=Remote(cost_usd=0.75))["autopilot"]["reason"] != "needs_you"
+
+
+def test_a_run_for_a_modal_that_is_not_signed_in_waits_and_says_what_to_do(tmp_path, monkeypatch):
+    """What waits is what the approval itself would refuse now: asked of the same checks,
+    so the two cannot differ, and over as soon as Modal can be used."""
+    project = classic_project(tmp_path)
+    name = planned(project)
+    assert autopilot.held(project) == []
+    modal_signed_in(monkeypatch, False)
+    [waits] = autopilot.held(project)
+    assert waits["id"] == name and waits["kind"] == "refused"
+    assert waits["reason"].startswith("it cannot be approved as things are: Modal is not auth")
+    assert "`modal setup`" in waits["reason"]
+    with pytest.raises(ProjectError) as refused:
+        experiments.approve_by_rule(project, name)
+    said = " ".join(str(refused.value).split())
+    assert experiments.rule_refused(project, name) in said.replace("- ", "")
+    assert experiments.rule_cannot_run(project).startswith(experiments.RUNS_BLOCKED)
+    assert project.page(name).state == "planned"
+    modal_signed_in(monkeypatch, True)
+    assert autopilot.held(project) == [] and experiments.rule_cannot_run(project) is None
+    assert experiments.approve_by_rule(project, name).state == "approved"
+
+
+class Unsigned(Remote):
+    """A remote backend that could start nothing: its own check says so, as Modal's does
+    without a token."""
+
+    def check(self, *, python: bool = True, latex: bool = True) -> list[str]:
+        return ["Modal is not authenticated (no token is configured on this machine)."]
+
+
+def test_a_stretch_on_a_modal_that_cannot_be_used_says_so_from_its_start(tmp_path):
+    """The stretch is told by the backend it runs on, not by the settings alone: it does
+    not begin as if runs were approved, and its checkpoint counts the runs that wait."""
+    project = classic_project(tmp_path)
+    state = stretch(project, backend=Unsigned())
+    [began] = events(project, autopilot.STARTED)
+    assert (
+        "No run can be approved now, by autopilot or by you: this project's experiments run "
+        "on Modal, which cannot be used on this machine now: Modal is not authenticated"
+    ) in began["summary"]
+    assert state["autopilot"]["reason"] == "needs_you"
+    assert "Modal is not authenticated" in state["autopilot"]["said"]
+    [paused] = events(project, "checkpoint")[-1:]
+    assert paused["data"]["held"] == ["E1", "E2"]
+    assert "2 runs that autopilot did not approve await your review." in paused["summary"]
+    # Where it can be used, the start says nothing of the kind.
+    fine = make_project(
+        tmp_path,
+        name="fine",
+        files=[notes(tmp_path)],
+        settings={"compute": "modal", "autonomy": AUTO},
+    )
+    stretch(fine)
+    assert "No run can be approved" not in events(fine, autopilot.STARTED)[0]["summary"]
+
+
+def test_a_run_whose_code_has_errors_waits_with_the_error(tmp_path):
+    project = classic_project(tmp_path)
+    name = planned(project, code="def broken(:\n    pass\n")
+    [waits] = autopilot.held(project, backends={"modal": Remote()})
+    assert waits["id"] == name and waits["kind"] == "refused"
+    assert "main.py" in waits["reason"]
+    assert [item["id"] for item in autopilot.refused([waits])] == [name]
+    assert autopilot.left([waits]) == []
+    # Once the code is sound nothing waits: the rule approves it in the next stretch.
+    from test_research_agents import GOOD_CODE
+
+    experiments.write_code(project, name, {"main.py": GOOD_CODE}, author="agent:designer")
+    assert autopilot.held(project, backends={"modal": Remote()}) == []
 
 
 def test_a_model_that_cannot_be_used_ends_the_stretch(tmp_path):

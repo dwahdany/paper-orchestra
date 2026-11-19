@@ -38,6 +38,17 @@ def _isolated(monkeypatch):
             signal.signal(number, handler)
 
 
+@pytest.fixture(autouse=True)
+def _modal_is_signed_in(monkeypatch):
+    """What waits and what is promised are asked of the machine as it is; no test's
+    answer may depend on whether this one has a Modal token."""
+    try:
+        from paper_orchestra.compute import modal_backend
+    except ImportError:
+        return
+    monkeypatch.setattr(modal_backend, "modal_token_configured", lambda: True)
+
+
 @pytest.fixture
 def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
@@ -183,7 +194,10 @@ def test_a_stretch_started_from_the_command_line_goes_on_in_that_worker(workspac
     assert state["autopilot"]["reason"] == "needs_you" and state["status"] == "checkpoint"
     out = flat(started.stdout)
     assert "The last stretch ended" in out
-    assert "Nothing more can happen without you: autopilot did not approve E1" in out
+    assert "Nothing more can happen without you. Without you:" in out
+    assert "Autopilot did not approve E1 and E2: it would run on this machine as you" in out
+    assert "2 runs that autopilot did not approve await your review." in out
+    assert "Nothing awaits your review" not in out
     assert "outside a sandbox" in out and "pages accepted" in out
     assert "starts a new stretch on autopilot" in out
     # What was promised before the first agent started is what happened: no run of this
@@ -202,11 +216,18 @@ def test_a_stretch_started_from_the_command_line_goes_on_in_that_worker(workspac
     assert {page.state for page in project.pages(kind="experiment")} == {"planned"}
     lines = flat(status.stdout)
     assert "Autopilot: on." in lines and "The last stretch ended" in lines
-    assert "Waiting for you: E1" in lines and "it would run on this machine as you" in lines
     # The runs the rule left wait for the person, and no line says that nothing does.
     assert "Waiting for you: 2 runs autopilot left for you (E1 and E2)" in lines
     assert "Nothing is waiting for you." not in lines
     assert approve in lines
+    # Why they wait is said once, with them, and what to do stands right under it:
+    # before the settings, the account of the stretch and what the checkpoint did.
+    assert lines.count("it would run on this machine as you") == 1
+    assert lines.count("outside a sandbox") == 1 and lines.count("did not approve") == 0
+    assert "E1 and E2: it would run on this machine as you" in lines
+    assert lines.count("Next:") == 1
+    assert lines.index("Waiting for you:") < lines.index("Next:") < lines.index("Autopilot: on.")
+    assert "Runs on this machine are not approved without you (why is said" in lines
     assert data["autonomy"]["mode"] == "autopilot"
     assert data["autopilot"]["reason"] == "needs_you" and data["autopilot"]["held"]
     assert data["autopilot"]["accepted_by_kind"]["hypothesis"] >= 1
@@ -228,11 +249,102 @@ def test_the_switch_promises_runs_only_where_the_rule_approves_them(workspace):
     remote = flat(invoke("status", "a").stdout)
     assert "runs approved and checkpoints passed without you" in remote
     assert "not approved without you" not in remote
+    # The advice names a path that exists: the backend is an option of the two commands.
+    assert "Modal as the compute backend (`--compute modal`)" in local
+    made = invoke(
+        "new", "--brief", "Another.", "--dir", "m", "--no-run", "--autopilot", "--compute", "modal"
+    )
+    assert made.exit_code == 0, made.output
+    assert Project.open(workspace / "m").settings.compute == "modal"
+    assert "runs approved and checkpoints passed without you" in flat(made.stdout)
+    back = invoke("settings", "m", "--compute", "local")
+    assert back.exit_code == 0, back.output
+    assert Project.open(workspace / "m").settings.compute == "local"
+    assert "Changed compute for" in back.stdout
+    assert "Runs on this machine are not approved without you" in flat(back.stdout)
     for said in (local, remote):
         assert (
             "What the experiments cost is no part of these caps: the project's own limit "
             "holds it ($5.00, settings.limits.experiment_usd)." in said
         )
+
+
+def test_the_promise_of_runs_is_not_made_where_modal_is_not_signed_in(workspace, monkeypatch):
+    """ "Runs approved" is true of the settings and of this machine, or it is not said."""
+    import test_research_autopilot as offline
+
+    made = invoke(
+        "new", "--brief", "An idea.", "--dir", "m", "--no-run", "--autopilot", "--compute", "modal"
+    )
+    assert "runs approved and checkpoints passed without you" in flat(made.stdout)
+    offline.modal_signed_in(monkeypatch, False)
+    said = flat(invoke("settings", "m").stdout)
+    assert "runs approved" not in said
+    assert (
+        "No run can be approved now, by autopilot or by you: this project's experiments run "
+        "on Modal, which cannot be used on this machine now: Modal is not authenticated"
+    ) in said
+    assert "`modal setup`" in said and "Once it can be used, runs are approved." in said
+
+
+def test_settle_says_what_becomes_of_the_planned_experiments_in_this_project(workspace):
+    """On a project whose runs the rule does not approve, settling does not promise them."""
+    project = waiting_project(workspace / "p")
+    said = flat(invoke("settings", str(project.root), "--autopilot", "--settle").stdout)
+    assert "Runs on this machine are not approved without you" in said
+    assert "Experiments that were planned before still wait for your approval" in said
+    assert "planned before are approved and run in the next stretch" not in said
+    remote = waiting_project(workspace / "r")
+    remote.settings.update({"compute": "modal"})
+    remote.save_settings()
+    said = flat(invoke("settings", str(remote.root), "--autopilot", "--settle").stdout)
+    assert "planned before are approved and run in the next stretch." in said
+
+
+def test_status_keeps_the_reason_of_the_settings_where_what_waits_has_another(workspace):
+    """A plan from before the switch waits for that; why no run on this machine is
+    approved is then said with the settings, in full, and not "said above"."""
+    import test_research_autopilot as offline
+
+    project = Project.create(workspace / "p", title="Warmup", brief="Does warmup matter?")
+    name = offline.planned(project)
+    project.review(name, "accept")
+    assert invoke("settings", str(project.root), "--autopilot").exit_code == 0
+    lines = flat(invoke("status", str(project.root)).stdout)
+    assert f"{name}: it was planned before autopilot was switched on" in lines
+    assert f"Runs on this machine are not approved without you: {RUNS_WAIT}." in lines
+    assert "why is said with what waits" not in lines
+
+
+def test_status_counts_a_run_the_approval_refuses_and_says_what_to_do(workspace):
+    """The experiment budget is used up: the run waits for the person, is said to, and
+    what is next is not "advance starts a new stretch" alone."""
+    import test_research_autopilot as offline
+
+    project = offline.classic_project(
+        workspace, autonomy={"mode": "autopilot", "rounds": 3}, limits={"experiment_usd": 0.5}
+    )
+    offline.stretch(project, backend=offline.Remote(cost_usd=0.75))
+    lines = flat(invoke("status", str(project.root)).stdout)
+    assert "Nothing is waiting for you." not in lines
+    assert "Waiting for you: 3 runs that cannot be approved as things are (E2, E3 and E4)" in lines
+    # One reason for the three, said once.
+    assert "E2, E3 and E4: it cannot be approved as things are: The experiment cost" in lines
+    assert lines.count("Raise settings.limits.experiment_usd") == 1
+    assert (
+        "Next: deal with what keeps E2, E3 and E4 from being approved (said with what waits "
+        "for you); autopilot approves them in the stretch after that; then `paper-orchestra "
+        "research advance"
+    ) in lines
+    assert "research approve" not in lines  # nobody can approve it as things are
+    data = json.loads(invoke("status", str(project.root), "--json").stdout)
+    assert {item["kind"] for item in data["autopilot"]["held"]} == {"refused"}
+    # With the limit raised nothing waits, and the next stretch is what is next.
+    project.settings.update({"limits": {"experiment_usd": 50}})
+    project.save_settings()
+    lines = flat(invoke("status", str(project.root)).stdout)
+    assert "Nothing is waiting for you." in lines and "cannot be approved" not in lines
+    assert lines.rstrip().endswith("(it goes on by itself until a cap is reached).")
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +391,7 @@ def test_the_view_carries_autonomy_and_patch_switches_it(client):
         "digest": None,
         "held": [],
         "runs_wait": RUNS_WAIT,
+        "runs_blocked": None,
     }
     assert client.get("/api/defaults").json()["autonomy"]["mode"] == "supervised"
     rows = client.get("/api/projects").json()["projects"]
@@ -388,6 +501,59 @@ def test_the_library_counts_the_runs_autopilot_left_and_the_app_says_which_runs_
     waits = client.get("/api/defaults").json()["autopilot_runs_wait"]
     assert waits["classic"] == {**dict.fromkeys(waits["classic"]), "local": RUNS_WAIT}
     assert not any(waits["sdk"].values())
+
+
+def test_the_library_row_follows_a_change_of_the_settings_that_writes_no_event(client):
+    """What the rule approves depends on the settings; the row's count is taken anew
+    when they change, also where the change adds nothing to the events."""
+    import test_research_autopilot as offline
+    from test_research_agents import FakeBackend, make_project
+
+    project = make_project(
+        client.workspace,
+        files=[offline.notes(client.workspace)],
+        settings={"autonomy": offline.AUTO},
+    )
+    offline.stretch(project, backend=FakeBackend())
+
+    def row():
+        rows = client.get("/api/projects").json()["projects"]
+        return next(row for row in rows if row["dir"] == project.root.name)
+
+    assert row()["held"] == 2
+    before = len(project.events())
+    patched = client.patch(f"/api/projects/{row()['id']}", json={"settings": {"compute": "modal"}})
+    assert patched.status_code == 200, patched.text
+    assert len(Project.open(project.root).events()) == before  # nothing in the events
+    assert row()["held"] == 0
+    assert client.get(f"/api/projects/{row()['id']}").json()["autopilot"]["held"] == []
+
+
+def test_the_app_counts_a_run_the_approval_refuses_and_does_not_promise_runs(client, monkeypatch):
+    """Modal is not signed in: the runs of a project on Modal wait for the person, in the
+    row, the view and the digest, each with what to do, and the switch and the composer
+    do not say "runs approved"."""
+    import test_research_autopilot as offline
+
+    project = offline.classic_project(client.workspace)
+    name = offline.planned(project)
+    offline.modal_signed_in(monkeypatch, False)
+    rows = client.get("/api/projects").json()["projects"]
+    row = next(row for row in rows if row["dir"] == project.root.name)
+    assert row["held"] == 1 and row["pending"] == 0
+    view = client.get(f"/api/projects/{row['id']}").json()["autopilot"]
+    [waits] = view["held"]
+    assert (waits["id"], waits["kind"]) == (name, "refused") and "modal setup" in waits["reason"]
+    assert view["runs_wait"] is None
+    assert view["runs_blocked"].startswith("this project's experiments run on Modal, which")
+    blocked = client.get("/api/defaults").json()["autopilot_runs_blocked"]
+    assert blocked["local"] is None and "Modal is not authenticated" in blocked["modal"]
+    offline.modal_signed_in(monkeypatch, True)
+    assert client.get(f"/api/projects/{row['id']}").json()["autopilot"]["runs_blocked"] is None
+    assert client.get("/api/defaults").json()["autopilot_runs_blocked"] == {
+        "local": None,
+        "modal": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -527,3 +693,122 @@ def test_the_client_shows_the_switch_the_digest_and_who_decided(tmp_path):
     for name in ("local", "remote", "composer"):
         assert [key for key, value in out[name].items() if value is False] == [], name
     assert out["rows"] == ["3 waiting for you", "5 waiting for you", "ready to continue"]
+
+
+WAITING_SCRIPT = r"""
+import { projectStore, page, checkpoint, said, ago } from './harness.js';
+import { app } from './js/core.js';
+import { overviewView } from './js/overview.js';
+import { inboxView } from './js/inbox.js';
+import { waitingSentence } from './js/shell.js';
+import { waitingCount } from './js/decisions.js';
+import { autopilotSub, heldAdvice, leftRuns, refusedRuns } from './js/autopilot.js';
+import { startView, composer } from './js/home.js';
+
+const autonomy = (mode) => ({ mode, rounds: 2, model_usd: 5, hours: 0.5, network: false });
+const LEFT = { id: 'E1', kind: 'rule', reason: 'it would run on this machine as you, outside a sandbox' };
+const REFUSED = { id: 'E2', kind: 'refused', reason: 'it cannot be approved as things are: The experiment cost budget does not cover it: $5.00 of $5.00 is spent. Raise settings.limits.experiment_usd <b>' };
+const e1 = page('experiment', 'E1', { state: 'planned' }), e2 = page('experiment', 'E2', { state: 'planned' });
+const digest = (reason, why, held) => ({ started: ago(900), ended: ago(60), running: false, reason, why, said: why, rounds: 1, caps: autonomy('autopilot'), spent_usd: 1, seconds: 800,
+  accepted: [], accepted_by_kind: {}, edits: [], decisions: [], runs: [], runs_with_network: 0, held, uncounted: 'x' });
+const store = (held, reason, why, extra) => projectStore({ pages: [e1, e2], experiments: [Object.assign({ runs: 0 }, e1), Object.assign({ runs: 0 }, e2)],
+  project: { settings: { limits: { model_usd: 25, experiment_usd: 5 }, autonomy: autonomy('autopilot') }, state: checkpoint('run', 'run'), next_step: said({ will_run: ['run'], then: 'analyze' }),
+    autopilot: Object.assign({ mode: 'autopilot', refused: null, since: '', digest: digest(reason, why, held), held }, extra || {}) } });
+if (typeof window === 'undefined') globalThis.window = {};   /* the Inbox asks how wide the sheet is */
+const show = (view, s, name) => {
+  app.store = s;
+  const root = { innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
+  app.route = { name: 'project', pid: 'p-1', view: name, ref: '', sel: '', sub: '', q: {} };
+  view.render(root, app.route);
+  return root.innerHTML;
+};
+const out = {};
+/* a run the approval refuses: counted and listed as a run the rule left is, with what to do, and never "approve it" */
+const refused = store([REFUSED], 'needs_you', 'nothing more can happen without you');
+const e = { working: false };
+const inbox = show(inboxView, refused, 'inbox'), over = show(overviewView, refused, 'overview');
+out.refused = { count: waitingCount(refused), kinds: [leftRuns(refused).length, refusedRuns(refused).length],
+  headline: waitingSentence(refused), sub: autopilotSub(refused, e), advice: heldAdvice(refused),
+  inboxHead: inbox.includes('1 waiting for you') && !inbox.includes('Nothing is waiting'),
+  inboxRow: inbox.includes('data-held="E2"') && inbox.includes('cannot be approved</span>') && inbox.includes('Raise settings.limits.experiment_usd'),
+  inboxTitle: inbox.includes('Runs autopilot did not approve') && !inbox.includes('Runs autopilot left for you'),
+  escaped: inbox.includes('&lt;b&gt;') && !inbox.includes('experiment_usd <b>'),
+  /* (e) with a run waiting, the Inbox does not say that the checkpoint can go on */
+  still: inbox.includes('Every proposal has a decision.') && inbox.includes('1 run above still waits for you: autopilot did not approve it.') && !inbox.includes('The checkpoint can go on'),
+  overview: over.includes('data-held="E2"') && over.includes('autopilot did not approve it · it cannot be approved as things are') };
+/* a run the rule left: as before */
+const left = store([LEFT], 'needs_you', 'nothing more can happen without you');
+const leftInbox = show(inboxView, left, 'inbox');
+out.left = { headline: waitingSentence(left), sub: autopilotSub(left, e),
+  inbox: leftInbox.includes('Runs autopilot left for you') && leftInbox.includes('not approved</span>') && !leftInbox.includes('The checkpoint can go on') };
+/* both, after a stretch that ended at a cap: Continue alone is not what is said */
+const both = store([LEFT, REFUSED], 'rounds', 'the cap on rounds was reached');
+out.both = { headline: waitingSentence(both), sub: autopilotSub(both, e) };
+/* nothing held: the checkpoint can go on, as it always could */
+const none = store([], 'rounds', 'the cap on rounds was reached');
+out.none = { headline: waitingSentence(none), sub: autopilotSub(none, e), inbox: show(inboxView, none, 'inbox').includes('Every proposal has a decision. The checkpoint can go on.') };
+/* the switch where Modal cannot be used: no promise of runs */
+const blocked = show(overviewView, store([REFUSED], 'needs_you', 'nothing more can happen without you', { runs_blocked: 'this project runs on Modal, which is not signed in <i>' }), 'overview');
+const nowAt = blocked.indexOf('class="auto-now"'), now = blocked.slice(nowAt, blocked.indexOf('</p>', nowAt));
+out.blocked = { says: now.includes('No run can be approved now, by autopilot or by you: this project runs on Modal'), noPromise: !now.includes('runs approved and'), escaped: now.includes('&lt;i&gt;') };
+/* (d) the composer: the route says who decides as the tick stands */
+const start = (ticked, compute) => {
+  app.ui.defaults = { data: { settings: { compute: 'local', limits: { model_usd: 25 }, models: {}, agents: { runtime: 'classic', sandbox: true } }, autonomy: autonomy('supervised'),
+    autopilot_runs_wait: { classic: { local: 'unread code would run as you', modal: null }, sdk: { local: null, modal: null } }, autopilot_runs_blocked: { local: null, modal: compute === 'blocked' ? 'Modal is not signed in' : null },
+    compute_backends: ['local', 'modal'], efforts: [], agent_runtimes: ['classic', 'sdk'], agent_credentials: [] }, loading: false, error: null, at: Date.now() };
+  const s = composer(); s.autopilot = ticked; s.adv = true; s.compute = compute === 'blocked' ? 'modal' : compute;
+  const root = { innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
+  startView.render(root, { q: {} });
+  const html = root.innerHTML, hints = {};
+  html.split('class="smap-name">').slice(1).forEach((part) => { hints[part.slice(0, part.indexOf('<'))] = part.slice(part.indexOf('smap-hint">') + 11, part.indexOf('</div>', part.indexOf('smap-hint">'))); });
+  const at = html.indexOf('id="opt-autopilot"');
+  return { hypotheses: hints.Hypotheses, experiments: hints.Experiments, lede: html.includes('nothing is accepted, and nothing runs, without you'), tick: html.slice(at, html.indexOf('</label>', at)) };
+};
+const offC = start(false, ''), onLocal = start(true, ''), onModal = start(true, 'modal'), onBlocked = start(true, 'blocked');
+out.composer = { off: [offC.hypotheses, offC.experiments, offC.lede], local: [onLocal.hypotheses, onLocal.experiments, onLocal.lede], modal: [onModal.hypotheses, onModal.experiments, onModal.lede],
+  blocked: [onBlocked.hypotheses, onBlocked.experiments], blockedTick: onBlocked.tick.includes('No run can be approved now, by autopilot or by you: Modal is not signed in') && !onBlocked.tick.includes('runs approved and') };
+console.log(JSON.stringify(out));
+"""
+
+
+def test_the_client_counts_refused_runs_and_says_who_decides_as_things_stand(tmp_path):
+    import test_web_static
+
+    if test_web_static.shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    out = test_web_static._client(tmp_path, WAITING_SCRIPT)
+    for name in ("refused", "left", "none", "blocked", "composer"):
+        assert [key for key, value in out[name].items() if value is False] == [], name
+    refused = out["refused"]
+    assert refused["count"] == 1 and refused["kinds"] == [0, 1]
+    assert refused["headline"] == (
+        "1 run cannot be approved as things are, by autopilot or by you: what waits for you "
+        "says what to change."
+    )
+    assert "Nothing is waiting" not in refused["headline"]
+    assert refused["sub"].endswith(
+        ": nothing more can happen without you. 1 run cannot be approved as things are: what "
+        "waits for you says what to change, and autopilot approves it in the stretch after that."
+    )
+    assert "Approve the runs" not in refused["sub"]
+    assert out["left"]["headline"] == (
+        "1 run waits for your approval: autopilot did not approve it."
+    )
+    assert out["left"]["sub"].endswith(
+        "Approve the runs it left for you; Continue then starts a new stretch."
+    )
+    assert out["both"]["headline"].startswith("1 run waits for your approval")
+    assert "1 run cannot be approved as things are" in out["both"]["headline"]
+    assert (
+        "the cap on rounds was reached. Approve the runs it left for you. 1 run cannot"
+        in (out["both"]["sub"])
+    )
+    assert out["none"]["headline"] == "Nothing is waiting for you."
+    assert out["none"]["sub"].endswith(
+        "the cap on rounds was reached. Continue starts a new stretch."
+    )
+    composer = out["composer"]
+    assert composer["off"] == ["you accept or reject", "you approve each run", True]
+    assert composer["local"] == ["accepted without you", "you approve each run", False]
+    assert composer["modal"] == ["accepted without you", "approved without you", False]
+    assert composer["blocked"] == ["accepted without you", "Modal is not set up"]

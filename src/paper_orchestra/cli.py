@@ -1170,12 +1170,31 @@ def _where_it_stands(state: Mapping[str, Any]) -> str:
     return line + f"{status}{following}"
 
 
-def _held_runs(project: Project) -> list[str]:
-    """The experiments autopilot does not approve as the project stands, by id: they wait
-    for the person although it is on (``research.autopilot.held``)."""
+def _held_runs(project: Project, state: Mapping[str, Any] | None = None) -> list[dict[str, str]]:
+    """The experiments that wait for the person although autopilot is on, as the project
+    stands, each with its reason and whether the person can approve it (``kind``:
+    ``research.autopilot.held``)."""
     from paper_orchestra.research import autopilot
 
-    return [item["id"] for item in autopilot.held(project)]
+    return autopilot.held(project, state)
+
+
+def _held_in_words(held: Sequence[Mapping[str, str]]) -> list[str]:
+    """What of autopilot's waits for the person, counted: the runs it left for them to
+    approve, and those nobody can approve until what refuses them is dealt with."""
+    from paper_orchestra.research import autopilot
+
+    left = [item["id"] for item in autopilot.left(held)]
+    refused = [item["id"] for item in autopilot.refused(held)]
+    said = []
+    if left:
+        said.append(f"{_plural(len(left), 'run')} autopilot left for you ({_and_words(left)})")
+    if refused:
+        said.append(
+            f"{_plural(len(refused), 'run')} that cannot be approved as things are "
+            f"({_and_words(refused)})"
+        )
+    return said
 
 
 def _and_words(names: Sequence[str]) -> str:
@@ -1183,8 +1202,14 @@ def _and_words(names: Sequence[str]) -> str:
     return f"{', '.join(names[:-1])} and {names[-1]}" if len(names) > 1 else "".join(names)
 
 
-def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str, Any]) -> str:
-    """What the person can do now, as commands they can paste."""
+def _next_steps(
+    project: Project,
+    state: Mapping[str, Any],
+    counts: Mapping[str, Any],
+    held: Sequence[Mapping[str, str]] | None = None,
+) -> str:
+    """What the person can do now, as commands they can paste.  ``held`` is what waits
+    of autopilot's (``_held_runs``), where the caller has asked already."""
     root = _quoted(project.root)
     advance = f"`paper-orchestra research advance {root}`"
     status = state.get("status")
@@ -1223,12 +1248,24 @@ def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str,
     if unattended:
         # What still waits is what autopilot left for the person; the rest it decides.
         steps = [step for step in steps if not step.startswith("approve the experiments")]
-        left = _held_runs(project)
+        from paper_orchestra.research import autopilot
+
+        held = _held_runs(project, state) if held is None else held
+        left = [item["id"] for item in autopilot.left(held)]
+        refused = [item["id"] for item in autopilot.refused(held)]
         if left:
             # Without these a new stretch finds nothing it may run, and ends at once.
             steps.append(
                 f"approve the runs autopilot left for you ({_and_words(left)}) with "
                 f"`paper-orchestra research approve {root} {left[0]}`"
+            )
+        if refused:
+            # Nobody can approve these as things are: the refusal says what to change,
+            # and a stretch that starts before that finds the same and ends at once.
+            steps.append(
+                f"deal with what keeps {_and_words(refused)} from being approved (said "
+                "with what waits for you); autopilot approves "
+                f"{'it' if len(refused) == 1 else 'them'} in the stretch after that"
             )
         steps.append(
             f"{'then ' if steps else ''}{advance} starts a new stretch on autopilot "
@@ -1296,23 +1333,35 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
     Of a checkpoint it repeats what the phases did.  What waits is counted now: the
     count the checkpoint took is not said again once the person has decided things.
     """
+    from paper_orchestra.research import autopilot
+
     counts = project.counts()
     lines = [f"  {_where_it_stands(state)}"]
-    lines += _autopilot_lines(project, state)
+    # With what autopilot did not approve: it waits for the person as a proposal does.
+    held = _held_runs(project, state)
+    waiting = [_waiting(counts)] if counts["pending"]["total"] else []
+    waiting += _held_in_words(held)
+    said: list[str] = []
+    if waiting:
+        said.append(f"  Waiting for you: {', '.join(waiting)}")
+    elif state.get("status") == "checkpoint":
+        said.append("  Nothing is waiting for you.")
+    if held:
+        # Why, once for all that share a reason, and right under it what to do: where a
+        # stretch stopped for these, that is what the person came to read, so it goes
+        # first and the lines below do not say the reason again.
+        why = autopilot.grouped([(item["id"], item["reason"]) for item in held])
+        said.append(f"  {_readable(_sentence(why))}")
+        said.append(f"  {_next_steps(project, state, counts, held)}")
+        lines += said
+    lines += _autopilot_lines(project, state, held)
     checkpoint = _mapping(state.get("checkpoint"))
     if state.get("status") == "checkpoint":
         did = _account(checkpoint)
         if did:
             lines.append(f"  {_readable(_sentence(did))}")
-    # With what autopilot did not approve: it waits for the person as a proposal does.
-    left = _held_runs(project)
-    waiting = [_waiting(counts)] if counts["pending"]["total"] else []
-    if left:
-        waiting.append(f"{_plural(len(left), 'run')} autopilot left for you ({_and_words(left)})")
-    if waiting:
-        lines.append(f"  Waiting for you: {', '.join(waiting)}")
-    elif state.get("status") == "checkpoint":
-        lines.append("  Nothing is waiting for you.")
+    if not held:
+        lines += said
     board = [f"{count} {name}" for name, count in counts["experiments"].items() if count]
     if board:
         lines.append(f"  Experiments: {', '.join(board)}")
@@ -1356,7 +1405,8 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
             "in usage.json and its cost is not in the sum"
         )
     lines += _problem_lines(project)
-    lines.append(_next_steps(project, state, counts))
+    if not held:
+        lines.append(_next_steps(project, state, counts, held))
     return lines
 
 
@@ -1370,12 +1420,34 @@ def _has_live_worker(state: Mapping[str, Any]) -> bool:
     return bool(worker_alive(state))
 
 
-def _autonomy_in_words(settings: Any) -> str:
+def _compute_in_words(backend: str) -> str:
+    """``settings.compute`` in a sentence: where an experiment runs unless its approval
+    names another backend."""
+    if backend == "modal":
+        return (
+            "Experiments: on Modal, each run in a sandbox of its own, unless an approval "
+            "names another backend."
+        )
+    return (
+        "Experiments: on this machine (the local backend: a run is a process of yours, "
+        "not in a sandbox), unless an approval names another backend; one that asks for "
+        "a GPU runs on Modal."
+    )
+
+
+def _autonomy_in_words(settings: Any, *, held: Sequence[Mapping[str, str]] = ()) -> str:
     """``settings.autonomy`` in a sentence: the mode, what a stretch is held to, and what
     it does not decide or count as these settings stand (the runs of a project whose
-    experiments would run unsandboxed as the person; what experiments cost)."""
+    experiments would run unsandboxed as the person, or on a Modal that cannot be used
+    on this machine; what experiments cost).  ``held`` is what the caller has said
+    waits, with the reasons: where the reason no run is approved is among them, it is
+    not said again."""
     from paper_orchestra.research.autopilot import caps_in_words
-    from paper_orchestra.research.experiments import rule_leaves_runs
+    from paper_orchestra.research.experiments import (
+        UNSANDBOXED_RUN,
+        rule_cannot_run,
+        rule_leaves_runs,
+    )
 
     autonomy = settings.autonomy
     caps = caps_in_words(autonomy.to_dict())
@@ -1390,12 +1462,27 @@ def _autonomy_in_words(settings: Any) -> str:
             f"you). Switched on, a stretch would be held to {caps}."
         )
     runs_wait = rule_leaves_runs(settings)
-    decided = (
-        "Pages are accepted, edits applied and checkpoints passed without you. Runs on "
-        f"this machine are not approved without you: {runs_wait}."
-        if runs_wait
-        else "Pages are accepted, edits applied, runs approved and checkpoints passed without you."
-    )
+    # What the settings promise is said only where this machine can keep it.
+    blocked = None if runs_wait else rule_cannot_run(settings)
+    above = " (why is said with what waits for you, above)."
+    reasons = [str(item.get("reason")) for item in held]
+    if runs_wait:
+        said = UNSANDBOXED_RUN in reasons
+        decided = (
+            "Pages are accepted, edits applied and checkpoints passed without you. Runs on "
+            "this machine are not approved without you" + (above if said else f": {runs_wait}.")
+        )
+    elif blocked:
+        said = any("Modal" in reason for reason in reasons)
+        decided = (
+            "Pages are accepted, edits applied and checkpoints passed without you. No run "
+            "can be approved now, by autopilot or by you"
+            + (above if said else f": {blocked}. Once it can be used, runs are approved.")
+        )
+    else:
+        decided = (
+            "Pages are accepted, edits applied, runs approved and checkpoints passed without you."
+        )
     return (
         f"Autopilot: on. {decided} One stretch is held to {caps}; {network}. What the "
         "experiments cost is no part of these caps: the project's own limit holds it "
@@ -1403,17 +1490,25 @@ def _autonomy_in_words(settings: Any) -> str:
     )
 
 
-def _autopilot_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
+def _autopilot_lines(
+    project: Project,
+    state: Mapping[str, Any],
+    held: Sequence[Mapping[str, str]] | None = None,
+) -> list[str]:
     """What ``status`` says of autopilot: the mode, where the stretch stands or why the
     last one ended, what was decided without the person, and what waits for them all
-    the same.  Nothing for a supervised project that never ran unattended."""
+    the same.  Nothing for a supervised project that never ran unattended.
+
+    ``held`` is what waits of autopilot's where the caller says that itself, with the
+    reasons (``_held_runs``): these lines then do not say the reasons a second time.
+    """
     from paper_orchestra.research import autopilot
 
     autonomy = project.settings.autonomy
     found = autopilot.digest(project, state)
     if autonomy.mode != "autopilot" and found is None:
         return []
-    lines = [f"  {_autonomy_in_words(project.settings)}"]
+    lines = [f"  {_autonomy_in_words(project.settings, held=held or ())}"]
     if found is None:
         if autonomy.mode == "autopilot":
             lines.append(
@@ -1433,8 +1528,12 @@ def _autopilot_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
             f"{(found['why'] or 'its worker ended without saying why')[0].upper()}"
             f"{(found['why'] or 'its worker ended without saying why')[1:]}."
         )
+        if held and found["reason"] == "needs_you":
+            why = "Nothing more can happen without you."  # what waits is said above
         ended = f" on {_readable(found['ended'])}" if found["ended"] else ""
         lines.append(f"  The last stretch ended{ended}: {_readable(_sentence(why))}")
+    if held is not None and found.get("held"):
+        found = {**found, "held": []}  # said by the caller
     lines.append(f"  {_readable(autopilot.summary(found))}")
     return lines
 
@@ -1558,10 +1657,12 @@ def _advance(project: Project, *, phase: str | None, instruction: str | None) ->
         state = Engine(project).advance(phase=phase, instruction=instruction)
     status = state.get("status")
     root = _quoted(project.root)
+    held = _held_runs(project, state)
     if _mapping(state.get("autopilot")).get("ended") and project.settings.autonomy.autopilot:
         # The unattended stretch this command was is over: why, and what was decided
         # without the person meanwhile.  Said before how the last phase ended.
-        for line in _autopilot_lines(project, state)[1:]:
+        # (What waits is counted below; the checkpoint's own sentence has the reasons.)
+        for line in _autopilot_lines(project, state, held)[1:]:
             _say(line.strip())
     if status == "failed":
         from paper_orchestra.research.engine import phase_in_words
@@ -1590,9 +1691,10 @@ def _advance(project: Project, *, phase: str | None, instruction: str | None) ->
     else:
         _say(_where_it_stands(state))
     counts = project.counts()
-    if counts["pending"]["total"]:
-        _say(f"Waiting for you: {_waiting(counts)}")
-    _say(_next_steps(project, state, counts))
+    waiting = ([_waiting(counts)] if counts["pending"]["total"] else []) + _held_in_words(held)
+    if waiting:
+        _say(f"Waiting for you: {', '.join(waiting)}")
+    _say(_next_steps(project, state, counts, held))
 
 
 def _brief_text(brief: str | None, brief_file: Path | None) -> str:
@@ -1761,6 +1863,7 @@ def research_new(
     ultracode: AgentUltracodeOption = None,
     credential: AgentCredentialOption = None,
     sandbox: AgentSandboxOption = None,
+    compute: ExperimentComputeOption = None,
     autopilot: AutopilotOption = None,
     rounds: AutopilotRoundsOption = None,
     stretch_usd: AutopilotUsdOption = None,
@@ -1791,6 +1894,8 @@ def research_new(
     chosen = _agent_changes(runtime, model, fast, ultracode, credential, sandbox)
     if chosen:
         given["agents"] = chosen
+    if compute is not None:
+        given["compute"] = compute.value
     unattended = _autonomy_changes(autopilot, rounds, stretch_usd, hours, stretch_network)
     if unattended:
         given["autonomy"] = unattended
@@ -1836,6 +1941,16 @@ def research_new(
     _advance(project, phase=None, instruction=None)
 
 
+ExperimentComputeOption = Annotated[
+    _Compute | None,
+    typer.Option(
+        "--compute",
+        help="Where the project's experiments run unless an approval says otherwise "
+        "(settings.compute): local (this machine, as you, not a sandbox) or modal (a "
+        "Modal sandbox for each run). Default: local.",
+        show_default=False,
+    ),
+]
 AutopilotOption = Annotated[
     bool | None,
     typer.Option(
@@ -2000,8 +2115,25 @@ def research_advance(
     _advance(_open_project(project), phase=phase.value if phase else None, instruction=instruction)
 
 
-def _settled_in_words(done: Mapping[str, Sequence[str]]) -> str:
-    """What "also settle what waits now" did, in a sentence."""
+def _settled_in_words(done: Mapping[str, Sequence[str]], settings: Any) -> str:
+    """What "also settle what waits now" did, in a sentence, and what becomes of the
+    experiments that were plans before: said as the rule will treat them in this
+    project (it approves none where they would run unsandboxed as the person)."""
+    from paper_orchestra.research.experiments import rule_cannot_run, rule_leaves_runs
+
+    if rule_leaves_runs(settings):
+        planned = (
+            "Experiments that were planned before still wait for your approval, as every "
+            "run on this machine does (one that asks for a GPU is approved and run in the "
+            "next stretch)."
+        )
+    elif rule_cannot_run(settings):
+        planned = (
+            "Experiments that were planned before are approved and run in the next stretch "
+            "once Modal can be used on this machine."
+        )
+    else:
+        planned = "Experiments that were planned before are approved and run in the next stretch."
     parts = [
         f"{len(done['accepted'])} page{'' if len(done['accepted']) == 1 else 's'} accepted",
         f"{len(done['applied'])} edit{'' if len(done['applied']) == 1 else 's'} applied",
@@ -2014,10 +2146,7 @@ def _settled_in_words(done: Mapping[str, Sequence[str]]) -> str:
         if done["left"]
         else ""
     )
-    return (
-        f"Autopilot settled what waited: {', '.join(parts)}.{left} Experiments that were "
-        "planned before are approved and run in the next stretch."
-    )
+    return f"Autopilot settled what waited: {', '.join(parts)}.{left} {planned}"
 
 
 def _kind_named(name: str) -> str:
@@ -2824,6 +2953,7 @@ def research_settings(
     ultracode: AgentUltracodeOption = None,
     credential: AgentCredentialOption = None,
     sandbox: AgentSandboxOption = None,
+    compute: ExperimentComputeOption = None,
     autopilot: AutopilotOption = None,
     rounds: AutopilotRoundsOption = None,
     stretch_usd: AutopilotUsdOption = None,
@@ -2836,7 +2966,8 @@ def research_settings(
             help="With autopilot on: also settle what waits now. Proposed pages are "
             "accepted, suggested edits applied and open decisions left at their default, "
             "each recorded as autopilot's doing; the experiments that were planned before "
-            "are approved and run in the next stretch.",
+            "are the rule's from then on (approved and run in the next stretch, where it "
+            "approves runs at all: not those that would run on this machine unsandboxed).",
         ),
     ] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print the settings as JSON.")] = False,
@@ -2845,7 +2976,7 @@ def research_settings(
 
     Without an option this prints `settings.agents` and `settings.autonomy`. With
     options it changes the values named and leaves the rest; the change holds from the
-    next phase on.
+    next phase on. `--compute` sets where experiments run (`settings.compute`).
 
     Autopilot is yours alone to switch on: no agent can run this command, write the
     project's file or reach the app. What waits when you switch it on is left for you
@@ -2859,10 +2990,11 @@ def research_settings(
     unattended = _autonomy_changes(autopilot, rounds, stretch_usd, hours, stretch_network)
     settled: dict[str, list[str]] | None = None
     try:
-        if changes or unattended:
+        if changes or unattended or compute is not None:
             update = {
                 **({"agents": changes} if changes else {}),
                 **({"autonomy": unattended} if unattended else {}),
+                **({"compute": compute.value} if compute is not None else {}),
             }
             opened.settings.update(update)
             opened.save_settings()
@@ -2872,15 +3004,22 @@ def research_settings(
         _fail(str(exc))
     agents = opened.settings.agents
     if as_json:
-        shown = {**agents.to_dict(), "autonomy": opened.settings.autonomy.to_dict()}
+        shown = {
+            **agents.to_dict(),
+            "autonomy": opened.settings.autonomy.to_dict(),
+            "compute": opened.settings.compute,
+        }
         typer.echo(json.dumps(shown, indent=2, ensure_ascii=False, default=str))
         return
-    if changes or unattended:
+    if changes or unattended or compute is not None:
         named = [*changes, *(f"autonomy.{name}" for name in unattended)]
+        named += ["compute"] if compute is not None else []
         _say(f"Changed {', '.join(named)} for {opened.title}.")
+    if compute is not None:
+        _say(_compute_in_words(opened.settings.compute))
     _say(_autonomy_in_words(opened.settings))
     if settled is not None:
-        _say(_settled_in_words(settled))
+        _say(_settled_in_words(settled, opened.settings))
     elif unattended.get("mode") == "autopilot":
         waiting = opened.counts()["pending"]["total"] + opened.counts()["decisions"]["open"]
         if waiting:

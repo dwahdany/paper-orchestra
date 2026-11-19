@@ -10,10 +10,23 @@ import { KIND, icon } from './vocab.js';
 /** `settings.autonomy` of the project, as the server shows it (always there). */
 export const autonomyOf = (store) => (((store || {}).project || {}).settings || {}).autonomy || null;
 export const autopilotOn = (store) => { const a = autonomyOf(store); return !!a && a.mode === 'autopilot'; };
-/** `autopilot` of the project view: `{mode, refused, since, digest, held}`. */
+/** `autopilot` of the project view: `{mode, refused, since, digest, held, runs_wait, runs_blocked}`. */
 export const autopilotView = (store) => ((store || {}).project || {}).autopilot || {};
-/** The experiments autopilot does not approve, each `{id, reason}`: they wait for the person. */
+/** The experiments that wait for the person although autopilot is on, each `{id, reason, kind}`:
+    `kind: 'rule'` is a run its rule leaves for them to approve, `'refused'` one whose approval
+    would be refused as things are (a spent experiment budget, Modal not signed in, errors in
+    the code): nobody can approve that until the cause is gone, and the reason says what to do. */
 export const heldRuns = (store) => (autopilotOn(store) ? autopilotView(store).held || [] : []);
+export const refusedRuns = (store) => heldRuns(store).filter((h) => h.kind === 'refused');
+export const leftRuns = (store) => heldRuns(store).filter((h) => h.kind !== 'refused');
+/** What the person does about the runs that wait, in a sentence: approve what was left for
+    them, and remove what refuses the others. Nothing where none waits. */
+export function heldAdvice(store) {
+  const left = leftRuns(store).length, refused = refusedRuns(store).length;
+  if (!left && !refused) return '';
+  if (!refused) return 'Approve the runs it left for you; Continue then starts a new stretch.';
+  return (left ? 'Approve the runs it left for you. ' : '') + plural(refused, 'run') + ' cannot be approved as things are: what waits for you says what to change, and autopilot approves ' + (refused === 1 ? 'it' : 'them') + ' in the stretch after that.';
+}
 /** Why autopilot leaves an experiment to the person, or nothing. */
 export const heldReason = (store, id) => { const h = heldRuns(store).find((x) => x.id === id); return h ? h.reason : ''; };
 
@@ -31,7 +44,9 @@ export function autopilotSub(store, e) {
   if (!autopilotOn(store)) return '';
   if (e.working) return 'Autopilot is on: the agents go on by themselves until a cap is reached. Stop ends the stretch.';
   /* stopped for want of the person: a new stretch finds the same until they approve what it left */
-  if (d && d.ended && d.reason === 'needs_you' && heldRuns(store).length) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why) + '. Approve the runs it left for you; Continue then starts a new stretch.';
+  if (d && d.ended && d.reason === 'needs_you' && heldRuns(store).length) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why) + '. ' + heldAdvice(store);
+  /* stopped for another reason while runs cannot be approved: Continue alone would not run them */
+  if (d && d.ended && refusedRuns(store).length) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why || 'its worker ended without saying why') + '. ' + heldAdvice(store);
   if (d && d.ended) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why || 'its worker ended without saying why') + '. Continue starts a new stretch.';
   if (d && !d.ended) return 'The last stretch of autopilot ended without saying why: its worker is gone. Continue starts a new stretch.';
   return 'Autopilot is on: Continue starts a stretch that goes on by itself until a cap is reached.';
@@ -69,7 +84,7 @@ export function autopilotHTML(store, e, waiting) {
   const view = autopilotView(store), ui = app.ui.autopilotEdit, on = a.mode === 'autopilot';
   const field = (name, text, unit) => html`<label><span>${text}</span><input id="auto-${name}" data-input="autopilot" data-name="${name}" value="${ui[name]}" inputmode="decimal" autocomplete="off" size="7"><span class="quiet">${unit}</span></label>`;
   return html`<section class="ov-sec ov-auto" data-autopilot="${on ? 'on' : 'off'}"><h2>Autopilot <span>${on ? 'on' : 'off'}</span></h2>
-    <p class="auto-now">${on ? html`<b>On.</b> ${view.runs_wait ? html`Pages are accepted, edits applied and checkpoints passed without you. <span class="auto-runs-wait">Runs on this machine are not approved without you: ${plain(view.runs_wait)}.</span>` : 'Pages are accepted, edits applied, runs approved and checkpoints passed without you.'} One stretch is held to ${capsWords(a)}. ${networkWords(a)} <span class="auto-exp-limit">What the experiments cost is no part of these caps: the project's own limit holds it (${money(limitOf(store))}).</span>`
+    <p class="auto-now">${on ? html`<b>On.</b> ${view.runs_wait ? html`Pages are accepted, edits applied and checkpoints passed without you. <span class="auto-runs-wait">Runs on this machine are not approved without you: ${plain(view.runs_wait)}.</span>` : view.runs_blocked ? html`Pages are accepted, edits applied and checkpoints passed without you. <span class="auto-runs-blocked">No run can be approved now, by autopilot or by you: ${plain(view.runs_blocked)}. Once it can be used, runs are approved.</span>` : 'Pages are accepted, edits applied, runs approved and checkpoints passed without you.'} One stretch is held to ${capsWords(a)}. ${networkWords(a)} <span class="auto-exp-limit">What the experiments cost is no part of these caps: the project's own limit holds it (${money(limitOf(store))}).</span>`
       : html`<b>Off.</b> Every proposal, edit, run and checkpoint waits for you.`}</p>
     ${view.refused && !on ? html`<p class="note note-warn auto-refused">${icon('warn')}<span>${plain(view.refused)}</span></p>` : ''}
     ${digestHTML(store, e)}
