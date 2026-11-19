@@ -338,6 +338,18 @@ CHECKS.phone = async ({ browser, pid }) => {
       if (hash.endsWith('/map') || hash.endsWith('/overview')) await reach(page, width, hash.split('/').pop(), ['.go > .btn'], 40);
       /* the overview scrolls by itself, so the document is not wider when it is: what waits for an answer and what the feed says of it are read without a push sideways */
       if (hash.endsWith('/overview')) await reach(page, width, 'the overview', ['.ov-decide', '.ov-col', '.feed .ev', '.rq-form select']);
+      if (hash.endsWith('/overview')) {
+        /* autopilot: the one switch with its caps. Opened (nothing is saved), every field is within the screen, a finger wide, and written large enough that the phone does not zoom in */
+        await reach(page, width, 'the section of autopilot', ['.ov-auto', '.ov-auto .auto-now']);
+        await page.tap('.ov-auto [data-act="autopilot-open"]');
+        await page.waitForSelector('#auto-rounds');
+        ok(!(await page.evaluate(NARROW)).length && !(await page.evaluate(SMALL)).length, width + ' the form of autopilot on a phone: ' + (await page.evaluate(NARROW)).concat(await page.evaluate(SMALL)).join('; '));
+        await reach(page, width, 'the form of autopilot', ['.auto-form .tick', '.auto-form input:not([type=checkbox])', '.auto-form button[type=submit]'], 40);
+        ok(await page.evaluate(() => document.querySelector('.ov-auto').dataset.autopilot === 'off' && !document.querySelector('#auto-on').checked), width + ': the demo project is supervised, and the form of autopilot says so');
+        await shot(page, 'autopilot-phone-' + width);
+        await page.tap('.ov-auto [data-act="autopilot-open"]');
+        await until(page, () => !document.querySelector('.auto-more').open, null, 8000, 'the form of autopilot closes again');
+      }
       if (hash.endsWith('/inbox/E3')) ok(await page.evaluate(() => { const word = document.querySelector('.in-detail .kicker-kind > span').firstChild, r = document.createRange(); r.setStart(word, 0); r.setEnd(word, word.data.trimEnd().length); return r.getClientRects().length === 1; }), width + ': the kind of a proposal breaks in the middle of a word');
     }
     /* the row of views, scrolled to its end (the open view is then out of sight), stays there when the bar is written again */

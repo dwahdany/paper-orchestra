@@ -64,6 +64,13 @@ def _plain_output(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _supervised_unless_a_test_says_otherwise(monkeypatch):
+    """A project a test creates is supervised unless the test itself asks for autopilot,
+    whatever the shell that started the tests has set as the default of new projects."""
+    monkeypatch.delenv("PAPER_ORCHESTRA_AUTONOMY", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _restore_main_module(monkeypatch):
     """Give every test the ``__main__`` module it started with.
 

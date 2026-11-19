@@ -18,6 +18,7 @@ PaperOrchestra began as a multi-agent framework for writing AI research papers f
 - **Experiments that really run, when you say so.** Small Python scripts on your machine, GPU jobs on [Modal](https://modal.com), or a command in a copy of your own repository. Each run needs your approval, and it starts only while the experiment is still what you approved: the same code, run the same way, on the backend and with the time limit and network access you chose.
 - **Nothing invented.** Sources are verified against Semantic Scholar and written by code. Result records are written by code from the files a run produced. The numbers in a finding are looked for in the metrics of the runs, the sources and your files, and flagged where they occur in none.
 - **Rounds with checkpoints.** The agents work one phase at a time and pause for you after each: research, hypotheses, experiment design, runs and analysis.
+- **Or without you, up to a cap.** Autopilot is a switch per project: a standing rule accepts pages, applies edits, approves runs and passes checkpoints for at most so many rounds, dollars and hours, records each decision as its own, and tells you what happened while you were away.
 - **A web app with several views of the same wiki**: a map from the idea to the findings, the wiki itself, the review inbox, the experiments, and an overview with live activity and spending.
 - **Claude Fable 5.2 by default**, with an API key or keyless Workload Identity Federation. Budgets for model spend and compute are enforced.
 
@@ -160,6 +161,51 @@ Three things are never taken from the plan, which an agent may have written. The
 **Records.** Each run keeps a copy of the code it ran, its full log, `metrics.json`, its artifacts and a `run.json`, under `experiments/E1/runs/<k>/`. The result page is generated from those files; the number check and the write-up read `run.json`, so editing a result page changes neither. Credentials the worker knows (its environment, a token in the repository's address) are replaced by `[redacted]` in logs, in what run records and result pages hold of the job's own words (log lines, errors, notes, the names of metrics and their text values), and in everything the app shows. Stopping the agents puts a run that is still going back in the queue; a run that had finished stays finished. Cancelling ends a run that is queued or running; for an approved experiment that has not started it takes the approval back, and the experiment is a plan again. If a worker is killed in the middle of a run, the next Continue, Run or Cancel ends what its job left running and removes its working directory.
 
 **Limits** (`limits` in `project.json`, or the overview's "Change the limits"): `model_usd` is the total model spend of the research agents (default $25,000), `experiment_usd` the total estimated compute spend of all runs ($5), `experiment_seconds` the longest time limit one run may be given (900). Reaching a limit stops at a checkpoint that says which. The model budget is looked at before every session and turn and after every model request, so at most the one request that crossed it goes beyond; the phase resumes where it stopped once you raise the limit. Costs on Modal are estimates from list prices. A GPU type without a list price is not approved, because nothing could hold its run to the limit, and a run that was stopped or lost still counts for the time it ran.
+
+### Autopilot: a project that goes on without you
+
+By default a project is **supervised**: every proposal, every suggested edit, every run and every checkpoint waits for you. **Autopilot** is your standing rule for the same decisions, made beforehand, with caps. You switch it on per project; nothing else can.
+
+```bash
+paper-orchestra research settings <project> --autopilot --autopilot-rounds 3 --autopilot-usd 200 --autopilot-hours 12
+paper-orchestra research new --brief "..." --autopilot          # a new project on autopilot
+paper-orchestra research settings <project> --supervised        # off again
+```
+
+In the app it is one switch on the overview ("Autopilot"), with the caps beside it, and a tick in the options of a new project. `PAPER_ORCHESTRA_AUTONOMY=autopilot` makes it the default of projects that are created while it is set. The settings are `autonomy` in `project.json`: `mode` (`supervised` or `autopilot`), `rounds` (3), `model_usd` (200), `hours` (12) and `network` (false).
+
+**What autopilot decides for you**, while it is on:
+
+- **Pages.** A new page of an agent, of every kind, is accepted when it is written.
+- **Edits.** An edit an agent suggests is applied, also the verdict on a hypothesis ("supported", "refuted") that the analyst proposes.
+- **Decisions.** A decision an agent raises stands at the default the agent stated (state `defaulted`). It is not counted as waiting, it stays listed in the Inbox under "Went on at the default", and you can still answer it: your answer then holds for every later session.
+- **Runs.** An accepted experiment that can run is approved, through the same approval you would give, with the options the plan asks for on the project's backend, right before its run. It gets network access only if its plan asks for it **and** `autonomy.network` is on. The cost limit for experiments and every other check of an approval stay.
+- **Checkpoints.** The worker goes on with the next phase by itself, round after round. That happens in the worker process, not in the app: you can close the browser or restart the server.
+
+Each of these is recorded as autopilot's doing, never as yours: `decided_by: autopilot` on a page and in an edit proposal, `approved_by: autopilot` on an experiment and in its approval record, `defaulted_by: autopilot` in a decision, and "autopilot" as the actor in the activity feed. No record says that you read or approved something you did not.
+
+**The caps.** Autopilot runs in **stretches**. A stretch begins when you start the agents (Continue, `research advance`) and ends, at a checkpoint and with a summary, when the first of these happens:
+
+- `rounds` rounds have completed in this stretch, `model_usd` dollars went to the agents' models in it, or `hours` hours have passed. Dollars and hours are looked at where the model budget is (before every session and turn, after every model request), so an agent works past a cap for one request at most; a run that is under way on a backend is not cut short for the hours.
+- A limit of the project itself is reached (`limits`), or the next phase needs a model that cannot be used.
+- A phase fails (after its one retry), or the same experiment fails twice.
+- Nothing more can happen without you (the round is at its run phase and autopilot may approve none of the experiments).
+- You press Stop, or switch autopilot off.
+
+Nothing but your next start begins a new stretch. Today no rule of the engine ends a project by itself (a round follows a round), so in autopilot the caps are what stops the work; keep them at what you are willing to spend unattended. What a stretch approved and did not get to run is a plan again when it ends, and no other worker runs it.
+
+**While you were away.** The overview shows the digest of the latest stretch: which pages were accepted, which edits applied, which decisions went on at their default, which runs were approved and how each ended, what was spent of the caps, and why it stopped. `research status` says the same, and `research advance` ends with it. The Inbox shows only what truly needs you.
+
+**What autopilot never does.**
+
+- It is never switched on, widened or started by an agent. The settings are in `project.json`, which no agent's tool writes; under the `sdk` runtime the project's command line is refused to agents, the project's directory is hidden from their shell and their file tools, and the app on the loopback is closed to them. For that reason autopilot is **refused for a project whose agents work outside the sandbox** (`agents.sandbox: false`), with one sentence, whichever of the two settings you try to change.
+- It does not approve a run that would execute code nobody has read as you, outside a sandbox: the `local` backend under the classic runtime. Those experiments wait for your approval, and the summary says so. Runs on Modal, and runs that sandboxed `sdk` agents carry out, are approved.
+- It does not rewrite your own words: an edit that replaces the text of a page you wrote (your idea, your own pages) waits in the Inbox, as does an edit the project cannot apply as it stands. Fields of such a page, like a verdict, are set.
+- It does not settle what was waiting when you switched it on, unless you ask: `--settle` on the command line, "Also settle what waits now" in the app. Then the proposed pages are accepted, the suggested edits applied and the open decisions left at their default, each recorded as autopilot's, and the experiments that were plans before are approved and run in the next stretch.
+- It approves an experiment once, and a second time only if it failed and its plan or code was changed since; never a third time, never one you cancelled, never one that already succeeded. It takes no approval back and cancels nothing.
+- It does not choose another phase than the next one: more research stays your choice.
+
+**What is not counted.** The model spend that the caps and the budget count is that of the agents' own sessions. What the code of an experiment spends on model calls of its own is counted by nothing: a run with network access can call a model API with whatever credential its code finds, and with the worker's federation settings where `PAPER_ORCHESTRA_JOB_MODEL_ACCESS` is on. The summary of every stretch says so and gives the one bound there is, the number of runs that had network access; with `autonomy.network` off (the default) no run that autopilot approves has it.
 
 ### Two runtimes: the tool loop and Claude Agent SDK agents
 

@@ -21,6 +21,15 @@ agents have a shell (below).
 It also checks that the interface follows the rules of the engine and the store, each
 against what the server answers:
 
+- autopilot is one section of the overview: on a phone (three widths) the section and, once
+  opened, its form (the switch, the three caps, the tick for network access) are within the
+  screen, every field a finger wide and none under 16 px; the demo project is supervised and
+  the form says so, and nothing is saved (the check `phone`). What the section shows of a
+  stretch (the digest "While you were away", what waits all the same, autopilot as the actor
+  of the feed, decisions that went on at their default) is checked against the client's own
+  modules in `tests/test_autopilot_cli_web.py`, and the switch, "also settle what waits now"
+  and the refusal against the server there as well;
+
 - what an agent asks the person to choose (a decision) heads the inbox and is counted with
   what waits, on the tab, in its heading, on the overview and in the strip; on a phone every
   option, the field for the person's own words and both answers are within the screen and a
