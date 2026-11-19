@@ -6,6 +6,7 @@ import { MONTH_NAMES, ago, bytes, checkpointDid, codeSpans, cutoffFrom, cutoffPa
 import { KIND, STAGES, computeName, credentialName, effortName, icon, phaseName, runtimeName } from './vocab.js';
 import { stripMapSmall } from './overview.js';
 import { DEMO_COST, agentFields } from './shell.js';
+import { capsWords } from './autopilot.js';
 
 /* ---------- start: one box for the idea ---------- */
 const EXAMPLE = 'Learning-rate warmup is assumed to matter most for large batches. I suspect that with adaptive optimisers it is small batches that need it, because early second-moment estimates are noisy.';
@@ -67,6 +68,8 @@ export function composer() {
       /* how the agents are run: empty, or `null` for a tick, where the person chose nothing and the server's default holds */
       runtime: saved.runtime || '', model: saved.model || '', credential: saved.credential || '',
       fast: typeof saved.fast === 'boolean' ? saved.fast : null, ultracode: typeof saved.ultracode === 'boolean' ? saved.ultracode : null, sandbox: typeof saved.sandbox === 'boolean' ? saved.sandbox : null,
+      /* autopilot: `null` where the person chose nothing and the server's default holds */
+      autopilot: typeof saved.autopilot === 'boolean' ? saved.autopilot : null,
       /* kind -> true: accepted as it is written; false: waits for the person. Only what the person changed. */
       auto: saved.auto || {}, uploading: false, progress: 0, error: null, request: null,
     };
@@ -75,7 +78,7 @@ export function composer() {
 }
 export function keepComposer() {
   const s = composer();
-  storage.set(COMPOSER_KEY, { text: s.text, adv: s.adv, title: s.title, effort: s.effort, cutoffYear: s.cutoffYear, cutoffMonth: s.cutoffMonth, compute: s.compute, model_usd: s.model_usd, exp_minutes: s.exp_minutes, exp_usd: s.exp_usd, runtime: s.runtime, model: s.model, credential: s.credential, fast: s.fast, ultracode: s.ultracode, sandbox: s.sandbox, auto: s.auto, fileCount: s.files.length });
+  storage.set(COMPOSER_KEY, { text: s.text, adv: s.adv, title: s.title, effort: s.effort, cutoffYear: s.cutoffYear, cutoffMonth: s.cutoffMonth, compute: s.compute, model_usd: s.model_usd, exp_minutes: s.exp_minutes, exp_usd: s.exp_usd, runtime: s.runtime, model: s.model, credential: s.credential, fast: s.fast, ultracode: s.ultracode, sandbox: s.sandbox, autopilot: s.autopilot, auto: s.auto, fileCount: s.files.length });
 }
 export function clearComposer() { app.ui.start = null; storage.remove(COMPOSER_KEY); }
 export const composerReady = (s) => (s.text.trim().length > 0 || s.files.length > 0) && !s.uploading;
@@ -105,6 +108,8 @@ export function composerSettings(s) {
   if (s.credential) agents.credential = s.credential;
   ['fast', 'ultracode', 'sandbox'].forEach((name) => { if (typeof s[name] === 'boolean') agents[name] = s[name]; });
   if (Object.keys(agents).length) settings.agents = agents;
+  /* who decides: only where the person said so (the server's default may be autopilot) */
+  if (typeof s.autopilot === 'boolean') settings.autonomy = { mode: s.autopilot ? 'autopilot' : 'supervised' };
   return settings;
 }
 
@@ -128,6 +133,8 @@ export const startView = {
     if (d) { if (s.runtime && accepted('agent_runtimes').indexOf(s.runtime) < 0) s.runtime = ''; if (s.credential && accepted('agent_credentials').indexOf(s.credential) < 0) s.credential = ''; }
     /* how the agents are run: the server's default named as the default, the person's choice beside it */
     const agents = agentChoice(s), agentBase = agentDefaults();
+    /* who decides: the server's default (it may be autopilot) until the person ticks */
+    const autonomy = d && d.settings && d.settings.autonomy, autopilot = typeof s.autopilot === 'boolean' ? s.autopilot : !!autonomy && autonomy.mode === 'autopilot';
     const offer = (list, kept, base, name) => [['', base ? 'Default (' + name(base) + ')' : 'As the project default']].concat(accepted(list, kept).map((v) => [v, name(v)]));
     const kinds = reviewKinds();
     const waits = (kind) => (s.auto[kind] != null ? !s.auto[kind] : reviewDefault(kind) !== 'auto');
@@ -162,7 +169,9 @@ ${agents && agents.runtime === 'sdk' ? '' : html`        <label><span>Model effo
           ${reviewDefault('source') === 'auto' ? html`<label class="tick"><input type="checkbox" disabled> Sources <span class="quiet">verified by code, accepted on creation</span></label>` : ''}</fieldset>
         ${agents ? html`<fieldset class="adv-agents"><legend>How the agents work</legend>${agentFields(agents, { id: 'opt-agent', input: 'opt', tick: 'opt-agent',
           runtimes: offer('agent_runtimes', s.runtime, agentBase.runtime, runtimeName), credentials: offer('agent_credentials', s.credential, agentBase.credential, credentialName),
-          picked: { runtime: s.runtime, model: s.model, credential: s.credential }, modelHint: agentBase.model })}</fieldset>` : ''}</div></details>
+          picked: { runtime: s.runtime, model: s.model, credential: s.credential }, modelHint: agentBase.model })}</fieldset>` : ''}
+        ${autonomy ? html`<fieldset class="adv-agents adv-auto"><legend>Who decides</legend><label class="tick"><input type="checkbox" id="opt-autopilot" data-input="opt-autopilot"${autopilot ? raw(' checked') : ''}> <span>Autopilot: go on without me <span class="quiet">${autopilot ? 'Pages are accepted, edits applied, runs approved and checkpoints passed without you. One stretch is held to ' + capsWords(autonomy) + '; the caps are changed on the project\'s overview.' : 'Off: every proposal, edit, run and checkpoint waits for you.'}</span></span></label>
+          ${autopilot && agents && agents.runtime === 'sdk' && agents.sandbox === false ? html`<p class="note note-warn">${icon('warn')}<span>Autopilot is refused for agents that work outside the sandbox: the project would not be created.</span></p>` : ''}</fieldset>` : ''}</div></details>
       <div class="start-route" aria-label="What happens next"><div class="smap smap-route">
         ${[['Idea', 'yours'], ['Sources', 'verified papers'], ['Topics', 'what is known'], ['Questions', 'what is open'], ['Hypotheses', 'you accept or reject'], ['Experiments', 'you approve each run'], ['Results', 'written by code'], ['Findings', 'traced to results']].map((x, i) => html`<div class="smap-st${i ? ' none' : ' here'}"><div class="smap-dot"></div><div class="smap-name">${x[0]}</div><div class="smap-hint">${x[1]}</div></div>`)}</div></div>
     </div></div>`);
@@ -261,7 +270,7 @@ export const libraryView = {
         return html`<a class="lib-row" href="#/p/${encodeURIComponent(row.id)}/map"><div class="lib-main"><h2>${row.title || row.dir}</h2>${twin && row.dir ? html`<code class="lib-dir">${row.dir}/</code>` : ''}<p>${say}</p></div>
           <div class="lib-map">${stripMapSmall(by, pending ? pending.by_kind : null)}<span class="lib-counts">${by ? countsLine(by) : ' '}</span></div>
           <div class="lib-st st-${st[0]}"><span class="lib-st1">${st[0] === 'live' ? html`<span class="live-dot"></span>` : ''}${st[1]}</span><span class="lib-st2"${waits ? html` data-tip="${waits}"` : ''}>${st[2]}</span>${rebuilt ? html`<span class="lib-st3" data-state-problem data-tip="${rebuilt}">${icon('warn')}read from its events</span>` : ''}</div>
-          <div class="lib-num"${row.demonstration ? html` data-demonstration data-tip="${DEMO_COST}"` : ''}><span>${money((row.spent || {}).model_usd || 0)}</span>${row.demonstration ? html`<span class="lib-demo">in its story</span>` : ''}<span class="quiet">${ago(row.updated)}</span></div></a>`;
+          <div class="lib-num"${row.demonstration ? html` data-demonstration data-tip="${DEMO_COST}"` : ''}><span>${money((row.spent || {}).model_usd || 0)}</span>${row.demonstration ? html`<span class="lib-demo">in its story</span>` : ''}${row.autonomy === 'autopilot' ? html`<span class="lib-auto" data-autonomy="autopilot" data-tip="Autopilot is on: pages, edits, runs and checkpoints go on without you, up to the caps of one stretch">autopilot</span>` : ''}<span class="quiet">${ago(row.updated)}</span></div></a>`;
       })}</div>${broken}`;
     }
     setHTML(root, html`<div class="library"><div class="lib-wrap">${head}${body}</div></div>`);

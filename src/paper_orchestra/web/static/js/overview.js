@@ -8,6 +8,7 @@ import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
 import { DEMO_COST, UNVERIFIED, actHTML, agentFields, agentsSentence, continueControl, continueNotes, crashText, engineView, foldRuns, foldSteps, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, runWho, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
 import { decisionLink, openDecisions } from './decisions.js';
+import { autopilotHTML, autopilotOn, autopilotSub, autopilotView, heldReason } from './autopilot.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
 export function stripMap(store) {
@@ -271,10 +272,10 @@ export const overviewView = {
       : e.budget ? 'Round ' + (e.round || 1) + ' stopped at a budget.' : 'Round ' + (e.round || 1) + ' is paused at a checkpoint.';
     const sub = e.unverified ? plain(e.note) || UNVERIFIED
       : e.unknown && !e.crashed ? plain(e.stateNote) || 'Nothing on file says which round and phase it is in. Choose the phase to go on with.'
-      : e.working ? 'You can keep reading and deciding while it works.'
+      : e.working ? autopilotSub(store, e) || 'You can keep reading and deciding while it works.'
       : e.mode === 'failed' ? plain(e.error) : e.died ? plain(e.error) : e.crashed ? crashText(store, e.exit)
       : e.fresh ? 'Nothing has been spent. The idea' + ((p.attachments || []).length ? ' and ' + plural(p.attachments.length, 'file') : '') + ' are in place.'
-      : e.budget ? e.budget : waitingSentence(store);
+      : e.budget ? e.budget : [autopilotSub(store, e), waitingSentence(store)].filter(Boolean).join(' ');
     const idle = !e.working && !e.unverified;
     const actions = e.unverified ? html`${forgetButton(true)}<span class="quiet ov-unv">It is not this server's to stop, so there is no Stop. Nothing can be started here until it has ended or is forgotten.</span>`
       : !idle ? html`<a class="btn btn-l" href="${link({ view: 'map', sel: '', sub: '' })}">Watch on the map</a><button class="btn btn-l" data-act="stop"${e.stopping ? raw(' disabled') : ''}>${icon('stop')}${e.stopping ? 'Stopping…' : 'Stop'}</button>`
@@ -293,7 +294,7 @@ export const overviewView = {
       ${broken.map((x) => html`<a class="ov-run ov-broken" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">failed${x.runs > 1 ? ' ' + x.runs + ' times' : ''} · ${(x.meta || {}).state_reason || (x.last_run || {}).error || 'needs a decision from you'}</span></a>`)}
       ${interrupted.map((x) => html`<a class="ov-run ov-broken" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">interrupted · the worker that ran it is gone · run it again, or cancel it</span></a>`)}
       ${changed.map((x) => html`<a class="ov-run ov-broken" data-will-not-run="${x.id}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">needs approval again · ${whyNot(x.will_not_run)}</span></a>`)}
-      ${waitingApproval.map((x) => html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">accepted · runs only after you approve it</span></a>`)}`;
+      ${waitingApproval.map((x) => html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what" data-held="${x.id}">${autopilotOn(store) ? (heldReason(store, x.id) ? 'autopilot did not approve it · ' + plain(heldReason(store, x.id)) : 'accepted · autopilot approves and runs it in the next stretch') : 'accepted · runs only after you approve it'}</span></a>`)}`;
     const anyWatch = running.length + broken.length + interrupted.length + waitingApproval.length + changed.length;
     /* What the checkpoint said, as it said it then. (What the analyst recommended is among it;
        whether that still stands is the checkpoint's field, shown beside the button.) The
@@ -308,6 +309,8 @@ export const overviewView = {
     if (need) did = did.replace(need.message, '');
     did = did.replace(/\bThe [a-z ]{3,40} phase needs a model, and [^]*?show what is configured\)\.\s*/, '').trim();
     const beside = idle ? continueNotes(store, e, !!did) : '';
+    /* autopilot: at the top while it is on or has an account to give, among the settings otherwise */
+    const auto = autopilotHTML(store, e, items.length + asked.length), autoFirst = autopilotOn(store) || !!autopilotView(store).digest;
     setHTML(root, html`<div class="overview"><div class="ov-wrap">
       <header class="ov-head"><div class="ov-state">${e.working ? html`<span class="live-dot"></span>` : ''}${p.title}${e.unknown ? '' : ' · ' + (e.round ? 'round ' + e.round : 'new')}</div><h1>${headline}</h1><p class="ov-sub">${sub}</p>
         ${did ? html`<p class="ov-note">${cap1(phaseName(p.checkpoint.phase)) || 'The last phase'} finished ${ago(p.checkpoint.at)}: ${did}</p>` : ''}
@@ -315,6 +318,7 @@ export const overviewView = {
       ${problemsHTML(store)}
       <section class="ov-map" aria-label="Where things stand"><a class="ov-maplink" href="${link({ view: 'map', sel: '', sub: '' })}">Open the map <kbd>1</kbd></a>${stripMap(store)}${roundsLine(store, e)}</section>
       <div class="ov-cols"><div class="ov-col">
+        ${autoFirst ? auto : ''}
         <section class="ov-sec"><h2>Waiting for you<span>${items.length + asked.length}</span></h2>${decide}${waiting}</section>
         ${anyWatch ? html`<section class="ov-sec"><h2>Experiments that need watching</h2>${watch}</section>` : ''}
         <section class="ov-sec ov-arg"><h2>The argument so far<a class="ov-more" href="${link({ view: 'map', sel: '', sub: '' })}">see it as the map</a></h2>${argumentHTML(store)}</section>
@@ -322,6 +326,7 @@ export const overviewView = {
       </div><div class="ov-col">
         <section class="ov-sec"><h2>Activity</h2>${feedHTML(store)}</section>
         <section class="ov-sec"><h2>Spend</h2>${spendHTML(store)}</section>
+        ${autoFirst ? '' : auto}
         ${agentsHTML(store, e)}
         <section class="ov-sec"><h2>Write it up <span>optional</span></h2><p class="ov-paper">When the wiki says what you want to say, it can be written up as a paper with one of the bundled templates. <a class="linkish" href="${link({ view: 'paper', sel: '', sub: '' })}">Open the paper step</a></p></section>
       </div></div></div></div>`);

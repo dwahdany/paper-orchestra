@@ -439,7 +439,8 @@ const lower = (text) => (text ? text.charAt(0).toLowerCase() + text.slice(1) : '
 
 /* ---------- the strip ---------- */
 /** Who an event is from: the person, an agent, or the engine. */
-export const whoOf = (ev) => (ev.type === 'review.decided' || ev.type === 'request.created' || (ev.data || {}).by === 'human' ? 'you' : ev.agent || 'engine');
+/* (what the person's standing rule did is autopilot's: never said as theirs) */
+export const whoOf = (ev) => (ev.agent === 'autopilot' || (ev.data || {}).by === 'autopilot' ? 'autopilot' : ev.type === 'review.decided' || ev.type === 'request.created' || (ev.data || {}).by === 'human' ? 'you' : ev.agent || 'engine');
 /** The events with what belongs to one run on one line: queued, running, the result record
     and the end of the run are the steps of "E1 ran on this machine: succeeded after 1.8 s".
     A line is `{run: true, key, eid, n, backend, status, seconds, error, ts, parts}`. */
@@ -497,10 +498,10 @@ export function foldRuns(events) {
   const lines = [];
   out.forEach((ev) => {
     const prev = lines[lines.length - 1], d = ev.data || {}, pd = (prev && prev.data) || {};
-    if (prev && !prev.run && !ev.run && ev.type === 'experiment.state' && d.by === 'human' && d.state === 'approved'
-        && prev.type === 'page.updated' && pd.by === 'human' && pd.approval && pd.id === d.id) {
-      const said = /^You set how (.+) may run: (.+)$/.exec(prev.summary || '');
-      lines[lines.length - 1] = Object.assign({}, ev, { summary: said ? 'You approved ' + said[1] + ' to run ' + said[2].replace(/\bon local\b/, 'on this machine') : prev.summary });
+    if (prev && !prev.run && !ev.run && ev.type === 'experiment.state' && (d.by === 'human' || d.by === 'autopilot') && d.state === 'approved'
+        && prev.type === 'page.updated' && pd.by === d.by && pd.approval && pd.id === d.id) {
+      const said = /^(You|Autopilot) set how (.+) may run: (.+)$/.exec(prev.summary || '');
+      lines[lines.length - 1] = Object.assign({}, ev, { summary: said ? said[1] + ' approved ' + said[2] + ' to run ' + said[3].replace(/\bon local\b/, 'on this machine') : prev.summary });
       return;
     }
     lines.push(ev);

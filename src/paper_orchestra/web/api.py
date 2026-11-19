@@ -783,8 +783,23 @@ class Services:
         return list(self._experiments().number_check(project, page))
 
     def default_settings(self) -> dict[str, Any]:
-        """The settings a project starts with when nothing else is said."""
-        return ProjectSettings.from_dict(settings_for_new_project(None)).to_dict()
+        """The settings a project starts with when nothing else is said.  ``autonomy`` is
+        always among them, for the form that offers the switch."""
+        settings = ProjectSettings.from_dict(settings_for_new_project(None))
+        return {**settings.to_dict(), "autonomy": settings.autonomy.to_dict()}
+
+    def autopilot_digest(self, project: Project, state: Mapping[str, Any]) -> dict | None:
+        """What happened in the project's latest unattended stretch
+        (``research.autopilot.digest``); ``None`` when it never had one."""
+        from paper_orchestra.research import autopilot
+
+        return autopilot.digest(project, state)
+
+    def autopilot_held(self, project: Project) -> list[dict[str, str]]:
+        """What waits for the person although autopilot is on (``research.autopilot.held``)."""
+        from paper_orchestra.research import autopilot
+
+        return autopilot.held(project)
 
     def doctor(self, model: str | None = None) -> dict[str, Any]:
         from paper_orchestra import doctor
@@ -1804,6 +1819,8 @@ def _summary(context: Context, key: str, project: Project) -> dict[str, Any]:
         "dir": project.root.name,
         # Built to be looked at: what it "spent" on models is its story's, not a bill.
         "demonstration": project.demonstration,
+        # ``autopilot`` where the person's standing rule decides, else ``supervised``.
+        "autonomy": project.settings.autonomy.mode,
         "status": state["status"],
         "round": state["round"],
         "phase": state["phase"],
@@ -1857,7 +1874,8 @@ def _not_listed(key: str, project: Project, exc: Exception) -> dict[str, Any]:
 def _shown_settings(project: Project) -> dict[str, Any]:
     """The project's settings as they may leave the server: the URL of the repository
     without the password or token it carries, which stays in ``project.json``."""
-    settings = project.settings.to_dict()
+    # (``autonomy`` is always shown: the file leaves it out while nothing in it was set.)
+    settings = {**project.settings.to_dict(), "autonomy": project.settings.autonomy.to_dict()}
     if isinstance(settings.get("repo"), Mapping):
         repo = dict(settings["repo"])
         settings["repo"] = {**repo, "path": display_url(str(repo.get("path") or ""))}
@@ -1944,7 +1962,39 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
         "usage": usage if isinstance(usage, dict) else None,
         "problems": problems,
         "problems_total": total,
+        "autopilot": _autopilot_view(context, project, state),
     }
+
+
+def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]) -> dict[str, Any]:
+    """Autopilot as the project view carries it: ``{"mode", "refused", "since",
+    "digest", "held"}``.
+
+    ``refused`` is the sentence with which switching it on would be refused (the
+    project's agents work outside the sandbox), or ``null``.  ``since`` is when the
+    person switched it on (empty where the rule covers everything).  ``digest`` is the
+    account of the latest unattended stretch ("While you were away"), ``null`` for
+    a project that never had one, and ``held`` what waits for the person although it
+    is on: the experiments the rule does not approve, each with the reason.  A digest
+    that cannot be built does not cost the project view.
+    """
+    settings = project.settings
+    view: dict[str, Any] = {
+        "mode": settings.autonomy.mode,
+        "refused": settings.autopilot_refused(asked=True),
+        "since": project.autopilot_since,
+        "digest": None,
+        "held": [],
+    }
+    try:
+        view["digest"] = context.services.autopilot_digest(project, state)
+        view["held"] = (
+            view["digest"]["held"] if view["digest"] else context.services.autopilot_held(project)
+        )
+    except Exception as exc:
+        if context.standings.first_complaint(project.root, f"autopilot:{type(exc).__name__}"):
+            log.exception("The account of autopilot in %s could not be built.", project.root)
+    return view
 
 
 @router.get("/projects")
@@ -2274,23 +2324,40 @@ def get_project(project: Proj, context: Ctx) -> dict[str, Any]:
 class ProjectPatch(_Body):
     title: str | None = None
     settings: dict[str, Any] | None = None
+    #: With autopilot on (or switched on by this request): also settle what waits now.
+    settle: bool | None = None
 
 
 @router.patch("/projects/{pid}")
 def patch_project(body: ProjectPatch, project: Proj, context: Ctx) -> dict[str, Any]:
-    """Change the title and settings (a partial object is merged in, all or nothing)."""
+    """Change the title and settings (a partial object is merged in, all or nothing).
+
+    ``settings.autonomy`` is the switch of autopilot and the caps of one unattended
+    stretch (``mode``, ``rounds``, ``model_usd``, ``hours``, ``network``).  It is the
+    person's alone: agents cannot reach this server (the loopback is closed to them).
+    Switching it on for a project whose agents work outside the sandbox is refused
+    (422, with the sentence).  ``settle: true`` applies the standing rule to what
+    waits now, as the person's "also settle what waits now": proposed pages are
+    accepted, suggested edits applied and open decisions left at their default, each
+    recorded as autopilot's; the answer then carries ``settled`` (``{"accepted",
+    "applied", "defaulted", "left"}``).  Without it, what waited is left for them.
+    """
+    settled: dict[str, list[str]] | None = None
     try:
         if body.settings is not None:
             project.settings.update(_keep_repo_secret(project, body.settings))
         if body.title is not None:
             project.title = body.title
         project.save_settings()
+        if body.settle:
+            settled = project.settle_waiting()
     except BaseException:
         # Whatever went wrong (a refused value, a full disk): what could not be saved is
         # not kept in memory either, or it would be served as if it had been saved.
         context.workspace.restore(project)
         raise
-    return _project_view(context, project)
+    view = _project_view(context, project)
+    return view if settled is None else {**view, "settled": settled}
 
 
 # ---------------------------------------------------------------------------

@@ -598,6 +598,13 @@ const ACT = {
     app.render('ui');
   },
   'cutoff-none': () => saveCutoff(null),
+  /* autopilot: the form starts from what the project has (the server's values, also its caps) */
+  'autopilot-open': () => {
+    if (app.ui.autopilotEdit) { app.ui.autopilotEdit = null; return; }
+    const a = (store().project.settings || {}).autonomy || {};
+    app.ui.autopilotEdit = { on: a.mode === 'autopilot', rounds: String(a.rounds), model_usd: String(a.model_usd), hours: String(a.hours), network: !!a.network, settle: false, error: null, saving: false };
+    app.render('ui');
+  },
   'agents-open': () => {
     if (app.ui.agentsEdit) { app.ui.agentsEdit = null; return; }
     const a = (store().project.settings || {}).agents || {};
@@ -860,6 +867,22 @@ export function installActions() {
       saveCutoff(made.value);
     }
     else if (kind === 'agents') saveAgents();
+    else if (kind === 'autopilot') {
+      const ui = app.ui.autopilotEdit;
+      if (!ui || ui.saving) return;
+      const number = (text) => Number(String(text).replace(/[$,\s]/g, ''));
+      const autonomy = { mode: ui.on ? 'autopilot' : 'supervised', rounds: number(ui.rounds), model_usd: number(ui.model_usd), hours: number(ui.hours), network: !!ui.network };
+      if ([autonomy.rounds, autonomy.model_usd, autonomy.hours].some((v) => Number.isNaN(v) || v <= 0) || !Number.isInteger(autonomy.rounds)) { ui.error = 'Each cap is a number above zero: whole rounds, dollars, hours.'; app.render('autopilot'); return; }
+      ui.saving = true; ui.error = null;
+      const patch = { settings: { autonomy } };
+      if (ui.on && ui.settle) patch.settle = true;
+      api.patchProject(s.pid, patch).then(async (view) => {
+        app.ui.autopilotEdit = null; await s.refreshNow();
+        const done = view && view.settled;
+        say(ui.on ? 'Autopilot is on.' + (done ? ' It settled what waited: ' + plural(done.accepted.length, 'page') + ' accepted, ' + plural(done.applied.length, 'edit') + ' applied, ' + plural(done.defaulted.length, 'decision') + ' left at the default' + (done.left.length ? '; ' + done.left.length + ' left for you' : '') + '.' : ' Continue starts a stretch.') : 'Autopilot is off: everything waits for you again.');
+      }, (error) => { ui.error = message(error); })
+        .finally(() => { if (app.ui.autopilotEdit) app.ui.autopilotEdit.saving = false; app.render('autopilot'); });
+    }
     else if (kind === 'code') saveCode(form);
     else if (kind === 'start') startProject();
     else if (kind === 'request') {
@@ -940,6 +963,7 @@ export function installActions() {
     else if (what === 'ap-gpu') { (app.ui.approve[t.dataset.eid] = app.ui.approve[t.dataset.eid] || {}).gpu = t.value; app.render('backend'); }
     else if (what === 'paper-model') app.ui.paper.model = t.value;
     else if (what === 'limits' && app.ui.limits) app.ui.limits[t.dataset.name] = t.value;
+    else if (what === 'autopilot' && app.ui.autopilotEdit) app.ui.autopilotEdit[t.dataset.name] = t.value;
     else if (what === 'cutoff' && app.ui.cutoffEdit) app.ui.cutoffEdit[t.dataset.name] = t.value;
     else if (what === 'agents' && app.ui.agentsEdit && t.type !== 'checkbox' && t.tagName !== 'SELECT') app.ui.agentsEdit[t.dataset.name] = t.value;
     else if (what === 'limit' && app.ui.limitEdit) app.ui.limitEdit.value = t.value;
@@ -961,6 +985,8 @@ export function installActions() {
     else if (what === 'opt-review') { const s = composer(); s.auto[t.dataset.kind] = !t.checked; keepComposer(); }
     /* a tick about the agents: what it means is said beside it, and reads otherwise once it is changed */
     else if (what === 'opt-agent') { const s = composer(); s[t.dataset.name] = t.checked; keepComposer(); app.render('start'); }
+    else if (what === 'opt-autopilot') { const s = composer(); s.autopilot = t.checked; keepComposer(); app.render('start'); }
+    else if (what === 'autopilot-tick' && app.ui.autopilotEdit) { app.ui.autopilotEdit[t.dataset.name] = t.checked; app.render('autopilot'); }
     else if (what === 'request-about') { app.ui.request.about = t.checked; }
     else if (what === 'request-for') { app.ui.request.for = t.value; keepRequest(); app.render('request'); }
     else if (what === 'cutoff' && app.ui.cutoffEdit) { app.ui.cutoffEdit[t.dataset.name] = t.value; }

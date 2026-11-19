@@ -1577,3 +1577,22 @@ body { grid-template-rows: 44px auto minmax(0, 1fr) auto; }
   .smap-route .smap-st { padding-right: 8px; }
   .smap-route .smap-name, .smap-route .smap-hint { overflow-wrap: normal; word-break: normal; hyphens: none; }
 }
+
+/* ---------- autopilot: the switch, the caps, "While you were away" ---------- */
+.ov-auto[data-autopilot="on"] { border-left: 3px solid var(--accent); padding-left: 12px; }
+.auto-now { margin: 0 0 8px; font-size: 13px; line-height: 1.5; } .auto-now b { font-weight: 600; }
+.auto-digest { margin: 10px 0 4px; padding: 10px 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); min-width: 0; }
+.auto-digest h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+.auto-why { margin: 0 0 6px; font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+.auto-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; font-size: 12.5px; } .auto-list li { overflow-wrap: anywhere; } .auto-list b { font-weight: 600; }
+.auto-held, .auto-refused { margin: 8px 0 0; } .auto-held span, .auto-refused span { overflow-wrap: anywhere; min-width: 0; }
+.auto-form { max-width: 460px; } .auto-form .tick { display: flex; grid-template-columns: none; align-items: flex-start; gap: 8px; } .auto-form .tick input { height: auto; margin-top: 3px; flex: none; } .auto-form .tick > span { min-width: 0; }
+.auto-when { margin: 0; font-size: 12px; }
+.adv-auto .tick { display: flex; align-items: flex-start; gap: 8px; } .adv-auto .tick > span { min-width: 0; } .adv-auto .tick .quiet { display: block; }
+.lib-auto { font-size: 11px; padding: 1px 6px; border: 1px solid var(--rule); border-radius: 999px; color: var(--ink-2); }
+.dc-defaulted .dc-lead { margin: 0 0 6px; }
+@media (max-width: 720px) {
+  .auto-form label:not(.tick) { grid-template-columns: 72px minmax(0, 96px) minmax(0, 1fr); } .auto-form input:not([type="checkbox"]) { height: 44px; font-size: 16px; }
+  .auto-form .tick, .adv-auto .tick { min-height: 44px; } .auto-form .tick input, .adv-auto .tick input { width: 20px; height: 20px; }
+  .auto-form .btn { height: 44px; padding: 0 14px; font-size: 14.5px; } .auto-more summary { min-height: 44px; display: flex; align-items: center; }
+}

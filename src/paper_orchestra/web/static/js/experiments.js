@@ -503,7 +503,7 @@ function detailHTML(store, page, route) {
   const head = html`<header class="page-head"><div class="page-kicker"><span class="kicker-kind">${pageGlyph(page, 18)}<span>Experiment <b>${eid}</b></span></span>
       <span class="page-tools"><a class="ibtn" href="${link({ view: 'map', sel: page.path, sub: '' })}" data-tip="Show on the map (1)" aria-label="Show on the map">${icon('map')}</a><a class="ibtn" href="${link({ view: 'wiki', sel: page.path, sub: '' })}" data-tip="Open in the wiki (2)" aria-label="Open in the wiki">${icon('open')}</a></span></div>
     <h1 class="page-title">${page.title}</h1>${page.summary && page.summary !== page.title ? html`<p class="page-summary">${page.summary}</p>` : ''}
-    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by you ${ago(meta.decided_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span>${unacceptLink(page)}</div>
+    <div class="page-status">${reviewTag(page)}${stateTag(page)}<span class="page-by"><span>${page.author === 'human' ? 'written' : 'designed'} by ${who(page.author)}${page.round ? ', round ' + page.round : ''}</span>${meta.decided_by && page.review === 'accepted' ? html`<span>accepted by ${meta.decided_by === 'autopilot' ? 'autopilot' : 'you'} ${ago(meta.decided_at)}</span>` : ''}${meta.approved_by === 'autopilot' && meta.approved_at ? html`<span data-approved-by="autopilot">run approved by autopilot ${ago(meta.approved_at)}</span>` : ''}${meta.backend ? html`<span>${backendName(meta.backend, meta.gpu)}</span>` : ''}</span>${unacceptLink(page)}</div>
     ${tests.length ? html`<div class="ex-testsline"><span class="quiet">Tests</span>${tests.map((h) => html`<a class="chip" href="${link({ view: 'wiki', sel: h.path, sub: '' })}" data-sel="${h.path}" data-tip="${pageTip(h)}">${pageGlyph(h, 12)}<b>${h.id}</b> ${h.title}</a>`)}</div>` : ''}</header>`;
   if (!data) {
     return html`${head}${entry && entry.error ? html`<div class="note note-neg" role="alert">${icon('warn')}<span>The experiment could not be loaded: ${entry.error.message} <button class="linkish" data-act="reload-experiment" data-eid="${eid}">Try again</button></span></div>`
@@ -538,8 +538,8 @@ function detailHTML(store, page, route) {
     /* approved, and then the plan or the code changed: a run would be refused, so the page
        says so before the person presses anything, with what changed and by whom */
     const changes = (data.approval.changed || []).map((c) => whyNot(String(c)));
-    top = html`<section class="callout callout-changed"><h2>${icon('warn')}Changed since you approved it</h2>
-      <p>You approved this experiment${data.approval.at ? ' ' + ago(data.approval.at) : ''}. It is no longer what you approved, so it will not run as it is. Look at what changed, then approve it again.</p>
+    top = html`<section class="callout callout-changed"><h2>${icon('warn')}Changed since ${meta.approved_by === 'autopilot' ? 'it was approved' : 'you approved it'}</h2>
+      <p>${meta.approved_by === 'autopilot' ? 'Autopilot' : 'You'} approved this experiment${data.approval.at ? ' ' + ago(data.approval.at) : ''}. It is no longer what was approved, so it will not run as it is. Look at what changed, then approve it again.</p>
       ${changes.length ? html`<ul class="changed-list">${changes.map((c) => html`<li>${c}</li>`)}</ul>` : ''}
       <div class="row"><button class="btn btn-primary" data-act="reapprove" data-eid="${eid}">Look and approve again…</button>
         ${cancelButton(eid, does, {})}</div></section>`;

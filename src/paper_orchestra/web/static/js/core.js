@@ -101,7 +101,7 @@ export function openProjectUi(pid) {
   ui.approve = {}; ui.codeTab = {}; ui.codeEdit = {}; ui.runOpen = {}; ui.asDiff = {}; ui.histVersion = {};
   ui.newPage = null; ui.limitEdit = null; ui.limits = null; ui.limitsOpen = false;
   ui.editProposal = {}; ui.reapprove = null; ui.netNudge = null; ui.showLessons = false; ui.focusEditor = '';
-  ui.goMenu = null; ui.cutoffEdit = null; ui.agentsEdit = null; ui.starting = {}; ui.cancelling = {}; ui.decidedAll = false;
+  ui.goMenu = null; ui.cutoffEdit = null; ui.agentsEdit = null; ui.autopilotEdit = null; ui.starting = {}; ui.cancelling = {}; ui.decidedAll = false;
   /* (an earlier version kept on this device what rests on a rejected experiment; the server says it now) */
   storage.remove('po-rested:' + pid);
   ui.paper = { templates: ui.paper.templates, template: ui.paper.template };

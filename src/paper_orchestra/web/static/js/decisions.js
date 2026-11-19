@@ -30,6 +30,8 @@ import { icon } from './vocab.js';
 /** The decisions of a store, whatever it has loaded (a store without the list has none). */
 export const allDecisions = (store) => (store && Array.isArray(store.decisions) ? store.decisions : []);
 export const openDecisions = (store) => allDecisions(store).filter((d) => d.state === 'open');
+/** Those that went on at the agents' default where autopilot is on: not waiting, still answerable. */
+export const defaultedDecisions = (store) => allDecisions(store).filter((d) => d.state === 'defaulted');
 /** Everything that waits for the person: the proposals and the open decisions. */
 export const waitingCount = (store) => store.pending().length + openDecisions(store).length;
 /** "1 decision waits for your answer.", or nothing. */
@@ -42,7 +44,7 @@ const NAMED = 160;
 /** What the person answered, in a few words; empty while the decision is open. Their own
     words are given whole, or cut after `limit` characters where the answer is only named. */
 export function answerWords(d, limit = 0) {
-  const a = d && d.state !== 'open' ? d.answer : null;
+  const a = d && d.state !== 'open' && d.state !== 'defaulted' ? d.answer : null;
   if (!a) return '';
   if (a.dismissed) return 'left to the agents: their default holds';
   const chosen = a.option ? (d.options || [])[a.option - 1] : null;
@@ -132,7 +134,7 @@ export function decisionsPanel(store) {
 
 /** What was answered or left to the agents, the latest first, each folded. */
 export function decidedDecisions(store) {
-  const done = allDecisions(store).filter((d) => d.state !== 'open')
+  const done = allDecisions(store).filter((d) => d.state === 'answered' || d.state === 'withdrawn')
     .sort((a, b) => String((b.answer || {}).at).localeCompare(String((a.answer || {}).at)));
   if (!done.length) return '';
   return html`<section class="in-group dc-done" aria-label="Decisions you answered"><h3>Your decisions<span>${done.length}</span></h3>
@@ -141,12 +143,24 @@ export function decidedDecisions(store) {
       <div class="dc dc-in">${card(store, d)}</div></details>`)}</section>`;
 }
 
+/** What autopilot left at the agents' default: listed, each still to be answered. Nobody
+    said anything to these, and nothing here says the person did. */
+export function defaultedPanel(store) {
+  const list = defaultedDecisions(store).slice().sort((a, b) => String(b.created).localeCompare(String(a.created)));
+  if (!list.length) return '';
+  return html`<section class="in-group dc-done dc-defaulted" aria-label="Decisions that went on at the agents' default"><h3>Went on at the default<span>${list.length}</span></h3>
+    <p class="dc-lead">Autopilot did not wait for you: the agents went on with the default each of these states. You can still answer; your answer holds from then on.</p>
+    ${list.map((d) => html`<details class="dc-old" data-keep="dc-${d.id}" data-decision="${d.id}"><summary><span class="in-dec">${icon('dot')}</span>
+      <span class="dc-oq">${d.question}</span><span class="dc-oa">default: ${d.default || 'what the agent that asked would have done'}</span><span class="in-when">autopilot · ${ago(d.defaulted_at || d.created)}${about(store, d)}</span></summary>
+      <div class="dc dc-in">${card(store, d)}</div></details>`)}</section>`;
+}
+
 /** The decisions that belong to a page, as one line each: for the page's own view. */
 export function pageDecisions(store, path) {
   const mine = allDecisions(store).filter((d) => d.page === path);
   if (!mine.length) return '';
-  return html`<div class="dc-on-page">${mine.map((d) => html`<p class="dc-ref" data-decision-of="${d.id}">${icon(d.state === 'open' ? 'dot' : d.state === 'withdrawn' ? 'x' : 'check')}<span><b>${d.state === 'open' ? 'Waits for your decision' : d.state === 'withdrawn' ? 'Left to the agents' : 'You decided'}:</b> ${d.question}${d.state === 'open' ? '' : html` <q>${answerWords(d, NAMED)}</q>`}
-    <a href="${decisionLink(d.id)}">${d.state === 'open' ? 'Answer it in the inbox' : 'Change it in the inbox'}</a></span></p>`)}</div>`;
+  return html`<div class="dc-on-page">${mine.map((d) => html`<p class="dc-ref" data-decision-of="${d.id}">${icon(d.state === 'open' || d.state === 'defaulted' ? 'dot' : d.state === 'withdrawn' ? 'x' : 'check')}<span><b>${d.state === 'open' ? 'Waits for your decision' : d.state === 'withdrawn' ? 'Left to the agents' : d.state === 'defaulted' ? 'Went on at the default (autopilot)' : 'You decided'}:</b> ${d.question}${d.state === 'open' ? '' : html` <q>${d.state === 'defaulted' ? d.default || '' : answerWords(d, NAMED)}</q>`}
+    <a href="${decisionLink(d.id)}">${d.state === 'open' || d.state === 'defaulted' ? 'Answer it in the inbox' : 'Change it in the inbox'}</a></span></p>`)}</div>`;
 }
 
 const message = (error) => (error instanceof Unreachable ? 'The server is not answering.' : (error && error.message) || 'Something went wrong.');

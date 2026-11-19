@@ -1,11 +1,12 @@
 /* The inbox: everything that waits for a decision, with the proposal beside it. */
 
 import { app, link, listAlone } from './core.js';
-import { ago, html, plural, raw, setHTML, tf } from './util.js';
+import { ago, html, plain, plural, raw, setHTML, tf } from './util.js';
 import { KIND, STAGES, agentName, glyph, icon, kindName, shownState } from './vocab.js';
 import { afterRender, pageName, panelHTML, proposalWhat } from './page.js';
 import { continueControl, engineView } from './shell.js';
-import { decidedDecisions, decisionsPanel, openDecisions } from './decisions.js';
+import { decidedDecisions, decisionsPanel, defaultedPanel, openDecisions } from './decisions.js';
+import { heldRuns } from './autopilot.js';
 
 export const whatOf = (item) => (item.type === 'page' ? 'New ' + kindName(item.kind).toLowerCase() : proposalWhat(item.prop, item.page));
 export const summaryOf = (item) => (item.type === 'edit' ? item.prop.summary : item.page.summary && item.page.summary !== item.page.title ? item.page.summary : '');
@@ -91,6 +92,10 @@ export const inboxView = {
         <span class="in-name">${pageName(it.page)}</span><span class="in-when">${it.edit ? 'edit ' : ''}${it.review} ${ago(it.at)}</span>
         ${it.edit && it.summary ? html`<span class="in-why in-sugg">${it.summary}</span>` : ''}${it.reason ? html`<span class="in-why"><q>${it.reason}</q></span>` : ''}</a>`)}
       ${decidedAll.length > decided.length && !app.ui.decidedAll ? html`<button class="linkish in-more" data-act="decided-more">Show earlier decisions</button>` : ''}</div>` : '';
+    /* what autopilot does not approve: it waits for the person although autopilot is on */
+    const heldList = heldRuns(store).map((h) => ({ h, x: store.expById.get(h.id) })).filter((it) => it.x);
+    const held = heldList.length ? html`<div class="in-group in-held"><h3>Runs autopilot left for you<span>${heldList.length}</span></h3>${heldList.map(({ h, x }) => html`
+      <a class="in-row in-old" data-held="${h.id}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}"><span class="in-dec">${icon('warn')}</span><span class="in-name">${pageName(x)}</span><span class="in-when">not approved</span><span class="in-why">${plain(h.reason)}</span></a>`)}</div>` : '';
     const shown = cur ? cur.page : route.sel && store.byPath.has(route.sel) ? store.byPath.get(route.sel) : null;
     const e = engineView(store);
     const idle = !e.working && !e.unverified;
@@ -100,7 +105,7 @@ export const inboxView = {
           <button class="btn btn-s" data-act="bulk-accept"${nChecked ? '' : raw(' disabled')}>Accept ${nChecked || ''} selected <kbd>⇧A</kbd></button>
           <button class="btn btn-s btn-neg-quiet" data-act="bulk-reject"${nChecked ? '' : raw(' disabled')} aria-expanded="${tf(app.ui.rejecting === 'bulk')}">Reject selected…</button></div>
           ${app.ui.rejecting === 'bulk' ? html`<form class="reject-form" data-form="bulk-reject"><label class="sr" for="why-bulk">Reason</label><input id="why-bulk" name="reason" data-input="reason" data-ref="bulk" value="${app.ui.reasons.bulk || ''}" placeholder="Why? One reason for all ${nChecked}; the agents read it." autocomplete="off"><button class="btn btn-neg" type="submit">Reject ${nChecked}</button><button class="btn btn-quiet" type="button" data-act="reject-cancel">Cancel</button></form>` : ''}` : ''}</header>
-        <div class="in-scroll">${decisionsPanel(store)}${items.length ? list : html`<div class="in-clear"><p>Every proposal has a decision.${idle && e.mode === 'checkpoint' ? ' The checkpoint can go on' + (asked ? ' without your answer: the agents use their default.' : '.') : ''}</p>${idle && !e.fresh ? continueControl(store, e, 'inbox') : ''}</div>`}${decidedDecisions(store)}${done}</div>
+        <div class="in-scroll">${decisionsPanel(store)}${held}${items.length ? list : html`<div class="in-clear"><p>Every proposal has a decision.${idle && e.mode === 'checkpoint' ? ' The checkpoint can go on' + (asked ? ' without your answer: the agents use their default.' : '.') : ''}</p>${idle && !e.fresh ? continueControl(store, e, 'inbox') : ''}</div>`}${defaultedPanel(store)}${decidedDecisions(store)}${done}</div>
         <footer class="in-keys"><span><kbd>J</kbd><kbd>K</kbd> move</span><span><kbd>X</kbd> select</span><span><kbd>A</kbd> accept</span><span data-tip="Saving an edit does not decide the proposal: “Save and accept” does"><kbd>E</kbd> edit</span><span><kbd>R</kbd> reject</span><span data-tip="A decision is sent after five seconds; until then Z takes it back"><kbd>Z</kbd> undo, within 5 s</span></footer></section>
       <section class="in-detail" aria-label="The proposal"><a class="back in-back" href="${link({ view: 'inbox', sel: '', sub: '' })}">Inbox${waiting ? html` <span class="quiet">· ${waiting} waiting</span>` : ''}</a>${shown ? panelHTML(store, shown, { mode: 'inbox', sub: route.sub }) : html`<div class="in-none"><p>${items.length ? 'Select a proposal to read it.' : 'Proposals appear here when the agents have something for you to decide.'}</p></div>`}</section></div>`);
     afterRender(root);

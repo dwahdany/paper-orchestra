@@ -38,7 +38,7 @@ export function alsoSucceeded(page) {
   return record ? html`<a class="st-also" href="${link({ view: 'wiki', sel: record.path, sub: '' })}" data-sel="${record.path}" data-tip="Its result record">${successWords(page)}</a>` : html`<span class="st-also">${successWords(page)}</span>`;
 }
 export const reviewTag = (page) => (page.review === 'proposed' ? html`<span class="tag tag-proposed">Proposed</span>` : page.review === 'rejected' ? html`<span class="tag tag-rejected">Rejected</span>` : '');
-export const who = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : 'the ' + agentName(author));
+export const who = (author) => (author === 'human' ? 'you' : author === 'system' ? 'code' : author === 'autopilot' ? 'autopilot' : 'the ' + agentName(author));
 function byline(page) {
   const meta = page.meta || {};
   const parts = [(page.author === 'human' ? 'written by you' : page.author === 'system' ? 'record written by code' : 'by the ' + agentName(page.author)) + (page.round ? ', round ' + page.round : '')];
