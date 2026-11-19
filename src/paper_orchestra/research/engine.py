@@ -384,6 +384,17 @@ def _from_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
             # The record of an unattended stretch travels with its events.
             carried = event.get("data") if isinstance(event.get("data"), Mapping) else {}
             stretch = autopilot.read_stretch(carried.get("stretch"))
+            if kind == autopilot.STARTED and isinstance(carried.get("caps"), Mapping):
+                # Its beginning says what it was held to and when it began; the rest
+                # (rounds, spend) is in the events that follow, where there are any.
+                begun = autopilot.new_stretch(
+                    carried["caps"],
+                    started=str(event.get("ts") or ""),
+                    spent_usd=0.0,
+                    round=round if _whole(round) else 0,
+                )
+                begun["seq"] = event.get("seq") if _whole(event.get("seq")) else 0
+                stretch = autopilot.read_stretch(begun)
             if stretch is not None:
                 state[autopilot.STRETCH_KEY] = stretch
             continue
@@ -3477,6 +3488,11 @@ class Engine:
         leaves no line of approved experiments behind.
         """
         self._recover()
+        if self._stretch is None:
+            # A stretch whose worker was killed in the middle of a run left the page as
+            # running; the recovery has just put it back in the queue.  It was
+            # autopilot's approval, for that stretch, and this is none.
+            self._take_back_rule_approvals()
         self._tidy_hypotheses(release=False)
         self._held = {}
         waiting = self._waiting_to_run()

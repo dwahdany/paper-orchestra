@@ -639,6 +639,11 @@ export function strip(store) {
       <span class="strip-text">You stopped the agents. What they had written is kept; the phase resumes where it stopped.</span>
       <span class="strip-actions">${n ? html`<a class="btn" href="${link({ view: 'inbox', sel: '', sub: '' })}">${store.pending().length ? 'Review' : 'Answer'} ${n}</a>` : ''}${continueControl(store, e, 'strip')}</span></div>${sub}`;
   }
+  if (e.budget && /autopilot's cap/i.test(e.budget)) {
+    /* a cap of the unattended stretch, not the project's limit: nothing is to be raised here, and Continue starts a new stretch */
+    return html`<div class="strip s-budget" role="status" data-cap="autopilot"><span class="strip-mark">${icon('warn')}</span><span class="strip-kicker">Autopilot's cap reached · round ${e.round || 1}</span>
+      <span class="strip-text">${e.budget}</span><span class="strip-actions">${continueControl(store, e, 'strip')}</span></div>${sub}`;
+  }
   if (e.budget) {
     const editing = app.ui.limitEdit;
     return html`<div class="strip s-budget" role="status"><span class="strip-mark">${icon('warn')}</span><span class="strip-kicker">Budget reached · round ${e.round || 1}</span>

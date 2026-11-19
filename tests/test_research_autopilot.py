@@ -757,6 +757,47 @@ def test_an_approval_left_by_a_stretch_that_died_is_run_by_nobody(tmp_path):
     assert backend.jobs == [] and project.page(name).state == "planned"
 
 
+def test_a_run_a_killed_stretch_left_running_is_not_run_by_a_supervised_start(tmp_path):
+    """The worker of a stretch is killed in the middle of a run: the page reads running.
+    The person switches autopilot off and continues; the recovery puts the run back in
+    the queue, and it is still autopilot's approval of a stretch that is over."""
+    project = classic_project(tmp_path)
+    name = planned(project)
+    page = experiments.approve_by_rule(project, name, backends={"modal": Remote()})
+    project.set_state(page.path, "running", by="system")
+    project.settings.update({"autonomy": {"mode": "supervised"}})
+    project.save_settings()
+    backend = Remote()
+    classic.make_engine(project, classic.Team(), backend).advance(phase="run")
+    assert backend.jobs == []
+    assert project.page(name).state == "planned"
+    assert experiments.runs(project, name) == []
+
+
+def test_no_record_of_a_run_says_that_the_person_approved_it(tmp_path):
+    project = classic_project(tmp_path)
+    stretch(project)
+    for page in project.pages(kind="result"):
+        text = (project.root / page.path).read_text()
+        assert "you approved" not in text.lower() and "the person approved" not in text.lower()
+        assert "by you" not in text.lower()
+    for record in experiments.runs(project, "E1"):
+        said = json.dumps(record).lower()
+        assert "human" not in said and "you approved" not in said and "the person" not in said
+
+
+def test_the_start_of_a_stretch_alone_rebuilds_its_record(tmp_path):
+    """A state file lost before the worker has gone on once: the event of the start says
+    what the stretch was held to, and it reads as ended, never as under way."""
+    project = classic_project(tmp_path)
+    team = classic.Team()
+    team.failures["intake.intake"] = 2
+    stretch(project, team)
+    (project.root / "state.json").unlink()
+    record = read_state(project)["autopilot"]
+    assert record["caps"]["rounds"] == 1 and record["seq"] > 0 and record["ended"]
+
+
 def test_nothing_that_may_run_ends_the_stretch_and_says_what_waits(tmp_path):
     """The classic runtime on the local backend: the rule approves no run, so the round
     cannot go on, and the stretch says so instead of running the phase again."""
