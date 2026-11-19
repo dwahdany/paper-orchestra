@@ -2180,6 +2180,33 @@ UNSANDBOXED_RUN = (
 )
 
 
+#: The same for a project as a whole, where its settings alone say that no run of it
+#: is approved by the rule: said wherever autopilot says what it does without the person.
+RUNS_WAIT = (
+    "an experiment that needs no GPU would run on this machine as you, outside a sandbox "
+    "(the local backend under the classic runtime), and autopilot does not approve code "
+    "nobody has read for that, so those runs still wait for your approval (one that asks "
+    "for a GPU runs on Modal, and is approved). With sandboxed sdk agents (`--runtime "
+    "sdk`) or Modal as the compute backend it approves them all"
+)
+
+
+def rule_leaves_runs(project_or_settings: Any, compute: str | None = None) -> str | None:
+    """Why the standing rule approves no run of a project with these settings, as the
+    rest of a sentence; ``None`` where it approves those it may (:func:`rule_holds`).
+
+    That is the case :data:`UNSANDBOXED_RUN` names, for every experiment that does
+    not ask for a GPU (one that does runs on Modal): the classic runtime (or sdk agents without their sandbox) on
+    the local backend.  ``compute`` stands in for the settings' backend where the
+    question is about a project that does not exist yet.
+    """
+    settings = getattr(project_or_settings, "settings", project_or_settings)
+    agents = settings.agents
+    sandboxed_agents = agents.runtime == "sdk" and agents.sandbox is True
+    backend = settings.compute if compute is None else compute
+    return RUNS_WAIT if backend == "local" and not sandboxed_agents else None
+
+
 def _ended_runs(project: Project, experiment_id: str) -> list[dict[str, Any]]:
     """The runs of the experiment that are over for good: settled, and not put back in
     the queue by a stop."""

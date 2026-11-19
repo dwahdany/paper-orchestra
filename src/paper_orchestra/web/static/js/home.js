@@ -135,6 +135,8 @@ export const startView = {
     const agents = agentChoice(s), agentBase = agentDefaults();
     /* who decides: the server's default (it may be autopilot) until the person ticks */
     const autonomy = d && d.autonomy, autopilot = typeof s.autopilot === 'boolean' ? s.autopilot : !!autonomy && autonomy.mode === 'autopilot';
+    /* why autopilot would approve no run of a project with this runtime and backend: the server's sentence, or nothing */
+    const runsWait = (((d && d.autopilot_runs_wait) || {})[(agents && agents.runtime) || 'classic'] || {})[s.compute || (d && d.settings && d.settings.compute) || ''] || '';
     const offer = (list, kept, base, name) => [['', base ? 'Default (' + name(base) + ')' : 'As the project default']].concat(accepted(list, kept).map((v) => [v, name(v)]));
     const kinds = reviewKinds();
     const waits = (kind) => (s.auto[kind] != null ? !s.auto[kind] : reviewDefault(kind) !== 'auto');
@@ -170,7 +172,7 @@ ${agents && agents.runtime === 'sdk' ? '' : html`        <label><span>Model effo
         ${agents ? html`<fieldset class="adv-agents"><legend>How the agents work</legend>${agentFields(agents, { id: 'opt-agent', input: 'opt', tick: 'opt-agent',
           runtimes: offer('agent_runtimes', s.runtime, agentBase.runtime, runtimeName), credentials: offer('agent_credentials', s.credential, agentBase.credential, credentialName),
           picked: { runtime: s.runtime, model: s.model, credential: s.credential }, modelHint: agentBase.model })}</fieldset>` : ''}
-        ${autonomy ? html`<fieldset class="adv-agents adv-auto"><legend>Who decides</legend><label class="tick"><input type="checkbox" id="opt-autopilot" data-input="opt-autopilot"${autopilot ? raw(' checked') : ''}> <span>Autopilot: go on without me <span class="quiet">${autopilot ? 'Pages are accepted, edits applied, runs approved and checkpoints passed without you. One stretch is held to ' + capsWords(autonomy) + '; the caps are changed on the project\'s overview.' : 'Off: every proposal, edit, run and checkpoint waits for you.'}</span></span></label>
+        ${autonomy ? html`<fieldset class="adv-agents adv-auto"><legend>Who decides</legend><label class="tick"><input type="checkbox" id="opt-autopilot" data-input="opt-autopilot"${autopilot ? raw(' checked') : ''}> <span>Autopilot: go on without me <span class="quiet">${autopilot ? (runsWait ? 'Pages are accepted, edits applied and checkpoints passed without you. Runs on this machine are not approved without you: ' + runsWait + '.' : 'Pages are accepted, edits applied, runs approved and checkpoints passed without you.') + ' One stretch is held to ' + capsWords(autonomy) + '; the caps are changed on the project\'s overview.' : 'Off: every proposal, edit, run and checkpoint waits for you.'}</span></span></label>
           ${autopilot && agents && agents.runtime === 'sdk' && agents.sandbox === false ? html`<p class="note note-warn">${icon('warn')}<span>Autopilot is refused for agents that work outside the sandbox: the project would not be created.</span></p>` : ''}</fieldset>` : ''}</div></details>
       <div class="start-route" aria-label="What happens next"><div class="smap smap-route">
         ${[['Idea', 'yours'], ['Sources', 'verified papers'], ['Topics', 'what is known'], ['Questions', 'what is open'], ['Hypotheses', 'you accept or reject'], ['Experiments', 'you approve each run'], ['Results', 'written by code'], ['Findings', 'traced to results']].map((x, i) => html`<div class="smap-st${i ? ' none' : ' here'}"><div class="smap-dot"></div><div class="smap-name">${x[0]}</div><div class="smap-hint">${x[1]}</div></div>`)}</div></div>
@@ -207,7 +209,8 @@ export function countsLine(by) {
 }
 /** How many proposals wait in a project, in words: the live number the row carries. */
 function waitingWords(row) {
-  const n = row.pending || 0;
+  /* with the runs autopilot left for the person: they wait as a proposal does (the Inbox counts them too) */
+  const n = (row.pending || 0) + (row.held || 0);
   /* (what the agents asked the person to choose is counted apart: it holds nothing up) */
   const asked = ((row.counts || {}).decisions || {}).open || 0;
   const decide = asked ? asked + (asked === 1 ? ' decision' : ' decisions') + ' to answer' : '';
@@ -219,7 +222,7 @@ function waitingWords(row) {
 /** Where a row says the project stands. The row carries the engine's reading and where it
     came from (`state_source`): a project whose state.json is lost is listed where its events
     say it stands, and "Not started" is said only of one the server says has not started. */
-function rowState(row) {
+export function rowState(row) {
   const running = row.worker && row.worker !== 'idle';
   const waiting = waitingWords(row);
   const and = (text) => (waiting ? text + ' · ' + waiting : text);

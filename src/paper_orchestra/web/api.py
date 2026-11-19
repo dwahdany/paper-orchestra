@@ -794,6 +794,21 @@ class Services:
         is set, as a project's file does."""
         return ProjectSettings.from_dict(settings_for_new_project(None)).autonomy.to_dict()
 
+    def autopilot_runs_wait(self) -> dict[str, dict[str, str | None]]:
+        """For each agent runtime and compute backend of a new project: why the standing
+        rule would approve no run of it, or ``None`` (``experiments.rule_leaves_runs``)."""
+        from paper_orchestra.research.experiments import rule_leaves_runs
+
+        found: dict[str, dict[str, str | None]] = {}
+        for runtime in AGENT_RUNTIMES:
+            settings = ProjectSettings.from_dict(
+                settings_for_new_project({"agents": {"runtime": runtime, "sandbox": True}})
+            )
+            found[runtime] = {
+                backend: rule_leaves_runs(settings, backend) for backend in COMPUTE_BACKENDS
+            }
+        return found
+
     def doctor(self, model: str | None = None) -> dict[str, Any]:
         from paper_orchestra import doctor
 
@@ -1143,7 +1158,7 @@ class _Counts:
 
     def __init__(self) -> None:
         self._guard = threading.Lock()
-        self._known: dict[Path, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+        self._known: dict[Path, tuple[tuple[Any, ...], dict[str, Any], int]] = {}
 
     @staticmethod
     def _signature(root: Path) -> tuple[Any, ...]:
@@ -1172,10 +1187,24 @@ class _Counts:
             return known[1]
         if time.monotonic() >= deadline:
             return None
-        counts = Project.open(root).counts()
+        project = Project.open(root)
+        counts = project.counts()
+        # What autopilot did not approve waits for the person as a proposal does, and
+        # is counted at the same look (a change of it is an event, as theirs is).
+        try:
+            held = len(autopilot.held(project))
+        except (ProjectError, OSError, ValueError):
+            held = 0
         with self._guard:
-            self._known[root] = (signature, counts)
+            self._known[root] = (signature, counts, held)
         return counts
+
+    def held(self, root: Path) -> int:
+        """How many runs autopilot left for the person in the project in ``root``, as
+        :meth:`of` last counted them; 0 where it is off, and before the first count."""
+        with self._guard:
+            known = self._known.get(root)
+        return known[2] if known is not None else 0
 
     def keep(self, roots: set[Path]) -> None:
         """Forget the projects that are no longer in the workspace."""
@@ -1558,7 +1587,10 @@ def defaults(context: Ctx) -> dict[str, Any]:
 
     ``autonomy`` is ``settings.autonomy`` as a project created now would have it: the
     mode (``autopilot`` where ``PAPER_ORCHESTRA_AUTONOMY`` asks for it) and the caps of
-    one unattended stretch, for the composer's tick.
+    one unattended stretch, for the composer's tick.  ``autopilot_runs_wait`` says for
+    each runtime and compute backend a project can be created with why autopilot would
+    approve no run of it (``{"classic": {"local": sentence, "modal": null}, ...}``;
+    ``experiments.rule_leaves_runs``), so that the tick promises what will happen.
 
     ``creatable_kinds`` are the kinds of page the person can write (``kind`` of
     ``POST .../pages``), and ``kind_writers`` says for each kind which agents write
@@ -1566,6 +1598,7 @@ def defaults(context: Ctx) -> dict[str, Any]:
     return {
         "settings": context.services.default_settings(),
         "autonomy": context.services.default_autonomy(),
+        "autopilot_runs_wait": context.services.autopilot_runs_wait(),
         "phases": list(PHASES),
         "request_for": list(REQUEST_FOR),
         "efforts": list(EFFORTS),
@@ -1836,6 +1869,8 @@ def _summary(context: Context, key: str, project: Project) -> dict[str, Any]:
         # False: the project's files name a worker this server cannot verify (no Stop).
         "worker_verified": worker.get("verified") if worker else None,
         "counts": None,
+        # How many runs autopilot left for the person: counted with ``counts``.
+        "held": 0,
     }
 
 
@@ -1852,7 +1887,12 @@ def _counted(
         counts = None
     if counts is None:
         return row
-    return {**row, "counts": counts, "pending": counts["pending"]["total"]}
+    return {
+        **row,
+        "counts": counts,
+        "pending": counts["pending"]["total"],
+        "held": context.counts.held(project.root),
+    }
 
 
 def _not_listed(key: str, project: Project, exc: Exception) -> dict[str, Any]:
@@ -1966,7 +2006,12 @@ def _project_view(context: Context, project: Project) -> dict[str, Any]:
 
 def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]) -> dict[str, Any]:
     """Autopilot as the project view carries it: ``{"mode", "refused", "since",
-    "digest", "held"}``.
+    "digest", "held", "runs_wait"}``.
+
+    ``runs_wait`` is why the standing rule approves no run of the project as its
+    settings stand (``experiments.rule_leaves_runs``: unread code would run as the
+    person outside a sandbox), as the rest of a sentence, or ``null``: what the
+    switch must not promise.
 
     ``refused`` is the sentence with which switching it on would be refused (the
     project's agents work outside the sandbox), or ``null``.  ``since`` is when the
@@ -1976,6 +2021,8 @@ def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]
     is on: the experiments the rule does not approve, each with the reason.  A digest
     that cannot be built does not cost the project view.
     """
+    from paper_orchestra.research.experiments import rule_leaves_runs
+
     settings = project.settings
     view: dict[str, Any] = {
         "mode": settings.autonomy.mode,
@@ -1983,6 +2030,7 @@ def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]
         "since": project.autopilot_since,
         "digest": None,
         "held": [],
+        "runs_wait": rule_leaves_runs(project),
     }
     try:
         view["digest"] = autopilot.digest(project, state)

@@ -96,6 +96,7 @@ def _plural(count: int, noun: str, many: str | None = None) -> str:
 def _hours(hours: float) -> str:
     """``12 hours``, ``1 hour``, ``30 minutes``: a length of time as it is said."""
     if hours >= 1:
+        hours = round(hours, 1)  # "5 hours", not "5.00002 hours"
         return f"{hours:g} hour{'' if hours == 1 else 's'}"
     minutes = hours * 60
     if minutes >= 1:
@@ -113,7 +114,13 @@ def caps_in_words(caps: Mapping[str, Any]) -> str:
 
 
 def new_stretch(
-    caps: Mapping[str, Any], *, started: str, spent_usd: float, round: int
+    caps: Mapping[str, Any],
+    *,
+    started: str,
+    spent_usd: float,
+    round: int,
+    unpriced_usd: float = 0.0,
+    experiment_usd: float = 0.0,
 ) -> dict[str, Any]:
     """The record of a stretch that begins now.
 
@@ -127,11 +134,22 @@ def new_stretch(
         "seq": 0,
         "caps": {name: caps.get(name) for name in ("rounds", "model_usd", "hours", "network")},
         "spent_at_start": round_usd(spent_usd),
+        #: What the tokens on models without a price counted for when it began, and
+        #: what the project's experiments had cost: the stretch counts from there.
+        "unpriced_at_start": round_usd(unpriced_usd),
+        "experiment_at_start": round_usd(experiment_usd),
         "round_at_start": round,
         #: Rounds whose analysis completed in this stretch, and passes of the engine.
         "rounds": 0,
         "passes": 0,
+        #: What counts against the dollar cap: what the ledger prices, and
+        #: ``unpriced_usd`` of it for the tokens of ``unpriced_models``, which have no
+        #: price and are counted at the highest list price.
         "spent_usd": 0.0,
+        "unpriced_usd": 0.0,
+        "unpriced_models": [],
+        #: What its experiments cost: no cap of autopilot counts that.
+        "experiment_usd": 0.0,
         "ended": None,
         "reason": None,
         "said": None,
@@ -149,6 +167,7 @@ def read_stretch(value: Any) -> dict[str, Any] | None:
         return None
     caps = value.get("caps") if isinstance(value.get("caps"), Mapping) else {}
     ended, reason, said = value.get("ended"), value.get("reason"), value.get("said")
+    models = value.get("unpriced_models")
     return {
         "started": value["started"],
         "seq": int(_number(value.get("seq"))),
@@ -159,10 +178,15 @@ def read_stretch(value: Any) -> dict[str, Any] | None:
             "network": caps.get("network") is True,
         },
         "spent_at_start": _number(value.get("spent_at_start")),
+        "unpriced_at_start": _number(value.get("unpriced_at_start")),
+        "experiment_at_start": _number(value.get("experiment_at_start")),
         "round_at_start": int(_number(value.get("round_at_start"))),
         "rounds": int(_number(value.get("rounds"))),
         "passes": int(_number(value.get("passes"))),
         "spent_usd": _number(value.get("spent_usd")),
+        "unpriced_usd": _number(value.get("unpriced_usd")),
+        "unpriced_models": [str(m) for m in models] if isinstance(models, list) else [],
+        "experiment_usd": _number(value.get("experiment_usd")),
         "ended": ended if isinstance(ended, str) else None,
         "reason": reason if isinstance(reason, str) else None,
         "said": said if isinstance(said, str) else None,
@@ -193,7 +217,8 @@ def digest(
     had one.  ``state`` is the engine's state (read from ``state.json`` without it)::
 
         {"started", "ended", "running": bool, "reason", "why", "said",
-         "rounds", "caps", "spent_usd", "experiment_usd", "seconds",
+         "rounds", "caps", "spent_usd", "unpriced_usd", "unpriced_models",
+         "experiment_usd", "experiment_limit": {"spent", "allowed"}, "seconds",
          "accepted": [{"path", "kind", "id"}], "accepted_by_kind": {kind: n},
          "edits": [{"proposal", "path"}],
          "decisions": [{"decision", "page"}],
@@ -207,6 +232,12 @@ def digest(
     the rule would not approve as the project stands, with the reason: what truly
     waits for the person.  Everything but ``held`` is counted from the project's
     events since the stretch began; nothing is written.
+
+    ``spent_usd`` is what counts against the dollar cap; ``unpriced_usd`` of it stands
+    for the tokens of ``unpriced_models``, which have no price here and are counted
+    at the highest list price there is.  ``experiment_usd`` is what the experiments
+    of the stretch cost, which no cap of autopilot counts: ``experiment_limit`` is
+    what does, the project's own limit and what is spent of it in all.
     """
     if state is None:
         from paper_orchestra.research.engine import read_state
@@ -261,8 +292,12 @@ def digest(
     ended = stretch["ended"]
     spent = state.get("spent") if isinstance(state.get("spent"), Mapping) else {}
     spent_usd = stretch["spent_usd"]
+    experiment_usd = stretch["experiment_usd"]
     if not ended:
         spent_usd = max(spent_usd, _number(spent.get("model_usd")) - stretch["spent_at_start"])
+        experiment_usd = max(
+            experiment_usd, _number(spent.get("experiment_usd")) - stretch["experiment_at_start"]
+        )
     return {
         "started": stretch["started"],
         "ended": ended,
@@ -273,6 +308,13 @@ def digest(
         "rounds": stretch["rounds"],
         "caps": stretch["caps"],
         "spent_usd": round(max(0.0, spent_usd), 4),
+        "unpriced_usd": stretch["unpriced_usd"],
+        "unpriced_models": stretch["unpriced_models"],
+        "experiment_usd": round(max(0.0, experiment_usd), 4),
+        "experiment_limit": {
+            "spent": _number(spent.get("experiment_usd")),
+            "allowed": _number(project.settings.limits.experiment_usd),
+        },
         "seconds": round(_seconds_between(stretch["started"], ended or now), 1),
         "accepted": accepted,
         "accepted_by_kind": by_kind,
@@ -333,6 +375,22 @@ def summary(found: Mapping[str, Any]) -> str:
         f"went to the agents' models in {_hours(_number(found.get('seconds')) / 3600)}, over "
         f"{_plural(int(_number(found.get('rounds'))), 'completed round')}."
     )
+    unpriced, models = _number(found.get("unpriced_usd")), found.get("unpriced_models") or []
+    if unpriced and models:
+        said.append(
+            f"Of that, {_money(unpriced)} is not a cost but a count: no price is known for "
+            f"{_listed(models)}, so against the cap {'its' if len(models) == 1 else 'their'} "
+            "tokens were counted at the highest list price there is, and what they really "
+            "cost is not known here."
+        )
+    limit = found.get("experiment_limit") or {}
+    if runs or _number(found.get("experiment_usd")):
+        said.append(
+            f"{_money(_number(found.get('experiment_usd')))} went to the experiments of this "
+            "stretch, which no cap of autopilot counts: the project's own limit holds it "
+            f"({_money(_number(limit.get('spent')))} of {_money(_number(limit.get('allowed')))} "
+            "spent in all, settings.limits.experiment_usd)."
+        )
     networked = int(_number(found.get("runs_with_network")))
     said.append(
         f"{UNCOUNTED}; "
@@ -348,6 +406,11 @@ def summary(found: Mapping[str, Any]) -> str:
             f"Waiting for you: {grouped([(item['id'], item['reason']) for item in waiting])}."
         )
     return " ".join(said)
+
+
+def _listed(names: Sequence[str]) -> str:
+    names = [str(name) for name in names]
+    return f"{', '.join(names[:-1])} and {names[-1]}" if len(names) > 1 else "".join(names)
 
 
 def grouped(held: Sequence[tuple[str, str]], limit: int = 6) -> str:

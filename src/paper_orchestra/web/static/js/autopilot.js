@@ -21,6 +21,8 @@ export const heldReason = (store, id) => { const h = heldRuns(store).find((x) =>
 const hoursWords = (h) => (h >= 1 ? plural(+(+h).toFixed(2), 'hour') : plural(Math.round(h * 60), 'minute'));
 /** What one stretch is held to: "at most 3 rounds, $200.00 on models or 12 hours". */
 export const capsWords = (a) => 'at most ' + plural(a.rounds, 'round') + ', ' + money(a.model_usd) + ' on models or ' + hoursWords(a.hours) + ', whichever comes first';
+/** The project's limit on what its experiments cost in all (`settings.limits.experiment_usd`). */
+const limitOf = (store) => ((((store || {}).project || {}).settings || {}).limits || {}).experiment_usd || 0;
 const networkWords = (a) => (a.network ? 'Runs it approves get the network access their plans ask for.' : 'Runs it approves get no network access.');
 
 /** The sentence under the headline while autopilot is on. */
@@ -40,7 +42,7 @@ export function digestHTML(store, e) {
   const live = !d.ended && e.working, caps = d.caps || {};
   const kinds = Object.keys(d.accepted_by_kind || {}).sort().map((k) => plural(d.accepted_by_kind[k], (KIND[k] || { one: k }).one.toLowerCase(), (KIND[k] || { many: k + 's' }).many.toLowerCase()));
   const runs = (d.runs || []).map((r) => { const x = store.expById.get(r.id); const said = r.id + ' ' + (r.outcome || (live ? 'is running' : 'has not run')); return x ? html`<a href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${said}</a>` : said; });
-  const held = d.held || [];
+  const held = d.held || [], unpriced = (d.unpriced_models || []).map(String), limit = d.experiment_limit || {};
   /* one reason is said once, for all the runs that share it */
   const groups = [];
   held.forEach((h) => { const g = groups.find((x) => x.reason === h.reason); if (g) g.ids.push(h.id); else groups.push({ reason: h.reason, ids: [h.id] }); });
@@ -52,6 +54,8 @@ export function digestHTML(store, e) {
       <li data-auto="decisions"><b>${plural((d.decisions || []).length, 'decision')}</b> went on at the agents' default${(d.decisions || []).length ? html` · <a href="${link({ view: 'inbox', sel: '', sub: '' })}">answer in the inbox</a>` : ''}</li>
       <li data-auto="runs"><b>${plural((d.runs || []).length, 'run')} approved</b>${runs.length ? html`: ${runs.map((r, i) => html`${i ? ', ' : ''}${r}`)}` : ''}</li>
       <li data-auto="spent"><b>${money(d.spent_usd)}</b> of ${money(caps.model_usd)} on the agents' models, ${duration(d.seconds) || '0 s'} of ${hoursWords(caps.hours)}, ${d.rounds} of ${plural(caps.rounds, 'round')}</li>
+      ${d.unpriced_usd && unpriced.length ? html`<li data-auto="unpriced"><b>${money(d.unpriced_usd)}</b> of that is a count, not a cost: no price is known for ${unpriced.join(', ')}, so against the cap its tokens were counted at the highest list price there is</li>` : ''}
+      ${(d.runs || []).length || d.experiment_usd ? html`<li data-auto="experiments"><b>${money(d.experiment_usd || 0)}</b> on the experiments of this stretch, which no cap of autopilot counts: the project's own limit holds it (${money(limit.spent || 0)} of ${money(limit.allowed || 0)} spent in all)</li>` : ''}
       <li class="quiet" data-auto="uncounted">${plain(d.uncounted)}; ${d.runs_with_network ? plural(d.runs_with_network, 'run') + ' had network access and could make such calls' : 'no run of this stretch had network access'}.</li></ul>
     ${held.length ? html`<p class="note note-warn auto-held">${icon('warn')}<span><b>Waiting for you:</b> ${groups.map((g, i) => html`${i ? '; ' : ''}${g.ids.map((id, k) => { const x = store.expById.get(id); return html`${k ? ', ' : ''}${x ? html`<a href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${id}</a>` : id}`; })}: ${plain(g.reason)}`)}.</span></p>` : ''}</div>`;
 }
@@ -63,7 +67,7 @@ export function autopilotHTML(store, e, waiting) {
   const view = autopilotView(store), ui = app.ui.autopilotEdit, on = a.mode === 'autopilot';
   const field = (name, text, unit) => html`<label><span>${text}</span><input id="auto-${name}" data-input="autopilot" data-name="${name}" value="${ui[name]}" inputmode="decimal" autocomplete="off" size="7"><span class="quiet">${unit}</span></label>`;
   return html`<section class="ov-sec ov-auto" data-autopilot="${on ? 'on' : 'off'}"><h2>Autopilot <span>${on ? 'on' : 'off'}</span></h2>
-    <p class="auto-now">${on ? html`<b>On.</b> Pages are accepted, edits applied, runs approved and checkpoints passed without you. One stretch is held to ${capsWords(a)}. ${networkWords(a)}`
+    <p class="auto-now">${on ? html`<b>On.</b> ${view.runs_wait ? html`Pages are accepted, edits applied and checkpoints passed without you. <span class="auto-runs-wait">Runs on this machine are not approved without you: ${plain(view.runs_wait)}.</span>` : 'Pages are accepted, edits applied, runs approved and checkpoints passed without you.'} One stretch is held to ${capsWords(a)}. ${networkWords(a)} <span class="auto-exp-limit">What the experiments cost is no part of these caps: the project's own limit holds it (${money(limitOf(store))}).</span>`
       : html`<b>Off.</b> Every proposal, edit, run and checkpoint waits for you.`}</p>
     ${view.refused && !on ? html`<p class="note note-warn auto-refused">${icon('warn')}<span>${plain(view.refused)}</span></p>` : ''}
     ${digestHTML(store, e)}

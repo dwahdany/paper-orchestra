@@ -701,6 +701,126 @@ def test_the_cap_on_hours_ends_the_stretch(tmp_path):
     assert [r["phase"] for r in state["phases"]] == ["intake"]
 
 
+def test_past_the_cap_on_hours_no_further_experiment_is_approved_or_started(tmp_path):
+    """The run phase of the classic runtime calls no model, so nothing in it asked the
+    cap: the rule went on approving, and the worker running, one experiment after the
+    other, for as long as there were plans."""
+    project = classic_project(tmp_path, autonomy={**AUTO, "hours": 1.0})
+    backend = Remote()
+    engine = classic.make_engine(project, classic.Team(), backend)
+
+    def five_hours_pass() -> None:
+        engine._stretch_clock -= 5 * 3600
+
+    backend.before = five_hours_pass
+    state = engine.advance()
+    assert len(backend.jobs) == 1  # the job that was running when the cap passed, and no other
+    approved = [
+        event["data"]["id"]
+        for event in events(project, "experiment.state")
+        if event["data"].get("state") == "approved"
+    ]
+    assert approved == ["E1"]
+    assert project.page("E2").state == "planned" and not project.page("E2").meta.get("approved_by")
+    record = state["autopilot"]
+    assert record["reason"] == "hours" and "it has run for 5 hours of 1 hour" in record["said"]
+    # What did run is told, and waits for the analysis of the next stretch.
+    assert state["status"] == "checkpoint"
+    ran = [r for r in state["phases"] if r["phase"] == "run"]
+    assert [r["status"] for r in ran] == ["completed"]
+    assert any(
+        "1 experiment ran: E1 succeeded" in event["summary"]
+        for event in events(project, "phase.finished")
+    )
+    assert len([page for page in project.pages(kind="result")]) == 1
+    assert [item["id"] for item in autopilot.digest(project)["runs"]] == ["E1"]
+
+
+def test_past_the_cap_a_run_the_person_approved_keeps_its_approval_and_waits(tmp_path):
+    project = classic_project(tmp_path, autonomy={**AUTO, "hours": 1.0})
+    backend = Remote()
+    engine = classic.make_engine(project, classic.Team(), backend)
+
+    def the_person_approves_another_and_five_hours_pass() -> None:
+        if len(backend.jobs) == 0:
+            experiments.approve(project, "E2", backends={"modal": backend})
+            engine._stretch_clock -= 5 * 3600
+
+    backend.before = the_person_approves_another_and_five_hours_pass
+    state = engine.advance()
+    assert len(backend.jobs) == 1 and state["autopilot"]["reason"] == "hours"
+    page = project.page("E2")
+    assert page.state == "approved" and not experiments.approved_by_rule(page)
+
+
+UNPRICED = {name: "some-new-model-9" for name in ("research", "reasoning", "coding", "fast")}
+
+
+def test_the_cap_on_dollars_holds_for_a_model_that_has_no_price(tmp_path):
+    """The ledger holds such a model's tokens with no cost; a cap that counted the same
+    would never be reached, and the stretch would run to its rounds or hours."""
+    project = classic_project(tmp_path, autonomy={**AUTO, "model_usd": 0.006}, models=UNPRICED)
+    state = stretch(project)
+    record = state["autopilot"]
+    assert record["reason"] == "model_usd"
+    assert state["status"] == "checkpoint" and record["rounds"] == 0
+    assert not any(page.kind == "result" for page in project.pages())
+    # The ledger is as it was: nothing is priced that has no price.
+    assert state["spent"]["model_usd"] == 0
+    usage = json.loads((project.root / "usage.json").read_text())
+    assert usage["unpriced_models"] == ["some-new-model-9"]
+    # What stopped it is a count, and every account of the stretch says so.
+    assert record["spent_usd"] >= 0.006 and record["unpriced_usd"] == record["spent_usd"]
+    assert record["unpriced_models"] == ["some-new-model-9"]
+    assert "no price is known" in record["said"] and "some-new-model-9" in record["said"]
+    told = autopilot.summary(autopilot.digest(project))
+    assert "is not a cost but a count: no price is known for some-new-model-9" in told
+    assert "$0.00 of" not in told
+    began, stopped = events(project, autopilot.STARTED, autopilot.STOPPED)
+    assert "No price is known for some-new-model-9" in began["summary"]
+    assert "no price is known for some-new-model-9" in stopped["summary"]
+    # A new stretch counts from where it begins, as with any model.
+    assert stretch(project)["autopilot"]["reason"] == "model_usd"
+    assert len(events(project, autopilot.STARTED)) == 2
+
+
+def test_a_priced_model_is_counted_as_it_was(tmp_path):
+    project = classic_project(tmp_path)
+    record = stretch(project)["autopilot"]
+    assert record["reason"] == "rounds"
+    assert record["unpriced_usd"] == 0 and record["unpriced_models"] == []
+    told = autopilot.summary(autopilot.digest(project))
+    assert "not a cost but a count" not in told
+    assert "No price is known" not in events(project, autopilot.STARTED)[0]["summary"]
+
+
+def test_the_account_says_what_the_experiments_cost_and_what_holds_that(tmp_path):
+    """Runs on a remote backend cost money that no cap of autopilot counts: the stretch
+    says so when it begins, and its account says what they cost and what limits it."""
+    project = classic_project(tmp_path, limits={"experiment_usd": 4})
+    state = stretch(project, backend=Remote(cost_usd=0.75))
+    record = state["autopilot"]
+    assert record["reason"] == "rounds" and record["experiment_usd"] == 1.5
+    found = autopilot.digest(project)
+    assert found["experiment_usd"] == 1.5
+    assert found["experiment_limit"] == {"spent": 1.5, "allowed": 4.0}
+    said = (
+        "$1.50 went to the experiments of this stretch, which no cap of autopilot counts: "
+        "the project's own limit holds it ($1.50 of $4.00 spent in all, "
+        "settings.limits.experiment_usd)."
+    )
+    assert said in autopilot.summary(found)
+    began, stopped = events(project, autopilot.STARTED, autopilot.STOPPED)
+    assert (
+        "What the experiments cost is no part of these caps: the project's own limit holds "
+        "it ($0.00 of $4.00 spent, settings.limits.experiment_usd)" in began["summary"]
+    )
+    assert said in stopped["summary"]
+    # The next stretch counts its own.
+    project.settings.update({"autonomy": {"rounds": 1}})
+    assert autopilot.read_stretch({"started": "2026-01-01T00:00:00Z"})["experiment_usd"] == 0
+
+
 def test_the_projects_own_limit_ends_the_stretch(tmp_path):
     project = classic_project(tmp_path, limits={"model_usd": 0.006})
     state = stretch(project)

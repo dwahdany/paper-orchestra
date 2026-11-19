@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from paper_orchestra import cli
 from paper_orchestra.research.engine import read_state
+from paper_orchestra.research.experiments import RUNS_WAIT
 from paper_orchestra.research.model import AUTONOMY_ENV, AUTOPILOT_NEEDS_SANDBOX
 from paper_orchestra.research.project import Project
 from paper_orchestra.web.app import create_app
@@ -185,15 +186,53 @@ def test_a_stretch_started_from_the_command_line_goes_on_in_that_worker(workspac
     assert "Nothing more can happen without you: autopilot did not approve E1" in out
     assert "outside a sandbox" in out and "pages accepted" in out
     assert "starts a new stretch on autopilot" in out
+    # What was promised before the first agent started is what happened: no run of this
+    # project is approved without the person, and nothing said that one would be.
+    assert "Runs on this machine are not approved without you" in out
+    assert "runs approved and checkpoints passed" not in out
+    # What is next is the one thing that lets a new stretch do anything.
+    approve = (
+        "Next: approve the runs autopilot left for you (E1 and E2) with "
+        "`paper-orchestra research approve w E1`; then `paper-orchestra research advance w` "
+        "starts a new stretch on autopilot"
+    )
+    assert approve in out
     # Nothing waits but what the rule left: no proposal, no decision, and the experiments.
     assert project.counts()["pending"]["total"] == 0
     assert {page.state for page in project.pages(kind="experiment")} == {"planned"}
     lines = flat(status.stdout)
     assert "Autopilot: on." in lines and "The last stretch ended" in lines
     assert "Waiting for you: E1" in lines and "it would run on this machine as you" in lines
+    # The runs the rule left wait for the person, and no line says that nothing does.
+    assert "Waiting for you: 2 runs autopilot left for you (E1 and E2)" in lines
+    assert "Nothing is waiting for you." not in lines
+    assert approve in lines
     assert data["autonomy"]["mode"] == "autopilot"
     assert data["autopilot"]["reason"] == "needs_you" and data["autopilot"]["held"]
     assert data["autopilot"]["accepted_by_kind"]["hypothesis"] >= 1
+
+
+def test_the_switch_promises_runs_only_where_the_rule_approves_them(workspace):
+    """Under the classic runtime on the local backend the rule approves no run that
+    needs no GPU; with Modal as the backend it does, and what those runs cost is held
+    by the project's own limit, which the switch names."""
+    local = flat(
+        invoke("new", "--brief", "An idea.", "--dir", "a", "--no-run", "--autopilot").stdout
+    )
+    assert "Pages are accepted, edits applied and checkpoints passed without you." in local
+    assert f"Runs on this machine are not approved without you: {RUNS_WAIT}." in local
+    assert "runs approved" not in local
+    project = Project.open(workspace / "a")
+    project.settings.update({"compute": "modal"})
+    project.save_settings()
+    remote = flat(invoke("status", "a").stdout)
+    assert "runs approved and checkpoints passed without you" in remote
+    assert "not approved without you" not in remote
+    for said in (local, remote):
+        assert (
+            "What the experiments cost is no part of these caps: the project's own limit "
+            "holds it ($5.00, settings.limits.experiment_usd)." in said
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +278,7 @@ def test_the_view_carries_autonomy_and_patch_switches_it(client):
         "since": "",
         "digest": None,
         "held": [],
+        "runs_wait": RUNS_WAIT,
     }
     assert client.get("/api/defaults").json()["autonomy"]["mode"] == "supervised"
     rows = client.get("/api/projects").json()["projects"]
@@ -315,6 +355,41 @@ def test_the_view_gives_the_account_of_the_last_stretch(client, tmp_path):
     assert actors == {"autopilot"}
 
 
+def test_the_library_counts_the_runs_autopilot_left_and_the_app_says_which_runs_wait(client):
+    import test_research_autopilot as offline
+    from test_research_agents import FakeBackend, make_project
+
+    project = make_project(
+        client.workspace,
+        files=[offline.notes(client.workspace)],
+        settings={"autonomy": offline.AUTO},
+    )
+    offline.stretch(project, backend=FakeBackend())
+    rows = client.get("/api/projects").json()["projects"]
+    row = next(row for row in rows if row["dir"] == project.root.name)
+    # No proposal waits, and two runs do: the row counts them as the project's own page does.
+    assert row["pending"] == 0 and row["held"] == 2
+    view = client.get(f"/api/projects/{row['id']}").json()
+    assert [item["id"] for item in view["autopilot"]["held"]] == ["E1", "E2"]
+    assert view["autopilot"]["runs_wait"] == RUNS_WAIT
+    assert view["autopilot"]["digest"]["experiment_limit"] == {"spent": 0.0, "allowed": 5.0}
+    # A supervised project has none, and one whose runs the rule approves is told nothing.
+    remote = make_project(
+        client.workspace,
+        name="r",
+        files=[offline.notes(client.workspace)],
+        settings={"compute": "modal", "autonomy": offline.AUTO},
+    )
+    rows = client.get("/api/projects").json()["projects"]
+    other = next(row for row in rows if row["dir"] == remote.root.name)
+    assert other["held"] == 0
+    assert client.get(f"/api/projects/{other['id']}").json()["autopilot"]["runs_wait"] is None
+    # What the composer says before a project exists, by runtime and backend.
+    waits = client.get("/api/defaults").json()["autopilot_runs_wait"]
+    assert waits["classic"] == {**dict.fromkeys(waits["classic"]), "local": RUNS_WAIT}
+    assert not any(waits["sdk"].values())
+
+
 # ---------------------------------------------------------------------------
 # The client: the switch, the digest, and who is said to have decided
 # ---------------------------------------------------------------------------
@@ -327,6 +402,7 @@ import { whoOf, foldRuns } from './js/shell.js';
 import { who } from './js/page.js';
 import { defaultedPanel, decidedDecisions, openDecisions, waitingCount, pageDecisions } from './js/decisions.js';
 import { heldRuns, capsWords } from './js/autopilot.js';
+import { rowState, startView, composer } from './js/home.js';
 
 const autonomy = (mode) => ({ mode, rounds: 2, model_usd: 5, hours: 0.5, network: false });
 const digest = { started: ago(900), ended: ago(60), running: false, reason: 'rounds', why: 'the cap on rounds was reached',
@@ -393,6 +469,35 @@ out.form = { fields: ['auto-rounds', 'auto-model_usd', 'auto-hours', 'auto-netwo
 app.ui.autopilotEdit = null;
 out.older = render(projectStore({ pages: [], experiments: [], project: { state: checkpoint('design', 'run'), next_step: said({ will_run: ['run'], then: 'analyze' }) } })).includes('ov-auto');
 out.caps = capsWords({ rounds: 1, model_usd: 200, hours: 12 });
+/* a project whose runs the rule does not approve: the switch does not promise them, and gives the server's reason */
+const WAIT = 'an experiment that needs no GPU would run on this machine as you <i>';
+const local = projectStore({ pages: [e3], experiments: [Object.assign({ runs: 0 }, e3)],
+  project: { settings: { limits: { model_usd: 25, experiment_usd: 5 }, autonomy: autonomy('autopilot') }, state: checkpoint('run', 'run'), next_step: said({ will_run: ['run'], then: 'analyze' }),
+    autopilot: { mode: 'autopilot', refused: null, since: '', held: digest.held, runs_wait: WAIT,
+      digest: Object.assign({}, digest, { runs: [], spent_usd: 0.02, unpriced_usd: 0.02, unpriced_models: ['some-new-model-9'], experiment_usd: 0, experiment_limit: { spent: 0, allowed: 5 } }) } } });
+const waits = render(local), nowAt = waits.indexOf('class="auto-now"'), now = waits.slice(nowAt, waits.indexOf('</p>', nowAt));
+out.local = { wait: now.includes('Runs on this machine are not approved without you: an experiment that needs no GPU'), escaped: now.includes('&lt;i&gt;') && !now.includes('you <i>'),
+  noPromise: !now.includes('runs approved'), limit: now.includes("the project's own limit holds it ($5.00)"),
+  unpriced: waits.includes('<b>$0.02</b> of that is a count, not a cost: no price is known for some-new-model-9'), noExperiments: !waits.includes('data-auto="experiments"') };
+/* where it approves them: the promise, what holds the cost of the runs, and what they cost in the stretch */
+out.remote = { promise: section.includes('runs approved and checkpoints passed without you'), limit: section.includes("What the experiments cost is no part of these caps: the project's own limit holds it ($5.00)"),
+  experiments: section.includes('data-auto="experiments"') && section.includes('which no cap of autopilot counts'), priced: !section.includes('data-auto="unpriced"') };
+/* the library: the runs autopilot left are counted with what waits, and such a row is not "ready to continue" */
+const row = { status: 'checkpoint', round: 2, phase: 'run', pending: 0, held: 3, counts: { pending: { total: 0 }, decisions: { open: 0 } } };
+out.rows = [rowState(row)[2], rowState(Object.assign({}, row, { pending: 2 }))[2], rowState(Object.assign({}, row, { held: 0 }))[2]];
+/* the composer: the tick promises what will happen, by the runtime and the backend the person chose */
+const start = (compute) => {
+  app.ui.defaults = { data: { settings: { compute: 'local', limits: { model_usd: 25 }, models: {}, agents: { runtime: 'classic', sandbox: true } }, autonomy: autonomy('supervised'),
+    autopilot_runs_wait: { classic: { local: WAIT, modal: null }, sdk: { local: null, modal: null } }, compute_backends: ['local', 'modal'], efforts: [], agent_runtimes: ['classic', 'sdk'], agent_credentials: [] }, loading: false, error: null, at: Date.now() };
+  const s = composer(); s.autopilot = true; s.adv = true; s.compute = compute;
+  const root = { innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
+  startView.render(root, { q: {} });
+  const at = root.innerHTML.indexOf('id="opt-autopilot"');
+  return root.innerHTML.slice(at, root.innerHTML.indexOf('</label>', at));
+};
+const onLocal = start(''), onModal = start('modal');
+out.composer = { wait: onLocal.includes('Runs on this machine are not approved without you: an experiment that needs no GPU'), noPromise: !onLocal.includes('runs approved'),
+  escaped: onLocal.includes('&lt;i&gt;'), promise: onModal.includes('runs approved and checkpoints passed without you') && !onModal.includes('not approved') };
 console.log(JSON.stringify(out));
 """
 
@@ -418,3 +523,6 @@ def test_the_client_shows_the_switch_the_digest_and_who_decided(tmp_path):
     assert out["form"] == {"fields": True, "settle": False, "only": True}
     assert out["older"] is False
     assert out["caps"] == "at most 1 round, $200.00 on models or 12 hours, whichever comes first"
+    for name in ("local", "remote", "composer"):
+        assert [key for key, value in out[name].items() if value is False] == [], name
+    assert out["rows"] == ["3 waiting for you", "5 waiting for you", "ready to continue"]

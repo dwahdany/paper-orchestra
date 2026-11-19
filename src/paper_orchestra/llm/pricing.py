@@ -79,3 +79,17 @@ def estimate_cost_usd(model: str, usage: Usage) -> float | None:
         + usage.cache_creation_input_tokens * price.cache_write
     )
     return tokens / 1_000_000 + usage.web_searches * WEB_SEARCH_USD
+
+
+def ceiling_cost_usd(usage: Usage) -> float:
+    """What ``usage`` would cost at the highest rate of the table for each kind of token:
+    a count for a model that has no price, where counting nothing would be worse (a
+    cap on spend that must hold).  Not an estimate of what such a model costs."""
+    rows = [*PRICES.values(), *(price for _, price in LONG_PROMPT_PRICES.values())]
+    tokens = (
+        usage.input_tokens * max(row.input for row in rows)
+        + usage.output_tokens * max(row.output for row in rows)
+        + usage.cache_read_input_tokens * max(row.cache_read for row in rows)
+        + usage.cache_creation_input_tokens * max(row.cache_write for row in rows)
+    )
+    return tokens / 1_000_000 + usage.web_searches * WEB_SEARCH_USD

@@ -1170,6 +1170,19 @@ def _where_it_stands(state: Mapping[str, Any]) -> str:
     return line + f"{status}{following}"
 
 
+def _held_runs(project: Project) -> list[str]:
+    """The experiments autopilot does not approve as the project stands, by id: they wait
+    for the person although it is on (``research.autopilot.held``)."""
+    from paper_orchestra.research import autopilot
+
+    return [item["id"] for item in autopilot.held(project)]
+
+
+def _and_words(names: Sequence[str]) -> str:
+    names = [str(name) for name in names]
+    return f"{', '.join(names[:-1])} and {names[-1]}" if len(names) > 1 else "".join(names)
+
+
 def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str, Any]) -> str:
     """What the person can do now, as commands they can paste."""
     root = _quoted(project.root)
@@ -1210,6 +1223,13 @@ def _next_steps(project: Project, state: Mapping[str, Any], counts: Mapping[str,
     if unattended:
         # What still waits is what autopilot left for the person; the rest it decides.
         steps = [step for step in steps if not step.startswith("approve the experiments")]
+        left = _held_runs(project)
+        if left:
+            # Without these a new stretch finds nothing it may run, and ends at once.
+            steps.append(
+                f"approve the runs autopilot left for you ({_and_words(left)}) with "
+                f"`paper-orchestra research approve {root} {left[0]}`"
+            )
         steps.append(
             f"{'then ' if steps else ''}{advance} starts a new stretch on autopilot "
             "(it goes on by itself until a cap is reached)"
@@ -1284,8 +1304,13 @@ def _status_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
         did = _account(checkpoint)
         if did:
             lines.append(f"  {_readable(_sentence(did))}")
-    if counts["pending"]["total"]:
-        lines.append(f"  Waiting for you: {_waiting(counts)}")
+    # With what autopilot did not approve: it waits for the person as a proposal does.
+    left = _held_runs(project)
+    waiting = [_waiting(counts)] if counts["pending"]["total"] else []
+    if left:
+        waiting.append(f"{_plural(len(left), 'run')} autopilot left for you ({_and_words(left)})")
+    if waiting:
+        lines.append(f"  Waiting for you: {', '.join(waiting)}")
     elif state.get("status") == "checkpoint":
         lines.append("  Nothing is waiting for you.")
     board = [f"{count} {name}" for name, count in counts["experiments"].items() if count]
@@ -1345,10 +1370,14 @@ def _has_live_worker(state: Mapping[str, Any]) -> bool:
     return bool(worker_alive(state))
 
 
-def _autonomy_in_words(autonomy: Any) -> str:
-    """``settings.autonomy`` in a sentence: the mode, and what a stretch is held to."""
+def _autonomy_in_words(settings: Any) -> str:
+    """``settings.autonomy`` in a sentence: the mode, what a stretch is held to, and what
+    it does not decide or count as these settings stand (the runs of a project whose
+    experiments would run unsandboxed as the person; what experiments cost)."""
     from paper_orchestra.research.autopilot import caps_in_words
+    from paper_orchestra.research.experiments import rule_leaves_runs
 
+    autonomy = settings.autonomy
     caps = caps_in_words(autonomy.to_dict())
     network = (
         "runs it approves get the network access their plans ask for"
@@ -1360,9 +1389,17 @@ def _autonomy_in_words(autonomy: Any) -> str:
             "Autopilot: off (supervised: every proposal, edit, run and checkpoint waits for "
             f"you). Switched on, a stretch would be held to {caps}."
         )
+    runs_wait = rule_leaves_runs(settings)
+    decided = (
+        "Pages are accepted, edits applied and checkpoints passed without you. Runs on "
+        f"this machine are not approved without you: {runs_wait}."
+        if runs_wait
+        else "Pages are accepted, edits applied, runs approved and checkpoints passed without you."
+    )
     return (
-        f"Autopilot: on. Pages are accepted, edits applied, runs approved and checkpoints "
-        f"passed without you. One stretch is held to {caps}; {network}."
+        f"Autopilot: on. {decided} One stretch is held to {caps}; {network}. What the "
+        "experiments cost is no part of these caps: the project's own limit holds it "
+        f"({_limit_usd(settings.limits.experiment_usd)}, settings.limits.experiment_usd)."
     )
 
 
@@ -1376,7 +1413,7 @@ def _autopilot_lines(project: Project, state: Mapping[str, Any]) -> list[str]:
     found = autopilot.digest(project, state)
     if autonomy.mode != "autopilot" and found is None:
         return []
-    lines = [f"  {_autonomy_in_words(autonomy)}"]
+    lines = [f"  {_autonomy_in_words(project.settings)}"]
     if found is None:
         if autonomy.mode == "autopilot":
             lines.append(
@@ -1778,7 +1815,7 @@ def research_new(
         _say(_who_pays(project.settings.agents))
     if project.settings.autonomy.autopilot:
         # Before anything is decided without them: that it will be, and up to where.
-        _say(_autonomy_in_words(project.settings.autonomy))
+        _say(_autonomy_in_words(project.settings))
     shown = _quoted(root)
     if not run:
         stops = (
@@ -2841,7 +2878,7 @@ def research_settings(
     if changes or unattended:
         named = [*changes, *(f"autonomy.{name}" for name in unattended)]
         _say(f"Changed {', '.join(named)} for {opened.title}.")
-    _say(_autonomy_in_words(opened.settings.autonomy))
+    _say(_autonomy_in_words(opened.settings))
     if settled is not None:
         _say(_settled_in_words(settled))
     elif unattended.get("mode") == "autopilot":

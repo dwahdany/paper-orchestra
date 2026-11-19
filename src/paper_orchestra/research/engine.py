@@ -63,7 +63,7 @@ from typing import Any
 from paper_orchestra.compute import ComputeBackend, ComputeError, get_backend
 from paper_orchestra.errors import chain, stops_the_run
 from paper_orchestra.llm.base import Usage
-from paper_orchestra.llm.pricing import estimate_cost_usd
+from paper_orchestra.llm.pricing import ceiling_cost_usd, estimate_cost_usd, price_for
 from paper_orchestra.memory.harness import ContextHarness, RunCancelled
 from paper_orchestra.memory.lock import WikiLock
 
@@ -222,6 +222,10 @@ class ModelNeeded(EngineError):
         super().__init__(message)
         self.phase = phase
         self.need = dict(need)
+
+
+#: The counts of a row of the usage ledger.
+_USAGE_FIELDS = tuple(Usage().to_dict())
 
 
 class _BudgetSpent(Exception):
@@ -1157,17 +1161,30 @@ class Engine:
         caps = self._caps()
         spent = self._write_usage()
         stretch = autopilot.new_stretch(
-            caps, started=_now(), spent_usd=spent, round=self._state["round"]
+            caps,
+            started=_now(),
+            spent_usd=spent,
+            round=self._state["round"],
+            unpriced_usd=self._unpriced_count()[0],
+            experiment_usd=self._state["spent"]["experiment_usd"],
         )
         network = (
             "runs it approves get the network access their plans ask for"
             if caps["network"]
             else "runs it approves get no network access"
         )
+        limits = self.project.settings.limits
+        runs = experiments.rule_leaves_runs(self.project)
         event = self.project.emit(
             autopilot.STARTED,
             f"Autopilot goes on from here without you: {autopilot.caps_in_words(caps)}; "
-            f"{network}. Stop ends it.",
+            f"{network}. "
+            + (f"Runs on this machine it does not approve: {_sentence(runs, 600)} " if runs else "")
+            + "What the experiments cost is no part of these caps: the project's own limit "
+            f"holds it ({_money(self._state['spent']['experiment_usd'])} of "
+            f"{_money(float(limits.experiment_usd))} spent, settings.limits.experiment_usd). "
+            + "".join(f"{note} " for note in self._no_price_note())
+            + "Stop ends it.",
             agent=AUTOPILOT,
             data={"by": AUTOPILOT, "caps": caps},
             round=self._state["round"],
@@ -1178,21 +1195,95 @@ class Engine:
             self._stretch = self._state[autopilot.STRETCH_KEY] = stretch
             self._save()
 
-    def _stretch_spent(self, more_usd: float = 0.0) -> float:
-        """What the models cost in this stretch so far (``more_usd`` on top: what a turn
-        in flight has used and the ledger does not hold yet)."""
-        assert self._stretch is not None
+    def _unpriced_count(self) -> tuple[float, list[str]]:
+        """What the ledger's tokens on models without a known price count for against the
+        cap of a stretch, and those models: each token at the highest list price there
+        is (``pricing.ceiling_cost_usd``).  The ledger itself holds them with nothing,
+        and a cap that counted nothing for them would never be reached."""
         with self._lock:
-            return max(0.0, self._ledger_usd() + more_usd - self._stretch["spent_at_start"])
+            report = usage_report(self.harness.usage, self._carried, self._baseline)
+        unpriced = {str(model) for model in report.get("unpriced_models") or []}
+        counted = sum(
+            ceiling_cost_usd(Usage(**{name: int(row.get(name) or 0) for name in _USAGE_FIELDS}))
+            for row in report.get("by_label") or []
+            if "cost_usd" not in row and str(row.get("model")) in unpriced
+        )
+        return counted, sorted(unpriced)
+
+    def _no_price_note(self) -> list[str]:
+        """Said where a stretch begins on models that have no known price (the classic
+        runtime's, by ``settings.models``; an sdk session reports its own cost)."""
+        if self.project.settings.agents.runtime == "sdk":
+            return []
+        models = self.project.settings.models
+        names = sorted(
+            {
+                str(name)
+                for name in (models.research, models.reasoning, models.coding, models.fast)
+                if price_for(str(name)) is None
+            }
+        )
+        if not names:
+            return []
+        return [
+            f"No price is known for {_and(names)}: against the cap on model spend "
+            f"{'its' if len(names) == 1 else 'their'} tokens count at the highest list "
+            "price there is, and what they really cost is not known here."
+        ]
+
+    def _stretch_spent(
+        self, more_usd: float = 0.0, stretch: Mapping[str, Any] | None = None
+    ) -> float:
+        """What counts against the dollar cap of this stretch so far (``more_usd`` on top:
+        what a turn in flight has used and the ledger does not hold yet): what the
+        ledger prices, and for a model without a price its tokens at the highest list
+        price (:meth:`_unpriced_count`)."""
+        stretch = self._stretch if stretch is None else stretch
+        assert stretch is not None
+        with self._lock:
+            priced = self._ledger_usd() - stretch["spent_at_start"]
+        return max(0.0, priced + self._stretch_unpriced(stretch) + more_usd)
+
+    def _stretch_unpriced(self, stretch: Mapping[str, Any] | None = None) -> float:
+        """The part of :meth:`_stretch_spent` that is a count of tokens without a price."""
+        stretch = self._stretch if stretch is None else stretch
+        assert stretch is not None
+        return max(0.0, self._unpriced_count()[0] - _number(stretch.get("unpriced_at_start")))
+
+    def _stretch_account(self, stretch: dict[str, Any]) -> None:
+        """Write into the record of the stretch what it has cost so far."""
+        unpriced = self._stretch_unpriced(stretch)
+        stretch["spent_usd"] = autopilot.round_usd(self._stretch_spent(stretch=stretch))
+        stretch["unpriced_usd"] = autopilot.round_usd(unpriced)
+        stretch["unpriced_models"] = self._unpriced_count()[1] if unpriced else []
+        stretch["experiment_usd"] = autopilot.round_usd(
+            max(
+                0.0,
+                self._state["spent"]["experiment_usd"]
+                - _number(stretch.get("experiment_at_start")),
+            )
+        )
 
     def _stretch_hours(self) -> float:
         return (time.monotonic() - self._stretch_clock) / 3600.0
 
-    def _stretch_cap(self, more_usd: float = 0.0, who: str = "") -> _BudgetSpent | None:
+    def _stretch_cap(
+        self,
+        more_usd: float = 0.0,
+        who: str = "",
+        *,
+        unpriced_usd: float = 0.0,
+        unpriced_model: str = "",
+    ) -> _BudgetSpent | None:
         """The cap of the stretch that is reached, as the limit that stops the work, or
         ``None``: the dollars of this stretch, or its hours.  Asked wherever the model
         budget is asked (before a session, before a turn, after every model request),
-        so that no agent works past a cap for longer than one request."""
+        so that no agent works past a cap for longer than one request, and before
+        every approval and start of an experiment (the run phase calls no model under
+        the classic runtime, and would otherwise never ask).
+
+        ``unpriced_usd`` is the part of ``more_usd`` that is a count of the tokens of
+        ``unpriced_model``, a model without a price, at the highest list price."""
         if self._stretch is None:
             return None
         caps = self._caps()
@@ -1200,11 +1291,21 @@ class Engine:
         ended = f" The work of {who} was ended at its next model call." if who else ""
         again = "Continue starts a new stretch; the phase then resumes where it stopped."
         if spent >= caps["model_usd"]:
+            unpriced, models = self._stretch_unpriced() + unpriced_usd, self._unpriced_count()[1]
+            if unpriced and unpriced_model and unpriced_model not in models:
+                models = sorted({*models, unpriced_model})
+            counted = (
+                f" Of that, {_money(unpriced)} counts the tokens of {_and(models)}, for which "
+                "no price is known, at the highest list price there is: what they really "
+                "cost is not known here."
+                if unpriced and models
+                else ""
+            )
             return _BudgetSpent(
                 "autopilot.model_usd",
                 f"Autopilot's cap on model spend for this stretch is reached: {_money(spent)} "
                 f"of {_money(caps['model_usd'])} went to the models since it began "
-                f"(settings.autonomy.model_usd).{ended} {again}",
+                f"(settings.autonomy.model_usd).{counted}{ended} {again}",
                 spent=spent,
                 allowed=caps["model_usd"],
             )
@@ -1278,7 +1379,7 @@ class Engine:
             if name == "analyze":
                 stretch["rounds"] += 1
             stretch["caps"] = caps
-            stretch["spent_usd"] = autopilot.round_usd(self._stretch_spent())
+            self._stretch_account(stretch)
             self._save()
         twice = self._failed_twice()
         if twice:
@@ -1345,9 +1446,8 @@ class Engine:
             with self._lock:
                 stretch.update(ended=_now(), reason=code, said=_one_line(said, 900))
                 stretch["caps"] = self._caps()
-                stretch["spent_usd"] = autopilot.round_usd(
-                    max(0.0, self._write_usage() - stretch["spent_at_start"])
-                )
+                self._write_usage()
+                self._stretch_account(stretch)
                 self._save()
             found = autopilot.digest(self.project, self._state)
             account = autopilot.summary(found) if found else ""
@@ -1907,7 +2007,8 @@ class Engine:
         ``more_usd`` is what the turn cost on other models, priced by whoever asks.
         """
         limit = float(self.project.settings.limits.model_usd)
-        in_flight = (estimate_cost_usd(model, usage) or 0.0) + more_usd
+        priced = estimate_cost_usd(model, usage)
+        in_flight = (priced or 0.0) + more_usd
         with self._lock:
             spent = self._ledger_usd() + in_flight
         if spent < limit:
@@ -1917,7 +2018,12 @@ class Engine:
                 if experiment
                 else f"the {_ROLE.get(str(phase or self._state.get('phase')), 'agent')}"
             )
-            return self._stretch_cap(in_flight, who)
+            # (Which counts a model without a price at the highest list price: a cap
+            # that counted nothing for it would never end the stretch.)
+            ceiling = ceiling_cost_usd(usage) if priced is None and self._stretch else 0.0
+            return self._stretch_cap(
+                in_flight + ceiling, who, unpriced_usd=ceiling, unpriced_model=str(model)
+            )
         if experiment:
             work = f"the work of the agent that carries out {experiment}"
             then = f"{experiment} is in the queue again and is run when the work goes on."
@@ -3495,6 +3601,9 @@ class Engine:
             self._take_back_rule_approvals()
         self._tidy_hypotheses(release=False)
         self._held = {}
+        cap = self._stretch_cap()
+        if cap is not None:
+            raise cap  # nothing is approved or started in a stretch that is over
         waiting = self._waiting_to_run()
         if not waiting:
             waiting = self._rule_approves_next()
@@ -3511,6 +3620,11 @@ class Engine:
         notes: list[str] = self._planned_again()
         tried: set[str] = set()
         while waiting:
+            if self._stretch_cap() is not None:
+                # A cap of the stretch was reached while the last experiment ran: no
+                # further one is started (what the person approved keeps its approval).
+                # The phase ends here with what did run, and the stretch at its checkpoint.
+                break
             page = waiting[0]
             tried.add(page.path)
             self._heed_stop()
@@ -3565,6 +3679,10 @@ class Engine:
         checkpoint and tried no more in this run phase.
         """
         if self._stretch is None or not self._autopilot_on():
+            return []
+        if self._stretch_cap() is not None:
+            # Past a cap the rule approves nothing more: an approval made now would be
+            # a run started after the stretch should have ended.
             return []
         for page in experiments.rule_candidates(self.project):
             name = str(page.id)
