@@ -2234,6 +2234,16 @@ def _next_step_notes(ctx: AgentContext, session: _Session) -> list[str]:
             else "Once you accept it, the designer writes its code in the next design "
             "phase; its run can be approved after that."
         )
+        if ctx.project.settings.autonomy.autopilot:
+            # Nothing here waits for the person: autopilot accepted the page, and decides
+            # on its run when the round gets to it.
+            after = (
+                "Autopilot accepted it; in the next run phase it is approved like any "
+                "other, and the agent that carries it out writes the code from the plan."
+                if ctx.runtime is not None
+                else "Autopilot accepted it; the designer writes its code in the next "
+                "design phase, and the run phase after that decides on its run."
+            )
         notes.append(
             f"{page.id} is a next step the analyst proposed as a plan, without code. {after}"
             + (

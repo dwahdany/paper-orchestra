@@ -117,6 +117,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from paper_orchestra import __version__
 from paper_orchestra.memory.wiki import slugify, split_front_matter
+from paper_orchestra.research import autopilot
 from paper_orchestra.research.decisions import DECISIONS_DIR, SAY_CHARS
 from paper_orchestra.research.model import (
     AGENT_CREDENTIALS,
@@ -783,23 +784,15 @@ class Services:
         return list(self._experiments().number_check(project, page))
 
     def default_settings(self) -> dict[str, Any]:
-        """The settings a project starts with when nothing else is said.  ``autonomy`` is
-        always among them, for the form that offers the switch."""
-        settings = ProjectSettings.from_dict(settings_for_new_project(None))
-        return {**settings.to_dict(), "autonomy": settings.autonomy.to_dict()}
+        """The settings a project starts with when nothing else is said."""
+        return ProjectSettings.from_dict(settings_for_new_project(None)).to_dict()
 
-    def autopilot_digest(self, project: Project, state: Mapping[str, Any]) -> dict | None:
-        """What happened in the project's latest unattended stretch
-        (``research.autopilot.digest``); ``None`` when it never had one."""
-        from paper_orchestra.research import autopilot
-
-        return autopilot.digest(project, state)
-
-    def autopilot_held(self, project: Project) -> list[dict[str, str]]:
-        """What waits for the person although autopilot is on (``research.autopilot.held``)."""
-        from paper_orchestra.research import autopilot
-
-        return autopilot.held(project)
+    def default_autonomy(self) -> dict[str, Any]:
+        """``settings.autonomy`` of a project created now: the mode (``autopilot`` where the
+        server's environment asks for it) and the caps of one unattended stretch.  Apart
+        from :meth:`default_settings`, which leaves the group out while nothing in it
+        is set, as a project's file does."""
+        return ProjectSettings.from_dict(settings_for_new_project(None)).autonomy.to_dict()
 
     def doctor(self, model: str | None = None) -> dict[str, Any]:
         from paper_orchestra import doctor
@@ -1563,11 +1556,16 @@ def defaults(context: Ctx) -> dict[str, Any]:
     itself (``{"hypothesize": "hypotheses"}``: "checkpoint after hypotheses"), as the
     command line says it too.
 
+    ``autonomy`` is ``settings.autonomy`` as a project created now would have it: the
+    mode (``autopilot`` where ``PAPER_ORCHESTRA_AUTONOMY`` asks for it) and the caps of
+    one unattended stretch, for the composer's tick.
+
     ``creatable_kinds`` are the kinds of page the person can write (``kind`` of
     ``POST .../pages``), and ``kind_writers`` says for each kind which agents write
     it as well: none for a lesson, which is the person's alone."""
     return {
         "settings": context.services.default_settings(),
+        "autonomy": context.services.default_autonomy(),
         "phases": list(PHASES),
         "request_for": list(REQUEST_FOR),
         "efforts": list(EFFORTS),
@@ -1987,10 +1985,8 @@ def _autopilot_view(context: Context, project: Project, state: Mapping[str, Any]
         "held": [],
     }
     try:
-        view["digest"] = context.services.autopilot_digest(project, state)
-        view["held"] = (
-            view["digest"]["held"] if view["digest"] else context.services.autopilot_held(project)
-        )
+        view["digest"] = autopilot.digest(project, state)
+        view["held"] = view["digest"]["held"] if view["digest"] else autopilot.held(project)
     except Exception as exc:
         if context.standings.first_complaint(project.root, f"autopilot:{type(exc).__name__}"):
             log.exception("The account of autopilot in %s could not be built.", project.root)
@@ -2317,6 +2313,15 @@ def get_project(project: Proj, context: Ctx) -> dict[str, Any]:
     around, each ``{"path", "message"}`` with the message not repeating the
     path; ``problems_total`` says how many there are.  A lost ``state.json`` is
     not among them when ``state_problem`` says it.
+
+    ``autopilot`` is ``{"mode", "refused", "since", "digest", "held"}``
+    (:func:`_autopilot_view`): the mode of ``settings.autonomy``, the sentence
+    with which switching it on would be refused (or ``null``), the account of the
+    latest unattended stretch (``research.autopilot.digest``: what was accepted,
+    applied, left at its default and approved without the person, what was spent
+    and why it stopped; ``null`` for a project that never had one), and what
+    waits for the person although it is on.  ``settings.autonomy`` is always
+    there, with the caps; ``state.autopilot`` is the record of the stretch.
     """
     return _project_view(context, project)
 

@@ -1338,8 +1338,13 @@ class Project:
                 before, autonomy = self._autonomy_on_file, self.settings.autonomy.to_dict()
                 was_on, is_on = before.get("mode") == "autopilot", self._autopilot()
                 if is_on and not was_on:
-                    # What waits at this moment was put there for the person.
-                    self._extra[AUTOPILOT_KEY] = {"since": self._clock.now()}
+                    # What waits at this moment was put there for the person: also the
+                    # experiments that are plans (or failed) now, which the rule leaves.
+                    plans = self.pages(kind="experiment", state=["planned", "failed"])
+                    self._extra[AUTOPILOT_KEY] = {
+                        "since": self._clock.now(),
+                        "waited": [page.path for page in plans],
+                    }
                 elif not is_on:
                     self._extra.pop(AUTOPILOT_KEY, None)
                 self._write_project_file()
@@ -1380,6 +1385,15 @@ class Project:
         noted = self._extra.get(AUTOPILOT_KEY)
         since = noted.get("since") if isinstance(noted, dict) else None
         return since if isinstance(since, str) else ""
+
+    @property
+    def autopilot_waited(self) -> frozenset[str]:
+        """The experiments (their paths) that were there, not yet approved, when the
+        person switched autopilot on: they are left for the person, like everything
+        that waited then, until they ask for what waits to be settled as well."""
+        noted = self._extra.get(AUTOPILOT_KEY)
+        waited = noted.get("waited") if isinstance(noted, dict) else None
+        return frozenset(str(path) for path in waited) if isinstance(waited, list) else frozenset()
 
     def _say_autonomy(self, before: Mapping[str, Any], now: Mapping[str, Any]) -> None:
         """Say in the feed that the person changed ``settings.autonomy``, and to what:

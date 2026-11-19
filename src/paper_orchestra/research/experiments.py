@@ -2220,8 +2220,7 @@ def rule_holds(project: Project, ref: str) -> str | None:
         return f"its page is {page.review}, not accepted"
     if page.state not in ("planned", "failed"):
         return f"it is {page.state}"
-    since = project.autopilot_since
-    if since and max(page.created, _text(page.meta.get("decided_at"))) < since:
+    if page.path in project.autopilot_waited:
         return (
             "it was planned before autopilot was switched on, and what waited then is "
             "yours unless you ask for it to be settled as well"

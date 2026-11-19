@@ -1062,6 +1062,9 @@ class Engine:
                     if why is not None:
                         break
                     self._say_it_goes_on()
+                    # A stretch may last for hours: whether the models can be used is
+                    # asked anew before each further pass, not once for all of it.
+                    self._needs.clear()
                     try:
                         self._pass(None, None)
                     except ModelNeeded as exc:
@@ -1284,7 +1287,8 @@ class Engine:
         if following == name:
             # The phase found nothing it could do (a run phase with nothing it may
             # run): doing it again would find the same.
-            held = "; ".join(f"{eid}: {why}" for eid, why in list(self._held.items())[:6])
+            waits = [(eid, why) for eid, why in self._held.items() if why]
+            held = "; ".join(f"{eid}: {why}" for eid, why in waits[:6])
             return "needs_you", (
                 "Nothing more can happen without you: "
                 + (f"autopilot did not approve {held}." if held else self._nothing_to_run())
@@ -3527,6 +3531,7 @@ class Engine:
         notes += [
             f"Autopilot did not approve {name}: {_sentence(why, 400)}"
             for name, why in self._held.items()
+            if why
         ]
         return AgentReport(produced=list(ctx.produced), summary=summary, notes=notes)
 
@@ -3549,6 +3554,11 @@ class Engine:
             self._heed_stop()
             try:
                 held = experiments.rule_holds(self.project, page.path)
+                if held is not None and page.state == "failed":
+                    # It ran and failed, and is not tried again as it stands: that was
+                    # said when it failed, and is no news at every later run phase.
+                    self._held[name] = ""
+                    continue
                 if held is None:
                     self._check_experiment_budget(page)
                     approved = experiments.approve_by_rule(

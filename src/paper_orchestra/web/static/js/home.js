@@ -134,7 +134,7 @@ export const startView = {
     /* how the agents are run: the server's default named as the default, the person's choice beside it */
     const agents = agentChoice(s), agentBase = agentDefaults();
     /* who decides: the server's default (it may be autopilot) until the person ticks */
-    const autonomy = d && d.settings && d.settings.autonomy, autopilot = typeof s.autopilot === 'boolean' ? s.autopilot : !!autonomy && autonomy.mode === 'autopilot';
+    const autonomy = d && d.autonomy, autopilot = typeof s.autopilot === 'boolean' ? s.autopilot : !!autonomy && autonomy.mode === 'autopilot';
     const offer = (list, kept, base, name) => [['', base ? 'Default (' + name(base) + ')' : 'As the project default']].concat(accepted(list, kept).map((v) => [v, name(v)]));
     const kinds = reviewKinds();
     const waits = (kind) => (s.auto[kind] != null ? !s.auto[kind] : reviewDefault(kind) !== 'auto');
