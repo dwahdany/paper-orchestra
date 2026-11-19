@@ -713,6 +713,8 @@ def test_the_record_of_an_approval_is_not_an_agents_to_write():
     agent's page cannot carry them, whatever its text says."""
     assert sorted(model.APPROVAL_FIELDS) == [
         "approved_at",
+        # Who approved, where it was the standing rule (autopilot) and not the person.
+        "approved_by",
         "approved_digest",
         "backend",
         "repaired_digest",

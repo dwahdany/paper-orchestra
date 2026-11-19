@@ -208,6 +208,12 @@ def kind_of_id(page_id: str) -> str | None:
 HUMAN = "human"
 SYSTEM = "system"
 AGENT_PREFIX = "agent:"
+#: The person's standing rule (``settings.autonomy.mode: autopilot``): who accepted a
+#: page, applied an edit, let a default hold or approved a run where the person had said
+#: beforehand that this is to happen without them.  It is neither the person nor an
+#: agent, and no tool of an agent writes as it: only the code of the rule does, and only
+#: in a project whose settings say ``autopilot`` (``Project`` refuses it elsewhere).
+AUTOPILOT = "autopilot"
 _AGENT_NAME = re.compile(r"^[a-z][a-z0-9_\-]*$")
 
 ROLES: tuple[str, ...] = (
@@ -248,13 +254,14 @@ def role_author(role: str) -> str:
 
 
 def normalize_author(value: Any) -> str:
-    """Canonical author: ``human``, ``system`` or ``agent:<name>``.
+    """Canonical author: ``human``, ``system``, ``agent:<name>`` or ``autopilot`` (the
+    person's standing rule, :data:`AUTOPILOT`).
 
     A bare role name is taken as that agent.  Anything else is refused, because the
     author decides what a page's writer may do next.
     """
     text = str(value).strip().lower() if isinstance(value, str) else ""
-    if text in (HUMAN, SYSTEM):
+    if text in (HUMAN, SYSTEM, AUTOPILOT):
         return text
     if text in ROLES:
         return agent_author(text)
@@ -318,6 +325,11 @@ INITIAL_STATE: dict[str, str] = {"question": "open", "hypothesis": "open", "expe
 _PERSON = frozenset({"person"})
 _CODE = frozenset({"code"})
 _EITHER = _PERSON | _CODE
+#: The person, or their standing rule where they switched it on (:data:`AUTOPILOT`).
+#: The rule makes two kinds of move in their place: it approves a plan that has not
+#: been approved or has failed, and it gives the verdict an agent proposed.  It takes
+#: nothing back and cancels nothing.
+_PERSON_OR_RULE = _PERSON | frozenset({"rule"})
 
 #: Every legal move of an experiment and who makes it.  Approval is the person's alone, from
 #: any state: it is what spends their money.  Code only carries an approved experiment
@@ -327,7 +339,7 @@ _EITHER = _PERSON | _CODE
 #: a page saved from an editor while its run was under way must not read as waiting to run
 #: once that run is over.
 _EXPERIMENT_MOVES: dict[tuple[str, str], frozenset[str]] = {
-    ("planned", "approved"): _PERSON,
+    ("planned", "approved"): _PERSON_OR_RULE,
     ("planned", "cancelled"): _PERSON,
     ("approved", "planned"): _EITHER,
     ("approved", "queued"): _CODE,
@@ -346,7 +358,7 @@ _EXPERIMENT_MOVES: dict[tuple[str, str], frozenset[str]] = {
     ("running", "cancelled"): _EITHER,
     ("succeeded", "approved"): _PERSON,
     ("succeeded", "planned"): _PERSON,
-    ("failed", "approved"): _PERSON,
+    ("failed", "approved"): _PERSON_OR_RULE,
     ("failed", "planned"): _PERSON,
     ("cancelled", "approved"): _PERSON,
     ("cancelled", "planned"): _PERSON,
@@ -354,10 +366,13 @@ _EXPERIMENT_MOVES: dict[tuple[str, str], frozenset[str]] = {
 
 
 def actor_class(by: str) -> str:
-    """``person``, ``code`` (the pipeline and the runner, which only executes) or ``agent``."""
+    """``person``, ``code`` (the pipeline and the runner, which only executes), ``rule``
+    (the person's standing rule, :data:`AUTOPILOT`) or ``agent``."""
     author = normalize_author(by)
     if author == HUMAN:
         return "person"
+    if author == AUTOPILOT:
+        return "rule"
     if author in (SYSTEM, agent_author("runner")):
         return "code"
     return "agent"
@@ -409,8 +424,10 @@ def _movers(kind: str, current: str, new: str) -> frozenset[str] | None:
     if kind == "hypothesis" and {current, new} == {"open", "testing"}:
         # Bookkeeping that follows from an experiment being run, not a judgement.
         return _EITHER
-    # Whether a hypothesis held or a question is answered is a verdict: the person's.
-    return _PERSON
+    # Whether a hypothesis held or a question is answered is a verdict: the person's, or
+    # where they said so beforehand their standing rule's, which gives the verdict an
+    # agent proposed.
+    return _PERSON_OR_RULE
 
 
 def check_transition(kind: str, current: str | None, new: str, by: str) -> None:
@@ -437,7 +454,7 @@ def check_transition(kind: str, current: str | None, new: str, by: str) -> None:
         return
     who = actor_class(by)
     movers = _movers(kind, current, new)
-    if movers is None and who != "agent":
+    if movers is None and who not in ("agent", "rule"):
         options = [target for (start, target) in _EXPERIMENT_MOVES if start == current]
         raise ProjectError(
             f"{with_article(kind).capitalize()} that is {current} cannot go straight to {new}; "
@@ -627,11 +644,12 @@ RUN_FIELDS: tuple[str, ...] = (
     "timeout_seconds",
 )
 #: The record of an approval on an experiment page: where the run goes, the digest of
-#: what was approved and when, and the digest after the runner's own repair.  Only the
+#: what was approved and when (and ``approved_by: autopilot`` where the person's standing
+#: rule approved it, not they), and the digest after the runner's own repair.  Only the
 #: approval (``research.experiments.approve``) and the run write them; no agent writes or
 #: proposes them, and of these only ``backend`` is a field the person may edit by hand.
 APPROVAL_FIELDS: frozenset[str] = frozenset(
-    {"backend", "approved_digest", "approved_at", "repaired_digest"}
+    {"backend", "approved_digest", "approved_at", "approved_by", "repaired_digest"}
 )
 #: What a model session cannot set by writing it into a page: the managed fields, the
 #: lifecycle state (approval is the person's), the session the page belongs to and the
@@ -659,6 +677,7 @@ _FIELD_ORDER: tuple[str, ...] = (
     "decision_reason",
     EDITED_BY_PERSON,
     "approved_at",
+    "approved_by",
     "approved_digest",
     "repaired_digest",
     *RELATIONS,
@@ -749,9 +768,18 @@ class ResearchPage:
 
     @property
     def decided_by(self) -> str | None:
-        """Who decided the page's review, when a person did."""
+        """Who decided the page's review: ``human``, or ``autopilot`` where the person's
+        standing rule accepted it; ``None`` when nobody did (it was accepted on creation
+        by the review policy, or still waits)."""
         value = self.meta.get("decided_by")
         return str(value) if value else None
+
+    @property
+    def decided_by_person(self) -> bool:
+        """Whether the person themselves decided the page's review.  What they read and
+        decided stays as they read it; what their standing rule accepted unread is, like
+        a page the policy accepted on creation, still its author's to work on."""
+        return bool(self.decided_by) and self.decided_by != AUTOPILOT
 
     @property
     def decision_reason(self) -> str:
@@ -1232,6 +1260,11 @@ EVENT_TYPES: tuple[str, ...] = (
     "decision.asked",
     "decision.answered",
     "decision.dismissed",
+    "decision.defaulted",
+    "autopilot.switched",
+    "autopilot.started",
+    "autopilot.continued",
+    "autopilot.stopped",
     "agent.activity",
     "experiment.state",
     "run.started",
@@ -1503,6 +1536,81 @@ class AgentSettings(_Section):
         return self.runtime == "sdk"
 
 
+#: Who decides what the agents propose: ``supervised`` leaves every decision to the
+#: person; ``autopilot`` is their standing rule, which accepts, applies, approves and
+#: goes on in their place up to the caps of one unattended stretch.
+AUTONOMY_MODES: tuple[str, ...] = ("supervised", "autopilot")
+#: Makes ``autopilot`` the mode of projects that are created while it is set to that.
+AUTONOMY_ENV = "PAPER_ORCHESTRA_AUTONOMY"
+#: Why a project whose agents work outside the sandbox gets no autopilot.
+AUTOPILOT_NEEDS_SANDBOX = (
+    "Autopilot is refused for this project: its agents run with the sandbox off "
+    "(settings.agents.sandbox is false), so an agent's shell reaches the project's own "
+    "files, and with them the switch and the caps that are yours alone to set. Turn the "
+    "sandbox on (settings.agents.sandbox: true), or keep the project supervised."
+)
+
+
+@dataclass
+class AutonomySettings(_Section):
+    """How much of the project happens without the person (``settings.autonomy``).
+
+    ``mode`` is ``supervised`` (every proposal, edit, run and checkpoint waits for the
+    person) or ``autopilot``: the person's standing rule decides in their place, and the
+    worker goes on from phase to phase by itself.  The other values are the caps of one
+    unattended stretch, counted from the person's last start: at most ``rounds`` rounds,
+    ``model_usd`` dollars of model spend and ``hours`` hours, whichever is reached first.
+    ``network`` says whether a run the rule approves gets the network access its plan
+    asks for (and with it model access, where the switch for that is on).
+
+    Only the person sets these: the file they are in is closed to agents, and the
+    command line and the app are refused to them (``research.sdk.guard``).
+    """
+
+    mode: str = "supervised"
+    rounds: int = 3
+    model_usd: float = 200.0
+    hours: float = 12.0
+    network: bool = False
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def invalid(self) -> dict[str, str]:
+        wrong: dict[str, str] = {}
+        if self.mode not in AUTONOMY_MODES:
+            wrong["mode"] = f"is {self.mode!r}; it must be one of: {', '.join(AUTONOMY_MODES)}"
+        whole = isinstance(self.rounds, int) and not isinstance(self.rounds, bool)
+        if not whole or self.rounds < 1:
+            wrong["rounds"] = f"is {self.rounds!r}; it must be a whole number, one or more"
+        for name in ("model_usd", "hours"):
+            value = getattr(self, name)
+            # A cap that is not a number, or is NaN or infinite, would cap nothing.
+            if not _is_number(value) or not math.isfinite(value) or value <= 0:
+                wrong[name] = f"is {value!r}; it must be a number above zero"
+        if not isinstance(self.network, bool):
+            wrong["network"] = f"is {self.network!r}; it must be true or false"
+        return wrong
+
+    def normalise(self) -> None:
+        if isinstance(self.mode, str):
+            self.mode = self.mode.strip().lower()
+        if isinstance(self.rounds, float) and self.rounds.is_integer():
+            self.rounds = int(self.rounds)
+
+    @property
+    def autopilot(self) -> bool:
+        """Whether the person's standing rule decides for them."""
+        return self.mode == "autopilot"
+
+
+def default_autonomy_mode(environ: Mapping[str, str] | None = None) -> str:
+    """The mode a project gets when it is created and nothing names one: ``supervised``,
+    or ``autopilot`` where :data:`AUTONOMY_ENV` says so.  Only asked when a project is
+    created, and only of the environment of the person's own command or app."""
+    environ = os.environ if environ is None else environ
+    asked = str(environ.get(AUTONOMY_ENV) or "").strip().lower()
+    return asked if asked in AUTONOMY_MODES else "supervised"
+
+
 def default_agent_runtime(environ: Mapping[str, str] | None = None) -> str:
     """The runtime a project gets when it is created and nothing names one:
     ``classic``, or ``sdk`` where :data:`AGENT_RUNTIME_ENV` says so.  Only asked when
@@ -1517,11 +1625,18 @@ def settings_for_new_project(
     settings: Mapping[str, Any] | None, environ: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
     """``settings`` as given for a project about to be created, with the runtime of its
-    agents named: the one given, else :func:`default_agent_runtime`."""
+    agents named: the one given, else :func:`default_agent_runtime`.  Where the
+    environment asks for autopilot (:data:`AUTONOMY_ENV`) and the settings name no
+    mode, the mode is named too."""
     chosen = dict(settings or {})
     agents = chosen.get("agents")
     if agents is None or (isinstance(agents, Mapping) and "runtime" not in agents):
         chosen["agents"] = {**(agents or {}), "runtime": default_agent_runtime(environ)}
+    autonomy = chosen.get("autonomy")
+    asked = default_autonomy_mode(environ)
+    unnamed = autonomy is None or (isinstance(autonomy, Mapping) and "mode" not in autonomy)
+    if asked != "supervised" and unnamed:
+        chosen["autonomy"] = {**(autonomy or {}), "mode": asked}
     return chosen
 
 
@@ -1595,6 +1710,8 @@ class ProjectSettings:
     limits: Limits = field(default_factory=Limits)
     #: How the agents are run: the classic tool loop, or Claude Agent SDK agents.
     agents: AgentSettings = field(default_factory=AgentSettings)
+    #: Who decides what the agents propose, and the caps of one unattended stretch.
+    autonomy: AutonomySettings = field(default_factory=AutonomySettings)
     lab_memory: bool = True
     #: The person's repository for experiments in ``repo`` mode; ``None`` when there is none.
     repo: RepoSettings | None = None
@@ -1619,6 +1736,11 @@ class ProjectSettings:
             "review": dict(self.review),
             "limits": self.limits.to_dict(),
             "agents": self.agents.to_dict(),
+            # Written once the person has set something there: the file of a project
+            # that was never anything but supervised stays as it always was.
+            **(
+                {} if self.autonomy == AutonomySettings() else {"autonomy": self.autonomy.to_dict()}
+            ),
             "lab_memory": self.lab_memory,
             # Written in its usual form whatever was assigned; an invalid value is written
             # as it is so that ``validate`` and a reader can see it.
@@ -1672,7 +1794,27 @@ class ProjectSettings:
         found += [f"settings.{name} {text}" for name, text in self._review_problems().items()]
         found += [f"settings.limits.{name} {text}" for name, text in self.limits.invalid().items()]
         found += [f"settings.agents.{name} {text}" for name, text in self.agents.invalid().items()]
+        found += [
+            f"settings.autonomy.{name} {text}" for name, text in self.autonomy.invalid().items()
+        ]
+        refused = self.autopilot_refused()
+        if refused:
+            found.append(refused)
         return found
+
+    def autopilot_refused(self) -> str | None:
+        """Why these settings cannot have ``autonomy.mode: autopilot``, as a sentence;
+        ``None`` when they can, and when they do not ask for it.
+
+        Agents with a shell outside the sandbox reach ``project.json``, and so the
+        switch and its caps: nothing would keep such an agent from widening what
+        happens without the person.  The check is of the settings as a whole, so it
+        holds whichever of the two values is changed, and by whom.
+        """
+        sandbox_off = self.agents.runtime == "sdk" and self.agents.sandbox is False
+        return (
+            AUTOPILOT_NEEDS_SANDBOX if self.autonomy.mode == "autopilot" and sandbox_off else None
+        )
 
     def validate(self) -> None:
         """Raise ``ProjectError`` naming every invalid value."""
@@ -1700,6 +1842,7 @@ class ProjectSettings:
             "review",
             "limits",
             "agents",
+            "autonomy",
             "lab_memory",
             "repo",
         }
@@ -1707,6 +1850,7 @@ class ProjectSettings:
             models=ModelSettings.load(raw.get("models"), "settings.models", problems),
             limits=Limits.load(raw.get("limits"), "settings.limits", problems),
             agents=AgentSettings.load(raw.get("agents"), "settings.agents", problems),
+            autonomy=AutonomySettings.load(raw.get("autonomy"), "settings.autonomy", problems),
             extra={str(key): value for key, value in raw.items() if key not in known},
         )
         for name in ("research_cutoff", "compute", "lab_memory", "repo"):
@@ -1735,6 +1879,13 @@ class ProjectSettings:
                 settings.review[kind] = default
         elif review is not None:
             problems.append(f"settings.review is {review!r}, not an object; the defaults are used")
+        refused = settings.autopilot_refused()
+        if refused:
+            # Fail closed: a file that asks for both (edited by hand, or by an agent
+            # outside the sandbox) is read as supervised.
+            problems.append(f"{refused.rstrip('.')}; the default ('supervised') is used")
+            if not strict:
+                settings.autonomy.mode = "supervised"
         if strict and problems:
             # A refusal uses nothing: it says what is wrong and stops there.
             said = [_DEFAULT_USED.sub("", problem) for problem in problems]
@@ -1761,7 +1912,16 @@ class ProjectSettings:
                     f"settings.agents has no value named {', '.join(unknown)}; it has: "
                     f"{', '.join(AgentSettings.names())}."
                 )
-        merged = self.to_dict()
+        autonomy = changes.get("autonomy")
+        if isinstance(autonomy, Mapping):
+            # As above: a cap under a misspelt name would be stored and cap nothing.
+            unknown = sorted(str(key) for key in autonomy if key not in AutonomySettings.names())
+            if unknown:
+                raise ProjectError(
+                    f"settings.autonomy has no value named {', '.join(unknown)}; it has: "
+                    f"{', '.join(AutonomySettings.names())}."
+                )
+        merged = {"autonomy": self.autonomy.to_dict(), **self.to_dict()}
         for key, value in changes.items():
             if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
                 merged[key] = {**merged[key], **value}
@@ -1775,6 +1935,7 @@ class ProjectSettings:
             "review",
             "limits",
             "agents",
+            "autonomy",
             "lab_memory",
             "repo",
         ):
