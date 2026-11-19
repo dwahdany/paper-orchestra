@@ -52,11 +52,18 @@ __all__ = [
 ]
 
 DECISIONS_DIR = "decisions"
-DECISION_STATES: tuple[str, ...] = ("open", "answered", "withdrawn")
-#: The events of a decision: asked by an agent, answered or left to the agents by the person.
+#: ``defaulted`` is what a decision is where the person's standing rule (autopilot) let
+#: the agent's stated default hold: it does not wait and is not counted as waiting, it
+#: stays listed, and the person may still answer it (it is then ``answered``).
+DECISION_STATES: tuple[str, ...] = ("open", "answered", "withdrawn", "defaulted")
+#: The events of a decision: asked by an agent, answered or left to the agents by the
+#: person, or left at its default by their standing rule.
 DECISION_ASKED = "decision.asked"
 DECISION_ANSWERED = "decision.answered"
 DECISION_DISMISSED = "decision.dismissed"
+DECISION_DEFAULTED = "decision.defaulted"
+#: Who let a default hold, as the record names it (``research.model.AUTOPILOT``).
+DEFAULTED_BY = "autopilot"
 #: The roles that are given ``ask_decision``: those whose sessions write pages.  (The
 #: runner executes what was approved and writes none.)
 ASKING_ROLES: tuple[str, ...] = ("intake", "scout", "theorist", "designer", "analyst")
@@ -165,11 +172,17 @@ class Decision:
     state: str = "open"
     #: Everything the person said to it, oldest first.  The last entry is the answer.
     answers: tuple[Answer, ...] = ()
+    #: When the person's standing rule let the default hold; empty when it never did.
+    #: It stays on the record after the person answered: the work went on by the
+    #: default until then.
+    defaulted_at: str = ""
 
     @property
     def answer(self) -> Answer | None:
-        """What holds now: the person's latest word, or ``None`` while it is open."""
-        return self.answers[-1] if self.answers and self.state != "open" else None
+        """What holds now: the person's latest word, or ``None`` while it is open or
+        stands at its default (nobody has said anything to it)."""
+        said = self.state in ("answered", "withdrawn")
+        return self.answers[-1] if self.answers and said else None
 
     @property
     def chosen(self) -> Option | None:
@@ -200,6 +213,12 @@ class Decision:
             "state": self.state,
             "answer": answer.to_dict() if answer else None,
             "answers": [given.to_dict() for given in self.answers],
+            # Only where the rule acted: a decision of a supervised project is as it was.
+            **(
+                {"defaulted_by": DEFAULTED_BY, "defaulted_at": self.defaulted_at}
+                if self.defaulted_at
+                else {}
+            ),
         }
 
     @classmethod
@@ -220,6 +239,8 @@ class Decision:
         if not answers and isinstance(data.get("answer"), Mapping):
             answers = [Answer.from_dict(data["answer"])]
         state = data.get("state")
+        if state == "defaulted" and answers:
+            state = None  # the person has spoken since: the answers say how it stands
         if state not in DECISION_STATES:
             state = "open" if not answers else "withdrawn" if answers[-1].dismissed else "answered"
         recommended = _whole(data.get("recommended"))
@@ -239,6 +260,8 @@ class Decision:
             created=str(data.get("created") or ""),
             state=state,
             answers=tuple(answers),
+            defaulted_at=str(data.get("defaulted_at") or "")
+            or (str(data.get("created") or "") if state == "defaulted" else ""),
         )
 
 
@@ -352,6 +375,12 @@ def with_dismissal(decision: Decision, *, at: str) -> Decision:
     return replace(decision, state="withdrawn", answers=(*decision.answers, answer))
 
 
+def with_default(decision: Decision, *, at: str) -> Decision:
+    """``decision`` left at its default by the person's standing rule: nobody answered,
+    and nobody is waited for.  It can still be answered."""
+    return replace(decision, state="defaulted", defaulted_at=at)
+
+
 def same_question(first: str, second: str) -> bool:
     """Whether two questions are the same words, whatever their case and spacing."""
     return _one_line(first).lower().rstrip("?.! ") == _one_line(second).lower().rstrip("?.! ")
@@ -396,11 +425,20 @@ def waiting(count: int) -> str:
     )
 
 
+class Told(list):  # type: ignore[type-arg]
+    """What :func:`told` returns: the list of decisions, which also says whether the
+    project runs on autopilot (``unattended``): a session is then told that nobody
+    reads its work before it counts."""
+
+    unattended: bool = False
+
+
 def told(project: Project) -> list[dict[str, Any]]:
     """What every session is told about the decisions, oldest first: for each one its
     state, the question, the page it is about, the labels of its options, the default
     and, once the person has spoken, the answer (``{"option", "label", "text"}``)."""
-    items = []
+    items = Told()
+    items.unattended = bool(project.settings.autonomy.autopilot)
     for decision in project.decisions():
         answer = decision.answer
         chosen = decision.chosen

@@ -868,6 +868,20 @@ _UNASKED = (
 )
 
 
+#: Said to every session of a project that runs on autopilot.  The standing instructions
+#: of a role describe a researcher who reads and decides; here a rule stands in for them.
+_UNATTENDED = (
+    "The researcher has switched this project to autopilot: nobody reads your work before "
+    "it counts. A page you write is accepted at once, an edit you propose is applied, an "
+    "accepted experiment is approved and run by a standing rule, and a decision you raise "
+    "goes on with the default you state. Where your instructions say that the researcher "
+    "accepted, approved or will decide something, that rule did or will, unread. Take the "
+    "care that unread work needs: claim only what the sources and the runs show, say what "
+    "is uncertain, keep experiments small and cheap, and still raise what is the "
+    "researcher's own choice with ask_decision, so that they find it when they look."
+)
+
+
 def _decisions(decisions: Sequence[Mapping[str, Any]]) -> list[str]:
     """What the agents asked the researcher to decide: every answer, for as long as the
     project lives, and what still waits or was left to the agents, with its default.
@@ -875,15 +889,18 @@ def _decisions(decisions: Sequence[Mapping[str, Any]]) -> list[str]:
     That nothing was asked yet is said as well: a session that reads "the researcher
     has to decide" on a page must be able to tell that nobody has asked them.
     """
+    unattended = [_UNATTENDED] if getattr(decisions, "unattended", False) else []
     if not decisions:
         return [
+            *unattended,
             "No decision has been put to the researcher with ask_decision so far, so "
-            "whatever a page says is theirs to decide has not been asked. " + _UNASKED
+            "whatever a page says is theirs to decide has not been asked. " + _UNASKED,
         ]
-    blocks: list[str] = []
+    blocks: list[str] = list(unattended)
     answered = [item for item in decisions if item.get("state") == "answered"]
     waiting = [item for item in decisions if item.get("state") == "open"]
     left = [item for item in decisions if item.get("state") == "withdrawn"]
+    defaulted = [item for item in decisions if item.get("state") == "defaulted"]
     if answered:
         blocks.append(
             "The researcher decided the questions below. The answers are the researcher's "
@@ -903,6 +920,17 @@ def _decisions(decisions: Sequence[Mapping[str, Any]]) -> list[str]:
             'The researcher left these to the agents ("not for me to decide"). The default '
             "holds; do not ask again.\n"
             + _block("decisions_left_to_you", "\n".join(_decision_line(item) for item in left))
+        )
+    if defaulted:
+        blocks.append(
+            "The researcher lets this project run without them (autopilot). These choices "
+            "were raised with ask_decision; nobody was waited for, and the default each one "
+            "states holds unless the researcher answers later. Do not ask them again; go on "
+            "with the default, and write so that the other answer could still be taken.\n"
+            + _block(
+                "decisions_at_their_default",
+                "\n".join(_decision_line(item) for item in defaulted),
+            )
         )
     blocks.append("Only the decisions listed above have been put to the researcher. " + _UNASKED)
     return blocks

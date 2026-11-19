@@ -214,7 +214,7 @@ class ProjectMemoryBackend:
             and page.author == self.author
             and page.session == self.session_id
             and page.review != "rejected"
-            and not page.decided_by
+            and not page.decided_by_person
             and not moved_on(page)
             and not self.project.edited_by_person(page)
         )
@@ -236,7 +236,7 @@ class ProjectMemoryBackend:
                 f"{name} was rejected by the person{_reason(page)}. It is kept as it was; "
                 "write a new page that addresses the reason instead."
             )
-        if page.decided_by:
+        if page.decided_by_person:
             raise ToolError(
                 f"{name} was accepted by the person; propose an edit with propose_edit."
             )
@@ -766,6 +766,14 @@ def propose_edit_tool(project: Project, role: str, round: int) -> ToolSpec:
             )
         except ProjectError as exc:
             raise ToolError(str(exc)) from exc
+        if proposal.review == "accepted":
+            # The person's standing rule (autopilot) applied it at once.
+            return (
+                f"Applied as {proposal.id}: {proposal.summary} (The researcher lets the "
+                f"project run on autopilot, so the edit is on "
+                f"{page.id or virtual_path(page.path)} now, unread by them; do not propose it "
+                f"again.){note}"
+            )
         return (
             f"Proposed as {proposal.id}: {proposal.summary} "
             f"({page.id or virtual_path(page.path)} is unchanged until the person accepts "

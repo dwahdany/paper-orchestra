@@ -56,6 +56,7 @@ from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.decisions import DECISIONS_DIR, Decision
 from paper_orchestra.research.model import (
     APPROVAL_FIELDS,
+    AUTOPILOT,
     EDITED_BY_PERSON,
     EVENT_TYPES,
     FOR_ALL,
@@ -139,6 +140,8 @@ PAPER_DIR = "paper"
 LOCK_FILE = ".project.lock"
 #: The event of a request the person withdrew (:meth:`Project.delete_request`).
 REQUEST_WITHDRAWN = "request.withdrawn"
+#: The event of the person changing ``settings.autonomy``: the switch, or its caps.
+AUTOPILOT_SWITCHED = "autopilot.switched"
 
 
 def _event_types() -> tuple[str, ...]:
@@ -218,6 +221,10 @@ HOME_KEY = "home"
 #: Key in ``project.json`` of a project that was built to be looked at (``research demo``):
 #: what it says it spent on models is part of its story, and no model was called.
 DEMONSTRATION_KEY = "demonstration"
+#: Key in ``project.json`` beside the settings: ``{"since": stamp}``, the moment the
+#: person switched autopilot on.  What waited by then is left for them unless they asked
+#: for it to be settled as well (``since`` is then empty: everything is the rule's).
+AUTOPILOT_KEY = "autopilot"
 _HOW_TO_APPROVE = (
     "A run is approved with `paper-orchestra research approve`, or with Approve in the app: "
     "that records what may run, and nothing else moves an experiment to approved, queued or "
@@ -487,12 +494,16 @@ def _who(author: str) -> str:
     and ``The engine`` for the code that runs the project (the app's word for it)."""
     if author == HUMAN:
         return "You"
+    if author == AUTOPILOT:
+        return "Autopilot"
     return f"The {role_of(author)}" if is_agent(author) else "The engine"
 
 
 def _whose(author: str) -> str:
     if author == HUMAN:
         return "your"
+    if author == AUTOPILOT:
+        return "autopilot's"
     return f"the {role_of(author)}'s" if is_agent(author) else "the engine's"
 
 
@@ -1011,6 +1022,8 @@ class Project:
         self._extra: dict[str, Any] = {}
         #: The title as project.json holds it, to tell a renaming from a settings change.
         self._title_on_file = ""
+        #: ``settings.autonomy`` as project.json holds it, to tell (and say) a change of it.
+        self._autonomy_on_file: dict[str, Any] = self.settings.autonomy.to_dict()
         self._file_problems: list[str] = []
         #: Size of events.jsonl when this process last wrote it, and the last seq in it.
         self._tail: tuple[int, int] = (0, 0)
@@ -1092,6 +1105,7 @@ class Project:
             # The directory the project will be: a rename keeps the inode.
             project._extra[HOME_KEY] = {"inode": (root if existed else built).stat().st_ino}
             project._title_on_file = title
+            project._autonomy_on_file = typed.autonomy.to_dict()
             project.created = project._clock.now()
             project._start(brief, chosen, skipped)
             if existed:
@@ -1288,6 +1302,7 @@ class Project:
         }
         self._file_problems = problems + self.settings.load_problems
         self._title_on_file = self.title
+        self._autonomy_on_file = self.settings.autonomy.to_dict()
         self.wiki.name = self.title
 
     def _write_project_file(self) -> None:
@@ -1320,17 +1335,112 @@ class Project:
                 self.title = title
                 if title != self._title_on_file:
                     self._extra.pop(TITLE_FROM_BRIEF, None)  # someone chose this one
+                before, autonomy = self._autonomy_on_file, self.settings.autonomy.to_dict()
+                was_on, is_on = before.get("mode") == "autopilot", self._autopilot()
+                if is_on and not was_on:
+                    # What waits at this moment was put there for the person.
+                    self._extra[AUTOPILOT_KEY] = {"since": self._clock.now()}
+                elif not is_on:
+                    self._extra.pop(AUTOPILOT_KEY, None)
                 self._write_project_file()
                 self._title_on_file = title
+                self._autonomy_on_file = autonomy
                 self._file_problems = []
                 self.wiki.name = title
                 self._changed()
+                if autonomy != before:
+                    self._say_autonomy(before, autonomy)
         except BaseException:
             # What could not be saved is not kept in memory: whoever holds this object
             # would go on showing, and working with, settings the project does not have.
             with contextlib.suppress(ProjectError):
                 self.reload()
             raise
+
+    # -- the standing rule -------------------------------------------------------
+
+    def _autopilot(self) -> bool:
+        """Whether the person's standing rule holds in this project."""
+        return self.settings.autonomy.mode == "autopilot"
+
+    def _check_rule(self, by: str) -> None:
+        """Raise ``NotAllowed`` when something is done as the standing rule in a project
+        whose person did not switch it on: the rule has no say of its own."""
+        if by == AUTOPILOT and not self._autopilot():
+            raise NotAllowed(
+                "Autopilot decides only in a project whose person switched it on "
+                "(settings.autonomy.mode is not autopilot here)."
+            )
+
+    @property
+    def autopilot_since(self) -> str:
+        """The moment the person switched autopilot on, as a stamp; empty when the rule
+        covers everything (the project was created with it, or the person asked for
+        what waited to be settled as well) and when it is off."""
+        noted = self._extra.get(AUTOPILOT_KEY)
+        since = noted.get("since") if isinstance(noted, dict) else None
+        return since if isinstance(since, str) else ""
+
+    def _say_autonomy(self, before: Mapping[str, Any], now: Mapping[str, Any]) -> None:
+        """Say in the feed that the person changed ``settings.autonomy``, and to what:
+        the switch and its caps are what everything unattended rests on."""
+        caps = (
+            f"at most {now.get('rounds')} round{'' if now.get('rounds') == 1 else 's'}, "
+            f"${float(now.get('model_usd') or 0):,.2f} on models and {now.get('hours'):g} hours "
+            "in one stretch; runs it approves get "
+            f"{'the network access their plans ask for' if now.get('network') else 'no network access'}"
+        )
+        if now.get("mode") != "autopilot":
+            said = (
+                "You switched autopilot off: everything waits for you again."
+                if before.get("mode") == "autopilot"
+                else f"You changed what autopilot would be held to ({caps}); it is off."
+            )
+        elif before.get("mode") != "autopilot":
+            said = f"You switched autopilot on: {caps}."
+        else:
+            said = f"You changed autopilot's caps: {caps}."
+        self.emit(
+            AUTOPILOT_SWITCHED,
+            said,
+            data={
+                "mode": now.get("mode"),
+                "autonomy": dict(now),
+                "before": dict(before),
+                "by": HUMAN,
+            },
+        )
+
+    def settle_waiting(self) -> dict[str, list[str]]:
+        """Apply the standing rule to what already waits: the person's "also settle what
+        waits now", asked for with the switch.  ``NotAllowed`` where autopilot is off.
+
+        Proposed pages are accepted, edit proposals applied and open decisions left
+        at their default, each recorded as the rule's doing; from here on the rule
+        also covers the experiments that were planned before it was switched on (they
+        are approved and run in the next stretch, under its caps: nothing runs here).
+        Returns what was done: ``{"accepted": [paths], "applied": [proposal ids],
+        "defaulted": [decision ids], "left": [what the rule leaves for the person]}``.
+        """
+        self._check_rule(AUTOPILOT)
+        done: dict[str, list[str]] = {"accepted": [], "applied": [], "defaulted": [], "left": []}
+        with self._lock:
+            for page in self.pages(review="proposed"):
+                try:
+                    self._decide_page(page.path, "accept", None, {}, None, by=AUTOPILOT)
+                    done["accepted"].append(page.path)
+                except ProjectError:
+                    done["left"].append(page.path)
+            for proposal in self.proposals():
+                after = self._rule_applies(proposal)
+                done["applied" if after.review == "accepted" else "left"].append(proposal.id)
+            for decision in self.decisions(state="open"):
+                self._default_decision(decision)
+                done["defaulted"].append(decision.id)
+            self._extra[AUTOPILOT_KEY] = {"since": "", "settled": self._clock.now()}
+            self._write_project_file()
+            self._changed()
+        return done
 
     @property
     def title_is_provisional(self) -> bool:
@@ -1710,6 +1820,7 @@ class Project:
 
     def _check_state(self, page: ResearchPage, state: Any, by: str) -> None:
         """Raise unless ``by`` may move ``page`` to ``state`` (messages name the page)."""
+        self._check_rule(by)
         try:
             check_transition(page.kind, page.state, str(state), by)
         except ProjectError as exc:
@@ -1791,7 +1902,7 @@ class Project:
         if author == HUMAN:
             return
         name = _name(page)
-        decided = bool(page.decided_by) or page.review == "rejected"
+        decided = page.decided_by_person or page.review == "rejected"
         if is_agent(author):
             if page.is_record:
                 raise NotAllowed(
@@ -1885,7 +1996,8 @@ class Project:
         self.emit(
             type,
             summary,
-            agent=role_of(by) or "",
+            # What the standing rule did is said as its own: "autopilot" is the actor.
+            agent=AUTOPILOT if by == AUTOPILOT else role_of(by) or "",
             refs=[page.path],
             data={
                 "path": page.path,
@@ -1973,6 +2085,11 @@ class Project:
             if summary:
                 meta["summary"] = summary
             meta["review"] = initial_review(kind, author, {kind: self.settings.policy(kind)})
+            # Where the person's standing rule holds, what would wait for them is
+            # accepted at once, and the page says who accepted it: the rule, not they.
+            by_rule = meta["review"] == "proposed" and self._autopilot()
+            if by_rule:
+                meta["review"] = "accepted"
             wanted = changes.pop("state", None)
             if kind in INITIAL_STATE:
                 meta["state"] = INITIAL_STATE[kind]
@@ -1992,12 +2109,23 @@ class Project:
             changes.pop("title", None)
             meta.update({key: value for key, value in changes.items() if value is not None})
             meta.update({name: targets for name, targets in relation_changes.items() if targets})
-            page = self._write(
-                path, meta, str(body or ""), editor=author, stamp=self._next_stamp(path)
-            )
+            stamp = self._next_stamp(path)
+            if by_rule:
+                meta.update({"decided_by": AUTOPILOT, "decided_at": stamp})
+            page = self._write(path, meta, str(body or ""), editor=author, stamp=stamp)
             self._changed()
             verb = "proposed" if page.review == "proposed" else "added"
-            self._page_event("page.created", f"{_who(author)} {verb} {_what(page)}.", page, author)
+            said = f"{_who(author)} {verb} {_what(page)}"
+            if by_rule:
+                self._page_event(
+                    "page.created",
+                    f"{said}; autopilot accepted it.",
+                    page,
+                    author,
+                    decided_by=AUTOPILOT,
+                )
+            else:
+                self._page_event("page.created", f"{said}.", page, author)
         return page
 
     def update_page(
@@ -2043,7 +2171,7 @@ class Project:
         with self._lock:
             page, text = self._fresh(ref)
             self._check_base(page, base_updated)
-            settled = page.review == "accepted" and (bool(page.decided_by) or page.author == HUMAN)
+            settled = page.review == "accepted" and (page.decided_by_person or page.author == HUMAN)
             if accept and not settled:
                 given = {"body": body, "fields": fields, "relations": relations}
                 edits = {name: value for name, value in given.items() if value is not None}
@@ -2056,7 +2184,7 @@ class Project:
                 return page
             _check_storable(page.path, meta, new_body)
             stamp = self._supersede(page, text)
-            if author == HUMAN and page.review == "accepted" and not page.decided_by:
+            if author == HUMAN and page.review == "accepted" and not page.decided_by_person:
                 # It was accepted without a look; now it holds what the person wrote, and
                 # from here on its author proposes changes like everyone else.  (Nothing
                 # is decided by this: the page was accepted already.)
@@ -2209,7 +2337,10 @@ class Project:
         reason: str | None,
         edits: Mapping[str, Any],
         base_updated: str | None,
+        by: str = HUMAN,
     ) -> ResearchPage:
+        """``by`` is the person, or their standing rule (:meth:`settle_waiting`): the
+        page, its history and the event then say that the rule accepted it."""
         page, text = self._fresh(ref)
         self._check_base(page, base_updated)
         if page.author == HUMAN and choice == "reject":
@@ -2228,7 +2359,7 @@ class Project:
             edited = meta != page.meta or body != page.body
             # Nothing to decide: already accepted by the person, or their own page.  (A page
             # of theirs that a hand-written file marks ``proposed`` is accepted below.)
-            settled = bool(page.decided_by) or page.author == HUMAN
+            settled = page.decided_by_person or page.author == HUMAN
             if page.review == "accepted" and settled and not edited:
                 return page
         else:
@@ -2246,28 +2377,28 @@ class Project:
         meta.update(
             {
                 "review": "accepted" if choice == "accept" else "rejected",
-                "decided_by": HUMAN,
+                "decided_by": by,
                 "decided_at": stamp,
             }
         )
         meta.pop("decision_reason", None)
         if reason:
             meta["decision_reason"] = reason
-        new = self._write(page.path, meta, body, editor=HUMAN, stamp=stamp, previous=page)
+        new = self._write(page.path, meta, body, editor=by, stamp=stamp, previous=page)
         self._changed()
         verb = "accepted" if choice == "accept" else "rejected"
         tail = f": {reason}" if reason and choice == "reject" else ""
         self._page_event(
             "review.decided",
-            _sentence(f"You {verb} {_what(new)}{tail}"),
+            _sentence(f"{_who(by)} {verb} {_what(new)}{tail}"),
             new,
-            HUMAN,
+            by,
             decision=choice,
             reason=reason,
             edited=edited,
             target="page",
         )
-        self._state_event(page, new, HUMAN, reason)
+        self._state_event(page, new, by, reason)
         return new
 
     # -- edit proposals ----------------------------------------------------------
@@ -2426,16 +2557,48 @@ class Project:
                 data={"proposal": proposal.id, "path": page.path, "id": page.id, "by": author},
                 round=proposal.round,
             )
+            if self._autopilot():
+                proposal = self._rule_applies(proposal)
         return proposal
 
+    def _rule_applies(self, proposal: EditProposal) -> EditProposal:
+        """The person's standing rule on one edit proposal: it is applied, as their
+        accepting it would apply it, and the proposal and the event say that the rule
+        did.  Returns the proposal as it stands afterwards.
+
+        Two kinds of edit are left for the person, and wait as they would without the
+        rule: a new text for a page the person wrote themselves (their idea, their own
+        pages: the rule changes fields of such a page, never their words), and one the
+        project refuses or cannot apply as it stands (the page changed since, or it is
+        gone).  Nothing waits on them: an edit proposal holds nobody up.
+        """
+        try:
+            page = self._fresh(proposal.target)[0]
+            if proposal.body is not None and page.author == HUMAN:
+                return proposal
+            return self._decide_proposal(proposal, "accept", None, {}, by=AUTOPILOT)
+        except Conflict as exc:
+            left = getattr(exc, "proposal", None)
+            return left if isinstance(left, EditProposal) else proposal
+        except ProjectError:
+            return proposal
+
     def _decide_proposal(
-        self, proposal: EditProposal, choice: str, reason: str | None, edits: Mapping[str, Any]
+        self,
+        proposal: EditProposal,
+        choice: str,
+        reason: str | None,
+        edits: Mapping[str, Any],
+        by: str = HUMAN,
     ) -> EditProposal:
+        """``by`` is the person, or their standing rule (:meth:`_rule_applies`): the
+        proposal's file and the event then say that the rule applied it, and the page
+        is not marked as something the person decided."""
         if proposal.review != "proposed":
             raise ProjectError(
                 f"{proposal.id} was already {proposal.review} at {proposal.decided_at}."
             )
-        decided = {"decided_by": HUMAN, "decided_at": self._clock.now(), "decision_reason": reason}
+        decided = {"decided_by": by, "decided_at": self._clock.now(), "decision_reason": reason}
         if choice == "reject":
             # The page it would have changed is named by what it is called, if it is there.
             try:
@@ -2488,13 +2651,13 @@ class Project:
         }
         relations.update(edits.get("relations") or {})
         meta, new_body = self._apply_changes(
-            page, by=HUMAN, body=body, fields=fields, relations=relations
+            page, by=by, body=body, fields=fields, relations=relations
         )
         new = page
         applied = meta != page.meta or new_body != page.body
         if applied:
             stamp = self._supersede(page, text)
-            if page.review == "accepted" and not page.decided_by:
+            if by == HUMAN and page.review == "accepted" and not page.decided_by_person:
                 # A page that was accepted without review now holds something the person
                 # approved: from here on its author proposes changes like everyone else.
                 meta.update({"decided_by": HUMAN, "decided_at": stamp})
@@ -2507,7 +2670,7 @@ class Project:
                 previous=page,
             )
             self._changed()
-            self._state_event(page, new, HUMAN)
+            self._state_event(page, new, by)
         if not stale:
             return self._close_proposal(replace(proposal, review="accepted", **decided), new)
         conflict = (
@@ -2555,12 +2718,16 @@ class Project:
         what = _what(page) if page is not None else quotable(proposal.target, 120)
         # The reason is the person's own; the summary is what an agent called its edit.
         tail = proposal.decision_reason if verb == "rejected" and proposal.decision_reason else ""
+        by = AUTOPILOT if proposal.decided_by == AUTOPILOT else HUMAN
+        # The rule reads nothing and so accepts nothing: it applies the edit.
+        did = "applied" if by == AUTOPILOT and verb == "accepted" else verb
         self.emit(
             "review.decided",
             _sentence(
-                f"You {verb} {_whose(proposal.author)} edit to {what}: "
+                f"{_who(by)} {did} {_whose(proposal.author)} edit to {what}: "
                 f"{tail or _said(proposal.summary)}"
             ),
+            agent=AUTOPILOT if by == AUTOPILOT else "",
             refs=[proposal.target, f"{PROPOSALS_DIR}/{proposal.id}.json"],
             data={
                 "proposal": proposal.id,
@@ -2569,7 +2736,7 @@ class Project:
                 "reason": proposal.decision_reason,
                 "conflict": bool(proposal.conflict),
                 "target": "proposal",
-                "by": HUMAN,
+                "by": by,
             },
         )
         return proposal
@@ -2669,6 +2836,7 @@ class Project:
                 f"The record of an approval is written when the person approves a run; {by} "
                 "cannot write it."
             )
+        self._check_rule(by)
         unknown = sorted(set(fields) - _APPROVAL_WRITES)
         if unknown:
             raise ProjectError(
@@ -2766,6 +2934,11 @@ class Project:
             # A result is what a run produced; a source is held back only where the person
             # asked to vet sources themselves.
             meta["review"] = "accepted" if self.settings.policy(kind) == "auto" else "proposed"
+            by_rule = meta["review"] == "proposed" and previous is None and self._autopilot()
+            if by_rule:
+                # The standing rule accepts what would wait, and the record says it did.
+                meta.update({"review": "accepted", "decided_by": AUTOPILOT})
+                meta["decided_at"] = self._clock.now()
             if state is not None:
                 meta["state"] = state
             meta["author"] = SYSTEM
@@ -2788,7 +2961,15 @@ class Project:
             # A record is what a run or a bibliographic service left: said as that.
             what = _what(page)
             what = f"{what[0].upper()}{what[1:]}"
-            if previous is None:
+            if previous is None and by_rule:
+                self._page_event(
+                    "page.created",
+                    f"{what} was recorded; autopilot accepted it.",
+                    page,
+                    SYSTEM,
+                    decided_by=AUTOPILOT,
+                )
+            elif previous is None:
                 self._page_event("page.created", f"{what} was recorded.", page, SYSTEM)
             else:
                 self._page_event("page.updated", f"{what} was recorded again.", page, SYSTEM)
@@ -2927,7 +3108,8 @@ class Project:
     def decisions(self, *, state: str | None = None) -> list[Decision]:
         """What the agents asked the person to decide, oldest first: everything, or what
         is in ``state`` (``open``, ``answered``, ``withdrawn``).  A project without the
-        folder has none."""
+        folder has none.  ``defaulted`` is a fourth state, of a decision that the
+        person's standing rule left at the agents' default: it does not wait."""
         folder = self.root / DECISIONS_DIR
         found = []
         for file in sorted(folder.glob("d-*.json")) if folder.is_dir() else []:
@@ -2995,10 +3177,22 @@ class Project:
                 },
                 created=self._created_after(self.decisions()),
             )
+            by_rule = self._autopilot()
+            if by_rule:
+                # Nobody is asked to look: the default the agent stated holds, the
+                # record says so, and the person may still answer whenever they do look.
+                decision = decision_records.with_default(decision, at=decision.created)
             _check_storable("The decision", decision.to_dict())
             (self.root / DECISIONS_DIR).mkdir(exist_ok=True)
             write_json(self._decision_path(decision.id), decision.to_dict())
             asks = f"The {decision.role} asks you to decide: {_quoted(decision.question, 200)}"
+            if by_rule:
+                asks = (
+                    f"The {decision.role} raised a choice that is yours: "
+                    f"{_quoted(decision.question, 200)} Autopilot went on with its default"
+                    + (f", {_quoted(decision.default, 160)}" if decision.default else "")
+                    + "; you can still answer"
+                )
             self.emit(
                 decision_records.DECISION_ASKED,
                 _sentence(asks),
@@ -3006,8 +3200,42 @@ class Project:
                 agent=decision.role,
                 round=round,
                 refs=[f"{DECISIONS_DIR}/{decision.id}.json", *([linked] if linked else [])],
-                data={"decision": decision.id, "page": linked, "options": len(decision.options)},
+                data={
+                    "decision": decision.id,
+                    "page": linked,
+                    "options": len(decision.options),
+                    **({"state": decision.state, "decided_by": AUTOPILOT} if by_rule else {}),
+                },
             )
+        return decision
+
+    def _default_decision(self, before: Decision) -> Decision:
+        """An open decision left at its default by the standing rule (the person asked for
+        what waits to be settled): it no longer waits, and can still be answered."""
+        latest = before.answers[-1].at if before.answers else ""
+        decision = decision_records.with_default(before, at=stamp_after(self._clock.now(), latest))
+        on_file = self._own_json(self._decision_path(decision.id))
+        extra = on_file if isinstance(on_file, dict) else {}
+        write_json(self._decision_path(decision.id), {**extra, **decision.to_dict()})
+        goes_on = f": {_quoted(decision.default, 160)}" if decision.default else ""
+        self.emit(
+            decision_records.DECISION_DEFAULTED,
+            _sentence(
+                f"Autopilot left {_quoted(decision.question, 120)} at the agents' "
+                f"default{goes_on}; you can still answer"
+            ),
+            agent=AUTOPILOT,
+            refs=[
+                f"{DECISIONS_DIR}/{decision.id}.json",
+                *([decision.page] if decision.page else []),
+            ],
+            data={
+                "decision": decision.id,
+                "page": decision.page,
+                "state": decision.state,
+                "by": AUTOPILOT,
+            },
+        )
         return decision
 
     def _decided(self, decision: Decision, type: str, summary: str, changed: bool) -> Decision:
@@ -3057,7 +3285,9 @@ class Project:
                 before, at=stamp_after(self._clock.now(), latest), option=option, text=text
             )
             _check_storable("The answer", decision.answers[-1].text)
-            verb = "changed your answer to" if before.state != "open" else "decided"
+            # (A default that autopilot let hold is not something the person said.)
+            spoke = before.state in ("answered", "withdrawn")
+            verb = "changed your answer to" if spoke else "decided"
             # The question and the labels are an agent's words: quoted, as the answer is.
             answer, chosen = decision.answers[-1], decision.chosen
             parts = [
@@ -3068,7 +3298,7 @@ class Project:
                 decision,
                 decision_records.DECISION_ANSWERED,
                 f"You {verb} {_quoted(decision.question, 120)}: {'; '.join(parts)}",
-                before.state != "open",
+                spoke,
             )
 
     def dismiss_decision(self, decision_id: str) -> Decision:
@@ -3095,7 +3325,7 @@ class Project:
                 decision,
                 decision_records.DECISION_DISMISSED,
                 f"You left {_quoted(decision.question, 120)} to the agents{goes_on}",
-                before.state != "open",
+                before.state == "answered",
             )
 
     # -- events ------------------------------------------------------------------

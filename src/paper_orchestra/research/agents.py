@@ -1598,7 +1598,7 @@ def _own_proposal(page: ResearchPage, backend: ProjectMemoryBackend) -> bool:
         page.author == backend.author
         and page.session == backend.session_id
         and page.review != "rejected"
-        and not page.decided_by
+        and not page.decided_by_person
         and not moved_on(page)
     )
 

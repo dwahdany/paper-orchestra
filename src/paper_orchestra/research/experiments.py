@@ -75,6 +75,7 @@ from paper_orchestra.memory.leakscan import NUMBER, is_identifying, number_readi
 from paper_orchestra.memory.lock import WikiLock
 from paper_orchestra.research import repo as repositories
 from paper_orchestra.research.model import (
+    AUTOPILOT,
     COMPUTE_BACKENDS,
     EDITED_BY_PERSON,
     HUMAN,
@@ -106,6 +107,8 @@ __all__ = [
     "adopt_run_code",
     "approval",
     "approve",
+    "approve_by_rule",
+    "approved_by_rule",
     "check_code",
     "code_authors",
     "code_digest",
@@ -114,6 +117,7 @@ __all__ = [
     "dependents",
     "edit_report",
     "edited_record",
+    "failures",
     "job_command",
     "job_spec",
     "keep_code_as_run",
@@ -130,6 +134,8 @@ __all__ = [
     "reportable_text",
     "request_cancel",
     "result_records",
+    "rule_candidates",
+    "rule_holds",
     "run",
     "run_code_changed",
     "runs",
@@ -1041,13 +1047,20 @@ def _approval_record(project: Project, page: ResearchPage) -> dict[str, Any] | N
 
 
 def _write_approval(
-    project: Project, experiment_id: str, digest: str, stamp: str, fields: Mapping[str, Any]
+    project: Project,
+    experiment_id: str,
+    digest: str,
+    stamp: str,
+    fields: Mapping[str, Any],
+    by: str = HUMAN,
 ) -> None:
     record = {
         "digest": digest,
         "at": stamp,
         "plan": {name: _shown_field(name, value) for name, value in fields.items()},
         "code": _file_digests(code_dir(project, experiment_id)),
+        # Only where it was not the person: their own approvals are recorded as before.
+        **({"by": by} if by != HUMAN else {}),
     }
     try:
         write_json(_approval_path(project, experiment_id), record)
@@ -1176,7 +1189,16 @@ def will_not_run(project: Project, ref: str) -> str | None:
     return _departure(project, page, fields, _current_digest(project, str(page.id)))
 
 
-def waiting_in_line(project: Project, *, skip: Collection[str] = ()) -> list[ResearchPage]:
+def approved_by_rule(page: ResearchPage) -> bool:
+    """Whether the approval on ``page`` is the standing rule's (autopilot's) and not the
+    person's own.  Such an approval holds for the unattended stretch it was made in:
+    nothing but that stretch's worker runs it."""
+    return _text(page.meta.get("approved_by")) == AUTOPILOT
+
+
+def waiting_in_line(
+    project: Project, *, skip: Collection[str] = (), rule: bool = False
+) -> list[ResearchPage]:
     """The experiments that wait for their run, in the order they are run in.
 
     Those are the accepted experiments whose page reads ``approved`` or ``queued`` and
@@ -1185,10 +1207,16 @@ def waiting_in_line(project: Project, *, skip: Collection[str] = ()) -> list[Res
     one experiment needs another's result, so the order is that of the approvals:
     whoever was approved first runs first, and two of the same moment go by their
     ids.  ``skip`` are page paths that are left out (what a worker has already tried).
+
+    An experiment that autopilot approved (:func:`approved_by_rule`) is in the line only
+    for the worker of the stretch it was approved in, which asks with ``rule``: for
+    everyone else it does not wait to run, because nobody but that worker runs it.
     """
     waiting = []
     for page in project.pages(kind="experiment", review="accepted", state=["approved", "queued"]):
         if page.path in skip or not page.id:
+            continue
+        if approved_by_rule(page) and not rule:
             continue
         try:
             if will_not_run(project, page.path) is not None:
@@ -1274,7 +1302,7 @@ def _check_may_write(
         reason = "was rejected by the person and is kept as it was"
     elif supplies_missing_code(project, page, author):
         return
-    elif page.decided_by:
+    elif page.decided_by_person:
         reason = "was accepted by the person, so its code stays as they read it"
     elif page.author != author:
         reason = f"was written by {page.author}, and only its author changes its code"
@@ -1990,12 +2018,17 @@ def approve(
     base_updated: str | None = None,
     code_digest: str | None = None,
     backends: Any = None,
+    by: str = HUMAN,
 ) -> ResearchPage:
     """The person approves a run of the experiment; returns its page, now ``approved``.
 
     This is the person's decision and nothing else calls it for them: it is what
     the command line and the web app do when the person says so, and it is the
-    only way an experiment becomes ``approved``.
+    only way an experiment becomes ``approved``.  One caller stands in for them
+    where they said so beforehand: their standing rule (:func:`approve_by_rule`,
+    ``by`` is then ``autopilot``), in a project whose settings switch it on.  The
+    page, the record of the approval and the events then name the rule, never the
+    person (``approved_by: autopilot``), and every check below is made all the same.
 
     The approval decides how the run may happen and never takes that from the
     page, which an agent may have written.  ``network``: ``True`` or ``False``
@@ -2066,7 +2099,7 @@ def approve(
         choice.close()
     if reasons:
         raise ProjectError(f"{name} cannot be approved:\n- " + "\n- ".join(reasons))
-    approved = _record_approval(project, page, reading.plan, read, base_updated)
+    approved = _record_approval(project, page, reading.plan, read, base_updated, by)
     with contextlib.suppress(OSError):
         _flag_path(project, name).unlink(missing_ok=True)  # of a run cancelled earlier
     _mark_testing(project, approved)
@@ -2079,6 +2112,7 @@ def _record_approval(
     plan: ExperimentPlan,
     code: str,
     base_updated: str | None,
+    by: str = HUMAN,
 ) -> ResearchPage:
     """Write what was approved onto the page and move it to ``approved``, as one step.
 
@@ -2115,8 +2149,10 @@ def _record_approval(
                 "approved_at": stamp,
                 "approved_digest": digest,
                 "repaired_digest": None,  # of the run an earlier approval allowed
+                # Who approved, where it was not the person (theirs takes the mark off).
+                "approved_by": by if by != HUMAN else None,
             },
-            by=HUMAN,
+            by=by,
             base_updated=base_updated,
         )
         if _digest_of(_run_fields(_read(project, noted).plan), code) != digest:
@@ -2127,8 +2163,129 @@ def _record_approval(
                 "once the approved options are written on it. Correct the page's fields "
                 f"({', '.join(RUN_FIELDS)}) and approve again."
             )
-        _write_approval(project, name, digest, stamp, fields)
-        return project.set_state(page.path, "approved", by=HUMAN)
+        _write_approval(project, name, digest, stamp, fields, by)
+        return project.set_state(page.path, "approved", by=by)
+
+
+# ---------------------------------------------------------------------------
+# The standing rule (autopilot)
+# ---------------------------------------------------------------------------
+
+#: Why the rule does not approve a run that the local backend would execute under the
+#: classic runtime: code no person has read, run as the person, outside any sandbox.
+UNSANDBOXED_RUN = (
+    "it would run on this machine as you, outside a sandbox (the local backend under the "
+    "classic runtime), and autopilot does not approve code nobody has read for that: "
+    "approve it yourself, or run experiments on Modal or with sandboxed sdk agents"
+)
+
+
+def _ended_runs(project: Project, experiment_id: str) -> list[dict[str, Any]]:
+    """The runs of the experiment that are over for good: settled, and not put back in
+    the queue by a stop."""
+    return [
+        record
+        for record in runs(project, experiment_id)
+        if record.get("status") in ("succeeded", "failed", "cancelled")
+        and not record.get("requeued")
+    ]
+
+
+def failures(project: Project, experiment_id: str, *, since: str = "") -> int:
+    """How many approved runs of the experiment ended as failed, counted by approval (a
+    run that was repaired and tried again is one), from the moment ``since`` on."""
+    failed = {
+        _text(record.get("approval")) or _text(record.get("started"))
+        for record in _ended_runs(project, experiment_id)
+        if record.get("status") == "failed"
+        and (not since or _text(record.get("finished") or record.get("started")) >= since)
+    }
+    return len(failed)
+
+
+def rule_holds(project: Project, ref: str) -> str | None:
+    """Why the person's standing rule does not approve a run of the experiment as it
+    stands, as the rest of a sentence about it; ``None`` when it would try.
+
+    The rule approves an accepted experiment that is planned and has not run, and
+    one whose only runs failed and whose plan or code was changed since (a second
+    try, and no third).  It leaves to the person: what was planned before they
+    switched autopilot on (unless they asked for that to be settled too), what
+    they cancelled or what succeeded already, and a run that would execute unread
+    code as them outside a sandbox (:data:`UNSANDBOXED_RUN`).  Nothing is written.
+    """
+    page = _experiment(project, ref)
+    name = str(page.id)
+    if page.review != "accepted":
+        return f"its page is {page.review}, not accepted"
+    if page.state not in ("planned", "failed"):
+        return f"it is {page.state}"
+    since = project.autopilot_since
+    if since and max(page.created, _text(page.meta.get("decided_at"))) < since:
+        return (
+            "it was planned before autopilot was switched on, and what waited then is "
+            "yours unless you ask for it to be settled as well"
+        )
+    ended = _ended_runs(project, name)
+    if ended:
+        last = ended[-1]
+        if last.get("status") != "failed":
+            return f"its last run {'was cancelled' if last.get('status') == 'cancelled' else last.get('status')}"
+        if failures(project, name) >= 2:
+            return "it has failed twice"
+        fields = _run_fields(_read(project, page).plan)
+        now = _digest_of(fields, _current_digest(project, name))
+        if now in (
+            _text(page.meta.get("approved_digest")),
+            _text(page.meta.get("repaired_digest")),
+        ):
+            return "it failed, and neither its plan nor its code has changed since"
+    elif page.state == "failed":
+        return "it failed, and nothing records the run"
+    agents = project.settings.agents
+    sandboxed_agents = agents.runtime == "sdk" and agents.sandbox is True
+    if _default_backend(project, page) == "local" and not sandboxed_agents:
+        return UNSANDBOXED_RUN
+    return None
+
+
+def rule_candidates(project: Project) -> list[ResearchPage]:
+    """The accepted experiments the standing rule would look at, by their ids: those
+    that are planned, or failed (see :func:`rule_holds` for which of them it approves)."""
+    pages = project.pages(kind="experiment", review="accepted", state=["planned", "failed"])
+
+    def order(page: ResearchPage) -> tuple[int, str]:
+        digits = "".join(ch for ch in str(page.id) if ch.isdigit())
+        return (int(digits) if digits else 0, str(page.id))
+
+    return sorted((page for page in pages if page.id), key=order)
+
+
+def approve_by_rule(project: Project, ref: str, *, backends: Any = None) -> ResearchPage:
+    """The person's standing rule approves a run of the experiment: through
+    :func:`approve`, with every check it makes, recorded as the rule's.
+
+    The options are the plan's, on the backend the person would get by default
+    (the project's; never one that merely stands on the page).  Network access is
+    granted only where the plan asks for it and ``settings.autonomy.network`` is
+    on; a plan that asks without that is approved to run without the network.
+    ``ProjectError`` says why nothing was approved: what :func:`rule_holds` says, or
+    what the approval itself refuses (errors in the code, a backend that cannot
+    run it, the cost limit).
+    """
+    if not project.settings.autonomy.autopilot:
+        raise ProjectError(
+            "Autopilot is off for this project (settings.autonomy.mode): nothing is "
+            "approved without the person."
+        )
+    page = _experiment(project, ref)
+    held = rule_holds(project, page.path)
+    if held is not None:
+        raise ProjectError(f"{page.id} was not approved by autopilot: {held}.")
+    wrong: list[str] = []
+    asks = _flag(page.meta.get("network"), "network", wrong)
+    grant = bool(asks and project.settings.autonomy.network)
+    return approve(project, page.path, network=grant, backends=backends, by=AUTOPILOT)
 
 
 # ---------------------------------------------------------------------------
