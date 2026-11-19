@@ -1802,23 +1802,25 @@ class ProjectSettings:
             found.append(refused)
         return found
 
-    def autopilot_refused(self) -> str | None:
+    def autopilot_refused(self, asked: bool | None = None) -> str | None:
         """Why these settings cannot have ``autonomy.mode: autopilot``, as a sentence;
-        ``None`` when they can, and when they do not ask for it.
+        ``None`` when they can, and when they do not ask for it.  With ``asked`` the
+        question is whether switching it on would be refused, whatever the mode is.
 
         Agents with a shell outside the sandbox reach ``project.json``, and so the
         switch and its caps: nothing would keep such an agent from widening what
         happens without the person.  The check is of the settings as a whole, so it
         holds whichever of the two values is changed, and by whom.
         """
+        wanted = self.autonomy.mode == "autopilot" if asked is None else asked
         sandbox_off = self.agents.runtime == "sdk" and self.agents.sandbox is False
-        return (
-            AUTOPILOT_NEEDS_SANDBOX if self.autonomy.mode == "autopilot" and sandbox_off else None
-        )
+        return AUTOPILOT_NEEDS_SANDBOX if wanted and sandbox_off else None
 
     def validate(self) -> None:
         """Raise ``ProjectError`` naming every invalid value."""
         found = self.problems()
+        if found == [AUTOPILOT_NEEDS_SANDBOX]:
+            raise ProjectError(AUTOPILOT_NEEDS_SANDBOX)
         if found:
             raise ProjectError("The project settings are not valid:\n" + "\n".join(found))
 
@@ -1886,6 +1888,8 @@ class ProjectSettings:
             problems.append(f"{refused.rstrip('.')}; the default ('supervised') is used")
             if not strict:
                 settings.autonomy.mode = "supervised"
+        if strict and refused and len(problems) == 1:
+            raise ProjectError(refused)  # one plain sentence, and nothing around it
         if strict and problems:
             # A refusal uses nothing: it says what is wrong and stops there.
             said = [_DEFAULT_USED.sub("", problem) for problem in problems]
