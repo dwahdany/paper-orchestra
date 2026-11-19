@@ -190,7 +190,7 @@ def test_a_stretch_started_from_the_command_line_goes_on_in_that_worker(workspac
     assert {page.state for page in project.pages(kind="experiment")} == {"planned"}
     lines = flat(status.stdout)
     assert "Autopilot: on." in lines and "The last stretch ended" in lines
-    assert "Waiting for you: E1: it would run on this machine as you" in lines
+    assert "Waiting for you: E1" in lines and "it would run on this machine as you" in lines
     assert data["autonomy"]["mode"] == "autopilot"
     assert data["autopilot"]["reason"] == "needs_you" and data["autopilot"]["held"]
     assert data["autopilot"]["accepted_by_kind"]["hypothesis"] >= 1
@@ -406,8 +406,9 @@ def test_the_client_shows_the_switch_the_digest_and_who_decided(tmp_path):
     on = out["on"]
     failed = [name for name, value in on.items() if value is False]
     assert not failed, failed
-    # What autopilot left at its default does not wait; what it did not approve does.
-    assert (on["waiting"], on["open"], on["heldRuns"]) == (0, 0, ["E3"])
+    # What autopilot left at its default does not wait; what it did not approve does,
+    # and is counted with what waits.
+    assert (on["waiting"], on["open"], on["heldRuns"]) == (1, 0, ["E3"])
     assert on["actors"] == ["autopilot", "autopilot", "autopilot", "you"]
     assert on["folded"].startswith('Autopilot approved experiment E1 "T" to run on this machine')
     assert on["who"] == ["autopilot", "you", "the scout"]

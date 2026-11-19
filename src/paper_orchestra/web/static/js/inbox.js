@@ -62,7 +62,9 @@ export function currentItem(store, route) {
 export const inboxView = {
   render(root, route) {
     const store = app.store, items = store.pending(), cur = currentItem(store, route), alone = listAlone(route);
-    const asked = openDecisions(store).length, waiting = items.length + asked;   // (a decision waits like a proposal, and holds nothing up)
+    /* what autopilot does not approve: it waits for the person although autopilot is on */
+    const heldList = heldRuns(store).map((h) => ({ h, x: store.expById.get(h.id) })).filter((it) => it.x);
+    const asked = openDecisions(store).length, waiting = items.length + asked + heldList.length;   // (a decision waits like a proposal, and holds nothing up)
     const checked = app.ui.checked;
     Object.keys(checked).forEach((ref) => { if (!items.find((it) => it.ref === ref)) delete checked[ref]; });
     const nChecked = Object.keys(checked).length;
@@ -92,8 +94,6 @@ export const inboxView = {
         <span class="in-name">${pageName(it.page)}</span><span class="in-when">${it.edit ? 'edit ' : ''}${it.review} ${ago(it.at)}</span>
         ${it.edit && it.summary ? html`<span class="in-why in-sugg">${it.summary}</span>` : ''}${it.reason ? html`<span class="in-why"><q>${it.reason}</q></span>` : ''}</a>`)}
       ${decidedAll.length > decided.length && !app.ui.decidedAll ? html`<button class="linkish in-more" data-act="decided-more">Show earlier decisions</button>` : ''}</div>` : '';
-    /* what autopilot does not approve: it waits for the person although autopilot is on */
-    const heldList = heldRuns(store).map((h) => ({ h, x: store.expById.get(h.id) })).filter((it) => it.x);
     const held = heldList.length ? html`<div class="in-group in-held"><h3>Runs autopilot left for you<span>${heldList.length}</span></h3>${heldList.map(({ h, x }) => html`
       <a class="in-row in-old" data-held="${h.id}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}"><span class="in-dec">${icon('warn')}</span><span class="in-name">${pageName(x)}</span><span class="in-when">not approved</span><span class="in-why">${plain(h.reason)}</span></a>`)}</div>` : '';
     const shown = cur ? cur.page : route.sel && store.byPath.has(route.sel) ? store.byPath.get(route.sel) : null;

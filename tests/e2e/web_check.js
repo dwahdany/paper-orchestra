@@ -347,6 +347,7 @@ CHECKS.phone = async ({ browser, pid }) => {
         await reach(page, width, 'the form of autopilot', ['.auto-form .tick', '.auto-form input:not([type=checkbox])', '.auto-form button[type=submit]'], 40);
         ok(await page.evaluate(() => document.querySelector('.ov-auto').dataset.autopilot === 'off' && !document.querySelector('#auto-on').checked), width + ': the demo project is supervised, and the form of autopilot says so');
         await shot(page, 'autopilot-phone-' + width);
+        await page.waitForTimeout(700);   // (a second touch right after the first is a double one, which the app ignores)
         await page.tap('.ov-auto [data-act="autopilot-open"]');
         await until(page, () => !document.querySelector('.auto-more').open, null, 8000, 'the form of autopilot closes again');
       }

@@ -774,7 +774,11 @@ def test_nothing_that_may_run_ends_the_stretch_and_says_what_waits(tmp_path):
     assert [r["phase"] for r in state["phases"]].count("run") == 1  # it did not spin
     found = autopilot.digest(project)
     assert [item["id"] for item in found["held"]] == ["E1", "E2"]
-    assert "Waiting for you: E1: it would run on this machine as you" in autopilot.summary(found)
+    # One reason, said once for the experiments that share it.
+    assert "Waiting for you: E1 and E2: it would run on this machine as you" in autopilot.summary(
+        found
+    )
+    assert record["said"].count("outside a sandbox") == 1
     assert {page.state for page in project.pages(kind="experiment")} == {"planned"}
 
 

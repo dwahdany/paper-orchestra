@@ -26,14 +26,16 @@ import { app, link } from './core.js';
 import { api, Unreachable } from './api.js';
 import { ago, html, plural, raw, tf } from './util.js';
 import { icon } from './vocab.js';
+import { heldRuns } from './autopilot.js';
 
 /** The decisions of a store, whatever it has loaded (a store without the list has none). */
 export const allDecisions = (store) => (store && Array.isArray(store.decisions) ? store.decisions : []);
 export const openDecisions = (store) => allDecisions(store).filter((d) => d.state === 'open');
 /** Those that went on at the agents' default where autopilot is on: not waiting, still answerable. */
 export const defaultedDecisions = (store) => allDecisions(store).filter((d) => d.state === 'defaulted');
-/** Everything that waits for the person: the proposals and the open decisions. */
-export const waitingCount = (store) => store.pending().length + openDecisions(store).length;
+/** Everything that waits for the person: the proposals, the open decisions, and under
+    autopilot the runs it did not approve. */
+export const waitingCount = (store) => store.pending().length + openDecisions(store).length + heldRuns(store).length;
 /** "1 decision waits for your answer.", or nothing. */
 export const decisionsSentence = (n) => (n ? plural(n, 'decision') + (n === 1 ? ' waits' : ' wait') + ' for your answer.' : '');
 

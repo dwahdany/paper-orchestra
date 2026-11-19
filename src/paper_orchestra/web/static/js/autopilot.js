@@ -28,7 +28,7 @@ export function autopilotSub(store, e) {
   const d = autopilotView(store).digest;
   if (!autopilotOn(store)) return '';
   if (e.working) return 'Autopilot is on: the agents go on by themselves until a cap is reached. Stop ends the stretch.';
-  if (d && d.ended) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.said || d.why || 'its worker ended without saying why') + ' Continue starts a new stretch.';
+  if (d && d.ended) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why || 'its worker ended without saying why') + '. Continue starts a new stretch.';
   if (d && !d.ended) return 'The last stretch of autopilot ended without saying why: its worker is gone. Continue starts a new stretch.';
   return 'Autopilot is on: Continue starts a stretch that goes on by itself until a cap is reached.';
 }
@@ -41,6 +41,9 @@ export function digestHTML(store, e) {
   const kinds = Object.keys(d.accepted_by_kind || {}).sort().map((k) => plural(d.accepted_by_kind[k], (KIND[k] || { one: k }).one.toLowerCase(), (KIND[k] || { many: k + 's' }).many.toLowerCase()));
   const runs = (d.runs || []).map((r) => { const x = store.expById.get(r.id); const said = r.id + ' ' + (r.outcome || (live ? 'is running' : 'has not run')); return x ? html`<a href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${said}</a>` : said; });
   const held = d.held || [];
+  /* one reason is said once, for all the runs that share it */
+  const groups = [];
+  held.forEach((h) => { const g = groups.find((x) => x.reason === h.reason); if (g) g.ids.push(h.id); else groups.push({ reason: h.reason, ids: [h.id] }); });
   return html`<div class="auto-digest" data-digest="${live ? 'running' : 'ended'}"><h3>${live ? 'This stretch so far' : 'While you were away'}</h3>
     <p class="auto-why">${live ? 'Started ' + ago(d.started) + '.' : d.ended ? html`Stopped ${ago(d.ended)}: ${plain(d.said || d.why)}` : 'The stretch ended without saying why: its worker is gone.'}</p>
     <ul class="auto-list">
@@ -50,7 +53,7 @@ export function digestHTML(store, e) {
       <li data-auto="runs"><b>${plural((d.runs || []).length, 'run')} approved</b>${runs.length ? html`: ${runs.map((r, i) => html`${i ? ', ' : ''}${r}`)}` : ''}</li>
       <li data-auto="spent"><b>${money(d.spent_usd)}</b> of ${money(caps.model_usd)} on the agents' models, ${duration(d.seconds) || '0 s'} of ${hoursWords(caps.hours)}, ${d.rounds} of ${plural(caps.rounds, 'round')}</li>
       <li class="quiet" data-auto="uncounted">${plain(d.uncounted)}; ${d.runs_with_network ? plural(d.runs_with_network, 'run') + ' had network access and could make such calls' : 'no run of this stretch had network access'}.</li></ul>
-    ${held.length ? html`<p class="note note-warn auto-held">${icon('warn')}<span><b>Waiting for you:</b> ${held.map((h, i) => { const x = store.expById.get(h.id); return html`${i ? '; ' : ''}${x ? html`<a href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${h.id}</a>` : h.id}: ${plain(h.reason)}`; })}.</span></p>` : ''}</div>`;
+    ${held.length ? html`<p class="note note-warn auto-held">${icon('warn')}<span><b>Waiting for you:</b> ${groups.map((g, i) => html`${i ? '; ' : ''}${g.ids.map((id, k) => { const x = store.expById.get(id); return html`${k ? ', ' : ''}${x ? html`<a href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${id}</a>` : id}`; })}: ${plain(g.reason)}`)}.</span></p>` : ''}</div>`;
 }
 
 /** The switch, the caps and the digest, as one section of the overview. */

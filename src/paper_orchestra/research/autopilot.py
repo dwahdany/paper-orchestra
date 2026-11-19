@@ -30,7 +30,7 @@ gives the one cheap bound there is: how many runs had network access.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from paper_orchestra.research.model import AUTOPILOT, SECTIONS, parse_stamp
@@ -47,6 +47,7 @@ __all__ = [
     "UNCOUNTED",
     "caps_in_words",
     "digest",
+    "grouped",
     "new_stretch",
     "read_stretch",
     "summary",
@@ -343,7 +344,21 @@ def summary(found: Mapping[str, Any]) -> str:
     )
     waiting = found.get("held") or []
     if waiting:
-        named = "; ".join(f"{item['id']}: {item['reason']}" for item in waiting[:6])
-        more = len(waiting) - 6
-        said.append(f"Waiting for you: {named}" + (f"; and {more} more" if more > 0 else "") + ".")
+        said.append(
+            f"Waiting for you: {grouped([(item['id'], item['reason']) for item in waiting])}."
+        )
     return " ".join(said)
+
+
+def grouped(held: Sequence[tuple[str, str]], limit: int = 6) -> str:
+    """``E1 and E2: <reason>; E3: <another>``: the experiments autopilot left, each reason
+    said once for all that share it, and of more than ``limit`` the number."""
+    by_reason: dict[str, list[str]] = {}
+    for name, why in held[:limit]:
+        by_reason.setdefault(why, []).append(name)
+    parts = [
+        f"{', '.join(names[:-1]) + ' and ' + names[-1] if len(names) > 1 else names[0]}: {why}"
+        for why, names in by_reason.items()
+    ]
+    more = len(held) - limit
+    return "; ".join(parts) + (f"; and {more} more" if more > 0 else "")

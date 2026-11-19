@@ -1288,10 +1288,13 @@ class Engine:
             # The phase found nothing it could do (a run phase with nothing it may
             # run): doing it again would find the same.
             waits = [(eid, why) for eid, why in self._held.items() if why]
-            held = "; ".join(f"{eid}: {why}" for eid, why in waits[:6])
             return "needs_you", (
                 "Nothing more can happen without you: "
-                + (f"autopilot did not approve {held}." if held else self._nothing_to_run())
+                + (
+                    f"autopilot did not approve {autopilot.grouped(waits)}."
+                    if waits
+                    else self._nothing_to_run()
+                )
             )
         return None
 
@@ -3370,12 +3373,12 @@ class Engine:
             # Under autopilot a plan that is still a plan is one the rule left alone.
             back = "".join(f" {sentence}" for sentence in self._planned_again())
             held = [
-                f"{page.id}: {self._held.get(str(page.id)) or 'it waits for your approval'}"
-                for page in planned[:6]
+                (str(page.id), self._held.get(str(page.id)) or "it waits for your approval")
+                for page in planned
             ]
             return (
                 f"No experiment is approved to run.{back} Autopilot did not approve "
-                f"{'; '.join(held)}{' and others' if len(planned) > 6 else ''}."
+                f"{autopilot.grouped(held)}."
             )
         if planned:
             # A title is an agent's words more often than not: given as a quotation.

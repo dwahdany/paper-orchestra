@@ -8,7 +8,7 @@ import { afterRender, label, pageName, pageTip, statusParts } from './page.js';
 import { DEMO_COST, UNVERIFIED, actHTML, agentFields, agentsSentence, continueControl, continueNotes, crashText, engineView, foldRuns, foldSteps, forgetButton, nextStep, problemsHTML, researchReasons, runSentence, runWho, waitingSentence, whoOf } from './shell.js';
 import { acceptTip, checkMark, summaryOf, whatOf } from './inbox.js';
 import { decisionLink, openDecisions } from './decisions.js';
-import { autopilotHTML, autopilotOn, autopilotSub, autopilotView, heldReason } from './autopilot.js';
+import { autopilotHTML, autopilotOn, autopilotSub, autopilotView, heldReason, heldRuns } from './autopilot.js';
 
 /** The strip map: every stage as a station, every page as a mark. */
 export function stripMap(store) {
@@ -259,7 +259,8 @@ export const overviewView = {
     /* the page says "running" and nothing is running it: its worker is gone */
     const interrupted = store.experiments.filter((x) => x.state === 'running' && x.interrupted && x.review !== 'rejected');
     const broken = store.experiments.filter((x) => x.state === 'failed' && x.review !== 'rejected');
-    const waitingApproval = store.experiments.filter((x) => x.review === 'accepted' && (x.state === 'planned' || !x.state));
+    /* (what autopilot did not approve is listed with what waits for the person, above) */
+    const waitingApproval = store.experiments.filter((x) => x.review === 'accepted' && (x.state === 'planned' || !x.state) && !heldReason(store, x.id));
     /* approved, and no longer what was approved: it will not run until it is approved again */
     const changed = store.experiments.filter((x) => lapsed(x));
     const lastAct = store.activity.slice().reverse().find((ev) => ev.agent);
@@ -295,6 +296,7 @@ export const overviewView = {
       ${interrupted.map((x) => html`<a class="ov-run ov-broken" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">interrupted · the worker that ran it is gone · run it again, or cancel it</span></a>`)}
       ${changed.map((x) => html`<a class="ov-run ov-broken" data-will-not-run="${x.id}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what">needs approval again · ${whyNot(x.will_not_run)}</span></a>`)}
       ${waitingApproval.map((x) => html`<a class="ov-run" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what" data-held="${x.id}">${autopilotOn(store) ? (heldReason(store, x.id) ? 'autopilot did not approve it · ' + plain(heldReason(store, x.id)) : 'accepted · autopilot approves and runs it in the next stretch') : 'accepted · runs only after you approve it'}</span></a>`)}`;
+    const leftRuns = heldRuns(store);
     const anyWatch = running.length + broken.length + interrupted.length + waitingApproval.length + changed.length;
     /* What the checkpoint said, as it said it then. (What the analyst recommended is among it;
        whether that still stands is the checkpoint's field, shown beside the button.) The
@@ -319,7 +321,7 @@ export const overviewView = {
       <section class="ov-map" aria-label="Where things stand"><a class="ov-maplink" href="${link({ view: 'map', sel: '', sub: '' })}">Open the map <kbd>1</kbd></a>${stripMap(store)}${roundsLine(store, e)}</section>
       <div class="ov-cols"><div class="ov-col">
         ${autoFirst ? auto : ''}
-        <section class="ov-sec"><h2>Waiting for you<span>${items.length + asked.length}</span></h2>${decide}${waiting}</section>
+        <section class="ov-sec"><h2>Waiting for you<span>${items.length + asked.length + leftRuns.length}</span></h2>${decide}${leftRuns.map((h) => { const x = store.expById.get(h.id); return x ? html`<a class="ov-run ov-decide" data-held="${h.id}" href="${link({ view: 'experiments', sel: x.path, sub: '' })}">${pageGlyph(x, 18)}<span class="in-name">${pageName(x)}</span><span class="in-what"><span class="in-kind">Run</span>autopilot did not approve it · ${plain(h.reason)}</span></a>` : ''; })}${items.length || !leftRuns.length ? waiting : ''}</section>
         ${anyWatch ? html`<section class="ov-sec"><h2>Experiments that need watching</h2>${watch}</section>` : ''}
         <section class="ov-sec ov-arg"><h2>The argument so far<a class="ov-more" href="${link({ view: 'map', sel: '', sub: '' })}">see it as the map</a></h2>${argumentHTML(store)}</section>
         <section class="ov-sec"><h2>Instructions for the agents</h2>${requestsHTML(store, e)}</section>
