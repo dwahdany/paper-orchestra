@@ -474,10 +474,11 @@ const WAIT = 'an experiment that needs no GPU would run on this machine as you <
 const local = projectStore({ pages: [e3], experiments: [Object.assign({ runs: 0 }, e3)],
   project: { settings: { limits: { model_usd: 25, experiment_usd: 5 }, autonomy: autonomy('autopilot') }, state: checkpoint('run', 'run'), next_step: said({ will_run: ['run'], then: 'analyze' }),
     autopilot: { mode: 'autopilot', refused: null, since: '', held: digest.held, runs_wait: WAIT,
-      digest: Object.assign({}, digest, { runs: [], spent_usd: 0.02, unpriced_usd: 0.02, unpriced_models: ['some-new-model-9'], experiment_usd: 0, experiment_limit: { spent: 0, allowed: 5 } }) } } });
+      digest: Object.assign({}, digest, { reason: 'needs_you', why: 'nothing more can happen without you', runs: [], spent_usd: 0.02, unpriced_usd: 0.02, unpriced_models: ['some-new-model-9'], experiment_usd: 0, experiment_limit: { spent: 0, allowed: 5 } }) } } });
 const waits = render(local), nowAt = waits.indexOf('class="auto-now"'), now = waits.slice(nowAt, waits.indexOf('</p>', nowAt));
 out.local = { wait: now.includes('Runs on this machine are not approved without you: an experiment that needs no GPU'), escaped: now.includes('&lt;i&gt;') && !now.includes('you <i>'),
   noPromise: !now.includes('runs approved'), limit: now.includes("the project's own limit holds it ($5.00)"),
+  sub: waits.includes('Approve the runs it left for you; Continue then starts a new stretch.') && !waits.includes('. Continue starts a new stretch.'),
   unpriced: waits.includes('<b>$0.02</b> of that is a count, not a cost: no price is known for some-new-model-9'), noExperiments: !waits.includes('data-auto="experiments"') };
 /* where it approves them: the promise, what holds the cost of the runs, and what they cost in the stretch */
 out.remote = { promise: section.includes('runs approved and checkpoints passed without you'), limit: section.includes("What the experiments cost is no part of these caps: the project's own limit holds it ($5.00)"),

@@ -30,6 +30,8 @@ export function autopilotSub(store, e) {
   const d = autopilotView(store).digest;
   if (!autopilotOn(store)) return '';
   if (e.working) return 'Autopilot is on: the agents go on by themselves until a cap is reached. Stop ends the stretch.';
+  /* stopped for want of the person: a new stretch finds the same until they approve what it left */
+  if (d && d.ended && d.reason === 'needs_you' && heldRuns(store).length) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why) + '. Approve the runs it left for you; Continue then starts a new stretch.';
   if (d && d.ended) return 'Autopilot stopped ' + ago(d.ended) + ': ' + plain(d.why || 'its worker ended without saying why') + '. Continue starts a new stretch.';
   if (d && !d.ended) return 'The last stretch of autopilot ended without saying why: its worker is gone. Continue starts a new stretch.';
   return 'Autopilot is on: Continue starts a stretch that goes on by itself until a cap is reached.';

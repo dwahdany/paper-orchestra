@@ -96,7 +96,7 @@ def _plural(count: int, noun: str, many: str | None = None) -> str:
 def _hours(hours: float) -> str:
     """``12 hours``, ``1 hour``, ``30 minutes``: a length of time as it is said."""
     if hours >= 1:
-        hours = round(hours, 1)  # "5 hours", not "5.00002 hours"
+        hours = round(hours, 2)  # "5 hours", not "5.00002 hours"; a cap of 1.25 as it is
         return f"{hours:g} hour{'' if hours == 1 else 's'}"
     minutes = hours * 60
     if minutes >= 1:

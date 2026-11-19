@@ -736,6 +736,14 @@ def test_past_the_cap_on_hours_no_further_experiment_is_approved_or_started(tmp_
     assert [item["id"] for item in autopilot.digest(project)["runs"]] == ["E1"]
 
 
+def test_a_length_of_time_is_said_as_it_is(tmp_path):
+    assert autopilot._hours(5.00002) == "5 hours" and autopilot._hours(1.0) == "1 hour"
+    assert autopilot._hours(1.25) == "1.25 hours"  # a cap is not said as another
+    assert "$200.00 on models or 1.25 hours" in autopilot.caps_in_words(
+        {"rounds": 3, "model_usd": 200, "hours": 1.25}
+    )
+
+
 def test_past_the_cap_a_run_the_person_approved_keeps_its_approval_and_waits(tmp_path):
     project = classic_project(tmp_path, autonomy={**AUTO, "hours": 1.0})
     backend = Remote()
